@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/client/src-tauri",
+    "apps/server",
+    "shared/protocol",
+    "shared/crypto",
+    "shared/manifest",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+locast-crypto = { path = "shared/crypto" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

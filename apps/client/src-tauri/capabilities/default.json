@@ -1,0 +1,33 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Locast desktop client default capabilities. The set is fixed by docs/ARCHITECTURE.md section 5 and is the least-privilege set required for the v1 application. No shell, no arbitrary HTTP, no unrestricted filesystem write is granted. Privileged filesystem and network operations live in Rust and are exposed only through typed IPC commands (added in P0-T06 and P1+).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-set-title",
+    "core:webview:allow-set-webview-focus",
+    "core:event:default",
+    "core:path:default",
+    "core:app:default",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "fs:default",
+    "fs:allow-read-text-file",
+    "fs:allow-read-file",
+    "opener:default",
+    "opener:allow-open-url",
+    "log:default",
+    "os:default",
+    "process:default"
+  ]
+}

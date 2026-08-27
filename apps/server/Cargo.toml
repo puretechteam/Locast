@@ -1,0 +1,26 @@
+[package]
+name = "locast-server"
+version = "0.0.0"
+description = "Locast signaling and room coordination server (axum 0.7 + tokio)."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "locast-server"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+axum = "0.7"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+prometheus = "0.14"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

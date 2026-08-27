@@ -1,0 +1,30 @@
+//! IPC command registry for the Locast desktop client.
+//!
+//! P0-T06 introduced the first command, `greet`, to prove the
+//! `tauri-specta` -> TypeScript bindings toolchain end-to-end.
+//! P1-T04 added the first non-trivial command, `media_import`, which
+//! ingests one or more files into the local library with content-
+//! addressed dedup. P1-T05 added `quota_get` and `quota_set` over the
+//! disk-quota engine. P1-T07 added `library_scan`, which reconciles
+//! the on-disk library against the `media_items` table. The companion
+//! `events` module is empty for P1-T07.
+
+pub mod import;
+pub mod quota;
+pub mod scan;
+
+pub use import::{media_import, AppError, ImportedMedia};
+pub use quota::{quota_get, quota_set, QuotaInfo};
+pub use scan::{library_scan, ScanResult};
+
+/// The single Tauri command exposed to the webview in P0-T06.
+///
+/// Returns a fixed greeting so the React side can confirm the IPC
+/// round-trip and render the generated binding. The lib's
+/// `invoke_handler` will register this in the bindings-generation
+/// bring-up that follows P0-T06.
+#[tauri::command]
+#[specta::specta]
+pub fn greet() -> String {
+    "Hello, Locast".to_string()
+}

@@ -1,0 +1,33 @@
+{
+  "name": "locast-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Locast desktop client (Tauri 2 + React).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -b --noEmit",
+    "test": "echo \"locast-client: no test runner yet (Vitest lands in P0-T04)\" && exit 0",
+    "lint": "echo \"locast-client: no linter yet (eslint lands in P0-T04)\" && exit 0",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/node": "^22.10.5",
+    "@types/react": "^18.3.29",
+    "@types/react-dom": "^18.3.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "^5.9.3",
+    "vite": "^5.4.21"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

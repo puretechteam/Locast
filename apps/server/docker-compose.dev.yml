@@ -1,0 +1,29 @@
+# Locast signaling server - local development compose.
+#
+# Brings up the signaling server on host port 8787 (mapped from the
+# container's LOCAST_BIND_ADDR=0.0.0.0:8787). The container image is built
+# from apps/server/Dockerfile in the repo root context. The bind mount
+# under ./apps/server/src is commented out - uncomment for live-reload
+# development once P2-T02 lands a watch-based dev server.
+
+services:
+  locast-server:
+    build:
+      context: ../..
+      dockerfile: apps/server/Dockerfile
+    image: locast/locast-server:dev
+    container_name: locast-server-dev
+    restart: unless-stopped
+    environment:
+      LOCAST_BIND_ADDR: "0.0.0.0:8787"
+      LOCAST_LOG: "info,locast_server=debug"
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    # volumes:
+    #   - ./src:/app/src:ro

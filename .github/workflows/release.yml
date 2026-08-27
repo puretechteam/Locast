@@ -1,0 +1,37 @@
+# Locast release workflow.
+#
+# P0-T04 establishes this as a no-op stub that triggers only on a
+# pushed git tag of the form `v<semver>`. The real release work -
+# building the Tauri bundles per OS, signing them, generating the
+# release notes, and publishing to the GitHub release - is owned by
+# P9-T01 (Beta packaging, docs, release). Per AGENTS.md, the only
+# thing in the project that should produce a tag is this workflow;
+# do not tag locally without explicit user instruction.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+# A release is intentionally never cancelled by a newer push.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  noop:
+    name: placeholder (filled in by P9-T01)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release workflow is a stub in P0-T04
+        run: |
+          echo "release workflow is a no-op stub in P0-T04."
+          echo "Real release work is implemented by P9-T01 (Beta packaging, docs, release)."
+          echo "Triggered by: ${{ github.ref }}"
+          echo "Event:        ${{ github.event_name }}"
