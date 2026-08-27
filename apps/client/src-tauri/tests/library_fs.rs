@@ -417,12 +417,18 @@ fn plant_symlink(target: &std::path::Path, link_path: &std::path::Path) {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn posix_symlink_planted_inside_root_is_detected() {
-    // Plant a symlink at `<root>/library/01/escape` -> `/tmp/somewhere-else`.
-    // A caller that asks to complete a download whose SHA prefix lands
-    // in this symlinked dir would have its destination under the
-    // symlink target, which is OUTSIDE the library root. The
-    // canonicalize-after-`create_dir_all` defense must catch this and
-    // return `PathEscapesLibrary`.
+    // Plant a symlink at `<root>/library/01` -> `<outside>` where the
+    // outside target is a real directory. The destination's content-
+    // addressed parent is `<root>/library/01/<full_sha>`; resolving
+    // that path's parent through the symlink redirects it OUTSIDE
+    // the library root. The canonicalize-after-`create_dir_all`
+    // defense must catch this and return `PathEscapesLibrary`.
+    //
+    // (An earlier version of this test planted the symlink at
+    // `<root>/library/01/escape`, which is not on the destination's
+    // parent chain and therefore could not be detected by the
+    // canonicalize(parent) check. Re-targeting the symlink to
+    // `<root>/library/01` is the correct setup for the test.)
     //
     // This test only runs on POSIX. The Windows host may not allow
     // unprivileged symlink creation, and the architecture's section 21.7
@@ -433,12 +439,20 @@ async fn posix_symlink_planted_inside_root_is_detected() {
     let lib_root_tmp = TempDir::new().expect("lib tempdir");
     let root = lib_root_tmp.path();
 
-    // Create the directory tree up to the prefix the symlink will
-    // replace.
+    // The content-addressed destination is
+    // `<root>/library/<sha[0..2]>/<sha[2..4]>/<sha>/<sanitized>`.
+    // For SHA = "0123456789abcdef..." the prefix is `01`. Plant a
+    // symlink AT `library/01` so the destination's parent chain
+    // resolves through the symlink.
+    //
+    // The real directory must be created first (so the prefix path
+    // is on disk), then removed and re-created as a symlink, because
+    // `symlink(2)` refuses to create a link where a directory
+    // already exists.
     let prefix_dir = root.join("library").join("01");
     std::fs::create_dir_all(&prefix_dir).expect("create prefix dir");
-    let link_path = prefix_dir.join("escape");
-    plant_symlink(outside.path(), &link_path);
+    std::fs::remove_dir(&prefix_dir).expect("remove prefix dir");
+    plant_symlink(outside.path(), &prefix_dir);
 
     // Now stage a partial and try to complete.
     let src = stage_partial(root, "deadbeef-cafe-0000-0000-000000000001", SHA, b"x");
@@ -446,7 +460,35 @@ async fn posix_symlink_planted_inside_root_is_detected() {
     let result = fs::complete_download(root, SHA, &src, "Movie.mkv").await;
     assert!(
         matches!(result, Err(FsError::PathEscapesLibrary)),
-        "symlink redirecting library/01/* to outside should be detected as PathEscapesLibrary, got {result:?}"
+        "symlink redirecting library/01 to outside should be detected as PathEscapesLibrary, got {result:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn posix_symlink_at_full_sha_dir_is_detected() {
+    // Plant a symlink at `<root>/library/01/<full_sha>` -> `<outside>`.
+    // The destination's parent is exactly this symlink; the
+    // canonicalize-after-`create_dir_all` defense must catch it.
+    let outside = tempfile::TempDir::new().expect("outside tempdir");
+    let lib_root_tmp = TempDir::new().expect("lib tempdir");
+    let root = lib_root_tmp.path();
+
+    // Create the prefix dir and then the full-sha dir; remove the
+    // full-sha dir and replace it with a symlink to outside.
+    let prefix_dir = root.join("library").join("01");
+    std::fs::create_dir_all(&prefix_dir).expect("create prefix dir");
+    let full_sha_dir = prefix_dir.join(SHA);
+    std::fs::create_dir_all(&full_sha_dir).expect("create full_sha dir");
+    std::fs::remove_dir(&full_sha_dir).expect("remove full_sha dir");
+    plant_symlink(outside.path(), &full_sha_dir);
+
+    let src = stage_partial(root, "deadbeef-cafe-0000-0000-000000000002", SHA, b"x");
+
+    let result = fs::complete_download(root, SHA, &src, "Movie.mkv").await;
+    assert!(
+        matches!(result, Err(FsError::PathEscapesLibrary)),
+        "symlink redirecting library/01/<sha> to outside should be detected as PathEscapesLibrary, got {result:?}"
     );
 }
 

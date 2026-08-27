@@ -1,0 +1,31 @@
+# Line ending and text/binary normalization for the Locast public
+# repository.
+#
+# Keep the working tree's line endings predictable across
+# Windows / macOS / Linux developer hosts and CI. Generated
+# TypeScript files (ts-rs, tauri-specta) MUST be LF; the
+# Windows host has historically committed CRLF by accident and
+# the generator produces LF, causing a CI byte-for-byte drift
+# in `cargo test -p locast-protocol -- --ignored`. This file
+# normalizes the generated files explicitly.
+#
+# Cargo.lock is vendored as-is; do not normalize it (different
+# hosts may check in slightly different line endings and we
+# want git to preserve them exactly).
+#
+# The icon files are binary; pin them as such so a Windows
+# host with `core.autocrlf=true` does not corrupt them.
+
+*               text=auto eol=lf
+
+# Vendored lockfile: preserve whatever the host checked in.
+Cargo.lock      -text
+
+# Tauri app icons (binary).
+apps/client/src-tauri/icons/*.png binary
+apps/client/src-tauri/icons/*.ico  binary
+
+# Generated TypeScript bindings: must be LF to match the
+# generator's output and avoid CI byte-for-byte drift.
+shared/protocol/ts/index.ts           text eol=lf
+apps/client/src/bindings/index.ts     text eol=lf
