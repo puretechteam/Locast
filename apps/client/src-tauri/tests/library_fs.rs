@@ -467,18 +467,24 @@ async fn posix_symlink_planted_inside_root_is_detected() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn posix_symlink_at_full_sha_dir_is_detected() {
-    // Plant a symlink at `<root>/library/01/<full_sha>` -> `<outside>`.
-    // The destination's parent is exactly this symlink; the
-    // canonicalize-after-`create_dir_all` defense must catch it.
+    // Plant a symlink at `<root>/library/<sha[0..2]>/<sha[2..4]>/<full_sha>`
+    // -> `<outside>`. The destination's parent is exactly this symlink;
+    // the canonicalize-after-`create_dir_all` defense must catch it.
+    //
+    // For SHA = "0123456789abcdef..." the content-addressed parent is
+    // `<root>/library/01/23/<full_sha>` (the first 2 hex chars land in
+    // `01`, the next 2 in `23`). The intermediate `library/01/23/`
+    // directory is real; only the leaf `<full_sha>` is a symlink.
     let outside = tempfile::TempDir::new().expect("outside tempdir");
     let lib_root_tmp = TempDir::new().expect("lib tempdir");
     let root = lib_root_tmp.path();
 
-    // Create the prefix dir and then the full-sha dir; remove the
-    // full-sha dir and replace it with a symlink to outside.
-    let prefix_dir = root.join("library").join("01");
-    std::fs::create_dir_all(&prefix_dir).expect("create prefix dir");
-    let full_sha_dir = prefix_dir.join(SHA);
+    // Create the intermediate `library/01/23/` directory tree, then
+    // create the full-sha dir, remove it, and replace it with a
+    // symlink to outside.
+    let intermediate = root.join("library").join(&SHA[0..2]).join(&SHA[2..4]);
+    std::fs::create_dir_all(&intermediate).expect("create intermediate dir");
+    let full_sha_dir = intermediate.join(SHA);
     std::fs::create_dir_all(&full_sha_dir).expect("create full_sha dir");
     std::fs::remove_dir(&full_sha_dir).expect("remove full_sha dir");
     plant_symlink(outside.path(), &full_sha_dir);
@@ -488,7 +494,7 @@ async fn posix_symlink_at_full_sha_dir_is_detected() {
     let result = fs::complete_download(root, SHA, &src, "Movie.mkv").await;
     assert!(
         matches!(result, Err(FsError::PathEscapesLibrary)),
-        "symlink redirecting library/01/<sha> to outside should be detected as PathEscapesLibrary, got {result:?}"
+        "symlink redirecting library/01/23/<sha> to outside should be detected as PathEscapesLibrary, got {result:?}"
     );
 }
 
