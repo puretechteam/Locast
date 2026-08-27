@@ -64,7 +64,7 @@ async fn insert_media_row(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    let rel_path = format!("library/{}/{}/{}/test.mp4", &sha[..2], &sha[2..4], &sha);
+    let rel_path = format!("library/{}/{}/{}/test.mp4", &sha[..2], &sha[2..4], sha);
     let abs_path = library_root.join(&rel_path);
     tokio::fs::create_dir_all(abs_path.parent().unwrap())
         .await
