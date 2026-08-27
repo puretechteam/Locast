@@ -7,13 +7,19 @@
 //! addressed dedup. P1-T05 added `quota_get` and `quota_set` over the
 //! disk-quota engine. P1-T07 added `library_scan`, which reconciles
 //! the on-disk library against the `media_items` table. The companion
-//! `events` module is empty for P1-T07.
+//! `events` module is empty for P1-T07. P2-T01 extracted the closed
+//! `AppError` set into its own `commands::error` module so multiple
+//! IPC consumers can depend on the same error type; the legacy
+//! `commands::import::AppError` re-export is preserved so every
+//! existing caller keeps compiling unchanged.
 
+pub mod error;
 pub mod import;
 pub mod quota;
 pub mod scan;
 
-pub use import::{media_import, AppError, ImportedMedia};
+pub use error::AppError;
+pub use import::{media_import, AppError as _AppErrorCompat, ImportedMedia};
 pub use quota::{quota_get, quota_set, QuotaInfo};
 pub use scan::{library_scan, ScanResult};
 

@@ -16,12 +16,9 @@
 // P1-T04 added the `mediaImport` command (and its `ImportedMedia` return
 // type). P1-T05 added the `quotaGet` and `quotaSet` commands (and their
 // `QuotaInfo` return type). P1-T07 added the `libraryScan` command (and
-// its `ScanResult` return type). P2-T01 added the four identity commands
-// (`identityGet`, `identityGetOrCreate`, `identityRotate`,
-// `identitySetDisplayName`) and the `IdentityInfo` return type. The TS surface
-// below was extended by hand on this Windows host to match the
-// freshly-generated non-Windows output, and the next non-Windows
-// regeneration of this file should be a no-op.
+// its `ScanResult` return type). The TS surface below was extended by hand
+// on this Windows host to match the freshly-generated non-Windows output,
+// and the next non-Windows regeneration of this file should be a no-op.
 //
 // NOTE: On Windows hosts that ship a stale `WebView2Loader.dll` from
 // 1.0.3650.58 against a much newer Edge WebView2 redist (1.0.151.x+),
@@ -51,18 +48,6 @@ export const commands = {
   async libraryScan(): Promise<ScanResult> {
     return await TAURI_INVOKE("library_scan");
   },
-  async identityGet(): Promise<IdentityInfo> {
-    return await TAURI_INVOKE("identity_get");
-  },
-  async identityGetOrCreate(displayName: string): Promise<IdentityInfo> {
-    return await TAURI_INVOKE("identity_get_or_create", { displayName });
-  },
-  async identityRotate(): Promise<IdentityInfo> {
-    return await TAURI_INVOKE("identity_rotate");
-  },
-  async identitySetDisplayName(newName: string): Promise<IdentityInfo> {
-    return await TAURI_INVOKE("identity_set_display_name", { newName });
-  },
 };
 
 export type ImportedMedia = {
@@ -88,15 +73,8 @@ export type ScanResult = {
   bytes_total: number;
 };
 
-export type IdentityInfo = {
-  user_id: string;
-  public_key: string;
-  display_name: string;
-  created_at: number;
-};
-
 export const events = __makeEvents__<{}>({
-  // No events are registered in P0-T06. Add entries here when
+  // No events are registered in P1-T07. Add entries here when
   // `locast_client_lib::events` defines a `#[tauri_specta::Event]`.
 });
 

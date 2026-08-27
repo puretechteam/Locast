@@ -23,37 +23,9 @@ use tokio::fs as tokio_fs;
 
 use crate::commands::error::AppError;
 use crate::core::quota::QuotaAccountant;
+use crate::library::scan;
 pub use crate::library::scan::ScanResult;
-use crate::library::scan::{self, ScanError};
 use crate::storage::Storage;
-
-/// Map [`ScanError`] onto the locked [`AppError`] variants.
-///
-/// - `ScanError::Io` -> `AppError::Read`. A scanner-side read
-///   error is structurally a read error; mapping to the existing
-///   `Read` variant keeps the closed [`AppError`] set intact and
-///   surfaces the underlying message.
-/// - `ScanError::Storage` -> `AppError::Storage`.
-/// - `ScanError::Sqlx` -> `AppError::Database`.
-/// - `ScanError::Paths` -> `AppError::Paths`.
-impl From<ScanError> for AppError {
-    fn from(err: ScanError) -> Self {
-        match err {
-            ScanError::Io(io) => AppError::Read {
-                message: io.to_string(),
-            },
-            ScanError::Storage(s) => AppError::Storage {
-                message: s.to_string(),
-            },
-            ScanError::Sqlx(s) => AppError::Database {
-                message: s.to_string(),
-            },
-            ScanError::Paths(p) => AppError::Paths {
-                message: p.to_string(),
-            },
-        }
-    }
-}
 
 /// Tauri command: scan the on-disk library and reconcile it
 /// against the `media_items` table.

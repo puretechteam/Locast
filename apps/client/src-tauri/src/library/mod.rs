@@ -7,8 +7,6 @@
 //! the content-addressed tree against the `media_items` table.
 
 pub mod fs;
-pub mod protocol;
 pub mod scan;
 
-pub use protocol::{install as install_protocol, ProtocolState};
 pub use scan::{scan as scan_library, ScanError, ScanResult};
