@@ -852,7 +852,7 @@ async fn scan_silently_skips_symlinks_under_library() {
     write_cap_file(&lib_root, &sha, "Good.mkv", &bytes);
 
     // A symlink inside library/ pointing OUTSIDE the library root.
-    let outside_target = lib_root_dir.path().join("outside.mkv");
+    let outside_target = lib_root_dir.join("outside.mkv");
     std::fs::write(&outside_target, b"some bytes the scanner should not read").unwrap();
     let sha_prefix_dir = lib_root.join("library").join(&sha[0..2]);
     std::fs::create_dir_all(&sha_prefix_dir).unwrap();
