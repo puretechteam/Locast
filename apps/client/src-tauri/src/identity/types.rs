@@ -56,6 +56,31 @@ impl Keypair {
             .ok()
             .map(|signing| Self { signing })
     }
+
+    /// The 32-byte public key. Mirrors
+    /// `ed25519_dalek::SigningKey::verifying_key().to_bytes()`;
+    /// provided as a stable helper so the network layer does not
+    /// need to import `ed25519_dalek` directly.
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    /// Sign the 32-byte nonce from a server CHALLENGE. P2-T02.
+    /// The signature is over the raw nonce with no domain tag
+    /// (architecture §20.4.4: "Client signs the nonce"). The
+    /// returned 64-byte signature is the value the client puts
+    /// in the `AUTH` envelope's `sig` field.
+    ///
+    /// This is the ONLY way the private key ever produces a
+    /// signature for the wire. There is intentionally no
+    /// `sign_arbitrary` helper: the keypair should never sign
+    /// anything except a server nonce, and the dedicated helper
+    /// makes that intent obvious in code review.
+    pub fn sign_challenge(&self, nonce: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer;
+        let sig = self.signing.sign(nonce);
+        sig.to_bytes()
+    }
 }
 
 /// The public view of the local identity. This is the only shape

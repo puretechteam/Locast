@@ -12,8 +12,11 @@ path = "src/lib.rs"
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-ts-rs = { version = "12.0.1", features = ["serde-compat"] }
+ts-rs = { version = "12.0.1", features = ["serde-compat", "uuid-impl", "serde-json-impl"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+locast-crypto = { path = "../crypto" }
 
 [dev-dependencies]
 serde_json.workspace = true

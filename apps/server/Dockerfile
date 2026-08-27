@@ -41,7 +41,11 @@ WORKDIR /app
 COPY --from=builder /build/target/release/locast-server /app/locast-server
 
 ENV LOCAST_BIND_ADDR=0.0.0.0:8787 \
+    LOCAST_DATABASE_URL=/var/lib/locast/locast-server.db \
     LOCAST_LOG=info
+
+# Database directory; the runtime data is mounted here in compose.
+RUN mkdir -p /var/lib/locast && chown locast:locast /var/lib/locast
 
 EXPOSE 8787
 ENTRYPOINT ["/app/locast-server"]

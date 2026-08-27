@@ -6,6 +6,9 @@
 # under ./apps/server/src is commented out - uncomment for live-reload
 # development once P2-T02 lands a watch-based dev server.
 
+volumes:
+  locast-data:
+
 services:
   locast-server:
     build:
@@ -16,9 +19,12 @@ services:
     restart: unless-stopped
     environment:
       LOCAST_BIND_ADDR: "0.0.0.0:8787"
+      LOCAST_DATABASE_URL: "/var/lib/locast/locast-server.db"
       LOCAST_LOG: "info,locast_server=debug"
     ports:
       - "8787:8787"
+    volumes:
+      - locast-data:/var/lib/locast
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/health"]
       interval: 10s

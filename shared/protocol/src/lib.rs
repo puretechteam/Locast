@@ -1,15 +1,24 @@
 //! Shared protocol crate.
 //!
-//! P0-T01: placeholder. P0-T07 adds the first `ts-rs` example struct and
-//! the TypeScript generator script. P3+ fills in playback, drawing, laser,
-//! manifest, and download message types per `docs/ARCHITECTURE.md`
-//! section 18 and section 26.4.
+//! Defines the wire-format types that the Rust client, the Rust
+//! server, and the TypeScript webview all agree on. The contents
+//! mirror the tables in `docs/ARCHITECTURE.md` section 18 (Network
+//! Protocol Design) and section 20 (Server Architecture).
+//!
+//! P0-T01: placeholder. P0-T07 added the first `ts-rs` example struct
+//! and the TypeScript generator script. P2-T02 adds the envelope
+//! scaffolding and the five handshake payload structs. P3+ fills
+//! in playback, drawing, laser, manifest, and download message
+//! types per the architecture.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
+
+pub mod envelope;
+pub mod handshake;
 
 /// Library version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -27,7 +36,7 @@ pub const WIRE_NAMESPACE: &str = "locast.v1";
 /// - a `String` (`id`) to exercise string marshalling
 /// - an integer (`counter`) to exercise numeric marshalling
 /// - an `Option<String>` (`note`) to exercise nullable fields
-/// - a nested `enum` (`Mood`) to exercise tagged-union marshalling
+/// - a nested `enum` (`mood`) to exercise tagged-union marshalling
 ///
 /// `mood` is marked `#[ts(inline)]` so the `Mood` union is rendered inline
 /// in `HelloWorld` and the generated `ts/index.ts` stays self-contained
@@ -77,8 +86,91 @@ mod tests {
     #[test]
     #[ignore]
     fn ts_export() {
-        let rendered = HelloWorld::export_to_string(&ts_rs::Config::default())
-            .expect("render HelloWorld bindings");
+        // We render each public type via `export_to_string` and
+        // compare the concatenation to the on-disk
+        // `ts/index.ts`. The `TS` trait is not object-safe so we
+        // call each type's method directly.
+        //
+        // `serde_json::Value` is exported too so the
+        // `serde_json/JsonValue.ts` helper is generated; without
+        // it the Envelope payload field's import statement would
+        // point to a non-existent file. We capture the helper
+        // content out of band and append it to the rendered
+        // output below the index.ts content.
+        let cfg = ts_rs::Config::default();
+        let mut rendered = String::new();
+        rendered.push_str(&HelloWorld::export_to_string(&cfg).expect("render HelloWorld bindings"));
+        rendered.push('\n');
+        rendered.push_str(&Mood::export_to_string(&cfg).expect("render Mood bindings"));
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::envelope::Envelope::export_to_string(&cfg).expect("render Envelope bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::envelope::MessageKind::export_to_string(&cfg)
+                .expect("render MessageKind bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::envelope::Sender::export_to_string(&cfg).expect("render Sender bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::HelloPayload::export_to_string(&cfg)
+                .expect("render HelloPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::WelcomePayload::export_to_string(&cfg)
+                .expect("render WelcomePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::WelcomeConfig::export_to_string(&cfg)
+                .expect("render WelcomeConfig bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::WelcomeRate::export_to_string(&cfg)
+                .expect("render WelcomeRate bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::ChallengePayload::export_to_string(&cfg)
+                .expect("render ChallengePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthPayload::export_to_string(&cfg)
+                .expect("render AuthPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthOkPayload::export_to_string(&cfg)
+                .expect("render AuthOkPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthBearer::export_to_string(&cfg)
+                .expect("render AuthBearer bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthFailPayload::export_to_string(&cfg)
+                .expect("render AuthFailPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthFailReason::export_to_string(&cfg)
+                .expect("render AuthFailReason bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::Platform::export_to_string(&cfg).expect("render Platform bindings"),
+        );
+        rendered.push('\n');
+
         let path = std::path::Path::new("ts/index.ts");
 
         if let Some(parent) = path.parent() {

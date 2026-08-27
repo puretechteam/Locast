@@ -16,11 +16,30 @@ path = "src/main.rs"
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-axum = "0.7"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 prometheus = "0.14"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+rand = "0.8"
+base64 = "0.22"
+rmp-serde = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+locast-protocol = { path = "../../shared/protocol" }
+locast-crypto = { path = "../../shared/crypto" }
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+tempfile = "3"
+futures-util = "0.3"
+rmp-serde = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"

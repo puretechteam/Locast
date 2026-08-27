@@ -6,8 +6,9 @@
 //! - `GET /metrics` returns `200 OK` with an empty Prometheus body
 //!   (counters and gauges are added in P2+).
 //!
-//! The WebSocket endpoint, auth handshake, room registry, presence, and
-//! rate limiting land in P2+. See `docs/ARCHITECTURE.md` section 26.3.
+//! P2-T02 adds the WebSocket endpoint, the auth handshake, the
+//! SQLite-backed user/bearer store, and the per-connection rate
+//! limiter. See `docs/ARCHITECTURE.md` section 26.3.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
@@ -22,10 +23,16 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tracing::info;
 
+pub mod auth;
 pub mod config;
+pub mod db;
 pub mod metrics;
+pub mod ws;
+
+pub mod test_support;
 
 pub use config::Config;
+pub use db::Db;
 pub use metrics::Metrics;
 
 /// Library version string. Bumped per release alongside the workspace.
@@ -36,31 +43,26 @@ pub fn name() -> &'static str {
     "locast-server"
 }
 
-/// Shared application state held by every axum handler. The struct is
-/// kept small for P0-T03; P2+ adds the room registry, the connection
-/// counter, and the auth context.
+/// Shared application state held by every axum handler.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub metrics: Metrics,
+    pub db: Db,
 }
 
 /// Build the axum router. Exposed so tests and integration harnesses can
 /// mount the router on a `tokio::net::TcpListener` without going through
 /// the binary entry point.
-///
-/// The router is built without a single stateful type. Handlers that do
-/// not need shared state (health, version) take no extractor; the metrics
-/// handler reads its own `Metrics` clone from the router extensions. This
-/// keeps the handler signatures minimal and avoids axum 0.7's
-/// `Handler<_, S>` bound issues.
 pub fn router(state: AppState) -> Router {
     let metrics = state.metrics.clone();
     Router::new()
         .route("/health", get(health))
         .route("/version", get(version))
         .route("/metrics", get(metrics_handler))
+        .route("/ws", get(ws::handler))
         .layer(Extension(metrics))
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -107,14 +109,24 @@ pub fn init_tracing(config: &Config) {
         .try_init();
 }
 
-/// Bind to `config.bind_addr` and serve until SIGINT / SIGTERM.
+/// Bind to `config.bind_addr`, open the database, and serve until
+/// SIGINT / SIGTERM.
 pub async fn serve(config: Config) -> Result<(), std::io::Error> {
+    init_tracing(&config);
+
+    let db = Db::open(&config)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Background cleanup of expired bearers every minute. The
+    // task runs for the lifetime of the server.
+    db::spawn_bearer_cleanup(db.clone(), std::time::Duration::from_secs(60));
+
     let state = AppState {
         config: Arc::new(config.clone()),
         metrics: Metrics::new(),
+        db,
     };
-
-    init_tracing(&config);
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
