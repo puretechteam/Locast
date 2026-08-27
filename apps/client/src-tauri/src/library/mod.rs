@@ -5,8 +5,12 @@
 //! atomic completion routine (`library::fs::complete_download`); P1-T07
 //! adds the on-disk scanner (`library::scan::scan`) that reconciles
 //! the content-addressed tree against the `media_items` table.
+//! P1-T08 adds the `locast://` custom protocol module
+//! (`library::protocol::ProtocolHandler`).
 
 pub mod fs;
+pub mod protocol;
 pub mod scan;
 
+pub use protocol::{resolve_media_url, resolve_subtitle_url, ProtocolHandler};
 pub use scan::{scan as scan_library, ScanError, ScanResult};

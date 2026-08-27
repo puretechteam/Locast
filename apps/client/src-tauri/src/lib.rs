@@ -3,18 +3,28 @@
 //! P0-T02: wires up the Tauri 2 builder, opens a single main window, and
 //! initializes the section-5 plugin set. The IPC command registry and the
 //! storage layer are added in P0-T05, P0-T06, and P1-T04..P1-T07.
+//! P1-T08: registers the `locast://` URI scheme handler and adds
+//! `media_resolve_url` to the IPC surface.
+//! P2-T01: installs the `IdentityService` as managed state and
+//! exposes `identity_get` / `identity_rotate` /
+//! `identity_set_display_name` over IPC.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+use tauri::Manager as _;
 use tauri_plugin_log::{Target, TargetKind};
 
 pub mod commands;
 pub mod core;
 pub mod events;
+pub mod identity;
 pub mod library;
 pub mod probe;
 pub mod storage;
+
+use identity::keystore::IdentityService;
+use library::protocol::ProtocolHandler;
 
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -67,10 +77,21 @@ pub fn run() {
             // Settings UI is the future task that lets the user pick
             // a different root.
             //
+            // P1-T08: install a `ProtocolHandler` against the same
+            // library root so the `locast://` scheme can be
+            // registered with Tauri. The library root is the parent
+            // of the SQLite file (matches the convention in
+            // `commands::import::resolve_library_root`).
+            //
+            // P2-T01: install the `IdentityService` so the
+            // `identity_*` commands can take
+            // `tauri::State<'_, IdentityService>`. The service holds
+            // a clone of the storage handle (cheap) and a real OS
+            // keyring.
+            //
             // `tauri::async_runtime::block_on` is used because `setup`
             // is synchronous; the open + migrate step is bounded by
             // the SQLx pool warm-up and the single 0001_init migration.
-            use tauri::Manager as _;
             let data_dir = app.path().app_data_dir().expect("resolve app data dir");
             std::fs::create_dir_all(&data_dir).expect("create app data dir");
             let db_path = data_dir.join("index.sqlite");
@@ -78,9 +99,14 @@ pub fn run() {
                 tauri::async_runtime::block_on(async { storage::Storage::open(&db_path).await })
                     .expect("open storage");
             let accountant = core::quota::QuotaAccountant::new(storage.clone());
+            let library_root = data_dir.clone();
+            let protocol_handler = ProtocolHandler::new(storage.clone(), library_root);
+            let identity_service = IdentityService::new(storage.clone());
 
             app.manage(storage);
             app.manage(accountant);
+            app.manage(protocol_handler);
+            app.manage(identity_service);
 
             Ok(())
         })
@@ -90,7 +116,99 @@ pub fn run() {
             commands::quota::quota_get,
             commands::quota::quota_set,
             commands::scan::library_scan,
+            commands::protocol::media_resolve_url,
+            commands::identity::identity_get,
+            commands::identity::identity_rotate,
+            commands::identity::identity_set_display_name,
         ])
+        .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
+            // P1-T08: the `locast://` URI scheme handler. Tauri
+            // hands us the request off the main thread; we
+            // resolve the URL, look up the row, and return the
+            // file content (or a Range slice) as an HTTP
+            // response. The handler state is fetched from the
+            // app handle's managed state.
+            let url = request.uri().to_string();
+            let method = request.method().to_string();
+            let range = request
+                .headers()
+                .get("range")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let app_handle = ctx.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let handler = app_handle.state::<ProtocolHandler>();
+                let res = handler.handle(&url, &method, range.as_deref()).await;
+                let response = match res {
+                    Ok(r) => protocol_response_to_tauri(r).await,
+                    Err(e) => error_to_tauri(&e),
+                };
+                responder.respond(response);
+            });
+        })
         .run(tauri::generate_context!())
         .expect("error while running Locast desktop client");
+}
+
+/// Convert a `ProtocolResponse` into a Tauri `Response`. For
+/// the 200 / Full path we read the file from disk and return
+/// its bytes; for the 206 / Range path we stream the requested
+/// window. Errors are flattened to a plain text body.
+async fn protocol_response_to_tauri(
+    r: library::protocol::ProtocolResponse,
+) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{HeaderValue, Response, StatusCode};
+    let status = StatusCode::from_u16(r.status).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    for (k, v) in &r.headers {
+        builder = builder.header(k.as_str(), HeaderValue::from_str(v).unwrap());
+    }
+    match r.body {
+        library::protocol::ResponseBody::Full(bytes) => builder.body(bytes).unwrap(),
+        library::protocol::ResponseBody::Range {
+            path,
+            start,
+            length,
+        } => {
+            let mut out: Vec<u8> = Vec::with_capacity(length.min(8 * 1024 * 1024) as usize);
+            let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+            let write_result =
+                library::protocol::stream_range(&path, start, length, &mut cursor).await;
+            if write_result.is_ok() {
+                out = cursor.into_inner();
+            }
+            builder.body(out).unwrap()
+        }
+        library::protocol::ResponseBody::File(path) => {
+            // For the no-Range 200 path, read the whole file
+            // into memory. Tauri 2's Response body is bounded
+            // by an in-memory `Vec<u8>`; for very large media
+            // (multi-GiB) the webview should issue a Range
+            // request after the first byte anyway, and the
+            // chunked path is what serves the bulk of the
+            // bytes. The 200 path is mostly used for tiny
+            // subtitle files and the very first frame; if a
+            // user has a multi-GiB file and the webview asks
+            // for the whole thing, we accept the memory cost
+            // and the user can restart with Range support.
+            let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+            builder.body(bytes).unwrap()
+        }
+    }
+}
+
+fn error_to_tauri(e: &library::protocol::ProtocolError) -> tauri::http::Response<Vec<u8>> {
+    use tauri::http::{Response, StatusCode};
+    let status = match e {
+        library::protocol::ProtocolError::NotFound(_) => StatusCode::NOT_FOUND,
+        library::protocol::ProtocolError::BadRange(_) => StatusCode::RANGE_NOT_SATISFIABLE,
+        library::protocol::ProtocolError::OutOfLibrary(_) => StatusCode::FORBIDDEN,
+        library::protocol::ProtocolError::BadUrl(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(e.to_string().into_bytes())
+        .unwrap()
 }

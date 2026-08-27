@@ -67,8 +67,21 @@ credentials.*
 **/id_ed25519
 **/*.asc
 
-# Draft scratchpads (design phase only; remove when v0 ships)
-design/drafts/
+# Internal-only documents. Kept on the local working tree for
+# agent and developer reference, but must not appear in the public
+# repository. These files were committed in the initial public
+# release; the matching `git rm --cached` is part of the same
+# recovery commit so future pushes do not include them.
+#
+# `AGENTS.md` is the agent rule book.
+# `docs/ARCHITECTURE.md` and `docs/ROADMAP.md` are the internal
+# canonical architecture and roadmap.
+# `design/` holds the per-section design drafts that were stitched
+# into ARCHITECTURE.md; they are not intended for public review.
+/AGENTS.md
+/docs/ARCHITECTURE.md
+/docs/ROADMAP.md
+/design/
 
 # Coverage and test artifacts
 **/coverage/

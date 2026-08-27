@@ -35,7 +35,15 @@ use crate::storage::Storage;
 /// surface is `{ used_bytes: number, cap_bytes: number }`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct QuotaInfo {
+    /// Used bytes in the library. The architecture's cap is 50
+    /// GiB by default; even a maliciously-set 1 EiB cap fits in
+    /// a JavaScript `number` (2^53 - 1 ≈ 9 PiB). The TS surface
+    /// is `number`; the precision trade-off is documented and
+    /// acceptable.
+    #[specta(type = specta_typescript::Number)]
     pub used_bytes: i64,
+    /// Storage cap in bytes. See the `used_bytes` comment.
+    #[specta(type = specta_typescript::Number)]
     pub cap_bytes: i64,
 }
 

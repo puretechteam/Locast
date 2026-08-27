@@ -47,7 +47,7 @@
 /// crate root as the CWD, so the bindings live at
 /// `apps/client/src/bindings/index.ts` (one directory up from
 /// `src-tauri/`).
-#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 const BINDINGS_PATH: &str = "../src/bindings/index.ts";
 
 /// On Windows hosts where the wry `WebView2Loader.dll` is incompatible
@@ -93,8 +93,24 @@ mod inner {
                 commands::quota::quota_get,
                 commands::quota::quota_set,
                 commands::scan::library_scan,
+                commands::protocol::media_resolve_url,
+                commands::identity::identity_get,
+                commands::identity::identity_rotate,
+                commands::identity::identity_set_display_name,
             ])
             .events(collect_events![])
+            // BigInt-style integer types (i64, u64, etc.) appear
+            // in the IPC surface (e.g. `ImportedMedia.size_bytes`,
+            // `QuotaInfo.used_bytes`, `quota_set(new_cap_bytes)`).
+            // JavaScript's `number` cannot represent the full
+            // i64/u64 range losslessly, but for a desktop media
+            // library the values stay well under 2^53 bytes
+            // (≈ 9 PiB). We opt into the lossy export; the
+            // per-field `#[specta(type =
+            // specta_typescript::Number)]` annotations on the
+            // structs that go over IPC are equivalent and
+            // document the decision in the type definitions.
+            .dangerously_cast_bigints_to_number()
     }
 
     /// Render the bindings into a string. Uses a temporary file

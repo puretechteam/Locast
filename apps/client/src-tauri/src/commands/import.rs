@@ -99,6 +99,15 @@ pub struct ImportedMedia {
     pub id: String,
     pub sha256: String,
     pub blake3: String,
+    /// The byte count of the on-disk file. Stored as i64 in
+    /// SQLite (matches `media_items.size_bytes`) but exposed to
+    /// TypeScript as `number`. JavaScript numbers can represent
+    /// values up to 2^53 - 1; files larger than that (~9 PiB)
+    /// will be truncated on the wire. The architecture's
+    /// `media_items.size_bytes` is a `CHECK (size_bytes >= 0)`
+    /// INTEGER; for a desktop media library, 2^53 bytes is
+    /// vastly more than any plausible file size.
+    #[specta(type = specta_typescript::Number)]
     pub size_bytes: i64,
     pub filename: String,
     pub relative_path: String,

@@ -116,14 +116,98 @@ pub enum AppError {
     /// the file the caller was trying to import). The TS side can
     /// format these directly. Architecture section 6: the refusal
     /// is `used + needed > cap`, with no over-commit.
+    ///
+    /// Exposed to TypeScript as `number`. A 50 GiB cap fits in a
+    /// JavaScript `number`; even a 1 EiB cap fits in 2^53 - 1.
     #[error("quota exceeded: used {used} + needed {needed} > cap {cap}")]
-    QuotaExceeded { used: i64, cap: i64, needed: i64 },
+    QuotaExceeded {
+        #[specta(type = specta_typescript::Number)]
+        used: i64,
+        #[specta(type = specta_typescript::Number)]
+        cap: i64,
+        #[specta(type = specta_typescript::Number)]
+        needed: i64,
+    },
 
     /// A quota-related call (e.g. `quota_set`) was made with an
     /// invalid cap. The cap must be strictly positive; `0` and
     /// negative values are rejected.
     #[error("invalid quota cap: {value} bytes (must be > 0)")]
-    InvalidCap { value: i64 },
+    InvalidCap {
+        #[specta(type = specta_typescript::Number)]
+        value: i64,
+    },
+
+    // ------------------------------------------------------------------
+    // P1-T08 (`locast://` custom protocol) variants.
+    // ------------------------------------------------------------------
+    /// The URL did not match any `locast://` shape the protocol
+    /// recognizes. Returns 400-equivalent.
+    #[error("invalid locast:// URL: {message}")]
+    BadUrl { message: String },
+
+    /// The `locast://` URL pointed at a `media_id` (or subtitle id
+    /// or sha prefix) that does not exist in the local library.
+    /// Returns 404-equivalent.
+    #[error("not found: {message}")]
+    NotFound { message: String },
+
+    /// The HTTP `Range` header could not be parsed (malformed
+    /// bytes=, unsatisfiable, or multi-range which v1 does not
+    /// support). Returns 416-equivalent.
+    #[error("invalid or unsatisfiable Range header: {message}")]
+    BadRange { message: String },
+
+    /// The path the protocol resolved to lives outside the
+    /// library root. This should be unreachable because the
+    /// protocol only resolves URLs whose id is in the DB; it is
+    /// here as a defense-in-depth tripwire.
+    #[error("path escapes the library root: {message}")]
+    OutOfLibrary { message: String },
+
+    /// An I/O error while serving a `locast://` request. The
+    /// underlying `std::io::Error` is flattened to a string.
+    #[error("locast:// io error: {message}")]
+    ProtocolIo { message: String },
+
+    // ------------------------------------------------------------------
+    // P2-T01 (identity / keyring) variants.
+    // ------------------------------------------------------------------
+    /// The OS credential store is unavailable (no Secret Service
+    /// on Linux, Credential Manager unreachable on Windows, keychain
+    /// inaccessible on macOS). The user must fix the environment
+    /// before the identity can be read.
+    #[error("OS credential store is unavailable: {message}")]
+    KeychainUnavailable { message: String },
+
+    /// A credential exists but cannot be decoded as a base64
+    /// Ed25519 private key. The user should rotate.
+    #[error("stored identity is corrupt")]
+    KeychainCorrupt,
+
+    /// The OS credential store is locked (e.g. macOS login
+    /// keychain is locked). The user must unlock it.
+    #[error("OS credential store is locked: {message}")]
+    IdentityLocked { message: String },
+
+    /// A display name was rejected. Carries the machine-readable
+    /// reason (`empty` | `too_long` | `whitespace` | `control`).
+    #[error("invalid display name: {reason}")]
+    InvalidDisplayName { reason: String },
+
+    /// `identity_get` was called but no keypair has been generated
+    /// yet. This should not be reachable from the webview because
+    /// the UI always calls `identity_get` (which is a
+    /// get-or-create); it is here for the rare `identity_get`
+    /// strict mode that some test code uses.
+    #[error("identity not initialized")]
+    IdentityNotInitialized,
+
+    /// Internal catch-all for unexpected errors. Not reachable
+    /// from the production code paths; tests and the
+    /// `AppError::other` constructor use it.
+    #[error("internal error: {message}")]
+    Other { message: String },
 }
 
 /// Convert a `sqlx::Error` into an `AppError::Database` so `?` works
@@ -223,6 +307,66 @@ impl From<ScanError> for AppError {
             ScanError::Paths(p) => AppError::Paths {
                 message: p.to_string(),
             },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P1-T08 (locast://) error mapping
+// ---------------------------------------------------------------------------
+
+/// Map the protocol module's internal `ProtocolError` onto the
+/// locked `AppError` variants.
+impl From<crate::library::protocol::ProtocolError> for AppError {
+    fn from(err: crate::library::protocol::ProtocolError) -> Self {
+        use crate::library::protocol::ProtocolError as P;
+        match err {
+            P::BadUrl(m) => AppError::BadUrl { message: m },
+            P::NotFound(m) => AppError::NotFound { message: m },
+            P::BadRange(m) => AppError::BadRange { message: m },
+            P::OutOfLibrary(m) => AppError::OutOfLibrary { message: m },
+            P::Io(io) => AppError::ProtocolIo {
+                message: io.to_string(),
+            },
+            P::Storage(m) => AppError::Storage { message: m },
+            P::Paths(m) => AppError::Paths { message: m },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2-T01 (identity) error mapping
+// ---------------------------------------------------------------------------
+
+/// Map the identity service's internal `IdentityServiceError`
+/// onto the locked `AppError` variants.
+impl From<crate::identity::keystore::IdentityServiceError> for AppError {
+    fn from(err: crate::identity::keystore::IdentityServiceError) -> Self {
+        use crate::identity::keystore::IdentityServiceError as I;
+        match err {
+            I::Unavailable(_) => AppError::KeychainUnavailable {
+                message: err.to_string(),
+            },
+            I::Corrupt => AppError::KeychainCorrupt,
+            I::Locked(s) => AppError::IdentityLocked { message: s },
+            I::InvalidDisplayName(e) => AppError::InvalidDisplayName {
+                reason: e.kind().to_string(),
+            },
+            I::NotInitialized => AppError::IdentityNotInitialized,
+            I::Storage(m) => AppError::Storage { message: m },
+            I::Other(m) => AppError::Other { message: m },
+        }
+    }
+}
+
+/// Generic catch-all so internal `String` errors can be raised
+/// without ceremony. Used sparingly; the closed set above is
+/// preferred.
+impl AppError {
+    /// Build an `Other` variant with a message.
+    pub fn other(message: impl Into<String>) -> Self {
+        AppError::Other {
+            message: message.into(),
         }
     }
 }

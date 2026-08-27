@@ -1128,7 +1128,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
 dependencies = [
  "pkcs8",
- "serde",
  "signature",
 ]
 
@@ -2350,12 +2349,20 @@ checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
 dependencies = [
  "byteorder",
  "dbus-secret-service",
- "linux-keyutils",
  "log",
  "security-framework 2.11.1",
  "security-framework 3.7.0",
  "windows-sys 0.60.2",
  "zeroize",
+]
+
+[[package]]
+name = "keyring-core"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95c88c9f6a100174c2303fe51bb24749978951cb1c6d9c817349d0beb8f3ab24"
+dependencies = [
+ "log",
 ]
 
 [[package]]
@@ -2446,16 +2453,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linux-keyutils"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
-dependencies = [
- "bitflags 2.13.1",
- "libc",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2471,12 +2468,15 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "locast-client"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
+ "blake3",
  "digest",
  "dirs 5.0.1",
  "ed25519-dalek",
  "hex",
  "keyring",
+ "keyring-core",
  "locast-crypto",
  "log",
  "rand 0.8.8",
@@ -2502,7 +2502,6 @@ dependencies = [
  "tracing",
  "unicode-normalization",
  "uuid",
- "zeroize",
 ]
 
 [[package]]

@@ -114,31 +114,39 @@ pub struct ScanResult {
     /// Total number of regular files observed under `library/`.
     /// This includes files that hit the idempotent no-op branch,
     /// files that were upserted, and files that failed mid-hash.
+    #[specta(type = specta_typescript::Number)]
     pub files_scanned: u64,
     /// Number of files whose on-disk state triggered a database
     /// INSERT or UPDATE (i.e. a new file or a renamed file). A
     /// re-scan of an unchanged library yields `files_upserted = 0`.
+    #[specta(type = specta_typescript::Number)]
     pub files_upserted: u64,
     /// Number of content-addressed files under `library/` that
     /// had no matching `media_items` row and were recovered into
     /// the table. P1-T07's recovery path: compute the hash, insert
     /// a row with
     /// `provenance = {"source":"library-scan","orphan":true}`.
+    #[specta(type = specta_typescript::Number)]
     pub files_orphans_discovered: u64,
     /// Number of `media_items` rows whose `relative_path` no
     /// longer corresponds to a file on disk. The scan bumps
     /// `last_seen_at` to now for these rows; it does NOT delete
     /// them.
+    #[specta(type = specta_typescript::Number)]
     pub files_missing: u64,
     /// Number of files the scan could not process (read error,
     /// metadata error, hash error, etc.). The scan is fail-soft:
     /// the error is recorded as `files_failed` and the scan
     /// continues with the next file.
+    #[specta(type = specta_typescript::Number)]
     pub files_failed: u64,
     /// Sum of `size_bytes` for every file the scanner
     /// successfully processed. Equal to `SUM(size_bytes) FROM
     /// media_items` after the scan (modulo the missing-file bump,
-    /// which does not change `size_bytes`).
+    /// which does not change `size_bytes`). Exposed to
+    /// TypeScript as `number`; a desktop library will not
+    /// realistically exceed 2^53 - 1 bytes.
+    #[specta(type = specta_typescript::Number)]
     pub bytes_total: i64,
 }
 
@@ -242,17 +250,35 @@ async fn walk_library(
 ) -> Result<(), ScanError> {
     let mut stack: Vec<PathBuf> = vec![library_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let mut entries = match tokio_fs::read_dir(&dir).await {
-            Ok(e) => e,
+        // Collect every entry into a `Vec` and sort by `file_name`
+        // before processing. The order returned by `tokio::fs::read_dir`
+        // is OS-dependent (alphabetical on Windows NTFS, insertion order
+        // on Linux ext4, catalog order on macOS APFS), and the
+        // scanner's "second file visited wins the UPDATE" semantics
+        // produces a different DB row on different platforms if the
+        // order is not pinned. Sorting by the final path component is
+        // a deterministic, locale-independent, byte-wise total order
+        // and gives identical test results on every host.
+        let mut entries: Vec<PathBuf> = match tokio_fs::read_dir(&dir).await {
+            Ok(mut e) => {
+                let mut v: Vec<PathBuf> = Vec::new();
+                loop {
+                    match e.next_entry().await {
+                        Ok(Some(entry)) => v.push(entry.path()),
+                        Ok(None) => break,
+                        Err(_) => continue,
+                    }
+                }
+                v
+            }
             Err(_) => continue,
         };
-        loop {
-            let entry = match entries.next_entry().await {
-                Ok(Some(e)) => e,
-                Ok(None) => break,
-                Err(_) => continue,
-            };
-            let path = entry.path();
+        entries.sort_by(|a, b| {
+            a.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .cmp(&b.file_name().map(|n| n.to_string_lossy().into_owned()))
+        });
+        for path in entries {
             let meta = match tokio_fs::symlink_metadata(&path).await {
                 Ok(m) => m,
                 Err(_) => {

@@ -16,9 +16,11 @@
 // P1-T04 added the `mediaImport` command (and its `ImportedMedia` return
 // type). P1-T05 added the `quotaGet` and `quotaSet` commands (and their
 // `QuotaInfo` return type). P1-T07 added the `libraryScan` command (and
-// its `ScanResult` return type). The TS surface below was extended by hand
-// on this Windows host to match the freshly-generated non-Windows output,
-// and the next non-Windows regeneration of this file should be a no-op.
+// its `ScanResult` return type). P1-T08 added the `mediaResolveUrl`
+// command. P2-T01 added the `identityGet`, `identityRotate`, and
+// `identitySetDisplayName` commands (and the `Identity` return type).
+// The TS surface below was extended to match the freshly-generated
+// output; the next regeneration of this file should be a no-op.
 //
 // NOTE: On Windows hosts that ship a stale `WebView2Loader.dll` from
 // 1.0.3650.58 against a much newer Edge WebView2 redist (1.0.151.x+),
@@ -48,6 +50,18 @@ export const commands = {
   async libraryScan(): Promise<ScanResult> {
     return await TAURI_INVOKE("library_scan");
   },
+  async mediaResolveUrl(mediaId: string): Promise<string> {
+    return await TAURI_INVOKE("media_resolve_url", { mediaId });
+  },
+  async identityGet(displayName: string): Promise<Identity> {
+    return await TAURI_INVOKE("identity_get", { displayName });
+  },
+  async identityRotate(displayName: string): Promise<Identity> {
+    return await TAURI_INVOKE("identity_rotate", { displayName });
+  },
+  async identitySetDisplayName(displayName: string): Promise<Identity> {
+    return await TAURI_INVOKE("identity_set_display_name", { displayName });
+  },
 };
 
 export type ImportedMedia = {
@@ -73,9 +87,16 @@ export type ScanResult = {
   bytes_total: number;
 };
 
+export type Identity = {
+  user_id: string;
+  public_key: string;
+  display_name: string;
+};
+
 export const events = __makeEvents__<{}>({
-  // No events are registered in P1-T07. Add entries here when
-  // `locast_client_lib::events` defines a `#[tauri_specta::Event]`.
+  // No events are registered in P1-T07 / P1-T08 / P2-T01. Add entries
+  // here when `locast_client_lib::events` defines a
+  // `#[tauri_specta::Event]`.
 });
 
 function __makeEvents__<T extends Record<string, any>>(mappings: Record<keyof T, string>) {
