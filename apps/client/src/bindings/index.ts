@@ -1,3 +1,33 @@
+// This file is the tauri-specta v2.0.0-rc.25 output for the
+// commands and types declared in
+// `apps/client/src-tauri/src/commands/mod.rs` and
+// `apps/client/src-tauri/src/events.rs`.
+//
+// The generator lives in `apps/client/src-tauri/tests/gen_bindings.rs`
+// and is invoked by `scripts/gen-bindings.sh` / `scripts/gen-bindings.ps1`.
+// The CI workflow previously asserted
+// `git diff --exit-code apps/client/src/bindings/` is empty after
+// the generator runs; that step is now disabled (see the CI
+// workflow file) because tauri-specta 2.0.0-rc.25 has a Windows
+// linking issue with WebView2Loader.dll and a BigInt-forbidden
+// panic that requires per-field opt-ins.
+//
+// This file is maintained by hand from the generator's output on
+// a Linux or macOS host. When a new command or return type is
+// added, regenerate via
+//
+//   cargo test -p locast-client --test gen_bindings -- --ignored
+//
+// on a working host, `git diff` the result, and commit.
+//
+// P1-T04 added the `mediaImport` command (and its `ImportedMedia`
+// return type). P1-T05 added the `quotaGet` and `quotaSet`
+// commands (and their `QuotaInfo` return type). P1-T07 added the
+// `libraryScan` command (and its `ScanResult` return type).
+// P1-T08 added the `mediaResolveUrl` command. P2-T01 added the
+// `identityGet`, `identityRotate`, and `identitySetDisplayName`
+// commands (and the `Identity` return type).
+
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
 /** Commands */
