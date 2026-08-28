@@ -100,18 +100,6 @@ async fn room_create_and_join_via_room_client() {
     let signaling_b = Arc::new(make_client(url.clone(), keyring_b).await);
     let room_a = Arc::new(RoomClient::new(signaling_a.clone()));
     let room_b = Arc::new(RoomClient::new(signaling_b.clone()));
-    room_a.init().await;
-    room_b.init().await;
-    // Drain inbound envelopes for both clients.
-    {
-        let rc = room_a.clone();
-        tokio::spawn(async move { rc.run_inbound().await });
-    }
-    {
-        let rc = room_b.clone();
-        tokio::spawn(async move { rc.run_inbound().await });
-    }
-
     signaling_a.start().await.expect("start a");
     signaling_b.start().await.expect("start b");
     wait_for_phase(
@@ -126,6 +114,22 @@ async fn room_create_and_join_via_room_client() {
         Duration::from_secs(5),
     )
     .await;
+    // P2-T05: the room client establishes its single
+    // inbound subscription AFTER the signaling WS is
+    // authenticated. `start()` clears the subscriber
+    // list, so calling `init()` before `start()` would
+    // leave the room client with a dead receiver.
+    room_a.init().await;
+    room_b.init().await;
+    // Drain inbound envelopes for both clients.
+    {
+        let rc = room_a.clone();
+        tokio::spawn(async move { rc.run_inbound().await });
+    }
+    {
+        let rc = room_b.clone();
+        tokio::spawn(async move { rc.run_inbound().await });
+    }
 
     // A creates a room.
     let summary = room_a
@@ -182,16 +186,6 @@ async fn migration_on_handoff_via_room_client() {
     let signaling_b = Arc::new(make_client(url.clone(), keyring_b).await);
     let room_a = Arc::new(RoomClient::new(signaling_a.clone()));
     let room_b = Arc::new(RoomClient::new(signaling_b.clone()));
-    room_a.init().await;
-    room_b.init().await;
-    {
-        let rc = room_a.clone();
-        tokio::spawn(async move { rc.run_inbound().await });
-    }
-    {
-        let rc = room_b.clone();
-        tokio::spawn(async move { rc.run_inbound().await });
-    }
     signaling_a.start().await.expect("start a");
     signaling_b.start().await.expect("start b");
     wait_for_phase(
@@ -206,6 +200,21 @@ async fn migration_on_handoff_via_room_client() {
         Duration::from_secs(5),
     )
     .await;
+    // P2-T05: the room client establishes its single
+    // inbound subscription AFTER the signaling WS is
+    // authenticated. `start()` clears the subscriber
+    // list, so calling `init()` before `start()` would
+    // leave the room client with a dead receiver.
+    room_a.init().await;
+    room_b.init().await;
+    {
+        let rc = room_a.clone();
+        tokio::spawn(async move { rc.run_inbound().await });
+    }
+    {
+        let rc = room_b.clone();
+        tokio::spawn(async move { rc.run_inbound().await });
+    }
 
     let summary = room_a.room_create("M".into(), true).await.expect("create");
     let code = summary.code.clone();
