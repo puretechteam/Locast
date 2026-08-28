@@ -505,7 +505,7 @@ impl RoomClient {
         if env.r#type == MessageKind::RoomError {
             // Route the error to the first pending
             // request of any kind.
-            for (_, senders) in pending.iter_mut() {
+            for senders in pending.values_mut() {
                 if !senders.is_empty() {
                     let tx = senders.remove(0);
                     let _ = tx.send(env.clone());
