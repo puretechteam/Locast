@@ -768,7 +768,10 @@ enum FrameError {
     },
     Decode(rmp_serde::decode::Error),
     Text,
-    Ws(tokio_tungstenite::tungstenite::Error),
+    /// The underlying tungstenite error. Boxed to keep the
+    /// enum's `Result<_, FrameError>` small enough that
+    /// `clippy::result_large_err` does not fire.
+    Ws(Box<tokio_tungstenite::tungstenite::Error>),
 }
 
 async fn read_frame(
@@ -778,7 +781,7 @@ async fn read_frame(
     loop {
         let frame = match socket.next().await {
             Some(Ok(f)) => f,
-            Some(Err(e)) => return Err(FrameError::Ws(e)),
+            Some(Err(e)) => return Err(FrameError::Ws(Box::new(e))),
             None => return Ok(None),
         };
         match frame {
