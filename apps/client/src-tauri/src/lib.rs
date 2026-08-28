@@ -20,11 +20,14 @@ pub mod core;
 pub mod events;
 pub mod identity;
 pub mod library;
+pub mod net;
 pub mod probe;
 pub mod storage;
 
 use identity::keystore::IdentityService;
 use library::protocol::ProtocolHandler;
+use net::config::SignalingConfig;
+use net::signaling::SignalingClient;
 
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -101,12 +104,22 @@ pub fn run() {
             let accountant = core::quota::QuotaAccountant::new(storage.clone());
             let library_root = data_dir.clone();
             let protocol_handler = ProtocolHandler::new(storage.clone(), library_root);
-            let identity_service = IdentityService::new(storage.clone());
+            let identity_service = std::sync::Arc::new(IdentityService::new(storage.clone()));
 
             app.manage(storage);
             app.manage(accountant);
             app.manage(protocol_handler);
-            app.manage(identity_service);
+            app.manage(identity_service.clone());
+
+            // P2-T03: install the `SignalingClient` as managed
+            // state so the `signaling_*` commands can take
+            // `tauri::State<'_, SignalingClient>`. The
+            // connection loop is NOT started here; the React
+            // side calls `signaling_connect` once it has
+            // confirmed the URL.
+            let signaling_config = SignalingConfig::from_env();
+            let signaling_client = SignalingClient::new(signaling_config, identity_service);
+            app.manage(signaling_client);
 
             Ok(())
         })
@@ -120,6 +133,9 @@ pub fn run() {
             commands::identity::identity_get,
             commands::identity::identity_rotate,
             commands::identity::identity_set_display_name,
+            commands::signaling::signaling_get_state,
+            commands::signaling::signaling_connect,
+            commands::signaling::signaling_disconnect,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

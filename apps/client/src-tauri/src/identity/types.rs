@@ -65,6 +65,13 @@ impl Keypair {
         self.signing.verifying_key().to_bytes()
     }
 
+    /// Construct a fresh `Keypair` using `OsRng`. Equivalent
+    /// to the free function [`generate`]; provided as a
+    /// method so call sites can write `Keypair::generate()`.
+    pub fn generate() -> Keypair {
+        generate()
+    }
+
     /// Sign the 32-byte nonce from a server CHALLENGE. P2-T02.
     /// The signature is over the raw nonce with no domain tag
     /// (architecture §20.4.4: "Client signs the nonce"). The

@@ -26,7 +26,10 @@
 // `libraryScan` command (and its `ScanResult` return type).
 // P1-T08 added the `mediaResolveUrl` command. P2-T01 added the
 // `identityGet`, `identityRotate`, and `identitySetDisplayName`
-// commands (and the `Identity` return type).
+// commands (and the `Identity` return type). P2-T03 added the
+// `signalingGetState`, `signalingConnect`, and
+// `signalingDisconnect` commands (and the `ConnectionState`,
+// `ConnPhase`, and `DisconnectReason` types).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 
@@ -59,6 +62,15 @@ export const commands = {
   async identitySetDisplayName(displayName: string): Promise<Identity> {
     return await __TAURI_INVOKE("identity_set_display_name", { displayName });
   },
+  async signalingGetState(): Promise<ConnectionState> {
+    return await __TAURI_INVOKE("signaling_get_state");
+  },
+  async signalingConnect(): Promise<void> {
+    await __TAURI_INVOKE("signaling_connect");
+  },
+  async signalingDisconnect(): Promise<void> {
+    await __TAURI_INVOKE("signaling_disconnect");
+  },
 };
 
 /* Types */
@@ -89,4 +101,31 @@ export type ScanResult = {
   files_missing: number;
   files_failed: number;
   bytes_total: number;
+};
+
+export type ConnPhase =
+  | "Disconnected"
+  | "Connecting"
+  | "Handshaking"
+  | "Authenticated"
+  | "Reconnecting"
+  | "ShuttingDown";
+
+export type DisconnectReason =
+  | "ServerClose"
+  | "ProtocolError"
+  | "AuthFailed"
+  | "HandshakeTimeout"
+  | "NetworkUnreachable"
+  | "LocalShutdown";
+
+export type ConnectionState = {
+  phase: ConnPhase;
+  server_url: string;
+  session_id: string | null;
+  user_id: string | null;
+  connected: boolean;
+  attempt: number;
+  last_error: string | null;
+  last_error_at_ms: number | null;
 };

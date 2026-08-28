@@ -327,6 +327,26 @@ impl IdentityService {
 
     /// Read the current identity. Returns `NotInitialized` if no
     /// keypair has been generated yet.
+    /// Load the raw keypair from the keyring without going
+    /// through the `get_or_create` flow. Returns `NotInitialized`
+    /// if no keypair has been generated yet. Used by P2-T03's
+    /// `SignalingClient` to sign the server's CHALLENGE nonce
+    /// during the WebSocket handshake.
+    ///
+    /// The returned `Keypair` holds the private key in memory;
+    /// it MUST be dropped as soon as the caller is done with
+    /// it. The signaling client only uses it to compute one
+    /// signature per handshake and then drops it.
+    pub async fn load_keypair(&self) -> Result<Keypair, IdentityServiceError> {
+        let _g = self.lock.lock().await;
+        match self.keyring.load().await? {
+            Some(k) => Ok(k),
+            None => Err(IdentityServiceError::NotInitialized),
+        }
+    }
+
+    /// Read the current identity. Returns `NotInitialized` if no
+    /// keypair has been generated yet.
     pub async fn get(&self, display_name: &str) -> Result<Identity, IdentityServiceError> {
         validate_display_name(display_name)?;
         let _g = self.lock.lock().await;

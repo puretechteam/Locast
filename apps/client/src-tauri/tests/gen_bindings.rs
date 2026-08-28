@@ -97,6 +97,9 @@ mod inner {
                 commands::identity::identity_get,
                 commands::identity::identity_rotate,
                 commands::identity::identity_set_display_name,
+                commands::signaling::signaling_get_state,
+                commands::signaling::signaling_connect,
+                commands::signaling::signaling_disconnect,
             ])
             .events(collect_events![])
             // BigInt-style integer types (i64, u64, etc.) appear
