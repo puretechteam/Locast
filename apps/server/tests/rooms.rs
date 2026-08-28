@@ -23,8 +23,9 @@ use futures_util::{SinkExt, StreamExt};
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
     HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
-    ParticipantLeftPayload, RoomClosedPayload, RoomCreatePayload, RoomCreatedPayload, RoomErrorCode,
-    RoomErrorPayload, RoomJoinRequestPayload, RoomJoinedPayload, RoomLeavePayload, RoomSummary,
+    ParticipantLeftPayload, RoomClosedPayload, RoomCreatePayload, RoomCreatedPayload,
+    RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomJoinedPayload, RoomLeavePayload,
+    RoomSummary,
 };
 use locast_server::time::MockClock;
 use locast_server::{AppState, Config, Db, Metrics, RoomRegistry, RoomRegistryConfig};
