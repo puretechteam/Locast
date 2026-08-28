@@ -66,6 +66,12 @@ fn test_config(challenge_ttl_ms: i64, max_frame_bytes: usize) -> Config {
         rate_msg_burst: 200,
         rate_bytes_per_sec: 1_000_000,
         rate_bytes_burst: 2_000_000,
+        room_code_length: 6,
+        room_code_alphabet: "ABCDEFGHJKLMNPQRSTUVWXYZ23456789".to_string(),
+        room_max_participants: 8,
+        host_disconnect_grace_ms: 30_000,
+        room_create_max_collisions: 5,
+        participant_stale_after_ms: 300_000,
     }
 }
 
@@ -88,10 +94,17 @@ fn test_config_low_rate(
 /// `ServerHandle` is dropped.
 async fn spawn_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()>, Db) {
     let db = Db::open(&config).await.expect("open db");
+    let rooms = std::sync::Arc::new(locast_server::RoomRegistry::new(
+        locast_server::RoomRegistryConfig::from_config(&config),
+    ));
+    let clock: std::sync::Arc<dyn locast_server::Clock> =
+        std::sync::Arc::new(locast_server::SystemClock);
     let state = AppState {
         config: Arc::new(config),
         metrics: Metrics::new(),
         db: db.clone(),
+        rooms,
+        clock,
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

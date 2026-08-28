@@ -27,6 +27,8 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod metrics;
+pub mod rooms;
+pub mod time;
 pub mod ws;
 
 pub mod test_support;
@@ -34,6 +36,8 @@ pub mod test_support;
 pub use config::Config;
 pub use db::Db;
 pub use metrics::Metrics;
+pub use rooms::{RoomEvent, RoomRegistry, RoomRegistryConfig};
+pub use time::{Clock, SystemClock};
 
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,6 +53,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub metrics: Metrics,
     pub db: Db,
+    pub rooms: Arc<RoomRegistry>,
+    pub clock: Arc<dyn Clock>,
 }
 
 /// Build the axum router. Exposed so tests and integration harnesses can
@@ -122,10 +128,21 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
     // task runs for the lifetime of the server.
     db::spawn_bearer_cleanup(db.clone(), std::time::Duration::from_secs(60));
 
+    let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&config)));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    // Background grace + stale-participant ticker.
+    rooms::spawn_room_ticker(
+        rooms.clone(),
+        clock.clone(),
+        std::time::Duration::from_millis(500),
+    );
+
     let state = AppState {
         config: Arc::new(config.clone()),
         metrics: Metrics::new(),
         db,
+        rooms,
+        clock,
     };
 
     let app = router(state);

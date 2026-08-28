@@ -100,6 +100,11 @@ mod inner {
                 commands::signaling::signaling_get_state,
                 commands::signaling::signaling_connect,
                 commands::signaling::signaling_disconnect,
+                commands::room::room_connect_signaling,
+                commands::room::room_create,
+                commands::room::room_join,
+                commands::room::room_leave,
+                commands::room::room_get_state,
             ])
             .events(collect_events![])
             // BigInt-style integer types (i64, u64, etc.) appear

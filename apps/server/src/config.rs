@@ -42,6 +42,33 @@ pub const DEFAULT_RATE_BYTES_PER_SEC: u32 = 1_000_000;
 /// Default per-connection bytes burst budget.
 pub const DEFAULT_RATE_BYTES_BURST: u32 = 2_000_000;
 
+/// Default room-code length. Pinned to 6 by the P2-T04 spec
+/// and the architecture.
+pub const DEFAULT_ROOM_CODE_LENGTH: usize = 6;
+
+/// Default room-code alphabet. The 32-character unambiguous
+/// set from `docs/ARCHITECTURE.md` §21.2.
+pub const DEFAULT_ROOM_CODE_ALPHABET: &str = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Default max participants per room. 1 host + 7 viewers
+/// per architecture §20.6.
+pub const DEFAULT_ROOM_MAX_PARTICIPANTS: u8 = 8;
+
+/// Default host-disconnect grace. The host has 30 seconds to
+/// re-auth before the server elects a new host. Tests can
+/// override via `LOCAST_HOST_DISCONNECT_GRACE_MS`.
+pub const DEFAULT_HOST_DISCONNECT_GRACE_MS: i64 = 30_000;
+
+/// Default max room-code generation collisions before
+/// aborting the create call.
+pub const DEFAULT_ROOM_CREATE_MAX_COLLISIONS: u8 = 5;
+
+/// Default "stale participant" timeout. A viewer that has
+/// not sent a `PRESENCE` in 5 minutes is removed from the
+/// room and a `PARTICIPANT_LEFT { reason: "timeout" }` is
+/// broadcast.
+pub const DEFAULT_PARTICIPANT_STALE_AFTER_MS: i64 = 300_000;
+
 /// Runtime configuration resolved from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -62,6 +89,22 @@ pub struct Config {
     pub rate_bytes_per_sec: u32,
     /// Per-connection bytes burst budget.
     pub rate_bytes_burst: u32,
+    /// Number of characters in a generated room code.
+    pub room_code_length: usize,
+    /// The room-code alphabet. Production MUST be the
+    /// 32-char default; tests may shrink it.
+    pub room_code_alphabet: String,
+    /// The cap on participants per room. Includes the host.
+    pub room_max_participants: u8,
+    /// The grace period (ms) the host gets to re-auth before
+    /// the server elects a new host.
+    pub host_disconnect_grace_ms: i64,
+    /// Max room-code generation collisions before
+    /// `create` returns an `Internal` error.
+    pub room_create_max_collisions: u8,
+    /// A viewer that has not sent a `PRESENCE` in this
+    /// many ms is removed from the room.
+    pub participant_stale_after_ms: i64,
 }
 
 impl Config {
@@ -93,6 +136,20 @@ impl Config {
             parse_env_u32("LOCAST_RATE_BYTES_PER_SEC")?.unwrap_or(DEFAULT_RATE_BYTES_PER_SEC);
         let rate_bytes_burst =
             parse_env_u32("LOCAST_RATE_BYTES_BURST")?.unwrap_or(DEFAULT_RATE_BYTES_BURST);
+        let room_code_length =
+            parse_env_usize("LOCAST_ROOM_CODE_LENGTH")?.unwrap_or(DEFAULT_ROOM_CODE_LENGTH);
+        let room_code_alphabet = env::var("LOCAST_ROOM_CODE_ALPHABET")
+            .unwrap_or_else(|_| DEFAULT_ROOM_CODE_ALPHABET.to_string());
+        let room_max_participants = parse_env_u32("LOCAST_ROOM_MAX_PARTICIPANTS")?
+            .map(|v| v as u8)
+            .unwrap_or(DEFAULT_ROOM_MAX_PARTICIPANTS);
+        let host_disconnect_grace_ms = parse_env_i64("LOCAST_HOST_DISCONNECT_GRACE_MS")?
+            .unwrap_or(DEFAULT_HOST_DISCONNECT_GRACE_MS);
+        let room_create_max_collisions = parse_env_u32("LOCAST_ROOM_CREATE_MAX_COLLISIONS")?
+            .map(|v| v as u8)
+            .unwrap_or(DEFAULT_ROOM_CREATE_MAX_COLLISIONS);
+        let participant_stale_after_ms = parse_env_i64("LOCAST_PARTICIPANT_STALE_AFTER_MS")?
+            .unwrap_or(DEFAULT_PARTICIPANT_STALE_AFTER_MS);
 
         Ok(Self {
             bind_addr,
@@ -106,6 +163,12 @@ impl Config {
             rate_msg_burst,
             rate_bytes_per_sec,
             rate_bytes_burst,
+            room_code_length,
+            room_code_alphabet,
+            room_max_participants,
+            host_disconnect_grace_ms,
+            room_create_max_collisions,
+            participant_stale_after_ms,
         })
     }
 }

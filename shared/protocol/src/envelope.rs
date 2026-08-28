@@ -68,6 +68,35 @@ pub enum MessageKind {
     AuthOk,
     #[serde(rename = "AUTH_FAIL")]
     AuthFail,
+    // ----- P2-T04: room lifecycle (create / join / leave / state / host migration) -----
+    #[serde(rename = "ROOM_CREATE")]
+    RoomCreate,
+    #[serde(rename = "ROOM_CREATED")]
+    RoomCreated,
+    #[serde(rename = "ROOM_JOIN_REQUEST")]
+    RoomJoinRequest,
+    #[serde(rename = "ROOM_JOINED")]
+    RoomJoined,
+    #[serde(rename = "ROOM_LEAVE")]
+    RoomLeave,
+    #[serde(rename = "ROOM_STATE")]
+    RoomState,
+    #[serde(rename = "PARTICIPANT_JOINED")]
+    ParticipantJoined,
+    #[serde(rename = "PARTICIPANT_LEFT")]
+    ParticipantLeft,
+    #[serde(rename = "HOST_DISCONNECTED")]
+    HostDisconnected,
+    #[serde(rename = "HOST_RECONNECTED")]
+    HostReconnected,
+    #[serde(rename = "HOST_MIGRATED")]
+    HostMigrated,
+    #[serde(rename = "ROOM_CLOSED")]
+    RoomClosed,
+    #[serde(rename = "ROOM_ERROR")]
+    RoomError,
+    #[serde(rename = "PRESENCE")]
+    Presence,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -86,8 +115,35 @@ impl MessageKind {
             MessageKind::Auth => "AUTH",
             MessageKind::AuthOk => "AUTH_OK",
             MessageKind::AuthFail => "AUTH_FAIL",
+            MessageKind::RoomCreate => "ROOM_CREATE",
+            MessageKind::RoomCreated => "ROOM_CREATED",
+            MessageKind::RoomJoinRequest => "ROOM_JOIN_REQUEST",
+            MessageKind::RoomJoined => "ROOM_JOINED",
+            MessageKind::RoomLeave => "ROOM_LEAVE",
+            MessageKind::RoomState => "ROOM_STATE",
+            MessageKind::ParticipantJoined => "PARTICIPANT_JOINED",
+            MessageKind::ParticipantLeft => "PARTICIPANT_LEFT",
+            MessageKind::HostDisconnected => "HOST_DISCONNECTED",
+            MessageKind::HostReconnected => "HOST_RECONNECTED",
+            MessageKind::HostMigrated => "HOST_MIGRATED",
+            MessageKind::RoomClosed => "ROOM_CLOSED",
+            MessageKind::RoomError => "ROOM_ERROR",
+            MessageKind::Presence => "PRESENCE",
             MessageKind::Other(s) => s,
         }
+    }
+
+    /// `true` if this is a room-lifecycle message (server
+    /// routes it through `room_dispatch` after bearer
+    /// validation).
+    pub fn is_room_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            MessageKind::RoomCreate
+                | MessageKind::RoomJoinRequest
+                | MessageKind::RoomLeave
+                | MessageKind::Presence
+        )
     }
 }
 

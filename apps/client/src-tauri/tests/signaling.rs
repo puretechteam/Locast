@@ -1094,6 +1094,7 @@ async fn end_to_end_with_real_server() {
     use locast_server::router;
     use locast_server::AppState;
     use locast_server::Metrics;
+    use locast_server::{Clock, RoomRegistry, RoomRegistryConfig, SystemClock};
     use std::net::SocketAddr as StdSocketAddr;
 
     let db = match locast_server::db::Db::open_in_memory().await {
@@ -1110,10 +1111,14 @@ async fn end_to_end_with_real_server() {
             return;
         }
     };
+    let rooms = std::sync::Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&config)));
+    let clock: std::sync::Arc<dyn Clock> = std::sync::Arc::new(SystemClock);
     let state = AppState {
         config,
         metrics: Metrics::new(),
         db,
+        rooms,
+        clock,
     };
     let app = router(state);
 

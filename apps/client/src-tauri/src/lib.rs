@@ -27,6 +27,7 @@ pub mod storage;
 use identity::keystore::IdentityService;
 use library::protocol::ProtocolHandler;
 use net::config::SignalingConfig;
+use net::room::RoomClient;
 use net::signaling::SignalingClient;
 
 /// Library version string. Bumped per release alongside the workspace.
@@ -118,8 +119,21 @@ pub fn run() {
             // side calls `signaling_connect` once it has
             // confirmed the URL.
             let signaling_config = SignalingConfig::from_env();
-            let signaling_client = SignalingClient::new(signaling_config, identity_service);
+            let signaling_client =
+                std::sync::Arc::new(SignalingClient::new(signaling_config, identity_service));
+            // P2-T04: the RoomClient piggy-backs on the
+            // signaling WS. Subscribe it to the signaling
+            // client's inbound envelope stream so the
+            // `room_*` commands can send ROOM_* envelopes
+            // and observe the server's replies.
+            let room_client = std::sync::Arc::new(RoomClient::new(signaling_client.clone()));
+            tauri::async_runtime::block_on(async {
+                room_client.init().await;
+                let rc = room_client.clone();
+                tokio::spawn(async move { rc.run_inbound().await });
+            });
             app.manage(signaling_client);
+            app.manage(room_client);
 
             Ok(())
         })
@@ -136,6 +150,11 @@ pub fn run() {
             commands::signaling::signaling_get_state,
             commands::signaling::signaling_connect,
             commands::signaling::signaling_disconnect,
+            commands::room::room_connect_signaling,
+            commands::room::room_create,
+            commands::room::room_join,
+            commands::room::room_leave,
+            commands::room::room_get_state,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

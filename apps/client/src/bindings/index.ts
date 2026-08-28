@@ -71,6 +71,24 @@ export const commands = {
   async signalingDisconnect(): Promise<void> {
     await __TAURI_INVOKE("signaling_disconnect");
   },
+  async roomConnectSignaling(): Promise<void> {
+    await __TAURI_INVOKE("room_connect_signaling");
+  },
+  async roomCreate(
+    title: string,
+    migrationEnabled: boolean,
+  ): Promise<RoomSummaryIpc> {
+    return await __TAURI_INVOKE("room_create", { title, migrationEnabled });
+  },
+  async roomJoin(code: string, displayName: string): Promise<RoomSummaryIpc> {
+    return await __TAURI_INVOKE("room_join", { code, displayName });
+  },
+  async roomLeave(): Promise<void> {
+    await __TAURI_INVOKE("room_leave");
+  },
+  async roomGetState(): Promise<RoomSummaryIpc | null> {
+    return await __TAURI_INVOKE("room_get_state");
+  },
 };
 
 /* Types */
@@ -129,3 +147,31 @@ export type ConnectionState = {
   last_error: string | null;
   last_error_at_ms: number | null;
 };
+
+export type RoomSummaryIpc = {
+  id: string;
+  code: string;
+  title: string;
+  host_user_id: string;
+  host_migration_enabled: boolean;
+  created_ms: number;
+  participants: ParticipantIpc[];
+  host_disconnected: boolean;
+  host_disconnect_deadline_ms: number | null;
+};
+
+export type ParticipantIpc = {
+  user_id: string;
+  display_name: string;
+  joined_ms: number;
+  status: ParticipantStatusIpc;
+  last_seen_ms: number;
+  is_host: boolean;
+};
+
+export type ParticipantStatusIpc =
+  | "Joining"
+  | "Connected"
+  | "Reconnecting"
+  | "Disconnected"
+  | "Left";

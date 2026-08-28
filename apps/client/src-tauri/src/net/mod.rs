@@ -21,11 +21,13 @@
 
 pub mod config;
 pub mod reconnect;
+pub mod room;
 pub mod signaling;
 pub mod state;
 
 pub use config::SignalingConfig;
 pub use locast_protocol::handshake::Platform;
 pub use reconnect::Backoff;
+pub use room::{ParticipantIpc, RoomClient, RoomClientError, RoomErrorCodeIpc, RoomSummaryIpc};
 pub use signaling::{BearerRecord, SignalingClient, SignalingError, SignalingInner};
 pub use state::{ConnPhase, ConnectionState, DisconnectReason};

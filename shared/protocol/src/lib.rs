@@ -19,6 +19,7 @@ use ts_rs::TS;
 
 pub mod envelope;
 pub mod handshake;
+pub mod room;
 
 /// Library version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -168,6 +169,99 @@ mod tests {
         rendered.push('\n');
         rendered.push_str(
             &crate::handshake::Platform::export_to_string(&cfg).expect("render Platform bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomCreatePayload::export_to_string(&cfg)
+                .expect("render RoomCreatePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomCreatedPayload::export_to_string(&cfg)
+                .expect("render RoomCreatedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomJoinRequestPayload::export_to_string(&cfg)
+                .expect("render RoomJoinRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomJoinedPayload::export_to_string(&cfg)
+                .expect("render RoomJoinedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomLeavePayload::export_to_string(&cfg)
+                .expect("render RoomLeavePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomStatePayload::export_to_string(&cfg)
+                .expect("render RoomStatePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ParticipantSelf::export_to_string(&cfg)
+                .expect("render ParticipantSelf bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomSummary::export_to_string(&cfg).expect("render RoomSummary bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::Participant::export_to_string(&cfg).expect("render Participant bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ParticipantStatus::export_to_string(&cfg)
+                .expect("render ParticipantStatus bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ParticipantJoinedPayload::export_to_string(&cfg)
+                .expect("render ParticipantJoinedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ParticipantLeftPayload::export_to_string(&cfg)
+                .expect("render ParticipantLeftPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::HostDisconnectedPayload::export_to_string(&cfg)
+                .expect("render HostDisconnectedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::HostReconnectedPayload::export_to_string(&cfg)
+                .expect("render HostReconnectedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::HostMigratedPayload::export_to_string(&cfg)
+                .expect("render HostMigratedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomClosedPayload::export_to_string(&cfg)
+                .expect("render RoomClosedPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomErrorPayload::export_to_string(&cfg)
+                .expect("render RoomErrorPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::RoomErrorCode::export_to_string(&cfg)
+                .expect("render RoomErrorCode bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::PresencePayload::export_to_string(&cfg)
+                .expect("render PresencePayload bindings"),
         );
         rendered.push('\n');
 

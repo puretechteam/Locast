@@ -74,7 +74,7 @@ use locast_protocol::handshake::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -163,6 +163,24 @@ pub struct SignalingInner {
     /// authenticated. The field is private to the module; no
     /// IPC consumer ever sees it.
     pub bearer: Option<BearerRecord>,
+    /// Inbound subscribers. Every envelope the connection
+    /// loop receives (post-handshake) is forwarded to each
+    /// subscriber via an `mpsc::UnboundedSender`. The
+    /// `RoomClient` subscribes to receive ROOM_* and
+    /// PRESENCE envelopes.
+    pub subscribers: Vec<mpsc::UnboundedSender<Envelope>>,
+    /// Outbound envelope queue. Producers (the RoomClient
+    /// and tests) push envelopes here; the connection loop
+    /// pops them and writes them to the WS. The
+    /// connection loop installs a fresh `UnboundedSender`
+    /// on every start; producers see `None` when no
+    /// connection is active.
+    pub outbound_tx: Option<mpsc::UnboundedSender<Envelope>>,
+    /// Notified when an outbound envelope is pushed. The
+    /// connection loop's idle phase waits on this so an
+    /// outbound send wakes the loop immediately rather
+    /// than waiting for the next inbound frame.
+    pub outbound_notify: Arc<tokio::sync::Notify>,
 }
 
 impl SignalingInner {
@@ -170,6 +188,9 @@ impl SignalingInner {
         Self {
             state: ConnectionState::for_url(&config.url),
             bearer: None,
+            subscribers: Vec::new(),
+            outbound_tx: None,
+            outbound_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -237,6 +258,7 @@ impl SignalingClient {
             g.bearer = None;
             g.state.session_id = None;
             g.state.user_id = None;
+            g.subscribers.clear();
         }
 
         let config = Arc::clone(&self.config);
@@ -294,6 +316,70 @@ impl SignalingClient {
     pub async fn bearer_for_test(&self) -> Option<BearerRecord> {
         self.inner.lock().await.bearer.clone()
     }
+
+    /// Subscribe to the inbound envelope stream. Every
+    /// envelope the connection loop receives (post-handshake)
+    /// is forwarded to the returned [`mpsc::UnboundedReceiver`].
+    /// The stream is closed (the receiver returns `None`)
+    /// when the connection is shut down or the signaling
+    /// client is dropped.
+    ///
+    /// Used by [`crate::net::room::RoomClient`] to receive
+    /// the ROOM_* and PRESENCE envelopes.
+    pub async fn subscribe(&self) -> mpsc::UnboundedReceiver<Envelope> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut g = self.inner.lock().await;
+        g.subscribers.push(tx);
+        rx
+    }
+
+    /// Send a single envelope over the signaling WS. The
+    /// envelope's `payload` should NOT include a `bearer`
+    /// field; the client attaches the current bearer
+    /// automatically. Returns an error if the WS is not
+    /// currently authenticated (the bearer is not held) or
+    /// if the connection is not running.
+    pub async fn send_envelope(&self, env: Envelope) -> Result<(), SignalingError> {
+        let (bearer, tx) = {
+            let g = self.inner.lock().await;
+            let bearer = g
+                .bearer
+                .as_ref()
+                .ok_or(SignalingError::IdentityNotInitialized)?;
+            let tx = g.outbound_tx.clone().ok_or(SignalingError::Protocol {
+                message: "signaling not connected".into(),
+            })?;
+            (bearer.clone(), tx)
+        };
+        // Inject the bearer into the payload.
+        let mut payload = env.payload.as_object().cloned().unwrap_or_default();
+        let bearer_arr: Vec<serde_json::Value> = bearer
+            .token
+            .iter()
+            .map(|b| serde_json::Value::from(*b))
+            .collect();
+        payload.insert("bearer".into(), serde_json::Value::Array(bearer_arr));
+        let env = Envelope {
+            v: env.v,
+            r#type: env.r#type,
+            id: env.id,
+            room_id: env.room_id,
+            sender: env.sender,
+            ts_ms: env.ts_ms,
+            seq: env.seq,
+            payload: serde_json::Value::Object(payload),
+        };
+        tx.send(env).map_err(|_| SignalingError::Protocol {
+            message: "ws send queue closed".into(),
+        })?;
+        // Wake the connection loop so it picks the
+        // envelope up promptly. We re-acquire the lock here
+        // rather than holding it across the rest of the
+        // function so other readers (subscribers, the
+        // connection loop's idle check) are not starved.
+        self.inner.lock().await.outbound_notify.notify_one();
+        Ok(())
+    }
 }
 
 /// Top-level connection loop. Drives the state machine: open
@@ -305,6 +391,17 @@ async fn connection_loop(
     inner: Arc<Mutex<SignalingInner>>,
     cancel: CancellationToken,
 ) {
+    // Install an outbound queue and stash the sender in
+    // `inner` so [`SignalingClient::send_envelope`] can push
+    // envelopes from any task. The notify is shared with
+    // `inner` so the idle phase can wake on outbound
+    // activity.
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Envelope>();
+    {
+        let mut g = inner.lock().await;
+        g.outbound_tx = Some(outbound_tx);
+    }
+    let outbound_notify = inner.lock().await.outbound_notify.clone();
     let mut backoff = Backoff::new();
     let mut last_disconnect: Option<DisconnectReason> = None;
     loop {
@@ -424,9 +521,23 @@ async fn connection_loop(
                 backoff.reset();
                 // Now idle on the read side: drop any further
                 // messages until disconnect or cancel.
-                let outcome =
-                    idle_until_disconnect(&mut socket, &config, &inner, &cancel, &mut backoff)
-                        .await;
+                let outcome = idle_until_disconnect(
+                    &mut socket,
+                    &config,
+                    &inner,
+                    &mut outbound_rx,
+                    &cancel,
+                    outbound_notify.clone(),
+                    &mut backoff,
+                )
+                .await;
+                // Keep `outbound_tx` installed for the next
+                // iteration of the connection loop; a new
+                // `outbound_tx` is only installed when a
+                // fresh `start()` is called. The current
+                // `outbound_rx` is dropped here; the next
+                // `idle_until_disconnect` re-borrows it from
+                // the channel.
                 last_disconnect = outcome;
             }
             Ok(HandshakeResult::AuthFailed { reason, message }) => {
@@ -711,7 +822,9 @@ async fn idle_until_disconnect(
     socket: &mut Ws,
     config: &SignalingConfig,
     inner: &Arc<Mutex<SignalingInner>>,
+    outbound_rx: &mut mpsc::UnboundedReceiver<Envelope>,
     cancel: &CancellationToken,
+    outbound_notify: Arc<tokio::sync::Notify>,
     _backoff: &mut Backoff,
 ) -> Option<DisconnectReason> {
     loop {
@@ -720,35 +833,101 @@ async fn idle_until_disconnect(
             let _ = socket.close(None).await;
             return Some(DisconnectReason::LocalShutdown);
         }
-        match read_frame(socket, config).await {
-            Ok(Some(_f)) => {
-                // P2-T03 ignores non-handshake frames. The
-                // P3+ room / playback / drawing handlers
-                // will route them.
-            }
-            Ok(None) => {
-                // Clean close.
-                return Some(DisconnectReason::ServerClose);
-            }
-            Err(FrameError::Oversized { bytes, cap: _ }) => {
-                warn!(bytes, "oversized frame in idle; closing");
+        let mut reason: Option<DisconnectReason> = None;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                set_phase(inner, ConnPhase::ShuttingDown, None).await;
                 let _ = socket.close(None).await;
-                return Some(DisconnectReason::ProtocolError);
+                reason = Some(DisconnectReason::LocalShutdown);
             }
-            Err(FrameError::Text) => {
-                warn!("text frame in idle; closing");
-                let _ = socket.close(None).await;
-                return Some(DisconnectReason::ProtocolError);
+            env = outbound_rx.recv() => {
+                if let Some(env) = env {
+                    if let Err(e) = send_envelope(socket, &env).await {
+                        warn!(error = %e, "ws send from outbound queue failed");
+                        reason = Some(DisconnectReason::NetworkUnreachable);
+                    }
+                } else {
+                    reason = Some(DisconnectReason::LocalShutdown);
+                }
             }
-            Err(FrameError::Decode(e)) => {
-                warn!(error = %e, "decode error in idle; closing");
-                let _ = socket.close(None).await;
-                return Some(DisconnectReason::ProtocolError);
+            _ = outbound_notify.notified() => {
+                while let Ok(env) = outbound_rx.try_recv() {
+                    if let Err(e) = send_envelope(socket, &env).await {
+                        warn!(error = %e, "ws send from outbound queue failed");
+                        reason = Some(DisconnectReason::NetworkUnreachable);
+                        break;
+                    }
+                }
             }
-            Err(FrameError::Ws(e)) => {
-                debug!(error = %e, "ws error in idle");
-                return Some(DisconnectReason::NetworkUnreachable);
+            frame_res = read_frame_async(socket, config) => {
+                let frame: Result<Option<Envelope>, FrameError> = frame_res;
+                match frame {
+                    Ok(Some(env)) => {
+                        let subs: Vec<mpsc::UnboundedSender<Envelope>> = {
+                            let g = inner.lock().await;
+                            g.subscribers.clone()
+                        };
+                        for tx in subs {
+                            let _ = tx.send(env.clone());
+                        }
+                    }
+                    Ok(None) => reason = Some(DisconnectReason::ServerClose),
+                    Err(FrameError::Oversized { bytes, cap: _ }) => {
+                        warn!(bytes, "oversized frame in idle; closing");
+                        let _ = socket.close(None).await;
+                        reason = Some(DisconnectReason::ProtocolError);
+                    }
+                    Err(FrameError::Text) => {
+                        warn!("text frame in idle; closing");
+                        let _ = socket.close(None).await;
+                        reason = Some(DisconnectReason::ProtocolError);
+                    }
+                    Err(FrameError::Decode(e)) => {
+                        warn!(error = %e, "decode error in idle; closing");
+                        let _ = socket.close(None).await;
+                        reason = Some(DisconnectReason::ProtocolError);
+                    }
+                    Err(FrameError::Ws(e)) => {
+                        debug!(error = %e, "ws error in idle");
+                        reason = Some(DisconnectReason::NetworkUnreachable);
+                    }
+                }
             }
+        }
+        if let Some(r) = reason {
+            return Some(r);
+        }
+    }
+}
+
+/// Async wrapper around the read_frame helper for use inside
+/// `tokio::select!`. Same semantics as `read_frame` but
+/// returns a `Result<Option<Envelope>, FrameError>`.
+async fn read_frame_async(
+    socket: &mut Ws,
+    config: &SignalingConfig,
+) -> Result<Option<Envelope>, FrameError> {
+    loop {
+        let frame = match socket.next().await {
+            Some(Ok(f)) => f,
+            Some(Err(e)) => return Err(FrameError::Ws(Box::new(e))),
+            None => return Ok(None),
+        };
+        match frame {
+            WsMessage::Binary(bytes) => {
+                if bytes.len() > config.max_frame_bytes {
+                    return Err(FrameError::Oversized {
+                        bytes: bytes.len(),
+                        cap: config.max_frame_bytes,
+                    });
+                }
+                let env: Envelope = rmp_serde::from_slice(&bytes).map_err(FrameError::Decode)?;
+                return Ok(Some(env));
+            }
+            WsMessage::Text(_) => return Err(FrameError::Text),
+            WsMessage::Close(_) => return Ok(None),
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Frame(_) => continue,
         }
     }
 }

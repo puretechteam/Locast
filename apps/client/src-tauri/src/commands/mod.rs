@@ -18,6 +18,7 @@ pub mod identity;
 pub mod import;
 pub mod protocol;
 pub mod quota;
+pub mod room;
 pub mod scan;
 pub mod signaling;
 
@@ -26,6 +27,7 @@ pub use identity::{identity_get, identity_rotate, identity_set_display_name};
 pub use import::{media_import, AppError as _AppErrorCompat, ImportedMedia};
 pub use protocol::media_resolve_url;
 pub use quota::{quota_get, quota_set, QuotaInfo};
+pub use room::{room_connect_signaling, room_create, room_get_state, room_join, room_leave};
 pub use scan::{library_scan, ScanResult};
 pub use signaling::{signaling_connect, signaling_disconnect, signaling_get_state};
 

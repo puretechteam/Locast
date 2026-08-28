@@ -227,6 +227,22 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // Rolling window of recent bad-msg timestamps (§20.4.1).
     let bad_msgs: Arc<Mutex<VecDeque<i64>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut authed: Option<(Uuid, [u8; 32])> = None;
+    // The user's current room, for the broadcast forwarder
+    // task spawned below. `None` if the user is not in a
+    // room (or not yet authed).
+    let current_room: Arc<tokio::sync::Mutex<Option<Uuid>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // The connection's authenticated user_id, so the
+    // forwarder can filter out events the user originated.
+    let self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    // mpsc::Sender the forwarder pushes outbound envelopes
+    // into. The main loop drains it on every iteration.
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    // Notify the forwarder when the user's room changes,
+    // so it can re-subscribe immediately rather than
+    // waiting for its 20ms sleep to elapse.
+    let room_changed = Arc::new(tokio::sync::Notify::new());
 
     debug!(request_id = %request_id, "ws connection open");
 
@@ -234,12 +250,80 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // the TCP accept, per the architecture's connection lifecycle.
     let handshake_deadline = now_ms() + state.config.handshake_timeout_ms;
 
-    while let Some(frame_res) = receiver.next().await {
-        let frame = match frame_res {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(request_id = %request_id, error = %e, "ws recv error");
+    // Spawn the broadcast forwarder. It watches
+    // `current_room`, subscribes to the new room's broadcast
+    // channel when the user joins, and forwards events to
+    // the main loop via `outbound_tx`. The task exits when
+    // the connection closes (`fwd_cancel` is notified).
+    let fwd_cancel = Arc::new(tokio::sync::Notify::new());
+    {
+        let state = state.clone();
+        let current_room = current_room.clone();
+        let fwd_cancel = fwd_cancel.clone();
+        let outbound_tx = outbound_tx.clone();
+        let room_changed = room_changed.clone();
+        let self_user_id = self_user_id.clone();
+        tokio::spawn(async move {
+            room_bcast_forwarder(
+                state,
+                current_room,
+                outbound_tx,
+                fwd_cancel,
+                room_changed,
+                self_user_id,
+            )
+            .await;
+        });
+    }
+
+    loop {
+        // Drain any pending outbound envelopes (broadcast
+        // forwarder) before pulling the next inbound frame.
+        // We bound the drain so a chatty forwarder cannot
+        // starve the inbound read.
+        let mut drained = 0;
+        while drained < 32 {
+            match outbound_rx.try_recv() {
+                Ok(env) => {
+                    if let Ok(msg) = encode_envelope_message(&env) {
+                        if let Err(e) = sender.send(msg).await {
+                            debug!(request_id = %request_id, error = %e, "ws send failed");
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+            drained += 1;
+        }
+        // Select: wake on the next inbound frame, the
+        // forwarder producing a new envelope, or a cancel
+        // notification.
+        let frame = tokio::select! {
+            biased;
+            _ = fwd_cancel.notified() => {
+                debug!(request_id = %request_id, "ws forwarder cancelled");
                 break;
+            }
+            res = receiver.next() => match res {
+                Some(Ok(f)) => f,
+                Some(Err(e)) => {
+                    warn!(request_id = %request_id, error = %e, "ws recv error");
+                    break;
+                }
+                None => break,
+            },
+            env = outbound_rx.recv() => {
+                if let Some(env) = env {
+                    if let Ok(msg) = encode_envelope_message(&env) {
+                        if let Err(e) = sender.send(msg).await {
+                            debug!(request_id = %request_id, error = %e, "ws send failed");
+                            break;
+                        }
+                    }
+                }
+                continue;
             }
         };
 
@@ -401,18 +485,57 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 }
                 Action::Upgrade { user_id, pubkey } => {
                     authed = Some((user_id, pubkey));
+                    {
+                        let mut g = self_user_id.lock().await;
+                        *g = Some(user_id);
+                    }
                 }
             }
         }
         if should_break {
             break;
         }
+
+        // Refresh the forwarder's view of the user's current
+        // room. Cheap (one read on the by_id map per authed
+        // message); the forwarder compares against its own
+        // last-known room and re-subscribes if it changed.
+        if let Some((uid, _)) = authed {
+            let r = state.rooms.get_user_room(uid).await;
+            let mut g = current_room.lock().await;
+            if *g != r {
+                *g = r;
+                drop(g);
+                room_changed.notify_waiters();
+            }
+        }
     }
+
+    // Stop the forwarder task. `outbound_tx` will also be
+    // dropped when the function returns, which is what the
+    // forwarder uses as the secondary exit signal.
+    fwd_cancel.notify_waiters();
+    drop(outbound_tx);
 
     // Mark the state machine closed.
     {
         let mut s = conn_state.lock().await;
         *s = s.clone().close();
+    }
+    // If the connection was authenticated, notify the room
+    // registry. The registry decides whether the user was a
+    // host (and starts the 30s grace) or just a viewer
+    // (mark Disconnected and let the stale cleanup task
+    // remove them after 5 min of silence).
+    if let Some((user_id, _pubkey)) = authed {
+        // Use the AppState clock so the deadline is on the
+        // same timeline as the room ticker's `now_ms`.
+        // The free `now_ms()` helper reads wall time and
+        // would drift from the test `MockClock`.
+        let now = state.clock.now_ms();
+        if let Err(e) = state.rooms.on_connection_lost(user_id, now).await {
+            debug!(request_id = %request_id, error = %e, "on_connection_lost noop");
+        }
     }
     debug!(request_id = %request_id, "ws connection closed");
 }
@@ -439,12 +562,12 @@ async fn record_bad_msg(bad_msgs: &Arc<Mutex<VecDeque<i64>>>, _started: Instant)
 /// in order, so the WELCOME+CHALLENGE two-frame send is expressed
 /// naturally.
 #[derive(Debug, Default)]
-struct DispatchOutcome {
-    actions: Vec<Action>,
+pub struct DispatchOutcome {
+    pub actions: Vec<Action>,
 }
 
 #[derive(Debug)]
-enum Action {
+pub enum Action {
     Send(Message),
     Close(&'static str),
     Upgrade { user_id: Uuid, pubkey: [u8; 32] },
@@ -520,15 +643,12 @@ async fn dispatch_authed(
 ) -> DispatchOutcome {
     // Post-handshake: every message must carry a bearer field
     // in its payload. The bearer is validated against the
-    // bearer table. (The v1 wire shape for post-handshake
-    // messages is reserved; P3+ room lifecycle etc. will
-    // define their own payload schemas and the bearer field
-    // becomes top-level.)
+    // bearer table.
     let payload = &envelope.payload;
     let bearer_bytes: Option<Vec<u8>> =
         payload.get("bearer").and_then(|v| v.as_array()).map(|arr| {
             arr.iter()
-                .filter_map(|n| n.as_u64().map(|x| x as u8))
+                .filter_map(|n| n.as_u64().and_then(|x| u8::try_from(x).ok()))
                 .collect()
         });
 
@@ -564,10 +684,31 @@ async fn dispatch_authed(
         warn!(request_id = %request_id, "bearer pubkey mismatch");
         return DispatchOutcome::close("bearer_mismatch");
     }
-    // The message passed bearer validation. v1 has nothing else
-    // to do here; the room lifecycle lands in P3+.
-    let _ = envelope;
-    let _ = request_id;
+    // The message passed bearer validation. Route ROOM_*
+    // envelopes to the room dispatcher. Other envelope
+    // types (future PLAY/PAUSE/SEEK/DRAW/LASER/CHAT/MANIFEST_*)
+    // are not implemented in v1 / P2-T04 and are silently
+    // accepted.
+    if envelope.r#type.is_room_lifecycle() {
+        let outcome = crate::rooms::dispatch_room_message(
+            envelope,
+            &state.rooms,
+            state.clock.as_ref(),
+            user_id,
+            pubkey,
+        )
+        .await;
+        let mut actions = Vec::new();
+        for env in outcome.to_caller {
+            if let Ok(msg) = encode_envelope_message(&env) {
+                actions.push(Action::Send(msg));
+            }
+        }
+        if outcome.close_caller {
+            actions.push(Action::Close("room_close"));
+        }
+        return DispatchOutcome { actions };
+    }
     DispatchOutcome::default()
 }
 
@@ -798,6 +939,44 @@ async fn handle_auth(
     };
     let mut out = DispatchOutcome::upgrade(user_id, pubkey);
     out.actions.push(Action::Send(msg));
+
+    // P2-T04: a fresh authenticated transport for a user
+    // who was the host with an active disconnect-grace
+    // timer restores the host. The room registry's
+    // `rejoin` returns the events; we both push the
+    // events to the room's broadcast channel (so other
+    // participants see HOST_RECONNECTED) and directly to
+    // the new connection.
+    if let Ok(Some(events)) = state
+        .rooms
+        .rejoin(user_id, pubkey, state.clock.now_ms())
+        .await
+    {
+        for event in events {
+            let (kind, payload) = match event {
+                crate::rooms::RoomEvent::HostReconnected(p) => (
+                    MessageKind::HostReconnected,
+                    serde_json::to_value(&p).unwrap_or(serde_json::json!({})),
+                ),
+                _ => continue,
+            };
+            if let Some(rid) = state.rooms.get_user_room(user_id).await {
+                let env = Envelope {
+                    v: 1,
+                    r#type: kind,
+                    id: Uuid::now_v7(),
+                    room_id: Some(rid),
+                    sender: None,
+                    ts_ms: now_ms(),
+                    seq: 0,
+                    payload,
+                };
+                if let Ok(msg) = encode_envelope_message(&env) {
+                    out.actions.push(Action::Send(msg));
+                }
+            }
+        }
+    }
     out
 }
 
@@ -830,6 +1009,99 @@ async fn send_auth_fail_bytes(
 fn encode_envelope_message(env: &Envelope) -> Result<Message, rmp_serde::encode::Error> {
     let bytes = rmp_serde::to_vec_named(env)?;
     Ok(Message::Binary(bytes))
+}
+
+/// Per-connection room-broadcast forwarder. Watches the
+/// `current_room` cell; when the user joins a new room,
+/// subscribes to its broadcast channel; forwards every
+/// received item to the connection's `outbound_tx`. Exits
+/// when `cancel` is notified (the connection is closing).
+///
+/// The `self_user_id` is the connection's authenticated
+/// user_id; the forwarder uses it to filter the originator
+/// field on broadcast items so the originating user does
+/// not see their own event echoed back. (Most events are
+/// originated by another user or by the server.)
+async fn room_bcast_forwarder(
+    state: AppState,
+    current_room: Arc<tokio::sync::Mutex<Option<Uuid>>>,
+    outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
+    cancel: Arc<tokio::sync::Notify>,
+    room_changed: Arc<tokio::sync::Notify>,
+    self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>>,
+) {
+    let mut subscribed: Option<(
+        Uuid,
+        tokio::sync::broadcast::Receiver<crate::rooms::registry::BroadcastItem>,
+    )> = None;
+    loop {
+        // 1) Detect a room change. If the user moved, drop
+        // the old subscription and grab a new one.
+        let now_room = {
+            let g = current_room.lock().await;
+            *g
+        };
+        match (subscribed.as_ref(), now_room) {
+            (Some((cur, _)), Some(now)) if *cur == now => {}
+            (None, None) => {}
+            _ => {
+                subscribed = match now_room {
+                    Some(rid) => state.rooms.subscribe(rid).await.map(|rx| (rid, rx)),
+                    None => None,
+                };
+            }
+        }
+        // 2) Wait for a room change, or pull the next item
+        // from the current subscription.
+        let (room_id, item) = if let Some(s) = subscribed.as_mut() {
+            let (rid, rx) = s;
+            match rx.recv().await {
+                Ok(item) => (*rid, item),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    subscribed = None;
+                    continue;
+                }
+            }
+        } else {
+            // No subscription. Wait for either a room
+            // change notification or a small sleep tick.
+            tokio::select! {
+                _ = cancel.notified() => return,
+                _ = room_changed.notified() => continue,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
+            }
+        };
+        // Filter events: skip if the originator is the
+        // current user (they already got the direct reply),
+        // and skip if the user has been removed from the
+        // room since the event was published.
+        let self_uid = {
+            let g = self_user_id.lock().await;
+            *g
+        };
+        if let Some(uid) = self_uid {
+            if item.originator == Some(uid) {
+                continue;
+            }
+            if !state.rooms.is_user_in_room(uid, room_id).await {
+                continue;
+            }
+        }
+        let env = Envelope {
+            v: 1,
+            r#type: item.kind,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: now_ms(),
+            seq: 0,
+            payload: item.payload,
+        };
+        if outbound_tx.send(env).is_err() {
+            return;
+        }
+    }
 }
 
 fn now_ms() -> i64 {
