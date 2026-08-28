@@ -33,10 +33,76 @@ use locast_protocol::room::{
 };
 use serde::Serialize;
 use specta::Type;
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
 use uuid::Uuid;
+
+/// Sink for `room://state` / `room://event` push events.
+/// `RoomClient` holds a `Mutex<Option<Arc<dyn RoomEventSink>>>`
+/// and dispatches every state-changing inbound envelope
+/// through it. Production code passes a Tauri-backed sink
+/// (see [`TauriEventSink`]); the unit tests use a no-op
+/// implementation so the test binary does not link
+/// Tauri's WebView2 DLL on Windows.
+pub trait RoomEventSink: Send + Sync {
+    /// Emit `room://state` with the given summary.
+    fn emit_state(&self, summary: &RoomSummaryIpc);
+    /// Emit `room://event` with the given summary.
+    fn emit_event(&self, summary: &RoomSummaryIpc);
+    /// Emit `room://state` with `None` to signal the
+    /// room has been cleared (RoomClosed / RoomError).
+    fn emit_state_cleared(&self);
+}
+
+/// A no-op sink. Used by the unit tests so the lib test
+/// binary does not pull in Tauri's runtime. Production
+/// code uses [`TauriEventSink`] instead.
+#[derive(Default)]
+pub struct NoopEventSink;
+
+impl RoomEventSink for NoopEventSink {
+    fn emit_state(&self, _summary: &RoomSummaryIpc) {}
+    fn emit_event(&self, _summary: &RoomSummaryIpc) {}
+    fn emit_state_cleared(&self) {}
+}
+
+/// A Tauri-backed sink. Wraps a `tauri::AppHandle` and
+/// forwards `room://state` / `room://event` events through
+/// the webview's event bus. Compiled only in non-test
+/// builds; the lib unit tests use [`NoopEventSink`] to
+/// avoid linking `WebView2Loader.dll` on Windows.
+#[cfg(not(test))]
+mod tauri_sink {
+    use super::*;
+    use tauri::Emitter;
+
+    pub struct TauriEventSink {
+        pub(super) handle: tauri::AppHandle,
+    }
+
+    impl TauriEventSink {
+        pub fn new(handle: tauri::AppHandle) -> Self {
+            Self { handle }
+        }
+    }
+
+    impl super::RoomEventSink for TauriEventSink {
+        fn emit_state(&self, summary: &RoomSummaryIpc) {
+            let _ = self.handle.emit(ROOM_STATE_EVENT, summary.clone());
+        }
+        fn emit_event(&self, summary: &RoomSummaryIpc) {
+            let _ = self.handle.emit(ROOM_EVENT_EVENT, summary.clone());
+        }
+        fn emit_state_cleared(&self) {
+            let _ = self
+                .handle
+                .emit(ROOM_STATE_EVENT, Option::<RoomSummaryIpc>::None);
+        }
+    }
+}
+
+#[cfg(not(test))]
+pub use tauri_sink::TauriEventSink;
 
 use super::signaling::SignalingClient;
 
@@ -208,10 +274,13 @@ pub struct RoomClient {
     /// flight at once and the inbound loop pops them in
     /// FIFO order.
     pending: Mutex<HashMap<MessageKind, Vec<oneshot::Sender<Envelope>>>>,
-    /// Tauri app handle for emitting `room://state` and
-    /// `room://event`. `None` until the host calls
-    /// [`RoomClient::install_app_handle`].
-    app_handle: Mutex<Option<AppHandle>>,
+    /// Sink for `room://state` / `room://event` push
+    /// events. `None` until the host calls
+    /// [`RoomClient::install_event_sink`]. Production code
+    /// installs a [`TauriEventSink`]; tests leave it as
+    /// `None` (the `handle_inbound` path becomes a
+    /// pure-state mutation).
+    sink: Mutex<Option<Arc<dyn RoomEventSink>>>,
 }
 
 impl RoomClient {
@@ -223,7 +292,7 @@ impl RoomClient {
             state: Mutex::new(None),
             inbound: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
-            app_handle: Mutex::new(None),
+            sink: Mutex::new(None),
         }
     }
 
@@ -235,12 +304,21 @@ impl RoomClient {
         *g = Some(rx);
     }
 
-    /// Install the Tauri `AppHandle` so the client can
-    /// emit `room://state` and `room://event` events.
-    /// Optional; the client works without it (the events
-    /// just don't fire).
-    pub async fn install_app_handle(&self, handle: AppHandle) {
-        *self.app_handle.lock().await = Some(handle);
+    /// Install a Tauri-backed [`RoomEventSink`] so the
+    /// client can emit `room://state` / `room://event`
+    /// events. Optional; the client works without a sink
+    /// (the events just don't fire). In non-test builds
+    /// the caller passes a `TauriEventSink::new(handle)`.
+    #[cfg(not(test))]
+    pub async fn install_app_handle(&self, handle: tauri::AppHandle) {
+        let sink: Arc<dyn RoomEventSink> = Arc::new(TauriEventSink::new(handle));
+        *self.sink.lock().await = Some(sink);
+    }
+
+    /// Install a generic event sink. The unit tests use
+    /// this with a [`NoopEventSink`].
+    pub async fn install_event_sink(&self, sink: Arc<dyn RoomEventSink>) {
+        *self.sink.lock().await = Some(sink);
     }
 
     /// Read the latest cached room summary. The cache is
@@ -569,20 +647,20 @@ impl RoomClient {
     }
 
     /// Best-effort emit of the `room://state` event. A
-    /// missing `AppHandle` is a no-op.
+    /// missing sink is a no-op.
     async fn emit_state(&self, summary: &RoomSummaryIpc) {
-        let g = self.app_handle.lock().await;
-        if let Some(h) = g.as_ref() {
-            let _ = h.emit(ROOM_STATE_EVENT, summary.clone());
+        let g = self.sink.lock().await;
+        if let Some(s) = g.as_ref() {
+            s.emit_state(summary);
         }
     }
 
     /// Best-effort emit of the `room://state` event when
     /// the cache is cleared (RoomClosed / RoomError).
     async fn emit_state_cleared(&self) {
-        let g = self.app_handle.lock().await;
-        if let Some(h) = g.as_ref() {
-            let _ = h.emit(ROOM_STATE_EVENT, Option::<RoomSummaryIpc>::None);
+        let g = self.sink.lock().await;
+        if let Some(s) = g.as_ref() {
+            s.emit_state_cleared();
         }
     }
 
@@ -592,9 +670,9 @@ impl RoomClient {
     /// React layer can update its cache and react to the
     /// delta with a single listener.
     async fn emit_event(&self, summary: &RoomSummaryIpc) {
-        let g = self.app_handle.lock().await;
-        if let Some(h) = g.as_ref() {
-            let _ = h.emit(ROOM_EVENT_EVENT, summary.clone());
+        let g = self.sink.lock().await;
+        if let Some(s) = g.as_ref() {
+            s.emit_event(summary);
         }
     }
 }

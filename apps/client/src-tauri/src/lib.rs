@@ -134,7 +134,24 @@ pub fn run() {
             let app_handle_for_room = app.handle().clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
-                room_client.install_app_handle(app_handle_for_room).await;
+                // P2-T05: install the Tauri `AppHandle` so
+                // the client can emit `room://state` and
+                // `room://event` events. The Tauri-backed
+                // sink is only compiled in non-test builds;
+                // tests must use `install_event_sink` (or
+                // leave the sink as `None`).
+                #[cfg(not(test))]
+                {
+                    use net::room::TauriEventSink;
+                    use net::room::RoomEventSink;
+                    let sink: std::sync::Arc<dyn RoomEventSink> =
+                        std::sync::Arc::new(TauriEventSink::new(app_handle_for_room));
+                    room_client.install_event_sink(sink).await;
+                }
+                #[cfg(test)]
+                {
+                    let _ = app_handle_for_room;
+                }
                 let rc = room_client.clone();
                 tokio::spawn(async move { rc.run_inbound().await });
             });
