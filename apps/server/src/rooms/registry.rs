@@ -609,7 +609,7 @@ impl RoomRegistry {
         let handle = {
             let by_id = self.by_id.read().await;
             let mut found = None;
-            for (_rid, h) in by_id.iter() {
+            for h in by_id.values() {
                 let s = h.read().await;
                 if s.participants
                     .iter()
@@ -656,7 +656,7 @@ impl RoomRegistry {
         let handle = {
             let by_id = self.by_id.read().await;
             let mut found = None;
-            for (_rid, h) in by_id.iter() {
+            for h in by_id.values() {
                 let s = h.read().await;
                 if s.participants
                     .iter()
@@ -711,7 +711,7 @@ impl RoomRegistry {
     /// the user is not in any room.
     pub async fn list_snapshot(&self, user_id: Uuid) -> Option<RoomStatePayload> {
         let by_id = self.by_id.read().await;
-        for (_rid, h) in by_id.iter() {
+        for h in by_id.values() {
             let s = h.read().await;
             if s.participants
                 .iter()
@@ -746,7 +746,7 @@ impl RoomRegistry {
     /// any room.
     pub async fn touch(&self, user_id: Uuid, now_ms: i64) {
         let by_id = self.by_id.read().await;
-        for (_rid, h) in by_id.iter() {
+        for h in by_id.values() {
             let mut state = h.write().await;
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.last_seen_ms = now_ms;
