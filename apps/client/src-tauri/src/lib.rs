@@ -126,9 +126,15 @@ pub fn run() {
             // client's inbound envelope stream so the
             // `room_*` commands can send ROOM_* envelopes
             // and observe the server's replies.
+            //
+            // P2-T05: install the Tauri `AppHandle` so
+            // the client can emit `room://state` and
+            // `room://event` events.
             let room_client = std::sync::Arc::new(RoomClient::new(signaling_client.clone()));
+            let app_handle_for_room = app.handle().clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
+                room_client.install_app_handle(app_handle_for_room).await;
                 let rc = room_client.clone();
                 tokio::spawn(async move { rc.run_inbound().await });
             });

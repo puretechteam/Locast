@@ -29,9 +29,14 @@
 // commands (and the `Identity` return type). P2-T03 added the
 // `signalingGetState`, `signalingConnect`, and
 // `signalingDisconnect` commands (and the `ConnectionState`,
-// `ConnPhase`, and `DisconnectReason` types).
+// `ConnPhase`, and `DisconnectReason` types). P2-T04 added the
+// `roomConnectSignaling`, `roomCreate`, `roomJoin`, `roomLeave`,
+// and `roomGetState` commands (and the `RoomSummaryIpc` and
+// `ParticipantIpc` types). P2-T05 added the `roomState` and
+// `roomEvent` event listeners (`room://state` and `room://event`).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
+import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
 
 /** Commands */
 export const commands = {
@@ -175,3 +180,28 @@ export type ParticipantStatusIpc =
   | "Reconnecting"
   | "Disconnected"
   | "Left";
+
+/* Events */
+// bindings-regen: keep in sync with the hand-maintained
+// `events.rs` registrations. These helpers are not in the
+// tauri-specta-generated surface; the generator does not
+// emit `listen()` wrappers, only event payload types. The
+// names + payload shapes are stable and must match the
+// emit!() calls in `apps/client/src-tauri/src/net/room.rs`.
+type EventListener<P> = (handler: (payload: P) => void) => Promise<() => void>;
+
+async function __listenAs__<P>(name: string, handler: (payload: P) => void): Promise<() => void> {
+  return await __TAURI_LISTEN(name, (event) => {
+    handler((event as { payload: P }).payload);
+  });
+}
+
+export const events = {
+  signalingState: <EventListener<ConnectionState>>((h) => __listenAs__("signaling://state", h)),
+  roomState: <EventListener<RoomSummaryIpc | null>>((h) => __listenAs__("room://state", h)),
+  roomEvent: <EventListener<RoomSummaryIpc>>((h) => __listenAs__("room://event", h)),
+};
+
+export const signalingStateChanged = events.signalingState;
+export const roomStateChanged = events.roomState;
+export const roomEventEnvelope = events.roomEvent;

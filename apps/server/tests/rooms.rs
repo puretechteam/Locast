@@ -95,9 +95,12 @@ async fn spawn_test_server() -> TestHarness {
     let _ticker_handle = {
         let rooms = rooms.clone();
         let clock = clock.clone();
+        let store: Arc<dyn locast_server::rooms::RoomStore> =
+            Arc::new(locast_server::rooms::DbRoomStore::new(db.clone()));
         tokio::spawn(async move {
             locast_server::rooms::spawn_room_ticker_for_test(
                 rooms,
+                store,
                 clock,
                 std::time::Duration::from_millis(50),
             )

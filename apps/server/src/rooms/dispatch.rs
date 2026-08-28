@@ -18,6 +18,8 @@ use uuid::Uuid;
 use super::codes;
 use super::error::RoomError;
 use super::registry::{RoomEvent, RoomRegistry};
+use super::store::RoomStore;
+use super::validation::validate_display_name;
 use crate::time::Clock;
 /// The result of dispatching a single ROOM_* message. The
 /// WS layer applies the `to_caller` envelopes first (in
@@ -41,6 +43,7 @@ pub struct RoomDispatchOutcome {
 pub async fn dispatch_room_message(
     envelope: Envelope,
     registry: &RoomRegistry,
+    store: &dyn RoomStore,
     clock: &dyn Clock,
     user_id: Uuid,
     pubkey: [u8; 32],
@@ -48,12 +51,12 @@ pub async fn dispatch_room_message(
     let now_ms = clock.now_ms();
     match envelope.r#type {
         MessageKind::RoomCreate => {
-            handle_room_create(envelope, registry, user_id, pubkey, now_ms).await
+            handle_room_create(envelope, registry, store, user_id, pubkey, now_ms).await
         }
         MessageKind::RoomJoinRequest => {
-            handle_room_join_request(envelope, registry, user_id, pubkey, now_ms).await
+            handle_room_join_request(envelope, registry, store, user_id, pubkey, now_ms).await
         }
-        MessageKind::RoomLeave => handle_room_leave(registry, user_id, now_ms).await,
+        MessageKind::RoomLeave => handle_room_leave(registry, store, user_id, now_ms).await,
         MessageKind::Presence => handle_presence(registry, user_id, now_ms).await,
         _ => RoomDispatchOutcome::default(),
     }
@@ -62,6 +65,7 @@ pub async fn dispatch_room_message(
 async fn handle_room_create(
     envelope: Envelope,
     registry: &RoomRegistry,
+    store: &dyn RoomStore,
     user_id: Uuid,
     pubkey: [u8; 32],
     now_ms: i64,
@@ -79,6 +83,7 @@ async fn handle_room_create(
     let mut out = RoomDispatchOutcome::default();
     match registry
         .create(
+            store,
             payload.title,
             user_id,
             pubkey,
@@ -111,6 +116,7 @@ async fn handle_room_create(
 async fn handle_room_join_request(
     envelope: Envelope,
     registry: &RoomRegistry,
+    store: &dyn RoomStore,
     user_id: Uuid,
     pubkey: [u8; 32],
     now_ms: i64,
@@ -138,17 +144,18 @@ async fn handle_room_join_request(
             return out;
         }
     };
-    if payload.display_name.is_empty() || payload.display_name.len() > 32 {
+    if let Err(e) = validate_display_name(&payload.display_name) {
         out.to_caller.push(err_envelope(
             MessageKind::RoomError,
             RoomErrorCode::InvalidState,
-            "display_name must be 1-32 chars".to_string(),
+            format!("display_name invalid: {e}"),
             now_ms,
         ));
         return out;
     }
+    let display_name = payload.display_name.clone();
     match registry
-        .join(&code, user_id, pubkey, payload.display_name, now_ms)
+        .join(store, &code, user_id, pubkey, display_name, now_ms)
         .await
     {
         Ok((joined, evt)) => {
@@ -183,11 +190,12 @@ fn strip_bearer(mut v: serde_json::Value) -> serde_json::Value {
 
 async fn handle_room_leave(
     registry: &RoomRegistry,
+    store: &dyn RoomStore,
     user_id: Uuid,
     now_ms: i64,
 ) -> RoomDispatchOutcome {
     let mut out = RoomDispatchOutcome::default();
-    match registry.leave(user_id, true, now_ms).await {
+    match registry.leave(store, user_id, true, now_ms).await {
         Ok((events, _summary)) => {
             out.events.extend(events);
         }
@@ -292,6 +300,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_room_create_sends_room_created() {
         let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -306,7 +315,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::RoomCreated);
     }
@@ -314,6 +323,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_invalid_code_yields_invalid_code_error() {
         let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomJoinRequest,
@@ -328,15 +338,40 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidCode);
     }
 
     #[tokio::test]
+    async fn dispatch_invalid_display_name_yields_invalid_state() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::RoomJoinRequest,
+            id: Uuid::now_v7(),
+            room_id: None,
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 1,
+            payload: serde_json::to_value(RoomJoinRequestPayload {
+                code: "AAAAAA".into(),
+                display_name: " leading".into(),
+            })
+            .unwrap(),
+        };
+        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        assert_eq!(out.to_caller.len(), 1);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::InvalidState);
+    }
+
+    #[tokio::test]
     async fn presence_refreshes_last_seen() {
         let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -351,7 +386,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let _ = dispatch_room_message(env, &reg, &clock, uid(1), pubkey()).await;
+        let _ = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
         clock.advance(5_000);
         let env = Envelope {
             v: 1,
@@ -366,7 +401,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
         assert!(out.to_caller.is_empty());
         let snap = reg.list_snapshot(uid(1)).await.expect("snap");
         let me = snap

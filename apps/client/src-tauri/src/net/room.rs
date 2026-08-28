@@ -7,23 +7,34 @@
 //! API plus a `mpsc` receiver for inbound `ROOM_*` and
 //! `PRESENCE` envelopes.
 //!
-//! P2-T04: the room lifecycle.
+//! P2-T05: the `request` correlation now uses a
+//! `HashMap<MessageKind, Vec<oneshot::Sender<Envelope>>>`
+//! so the inbound subscription is shared between the
+//! request-reply correlation and the background
+//! `run_inbound` loop. This fixes the leak where each
+//! `request` call used to register a fresh subscriber on
+//! the `SignalingClient`.
+//!
+//! P2-T05 also emits `room://state` and `room://event`
+//! Tauri events on every state-changing inbound envelope so
+//! the React layer can subscribe to deltas without polling.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
     HostMigratedPayload, Participant, ParticipantStatus, PresencePayload, RoomCreatePayload,
-    RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload,
-    RoomSummary,
+    RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload, RoomSummary,
 };
 use serde::Serialize;
 use specta::Type;
-use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -109,10 +120,10 @@ impl From<ParticipantStatus> for ParticipantStatusIpc {
     }
 }
 
-/// Room-error code returned across the IPC boundary. The
+/// IPC-safe error code returned across the IPC boundary. The
 /// set is closed; the wire enum is `RoomErrorCode`.
 #[derive(Debug, Clone, Copy, Serialize, Type)]
-#[serde(tag = "code", rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
 pub enum RoomErrorCodeIpc {
     Unauthorized,
     InvalidCode,
@@ -164,29 +175,55 @@ pub enum RoomClientError {
     Signaling(String),
 }
 
+/// Tauri event name emitted whenever the cached room
+/// summary changes. The payload is the redacted
+/// `RoomSummaryIpc`.
+pub const ROOM_STATE_EVENT: &str = "room://state";
+
+/// Tauri event name emitted for every state-changing
+/// room event (HostMigrated, HostReconnected,
+/// ParticipantJoined, ParticipantLeft, RoomClosed). The
+/// payload is the same redacted `RoomSummaryIpc` (the new
+/// authoritative snapshot) so the React layer can both
+/// listen for state changes and update the cache in one
+/// pass.
+pub const ROOM_EVENT_EVENT: &str = "room://event";
+
+/// Default timeout for a single request-reply round trip.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The room-lifecycle client. Holds a reference to the
-/// underlying `SignalingClient` and an inbound `mpsc`
-/// receiver for the ROOM_* and PRESENCE envelopes.
+/// underlying `SignalingClient`, the cached state, and the
+/// pending request-reply correlations.
 pub struct RoomClient {
     signaling: Arc<SignalingClient>,
     /// The most recent full room summary the client received.
     /// `None` if the user has not joined any room yet.
     state: Mutex<Option<RoomSummaryIpc>>,
     inbound: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Envelope>>>,
+    /// Pending request-reply correlations. Each entry is
+    /// keyed by the expected reply `MessageKind`; a value
+    /// is a `Vec` so multiple concurrent requests for the
+    /// same kind (e.g. two `room_create`s) can be in
+    /// flight at once and the inbound loop pops them in
+    /// FIFO order.
+    pending: Mutex<HashMap<MessageKind, Vec<oneshot::Sender<Envelope>>>>,
+    /// Tauri app handle for emitting `room://state` and
+    /// `room://event`. `None` until the host calls
+    /// [`RoomClient::install_app_handle`].
+    app_handle: Mutex<Option<AppHandle>>,
 }
 
 impl RoomClient {
-    /// Build a new room client and register an inbound
-    /// subscription with the signaling client.
+    /// Build a new room client. The inbound subscription
+    /// is established in [`RoomClient::init`].
     pub fn new(signaling: Arc<SignalingClient>) -> Self {
-        // We can't `await` in this constructor because the
-        // underlying `SignalingClient::subscribe` is async.
-        // Callers that need an inbound receiver should use
-        // [`RoomClient::init`].
         Self {
             signaling,
             state: Mutex::new(None),
             inbound: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            app_handle: Mutex::new(None),
         }
     }
 
@@ -196,6 +233,14 @@ impl RoomClient {
         let rx = self.signaling.subscribe().await;
         let mut g = self.inbound.lock().await;
         *g = Some(rx);
+    }
+
+    /// Install the Tauri `AppHandle` so the client can
+    /// emit `room://state` and `room://event` events.
+    /// Optional; the client works without it (the events
+    /// just don't fire).
+    pub async fn install_app_handle(&self, handle: AppHandle) {
+        *self.app_handle.lock().await = Some(handle);
     }
 
     /// Read the latest cached room summary. The cache is
@@ -221,6 +266,12 @@ impl RoomClient {
         let created: locast_protocol::room::RoomCreatedPayload = decode_payload(&reply)?;
         let summary = RoomSummaryIpc::from(created.room);
         *self.state.lock().await = Some(summary.clone());
+        // The room create is a "to caller" event; we
+        // emit a `room://state` so the React side
+        // observing via the event stream sees the
+        // new state immediately, without having to
+        // re-poll via `room_get_state`.
+        self.emit_state(&summary).await;
         Ok(summary)
     }
 
@@ -237,6 +288,7 @@ impl RoomClient {
         let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
         let summary = RoomSummaryIpc::from(joined.room);
         *self.state.lock().await = Some(summary.clone());
+        self.emit_state(&summary).await;
         Ok(summary)
     }
 
@@ -275,9 +327,11 @@ impl RoomClient {
     }
 
     /// Drive the inbound subscriber: pop envelopes off the
-    /// channel and update the cached state. Returns when
-    /// the channel closes (the signaling client has shut
-    /// down) or the future is cancelled.
+    /// channel, update the cached state, dispatch any
+    /// pending request-reply correlations, and emit
+    /// `room://state` / `room://event` Tauri events.
+    /// Returns when the channel closes (the signaling
+    /// client has shut down) or the future is cancelled.
     pub async fn run_inbound(&self) {
         let mut rx = {
             let mut g = self.inbound.lock().await;
@@ -287,78 +341,260 @@ impl RoomClient {
             }
         };
         while let Some(env) = rx.recv().await {
-            match env.r#type {
-                MessageKind::RoomState => {
-                    if let Ok(state) = decode_payload::<RoomStatePayload>(&env) {
-                        let summary = RoomSummaryIpc::from(state.room);
-                        *self.state.lock().await = Some(summary);
-                    }
+            self.handle_inbound(env).await;
+        }
+    }
+
+    /// Single inbound-envelope handler. Split out so it
+    /// is straightforward to unit test in isolation
+    /// (without the surrounding `mpsc::Receiver`).
+    async fn handle_inbound(&self, env: Envelope) {
+        // 1) Dispatch any pending request-reply
+        //    correlation. We do this BEFORE updating the
+        //    cache so a request that completes in the
+        //    same frame as a broadcast sees the reply
+        //    first, then any state changes follow.
+        self.deliver_to_pending(&env).await;
+        // 2) Update the cached state and emit Tauri
+        //    events for the types that callers care
+        //    about.
+        match env.r#type {
+            MessageKind::RoomState => {
+                if let Ok(state) = decode_payload::<RoomStatePayload>(&env) {
+                    let summary = RoomSummaryIpc::from(state.room);
+                    *self.state.lock().await = Some(summary.clone());
+                    self.emit_state(&summary).await;
                 }
-                MessageKind::HostMigrated => {
-                    if let Ok(m) = decode_payload::<HostMigratedPayload>(&env) {
-                        // Update the cached `host_user_id` and
-                        // clear the grace-window state. The
-                        // HOST_MIGRATED payload carries the
-                        // authoritative new host; the
-                        // participant list is unchanged so
-                        // no further refresh is required.
+            }
+            MessageKind::RoomJoined => {
+                if let Ok(p) = decode_payload::<locast_protocol::room::RoomJoinedPayload>(&env) {
+                    let summary = RoomSummaryIpc::from(p.room);
+                    *self.state.lock().await = Some(summary.clone());
+                    self.emit_state(&summary).await;
+                    // The viewer joined: the participant
+                    // list now includes them. The
+                    // server's per-participant
+                    // ParticipantJoined event for the
+                    // newly-joined user is filtered out
+                    // by the WS forwarder for that user
+                    // (it is the originator) but a
+                    // separate event for every existing
+                    // participant is not emitted on
+                    // join. We emit a `room://event`
+                    // here so subscribers can update
+                    // their view.
+                    self.emit_event(&summary).await;
+                }
+            }
+            MessageKind::RoomCreated => {
+                if let Ok(p) = decode_payload::<locast_protocol::room::RoomCreatedPayload>(&env) {
+                    let summary = RoomSummaryIpc::from(p.room);
+                    *self.state.lock().await = Some(summary.clone());
+                    self.emit_state(&summary).await;
+                    self.emit_event(&summary).await;
+                }
+            }
+            MessageKind::HostMigrated => {
+                if let Ok(m) = decode_payload::<HostMigratedPayload>(&env) {
+                    // P2-T05: if the server included a
+                    // post-migration summary, REPLACE the
+                    // cached state entirely. Otherwise
+                    // fall back to the pre-P2-T05
+                    // behavior of updating only the host
+                    // fields.
+                    if let Some(boxed) = m.summary {
+                        let summary = RoomSummaryIpc::from(*boxed);
+                        *self.state.lock().await = Some(summary.clone());
+                        self.emit_state(&summary).await;
+                        self.emit_event(&summary).await;
+                    } else {
                         let mut g = self.state.lock().await;
                         if let Some(s) = g.as_mut() {
                             s.host_user_id = m.new_host_user_id.to_string();
                             s.host_disconnected = false;
                             s.host_disconnect_deadline_ms = None;
                         }
+                        if let Some(s) = g.as_ref() {
+                            self.emit_state(s).await;
+                            self.emit_event(s).await;
+                        }
                     }
                 }
-                MessageKind::RoomClosed | MessageKind::RoomError => {
-                    *self.state.lock().await = None;
+            }
+            MessageKind::HostReconnected => {
+                if let Ok(m) = decode_payload::<locast_protocol::room::HostReconnectedPayload>(&env)
+                {
+                    let mut g = self.state.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        s.host_user_id = m.host_user_id.to_string();
+                        s.host_disconnected = false;
+                        s.host_disconnect_deadline_ms = None;
+                    }
+                    if let Some(s) = g.as_ref() {
+                        self.emit_state(s).await;
+                        self.emit_event(s).await;
+                    }
                 }
-                _ => {}
+            }
+            MessageKind::ParticipantJoined => {
+                if let Ok(p) =
+                    decode_payload::<locast_protocol::room::ParticipantJoinedPayload>(&env)
+                {
+                    let mut g = self.state.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        let participant: ParticipantIpc = p.participant.into();
+                        // Replace existing entry by
+                        // user_id if present.
+                        if let Some(slot) = s
+                            .participants
+                            .iter_mut()
+                            .find(|x| x.user_id == participant.user_id)
+                        {
+                            *slot = participant;
+                        } else {
+                            s.participants.push(participant);
+                        }
+                    }
+                    if let Some(s) = g.as_ref() {
+                        self.emit_state(s).await;
+                        self.emit_event(s).await;
+                    }
+                }
+            }
+            MessageKind::ParticipantLeft => {
+                if let Ok(p) = decode_payload::<locast_protocol::room::ParticipantLeftPayload>(&env)
+                {
+                    let mut g = self.state.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        s.participants
+                            .retain(|x| x.user_id != p.user_id.to_string());
+                    }
+                    if let Some(s) = g.as_ref() {
+                        self.emit_state(s).await;
+                        self.emit_event(s).await;
+                    }
+                }
+            }
+            MessageKind::RoomClosed | MessageKind::RoomError => {
+                *self.state.lock().await = None;
+                self.emit_state_cleared().await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Dispatch one inbound envelope to the first
+    /// `oneshot::Sender` in the FIFO queue for its
+    /// `MessageKind`, or to a single `RoomError` waiter
+    /// (the first error to arrive resolves the pending
+    /// request regardless of which kind the caller
+    /// expects).
+    async fn deliver_to_pending(&self, env: &Envelope) {
+        // RoomError resolves any pending request that has
+        // not been satisfied yet. Pop the first sender
+        // for the envelope's own kind first, then fall
+        // back to the first sender across all kinds.
+        let mut pending = self.pending.lock().await;
+        if let Some(senders) = pending.get_mut(&env.r#type) {
+            if !senders.is_empty() {
+                let tx = senders.remove(0);
+                let _ = tx.send(env.clone());
+                return;
+            }
+        }
+        if env.r#type == MessageKind::RoomError {
+            // Route the error to the first pending
+            // request of any kind.
+            for (_, senders) in pending.iter_mut() {
+                if !senders.is_empty() {
+                    let tx = senders.remove(0);
+                    let _ = tx.send(env.clone());
+                    return;
+                }
             }
         }
     }
 
     /// Send an envelope and wait for a specific reply
-    /// message kind. Times out after 10 seconds.
+    /// message kind. Times out after [`REQUEST_TIMEOUT`].
+    /// Does NOT call `signaling.subscribe()`; the
+    /// correlation goes through the `pending` map shared
+    /// with [`Self::run_inbound`].
     async fn request(
         &self,
         env: Envelope,
         expected: MessageKind,
     ) -> Result<Envelope, RoomClientError> {
-        // Subscribe to the inbound stream BEFORE sending
-        // so we don't miss the reply.
-        let mut rx = self.signaling.subscribe().await;
-        self.signaling
-            .send_envelope(env)
-            .await
-            .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
-        let deadline = std::time::Duration::from_secs(10);
-        let res = tokio::time::timeout(deadline, async {
-            while let Some(env) = rx.recv().await {
-                if env.r#type == MessageKind::RoomError {
-                    let p: RoomErrorPayload = match serde_json::from_value(env.payload) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return Err(RoomClientError::Unexpected(format!(
-                                "bad RoomErrorPayload: {e}"
-                            )));
-                        }
-                    };
-                    return Err(RoomClientError::Server {
-                        code: p.code.into(),
-                        message: p.message,
-                    });
-                }
-                if env.r#type == expected {
-                    return Ok(env);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            pending.entry(expected.clone()).or_default().push(tx);
+        }
+        if let Err(e) = self.signaling.send_envelope(env).await {
+            // Roll back the registration so a future
+            // request doesn't pick up our sender.
+            let mut pending = self.pending.lock().await;
+            if let Some(senders) = pending.get_mut(&expected) {
+                if !senders.is_empty() {
+                    senders.remove(0);
                 }
             }
-            Err(RoomClientError::NotConnected)
-        })
-        .await;
+            return Err(RoomClientError::Signaling(e.to_string()));
+        }
+        let res = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
         match res {
-            Ok(r) => r,
-            Err(_) => Err(RoomClientError::Unexpected("request timeout".into())),
+            Ok(Ok(env)) => Ok(env),
+            Ok(Err(_)) => {
+                let mut pending = self.pending.lock().await;
+                if let Some(senders) = pending.get_mut(&expected) {
+                    if !senders.is_empty() {
+                        senders.remove(0);
+                    }
+                }
+                Err(RoomClientError::NotConnected)
+            }
+            Err(_) => {
+                // Timeout: the sender is dropped when
+                // its receiver dies; clean it up so the
+                // queue does not grow.
+                let mut pending = self.pending.lock().await;
+                if let Some(senders) = pending.get_mut(&expected) {
+                    if !senders.is_empty() {
+                        senders.remove(0);
+                    }
+                }
+                Err(RoomClientError::Unexpected("request timeout".into()))
+            }
+        }
+    }
+
+    /// Best-effort emit of the `room://state` event. A
+    /// missing `AppHandle` is a no-op.
+    async fn emit_state(&self, summary: &RoomSummaryIpc) {
+        let g = self.app_handle.lock().await;
+        if let Some(h) = g.as_ref() {
+            let _ = h.emit(ROOM_STATE_EVENT, summary.clone());
+        }
+    }
+
+    /// Best-effort emit of the `room://state` event when
+    /// the cache is cleared (RoomClosed / RoomError).
+    async fn emit_state_cleared(&self) {
+        let g = self.app_handle.lock().await;
+        if let Some(h) = g.as_ref() {
+            let _ = h.emit(ROOM_STATE_EVENT, Option::<RoomSummaryIpc>::None);
+        }
+    }
+
+    /// Best-effort emit of the `room://event` event.
+    /// The payload is the same `RoomSummaryIpc` shape
+    /// (no bearer, no signature, no envelope) so the
+    /// React layer can update its cache and react to the
+    /// delta with a single listener.
+    async fn emit_event(&self, summary: &RoomSummaryIpc) {
+        let g = self.app_handle.lock().await;
+        if let Some(h) = g.as_ref() {
+            let _ = h.emit(ROOM_EVENT_EVENT, summary.clone());
         }
     }
 }
@@ -390,10 +626,378 @@ fn now_ms() -> i64 {
 
 impl Drop for RoomClient {
     fn drop(&mut self) {
-        // Best-effort: the inbound receiver will be
-        // dropped when this struct is dropped, which
-        // closes the channel on the sender side. The
-        // signaling client can then move on.
         warn!("RoomClient dropped");
+    }
+}
+
+#[cfg(test)]
+#[allow(unused_imports)]
+mod tests {
+    use super::*;
+    use locast_protocol::room::RoomErrorPayload;
+
+    fn env_of(kind: MessageKind, payload: serde_json::Value) -> Envelope {
+        Envelope {
+            v: 1,
+            r#type: kind,
+            id: Uuid::now_v7(),
+            room_id: None,
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload,
+        }
+    }
+
+    fn sample_summary(host: Uuid) -> RoomSummary {
+        RoomSummary {
+            id: Uuid::now_v7(),
+            code: "AAAAAA".into(),
+            title: "T".into(),
+            host_user_id: host,
+            host_migration_enabled: true,
+            created_ms: 1_000,
+            participants: vec![Participant {
+                user_id: host,
+                pubkey: vec![1; 32],
+                display_name: "host".into(),
+                joined_ms: 1_000,
+                status: ParticipantStatus::Connected,
+                last_seen_ms: 1_000,
+                is_host: true,
+            }],
+            host_disconnected: false,
+            host_disconnect_deadline_ms: None,
+        }
+    }
+
+    /// Build a `RoomClient` against a stub signaling
+    /// client. The signaling client is never started; the
+    /// tests use the `pending` map directly to drive
+    /// `handle_inbound`.
+    async fn fresh_room_client() -> RoomClient {
+        let signaling = Arc::new(SignalingClient::new(
+            super::super::config::SignalingConfig::from_env(),
+            // The keystore is never used in these unit
+            // tests because the test never starts the
+            // connection loop. A panic here would
+            // require the keystore to be constructed;
+            // we pass a dummy value via
+            // `Arc::new` from a fresh test
+            // IdentityService built against a
+            // tempdir-backed storage. For unit-test
+            // isolation we instead construct the
+            // signaling client with a custom test
+            // identity service created below.
+            {
+                // A real IdentityService needs a
+                // storage handle. We don't need any
+                // of that here because the
+                // `request` path in these tests is
+                // driven directly via the `pending`
+                // map, never through the real
+                // signaling transport. We can
+                // short-circuit by using a
+                // placeholder; `SignalingClient::new`
+                // does not touch the keystore, so
+                // any value works. Use
+                // `IdentityService::new_for_test` if
+                // available, else use
+                // `IdentityService::new` against a
+                // throwaway storage.
+                use crate::identity::keystore::IdentityService;
+                use crate::storage::Storage;
+                use tempfile::TempDir;
+                let dir = TempDir::new().expect("tempdir");
+                let path = dir.path().join("index.sqlite");
+                let storage = Storage::open(&path).await.expect("storage open");
+                Arc::new(IdentityService::new(storage))
+            },
+        ));
+        let r = RoomClient::new(signaling);
+        r.init().await;
+        r
+    }
+
+    #[tokio::test]
+    async fn host_migrated_with_summary_replaces_cached_state() {
+        let rc = fresh_room_client().await;
+        // Seed stale state: host A.
+        let host_a = Uuid::from_bytes([1u8; 16]);
+        let host_b = Uuid::from_bytes([2u8; 16]);
+        let stale = RoomSummaryIpc::from(sample_summary(host_a));
+        *rc.state.lock().await = Some(stale);
+        // New summary with host B and a different
+        // participant list.
+        let new_summary = RoomSummary {
+            id: Uuid::now_v7(),
+            code: "BBBBBB".into(),
+            title: "T2".into(),
+            host_user_id: host_b,
+            host_migration_enabled: true,
+            created_ms: 2_000,
+            participants: vec![
+                Participant {
+                    user_id: host_b,
+                    pubkey: vec![2; 32],
+                    display_name: "B".into(),
+                    joined_ms: 2_000,
+                    status: ParticipantStatus::Connected,
+                    last_seen_ms: 2_000,
+                    is_host: true,
+                },
+                Participant {
+                    user_id: host_a,
+                    pubkey: vec![1; 32],
+                    display_name: "A".into(),
+                    joined_ms: 1_000,
+                    status: ParticipantStatus::Connected,
+                    last_seen_ms: 1_000,
+                    is_host: false,
+                },
+            ],
+            host_disconnected: false,
+            host_disconnect_deadline_ms: None,
+        };
+        let payload = HostMigratedPayload {
+            previous_host_user_id: host_a,
+            new_host_user_id: host_b,
+            summary: Some(Box::new(new_summary.clone())),
+        };
+        let env = env_of(
+            MessageKind::HostMigrated,
+            serde_json::to_value(payload).unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        let s = rc.state().await.expect("state");
+        assert_eq!(s.host_user_id, host_b.to_string());
+        assert_eq!(s.participants.len(), 2);
+        assert!(s
+            .participants
+            .iter()
+            .any(|p| p.user_id == host_a.to_string() && !p.is_host));
+        assert!(s
+            .participants
+            .iter()
+            .any(|p| p.user_id == host_b.to_string() && p.is_host));
+    }
+
+    #[tokio::test]
+    async fn host_migrated_without_summary_keeps_participants() {
+        let rc = fresh_room_client().await;
+        let host_a = Uuid::from_bytes([1u8; 16]);
+        let host_b = Uuid::from_bytes([2u8; 16]);
+        let stale = RoomSummaryIpc::from(sample_summary(host_a));
+        *rc.state.lock().await = Some(stale);
+        let payload = HostMigratedPayload {
+            previous_host_user_id: host_a,
+            new_host_user_id: host_b,
+            summary: None,
+        };
+        let env = env_of(
+            MessageKind::HostMigrated,
+            serde_json::to_value(payload).unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        let s = rc.state().await.expect("state");
+        assert_eq!(s.host_user_id, host_b.to_string());
+        // Fallback path: the participants list is
+        // unchanged (only the host_user_id, host_disconnected,
+        // and deadline fields are updated).
+        assert_eq!(s.participants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn participant_left_removes_user() {
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        let viewer = Uuid::from_bytes([2u8; 16]);
+        let mut summary = sample_summary(host);
+        summary.participants.push(Participant {
+            user_id: viewer,
+            pubkey: vec![2; 32],
+            display_name: "V".into(),
+            joined_ms: 1_100,
+            status: ParticipantStatus::Connected,
+            last_seen_ms: 1_100,
+            is_host: false,
+        });
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(summary));
+        let env = env_of(
+            MessageKind::ParticipantLeft,
+            serde_json::to_value(locast_protocol::room::ParticipantLeftPayload {
+                user_id: viewer,
+                reason: "leave".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        let s = rc.state().await.expect("state");
+        assert_eq!(s.participants.len(), 1);
+        assert_eq!(s.participants[0].user_id, host.to_string());
+    }
+
+    #[tokio::test]
+    async fn room_closed_clears_cache() {
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+        let env = env_of(
+            MessageKind::RoomClosed,
+            serde_json::to_value(locast_protocol::room::RoomClosedPayload {
+                reason: "host_left".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        assert!(rc.state().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn room_state_replaces_cache() {
+        let rc = fresh_room_client().await;
+        let host_a = Uuid::from_bytes([1u8; 16]);
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host_a)));
+        let host_b = Uuid::from_bytes([2u8; 16]);
+        let new_summary = sample_summary(host_b);
+        let env = env_of(
+            MessageKind::RoomState,
+            serde_json::to_value(RoomStatePayload {
+                room: new_summary,
+                host_disconnect_deadline_ms: None,
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        let s = rc.state().await.expect("state");
+        assert_eq!(s.host_user_id, host_b.to_string());
+    }
+
+    #[tokio::test]
+    async fn room_error_clears_cache() {
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+        let env = env_of(
+            MessageKind::RoomError,
+            serde_json::to_value(RoomErrorPayload {
+                code: RoomErrorCode::Internal,
+                message: "boom".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        assert!(rc.state().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_to_pending_routes_to_first_waiter() {
+        let rc = fresh_room_client().await;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = rc.pending.lock().await;
+            pending
+                .entry(MessageKind::RoomCreated)
+                .or_default()
+                .push(tx);
+        }
+        let env = env_of(
+            MessageKind::RoomCreated,
+            serde_json::json!({"room": {"id": Uuid::now_v7()}}),
+        );
+        rc.deliver_to_pending(&env).await;
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("not timeout")
+            .expect("not closed");
+        assert_eq!(received.r#type, MessageKind::RoomCreated);
+    }
+
+    #[tokio::test]
+    async fn deliver_to_pending_room_error_routes_to_any_pending() {
+        let rc = fresh_room_client().await;
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = rc.pending.lock().await;
+            pending.entry(MessageKind::RoomJoined).or_default().push(tx);
+        }
+        let env = env_of(
+            MessageKind::RoomError,
+            serde_json::to_value(RoomErrorPayload {
+                code: RoomErrorCode::Internal,
+                message: "x".into(),
+            })
+            .unwrap(),
+        );
+        rc.deliver_to_pending(&env).await;
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("not timeout")
+            .expect("not closed");
+        assert_eq!(received.r#type, MessageKind::RoomError);
+    }
+
+    #[tokio::test]
+    async fn request_does_not_grow_subscribers() {
+        // P2-T05 spec Part 4: 1000 sequential `request`
+        // calls must NOT grow the signaling client's
+        // subscriber list beyond 1.
+        //
+        // The fresh client already holds 1 subscriber
+        // (the one registered in `init`). The test
+        // asserts the count is bounded at every step
+        // and that it does not grow.
+        let rc = fresh_room_client().await;
+        let initial = rc.signaling.subscribers_count_for_test().await;
+        assert_eq!(initial, 1, "init should register exactly one subscriber");
+        for i in 0..1000 {
+            // Each request fails fast (no real WS) and
+            // rolls back the registration. We just want
+            // to assert the subscriber count never grows.
+            let env = env_of(
+                MessageKind::RoomCreate,
+                serde_json::json!({"title": "x", "migration_enabled": false}),
+            );
+            let _ = rc.request(env, MessageKind::RoomCreated).await;
+            let n = rc.signaling.subscribers_count_for_test().await;
+            assert!(n <= 1, "subscribers grew to {n} after request {i}");
+        }
+        // Final count is still 1.
+        assert_eq!(rc.signaling.subscribers_count_for_test().await, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_resolve_independently() {
+        // Drive 4 concurrent requests against the same
+        // RoomClient. Each request registers its own
+        // oneshot in the `pending` map; the inbound
+        // loop dispatches them by kind.
+        let rc = fresh_room_client().await;
+        // Manually install 4 waiters and resolve them
+        // by hand to avoid a real WS.
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let (tx, rx) = oneshot::channel();
+            rc.pending
+                .lock()
+                .await
+                .entry(MessageKind::RoomJoined)
+                .or_default()
+                .push(tx);
+            waiters.push(rx);
+        }
+        for (i, rx) in waiters.into_iter().enumerate() {
+            let env = env_of(
+                MessageKind::RoomJoined,
+                serde_json::json!({"room": {"id": Uuid::now_v7()}}),
+            );
+            rc.deliver_to_pending(&env).await;
+            let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+                .await
+                .expect("not timeout")
+                .expect("not closed");
+            assert_eq!(received.r#type, MessageKind::RoomJoined);
+            let _ = i;
+        }
     }
 }

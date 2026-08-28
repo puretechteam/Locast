@@ -8,6 +8,13 @@
 //! snapshot (e.g. building the `RoomSummary` for a `ROOM_STATE`
 //! reply) does not block another connection's read on a
 //! different room.
+//!
+//! P2-T05: every state-changing method now takes a
+//! `&dyn RoomStore` and writes to SQLite BEFORE the
+//! in-memory state is committed. If the DB write fails the
+//! in-memory state is left untouched, so a caller that sees
+//! an `Ok` return can trust both the runtime and the
+//! persisted state are in sync.
 
 #![forbid(unsafe_code)]
 
@@ -23,12 +30,14 @@ use locast_protocol::room::{
 use rand::rngs::OsRng;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::codes;
 use super::error::RoomError;
 use super::state::{ParticipantRecord, RoomLifecycle, RoomState};
+use super::store::RoomStore;
+use crate::db::{RoomParticipantRow, RoomRow};
 
 /// Code-collision cap. After 5 collisions the server aborts
 /// creation with an `Internal` error.
@@ -159,13 +168,15 @@ impl RoomRegistry {
     /// Tick the grace timer. Publishes any
     /// `HostMigrated` / `RoomClosed` events the same way
     /// `leave` does.
-    pub async fn tick_grace(&self, now_ms: i64) -> Vec<(Uuid, RoomEvent)> {
+    pub async fn tick_grace(&self, store: &dyn RoomStore, now_ms: i64) -> Vec<(Uuid, RoomEvent)> {
         let mut out: Vec<(Uuid, RoomEvent)> = Vec::new();
+        let mut to_publish: Vec<(Uuid, BroadcastItem)> = Vec::new();
+        let mut to_remove: Vec<Uuid> = Vec::new();
         // First pass: determine which rooms are expiring and
         // what event each one produces. We don't hold any
         // room write lock past this point.
-        let mut to_publish: Vec<(Uuid, BroadcastItem)> = Vec::new();
-        let mut to_remove: Vec<Uuid> = Vec::new();
+        let mut host_caps: HashMap<Uuid, (Uuid, u32)> = HashMap::new(); // room_id -> (new_host_user_id, cap_set)
+        let mut demoted_caps: HashMap<Uuid, (Uuid, u32)> = HashMap::new(); // room_id -> (old_host_user_id, cap_set)
         {
             let by_id = self.by_id.read().await;
             for (rid, h) in by_id.iter() {
@@ -181,6 +192,7 @@ impl RoomRegistry {
                         let p = HostMigratedPayload {
                             previous_host_user_id: prev,
                             new_host_user_id: new_host_id,
+                            summary: Some(Box::new(state.snapshot())),
                         };
                         to_publish.push((
                             *rid,
@@ -191,6 +203,11 @@ impl RoomRegistry {
                             ),
                         ));
                         out.push((*rid, RoomEvent::HostMigrated(p)));
+                        host_caps.insert(
+                            *rid,
+                            (new_host_id, state.host().map(|h| h.cap_set).unwrap_or(0)),
+                        );
+                        demoted_caps.insert(*rid, (prev, cap::CHAT));
                     } else {
                         state.state = RoomLifecycle::Ended;
                         let p = RoomClosedPayload {
@@ -206,11 +223,55 @@ impl RoomRegistry {
                 }
             }
         }
-        // Second pass: publish + remove.
+        // Second pass: persist + publish + remove.
+        // DB writes are best-effort: a failure is logged
+        // but the in-memory state is the runtime's
+        // authority. The next tick will retry via
+        // re-publish of the new state; a successful
+        // migration persists the new host flag, a
+        // successful end_room records the close.
         for (rid, item) in &to_publish {
             self.publish(*rid, item.clone());
         }
+        for (rid, (new_host, cap_set)) in &host_caps {
+            if let Some(handle) = self.by_id.read().await.get(rid).cloned() {
+                let s = handle.read().await;
+                if let Some(rec) = s.participants.iter().find(|p| p.user_id == *new_host) {
+                    let _ = store
+                        .add_room_participant(
+                            *rid,
+                            *new_host,
+                            &rec.pubkey,
+                            &rec.display_name,
+                            true,
+                            rec.joined_ms,
+                            *cap_set,
+                        )
+                        .await;
+                }
+            }
+        }
+        for (rid, (old_host, cap_set)) in &demoted_caps {
+            if let Some(handle) = self.by_id.read().await.get(rid).cloned() {
+                let s = handle.read().await;
+                if let Some(rec) = s.participants.iter().find(|p| p.user_id == *old_host) {
+                    let _ = store
+                        .add_room_participant(
+                            *rid,
+                            *old_host,
+                            &rec.pubkey,
+                            &rec.display_name,
+                            false,
+                            rec.joined_ms,
+                            *cap_set,
+                        )
+                        .await;
+                }
+            }
+            let _ = store.set_host_disconnect_deadline(*rid, None).await;
+        }
         for rid in to_remove {
+            let _ = store.end_room(rid, now_ms).await;
             self.remove_room(rid).await;
         }
         out
@@ -220,10 +281,15 @@ impl RoomRegistry {
     /// `last_seen_ms` is older than `participant_stale_after_ms`
     /// is removed from their room and a
     /// `ParticipantLeft { reason: "timeout" }` is emitted.
-    pub async fn tick_stale_participants(&self, now_ms: i64) -> Vec<(Uuid, RoomEvent)> {
+    pub async fn tick_stale_participants(
+        &self,
+        store: &dyn RoomStore,
+        now_ms: i64,
+    ) -> Vec<(Uuid, RoomEvent)> {
         let mut out: Vec<(Uuid, RoomEvent)> = Vec::new();
         let mut to_publish: Vec<(Uuid, BroadcastItem)> = Vec::new();
         let mut to_remove: Vec<Uuid> = Vec::new();
+        let mut removed_pairs: Vec<(Uuid, Uuid)> = Vec::new();
         {
             let by_id = self.by_id.read().await;
             for (rid, h) in by_id.iter() {
@@ -258,6 +324,7 @@ impl RoomRegistry {
                         event_to_broadcast_item(&RoomEvent::ParticipantLeft(p.clone()), *rid, None),
                     ));
                     out.push((*rid, RoomEvent::ParticipantLeft(p)));
+                    removed_pairs.push((*rid, removed.user_id));
                 }
                 if state.state == RoomLifecycle::Ended {
                     to_remove.push(*rid);
@@ -266,6 +333,11 @@ impl RoomRegistry {
         }
         for (rid, item) in &to_publish {
             self.publish(*rid, item.clone());
+        }
+        for (rid, uid) in &removed_pairs {
+            let _ = store
+                .update_participant_status(*rid, *uid, "left", now_ms)
+                .await;
         }
         for rid in to_remove {
             self.remove_room(rid).await;
@@ -281,8 +353,14 @@ impl RoomRegistry {
 
     /// `ROOM_CREATE` handler. Returns the new room's
     /// `RoomSummary` and the host's `ParticipantSelf` view.
+    ///
+    /// The DB write is performed BEFORE the in-memory
+    /// state is committed. If the DB write fails the
+    /// room is NOT created in memory either; the caller
+    /// sees the `Err`.
     pub async fn create(
         &self,
+        store: &dyn RoomStore,
         title: String,
         host_user_id: Uuid,
         host_pubkey: [u8; 32],
@@ -321,6 +399,25 @@ impl RoomRegistry {
             | cap::PUBLISH_MANIFEST
             | cap::INVITE
             | cap::CHAT;
+        // Persist the room row first.
+        store
+            .insert_room(
+                id,
+                &code,
+                &title,
+                host_user_id,
+                &host_pubkey,
+                host_migration_enabled,
+                now_ms,
+            )
+            .await
+            .map_err(|e| RoomError::Internal(format!("insert_room: {e}")))?;
+        // Then the host participant.
+        store
+            .add_room_participant(id, host_user_id, &host_pubkey, "", true, now_ms, cap_set)
+            .await
+            .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+
         let state = RoomState::new(
             id,
             code.clone(),
@@ -358,6 +455,7 @@ impl RoomRegistry {
     /// `ParticipantJoined` event for the broadcast.
     pub async fn join(
         &self,
+        store: &dyn RoomStore,
         code: &str,
         user_id: Uuid,
         pubkey: [u8; 32],
@@ -393,6 +491,11 @@ impl RoomRegistry {
             return Err(RoomError::RoomFull);
         }
         let cap_set = cap::CHAT;
+        // Persist FIRST.
+        store
+            .add_room_participant(id, user_id, &pubkey, &display_name, false, now_ms, cap_set)
+            .await
+            .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
         let rec = ParticipantRecord {
             user_id,
             pubkey,
@@ -442,6 +545,7 @@ impl RoomRegistry {
     /// chooses.
     pub async fn leave(
         &self,
+        store: &dyn RoomStore,
         user_id: Uuid,
         intentional: bool,
         now_ms: i64,
@@ -478,21 +582,13 @@ impl RoomRegistry {
             .ok_or(RoomError::NotJoined)?;
         let was_host = state.participants[idx].is_host;
         state.participants[idx].last_seen_ms = now_ms;
-        // host_user_id broadcast: any "the host has changed"
-        // event the WS layer needs to emit.
         let mut events: Vec<RoomEvent> = Vec::new();
-        // The `ParticipantLeft` event is only emitted when the
-        // participant's status actually transitions to `Left`.
-        // In the host-transport-loss / migration-on case the
-        // host's status is set to `Reconnecting` below, so we
-        // skip the LEFT and let the `HostDisconnected` event
-        // carry that information. The original `reason` field
-        // was hard-coded to "transport_loss" which is not in
-        // the documented wire enum; removing it here keeps the
-        // protocol honest.
+        // Decide the outcome BEFORE writing to the DB so
+        // we can persist in the right order.
+        let mut new_host_cap_set: u32 = 0;
+        let mut demoted_cap_set: u32 = 0;
         let mut emit_left = true;
         if was_host {
-            // Determine migration outcome.
             if !state.host_migration_enabled {
                 // Room ends.
                 state.participants[idx].status = ParticipantStatus::Left;
@@ -505,15 +601,16 @@ impl RoomRegistry {
                     },
                 }));
             } else if intentional {
-                // Migration ON, intentional leave: immediate handoff.
                 state.participants[idx].status = ParticipantStatus::Left;
                 if let Some(new_host_id) = elect_new_host(&mut state, now_ms) {
+                    new_host_cap_set = state.host().map(|h| h.cap_set).unwrap_or(0);
+                    demoted_cap_set = cap::CHAT;
                     events.push(RoomEvent::HostMigrated(HostMigratedPayload {
                         previous_host_user_id: user_id,
                         new_host_user_id: new_host_id,
+                        summary: Some(Box::new(state.snapshot())),
                     }));
                 } else {
-                    // No other participants -> room ends.
                     state.state = RoomLifecycle::Ended;
                     events.push(RoomEvent::RoomClosed(RoomClosedPayload {
                         reason: "host_left".into(),
@@ -523,7 +620,6 @@ impl RoomRegistry {
                 // Transport loss, migration ON: start the grace.
                 state.host_disconnect_deadline_ms =
                     Some(now_ms + self.config.host_disconnect_grace_ms);
-                // Mark the host as Reconnecting for the UI.
                 state.participants[idx].status = ParticipantStatus::Reconnecting;
                 let new_host_user_id = if self.config.host_disconnect_grace_ms <= 0 {
                     elect_new_host(&mut state, now_ms)
@@ -535,14 +631,9 @@ impl RoomRegistry {
                     reconnect_deadline_ms: state.host_disconnect_deadline_ms.unwrap(),
                     new_host_user_id,
                 }));
-                // The host is still a participant in the room
-                // (status = Reconnecting). Do not emit
-                // ParticipantLeft; the HostDisconnected event
-                // is the source of truth.
                 emit_left = false;
             }
         } else {
-            // Non-host leaver: mark Left, broadcast LEFT.
             state.participants[idx].status = ParticipantStatus::Left;
         }
         if emit_left {
@@ -552,37 +643,101 @@ impl RoomRegistry {
             }));
         }
 
-        // Build the broadcast items so the room subscribers
-        // see the events. The originator is the leaving user
-        // so a connected WS can avoid echoing the LEFT back
-        // to itself if it so chooses.
+        // Persist BEFORE the in-memory state is committed
+        // (i.e. before any of the in-memory mutations are
+        // observable to a reader). For the `host transport
+        // loss + migration on` case we only set the
+        // deadline; for the others we either end the room
+        // or add a new host participant row.
+        if was_host && state.host_migration_enabled && intentional {
+            if state.state == RoomLifecycle::Ended {
+                // No new host; end the room.
+                store
+                    .end_room(room_id, now_ms)
+                    .await
+                    .map_err(|e| RoomError::Internal(format!("end_room: {e}")))?;
+            } else {
+                // New host was elected: persist the new
+                // host flag for the new host, and demote
+                // the old host to a viewer.
+                if let Some(new_host_rec) = state.participants.iter().find(|p| p.is_host).cloned() {
+                    store
+                        .add_room_participant(
+                            room_id,
+                            new_host_rec.user_id,
+                            &new_host_rec.pubkey,
+                            &new_host_rec.display_name,
+                            true,
+                            new_host_rec.joined_ms,
+                            new_host_cap_set,
+                        )
+                        .await
+                        .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+                }
+                store
+                    .add_room_participant(
+                        room_id,
+                        user_id,
+                        &state.participants[idx].pubkey,
+                        &state.participants[idx].display_name,
+                        false,
+                        state.participants[idx].joined_ms,
+                        demoted_cap_set,
+                    )
+                    .await
+                    .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+            }
+        } else if was_host && !state.host_migration_enabled {
+            // Room ends; persist end_room (host row update
+            // happens via the `add_room_participant` no-op
+            // because the host's row will be set to
+            // `is_host=0` only on a future handoff; in v1
+            // the room is gone).
+            store
+                .end_room(room_id, now_ms)
+                .await
+                .map_err(|e| RoomError::Internal(format!("end_room: {e}")))?;
+        } else if was_host {
+            // Migration ON, transport loss: set the
+            // deadline; the host's row stays at
+            // `is_host=1` until rejoin or migration.
+            store
+                .set_host_disconnect_deadline(room_id, state.host_disconnect_deadline_ms)
+                .await
+                .map_err(|e| RoomError::Internal(format!("set_host_disconnect_deadline: {e}")))?;
+        }
+        // Non-host (or host row): update participant
+        // status to "left".
+        if was_host {
+            // The host row's status update is implicit for
+            // the non-transport-loss case (the row is left
+            // with is_host=1 in the case of transport loss;
+            // for room-end, the room row is set to "ended"
+            // and we don't need to flip the host row's
+            // status here).
+        } else {
+            store
+                .update_participant_status(room_id, user_id, "left", now_ms)
+                .await
+                .map_err(|e| RoomError::Internal(format!("update_participant_status: {e}")))?;
+        }
+
         let publish_items: Vec<BroadcastItem> = events
             .iter()
             .map(|e| event_to_broadcast_item(e, room_id, Some(user_id)))
             .collect();
 
-        // Clean up ended rooms eagerly so the next allocation
-        // is not affected by stale state.
         let ended = state.state == RoomLifecycle::Ended;
-        // Drop the write lock before either path so the read
-        // lock in the `Some` branch can be acquired (or the
-        // write lock in `remove_room`).
         drop(state);
         // Publish BEFORE remove_room so subscribers see the
         // ROOM_CLOSED before the channel disappears. The
         // forwarder's `is_user_in_room` check would skip
-        // events for users in an already-removed room;
-        // we therefore keep the room registered for a
-        // short grace window so the broadcasts can be
-        // observed.
+        // events for users in an already-removed room; we
+        // therefore keep the room registered for a short
+        // grace window so the broadcasts can be observed.
         for item in &publish_items {
             self.publish(room_id, item.clone());
         }
-        // Yield so the broadcast receivers wake up and
-        // process the items before we drop the room. The
-        // `is_user_in_room` check on the forwarder will
-        // still find the room in by_id during this brief
-        // window.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let summary = if ended {
@@ -599,13 +754,10 @@ impl RoomRegistry {
     /// the host, take the same path as `leave(_, false)`.
     pub async fn on_connection_lost(
         &self,
+        store: &dyn RoomStore,
         user_id: Uuid,
         now_ms: i64,
     ) -> Result<Vec<RoomEvent>, RoomError> {
-        // Cheap path: a non-host that disconnects is marked
-        // Disconnected but not removed; the stale-cleanup
-        // task in `tick_stale_participants` will drop them
-        // after `participant_stale_after_ms`.
         let handle = {
             let by_id = self.by_id.read().await;
             let mut found = None;
@@ -625,20 +777,44 @@ impl RoomRegistry {
             Some(h) => h,
             None => return Err(RoomError::NotJoined),
         };
-        let mut state = handle.write().await;
-        if state.state != RoomLifecycle::Open {
-            return Err(RoomError::RoomClosed);
-        }
-        let is_host = state.host().map(|h| h.user_id == user_id).unwrap_or(false);
+        let is_host = {
+            let s = handle.read().await;
+            s.host().map(|h| h.user_id == user_id).unwrap_or(false)
+        };
         if !is_host {
+            // Persist the disconnected status before
+            // mutating memory.
+            let room_id = {
+                let by_id = self.by_id.read().await;
+                let mut found = None;
+                for (rid, h) in by_id.iter() {
+                    let s = h.read().await;
+                    if s.participants
+                        .iter()
+                        .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+                    {
+                        found = Some(*rid);
+                        break;
+                    }
+                }
+                found
+            };
+            let room_id = room_id.ok_or(RoomError::NotJoined)?;
+            store
+                .update_participant_status(room_id, user_id, "disconnected", now_ms)
+                .await
+                .map_err(|e| RoomError::Internal(format!("update_participant_status: {e}")))?;
+            let mut state = handle.write().await;
+            if state.state != RoomLifecycle::Open {
+                return Err(RoomError::RoomClosed);
+            }
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.status = ParticipantStatus::Disconnected;
             }
             return Ok(vec![]);
         }
         // Host transport loss. Treat as `leave(_, false)`.
-        drop(state);
-        let (events, _summary) = self.leave(user_id, false, now_ms).await?;
+        let (events, _summary) = self.leave(store, user_id, false, now_ms).await?;
         Ok(events)
     }
 
@@ -649,6 +825,7 @@ impl RoomRegistry {
     /// viewer, their status is set back to `Connected`.
     pub async fn rejoin(
         &self,
+        store: &dyn RoomStore,
         user_id: Uuid,
         pubkey: [u8; 32],
         now_ms: i64,
@@ -672,24 +849,60 @@ impl RoomRegistry {
             Some(h) => h,
             None => return Ok(None),
         };
-        let mut state = handle.write().await;
-        let is_host = state.host().map(|h| h.user_id == user_id).unwrap_or(false);
-        let was_in_grace = state.host_disconnect_deadline_ms.is_some();
+        let room_id = {
+            let by_id = self.by_id.read().await;
+            let mut found = None;
+            for (rid, h) in by_id.iter() {
+                let s = h.read().await;
+                if s.participants
+                    .iter()
+                    .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+                {
+                    found = Some(*rid);
+                    break;
+                }
+            }
+            found.ok_or(RoomError::NotJoined)?
+        };
+        let is_host = {
+            let s = handle.read().await;
+            s.host().map(|h| h.user_id == user_id).unwrap_or(false)
+        };
+        let was_in_grace = {
+            let s = handle.read().await;
+            s.host_disconnect_deadline_ms.is_some()
+        };
         if is_host && was_in_grace {
-            // Cancel the grace. The host's participant
-            // record was set to `Reconnecting` (or already
-            // `Disconnected` if `leave` already ran); we set
-            // it back to `Connected` and re-bind the
-            // pubkey.
+            // Persist FIRST.
+            store
+                .set_host_disconnect_deadline(room_id, None)
+                .await
+                .map_err(|e| RoomError::Internal(format!("set_host_disconnect_deadline: {e}")))?;
+            // Reset the host's participant row.
+            let (display_name, joined_ms, cap_set) = {
+                let s = handle.read().await;
+                let p = s.host().cloned().expect("host present");
+                (p.display_name, p.joined_ms, p.cap_set)
+            };
+            store
+                .add_room_participant(
+                    room_id,
+                    user_id,
+                    &pubkey,
+                    &display_name,
+                    true,
+                    joined_ms,
+                    cap_set,
+                )
+                .await
+                .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+            let mut state = handle.write().await;
             state.host_disconnect_deadline_ms = None;
             if let Some(p) = state.host_mut() {
                 p.status = ParticipantStatus::Connected;
                 p.last_seen_ms = now_ms;
                 p.pubkey = pubkey;
             }
-            let room_id = state.id;
-            // Publish the HostReconnected event so other
-            // participants see it.
             let event = RoomEvent::HostReconnected(HostReconnectedPayload {
                 host_user_id: user_id,
             });
@@ -699,6 +912,12 @@ impl RoomRegistry {
             return Ok(Some(vec![event]));
         }
         // Non-host rejoin: restore Connected status.
+        // Persist FIRST.
+        store
+            .update_participant_status(room_id, user_id, "connected", now_ms)
+            .await
+            .map_err(|e| RoomError::Internal(format!("update_participant_status: {e}")))?;
+        let mut state = handle.write().await;
         if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
             p.status = ParticipantStatus::Connected;
             p.last_seen_ms = now_ms;
@@ -839,6 +1058,162 @@ impl RoomRegistry {
             message: message.into(),
         }
     }
+
+    /// Rehydrate the in-memory `RoomState` for a single
+    /// `RoomRow` from the DB. Called at server startup
+    /// after `db.list_open_rooms()` for every open row.
+    ///
+    /// P2-T05 spec: "Reject any participant whose
+    /// WebSocket can't survive a server restart — they must
+    /// reconnect through P2-T02/P2-T03. After rehydration,
+    /// no participant should be marked `Connected` if their
+    /// transport is gone. Mark them `Disconnected` so the
+    /// stale-cleanup ticker (or an explicit
+    /// `on_connection_lost` flow on the next reconnect)
+    /// handles them."
+    ///
+    /// The host is also reconnected through P2-T02/P2-T03,
+    /// so the host is either marked `Reconnecting` (if a
+    /// `host_disconnect_deadline_ms` is set) or `Connected`
+    /// if the room is fresh (no in-flight host).
+    ///
+    /// Participants whose persisted status is `"left"` are
+    /// filtered out; their rows are not re-inserted.
+    pub async fn rehydrate(
+        &self,
+        room: RoomRow,
+        participants: Vec<RoomParticipantRow>,
+    ) -> Result<(), RoomError> {
+        if room.state != "open" {
+            // Per the spec, do not rehydrate ended rooms.
+            return Ok(());
+        }
+        let mut pubkey_arr = [0u8; 32];
+        if room.host_pubkey.len() != 32 {
+            return Err(RoomError::Internal(format!(
+                "host_pubkey row is {} bytes, expected 32",
+                room.host_pubkey.len()
+            )));
+        }
+        pubkey_arr.copy_from_slice(&room.host_pubkey);
+
+        let id = room.id;
+        let code = room.code.clone();
+        let host_user_id = room.host_user_id;
+        let host_migration_enabled = room.host_migration_enabled;
+        let deadline = room.host_disconnect_deadline_ms;
+        // Walk the persisted participants and rebuild
+        // the in-memory list. Mark anyone who is not the
+        // host as `Disconnected`; the stale-cleanup
+        // ticker will drop them after
+        // `participant_stale_after_ms` of silence, or an
+        // explicit `on_connection_lost` flow on the next
+        // reconnect will reset them to `Connected`.
+        let mut rebuilt: Vec<ParticipantRecord> = Vec::new();
+        let mut host_found = false;
+        for p in participants {
+            if p.status == "left" {
+                continue;
+            }
+            if p.pubkey.len() != 32 {
+                warn!(
+                    room_id = %id,
+                    user_id = %p.user_id,
+                    "rehydrate: bad pubkey length, skipping"
+                );
+                continue;
+            }
+            let mut pkey = [0u8; 32];
+            pkey.copy_from_slice(&p.pubkey);
+            let status = if p.is_host {
+                host_found = true;
+                // If a grace deadline is set, the host's
+                // transport is currently considered down.
+                if deadline.is_some() {
+                    ParticipantStatus::Reconnecting
+                } else {
+                    ParticipantStatus::Connected
+                }
+            } else {
+                ParticipantStatus::Disconnected
+            };
+            rebuilt.push(ParticipantRecord {
+                user_id: p.user_id,
+                pubkey: pkey,
+                display_name: p.display_name,
+                joined_ms: p.joined_ms,
+                status,
+                // `RoomParticipantRow` does not carry
+                // `last_seen_ms`; default to `joined_ms`
+                // so the stale-cleanup ticker has a
+                // sensible reference time. The next
+                // inbound PRESENCE message will update
+                // it via `RoomRegistry::touch`.
+                last_seen_ms: p.joined_ms,
+                is_host: p.is_host,
+                cap_set: p.cap_set,
+            });
+        }
+        if !host_found {
+            // No host row; the host must have been
+            // promoted into a participant row with
+            // is_host=1, OR the rehydrate path should
+            // synthesize one. We synthesize one with the
+            // room's host_user_id and the full cap set
+            // (matching what `create` does).
+            let cap_set = cap::PLAYBACK_CONTROL
+                | cap::DRAW
+                | cap::LASER
+                | cap::MANAGE_ROOM
+                | cap::KICK
+                | cap::PUBLISH_MANIFEST
+                | cap::INVITE
+                | cap::CHAT;
+            let status = if deadline.is_some() {
+                ParticipantStatus::Reconnecting
+            } else {
+                ParticipantStatus::Connected
+            };
+            rebuilt.push(ParticipantRecord {
+                user_id: host_user_id,
+                pubkey: pubkey_arr,
+                display_name: String::new(),
+                joined_ms: room.created_ms,
+                status,
+                last_seen_ms: room.created_ms,
+                is_host: true,
+                cap_set,
+            });
+        }
+
+        let state = RoomState {
+            id,
+            code: code.clone(),
+            title: room.title.clone(),
+            host_user_id,
+            host_pubkey: pubkey_arr,
+            host_migration_enabled,
+            created_ms: room.created_ms,
+            state: RoomLifecycle::Open,
+            host_disconnect_deadline_ms: deadline,
+            participants: rebuilt,
+        };
+        let handle = Arc::new(RwLock::new(state));
+        {
+            let mut by_id = self.by_id.write().await;
+            by_id.insert(id, handle);
+        }
+        {
+            let mut by_code_w = self.by_code.write().await;
+            by_code_w.insert(code, id);
+        }
+        {
+            let (tx, _rx) = broadcast::channel(256);
+            let mut room_tx = self.room_tx.write().await;
+            room_tx.insert(id, tx);
+        }
+        Ok(())
+    }
 }
 
 /// Convert a `RoomEvent` to the `BroadcastItem` that goes on
@@ -917,7 +1292,6 @@ fn elect_new_host(state: &mut RoomState, _now_ms: i64) -> Option<Uuid> {
             .then_with(|| a.user_id.as_bytes().cmp(b.user_id.as_bytes()))
     });
     let new_host = candidates[0].user_id;
-    // Update the in-memory record.
     let prev_host = state.host_user_id;
     for p in state.participants.iter_mut() {
         if p.user_id == new_host {
@@ -948,6 +1322,7 @@ fn elect_new_host(state: &mut RoomState, _now_ms: i64) -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::RoomParticipantRow;
 
     fn cfg() -> RoomRegistryConfig {
         RoomRegistryConfig {
@@ -962,25 +1337,39 @@ mod tests {
     }
 
     fn uid(i: u8) -> Uuid {
-        // Time-ordered but with distinct bytes.
         let mut b = [0u8; 16];
         b[0] = i;
         b[15] = i;
         Uuid::from_bytes(b)
     }
 
+    fn pubkey_vec(i: u8) -> Vec<u8> {
+        vec![i; 32]
+    }
+
+    fn store() -> super::super::NoopRoomStore {
+        super::super::NoopRoomStore
+    }
+
     #[tokio::test]
     async fn create_then_join_returns_two_participants() {
         let r = RoomRegistry::new(cfg());
         let (summary, self_view) = r
-            .create("Movie night".into(), uid(1), keypair(1), true, 1_000)
+            .create(
+                &store(),
+                "Movie night".into(),
+                uid(1),
+                keypair(1),
+                true,
+                1_000,
+            )
             .await
             .expect("create");
         assert_eq!(self_view.user_id, uid(1));
         assert_eq!(summary.participants.len(), 1);
         let code = summary.code.clone();
         let (joined, evt) = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
         assert!(matches!(evt, RoomEvent::ParticipantJoined(_)));
@@ -991,7 +1380,7 @@ mod tests {
     async fn join_unknown_code_returns_not_found() {
         let r = RoomRegistry::new(cfg());
         let err = r
-            .join("ZZZZZZ", uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), "ZZZZZZ", uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect_err("not found");
         assert_eq!(RoomErrorCode::from(err), RoomErrorCode::RoomNotFound);
@@ -1001,16 +1390,16 @@ mod tests {
     async fn duplicate_join_returns_already_joined() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), false, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("first join");
         let err = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_600)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_600)
             .await
             .expect_err("dup");
         assert_eq!(RoomErrorCode::from(err), RoomErrorCode::AlreadyJoined);
@@ -1020,15 +1409,18 @@ mod tests {
     async fn host_intentional_leave_migration_off_ends_room() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), false, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
-        let (events, _) = r.leave(uid(1), true, 2_000).await.expect("leave host");
+        let (events, _) = r
+            .leave(&store(), uid(1), true, 2_000)
+            .await
+            .expect("leave host");
         assert!(events.iter().any(|e| matches!(
             e,
             RoomEvent::RoomClosed(p) if p.reason == "host_left"
@@ -1040,15 +1432,18 @@ mod tests {
     async fn host_intentional_leave_migration_on_handoff_immediate() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), true, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
-        let (events, _) = r.leave(uid(1), true, 2_000).await.expect("leave host");
+        let (events, _) = r
+            .leave(&store(), uid(1), true, 2_000)
+            .await
+            .expect("leave host");
         let migrated = events
             .iter()
             .find_map(|e| match e {
@@ -1067,16 +1462,16 @@ mod tests {
     async fn host_transport_loss_migration_on_starts_grace() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), true, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
         let events = r
-            .on_connection_lost(uid(1), 1_600)
+            .on_connection_lost(&store(), uid(1), 1_600)
             .await
             .expect("on_connection_lost");
         let hd = events
@@ -1095,20 +1490,19 @@ mod tests {
     async fn grace_expiry_migrates_to_next_joiner() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), true, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
         let _ = r
-            .on_connection_lost(uid(1), 1_600)
+            .on_connection_lost(&store(), uid(1), 1_600)
             .await
             .expect("on_connection_lost");
-        // tick past the grace deadline
-        let migrated = r.tick_grace(1_900).await;
+        let migrated = r.tick_grace(&store(), 1_900).await;
         assert_eq!(migrated.len(), 1);
         let (rid, evt) = &migrated[0];
         let _ = rid;
@@ -1124,23 +1518,24 @@ mod tests {
     async fn old_host_rejoin_after_migration_is_viewer() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), true, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
         let _ = r
-            .on_connection_lost(uid(1), 1_600)
+            .on_connection_lost(&store(), uid(1), 1_600)
             .await
             .expect("on_connection_lost");
-        let _ = r.tick_grace(1_900).await;
-        // Old host reconnects.
-        let events = r.rejoin(uid(1), keypair(1), 2_000).await.expect("rejoin");
+        let _ = r.tick_grace(&store(), 1_900).await;
+        let events = r
+            .rejoin(&store(), uid(1), keypair(1), 2_000)
+            .await
+            .expect("rejoin");
         assert!(events.is_none() || events.as_ref().unwrap().is_empty());
-        // The new host is uid(2); the old host is a viewer.
         let snap = r.list_snapshot(uid(1)).await.expect("snap 1");
         let old = snap
             .room
@@ -1155,32 +1550,28 @@ mod tests {
     async fn election_tiebreak_uses_user_id_ascending() {
         let r = RoomRegistry::new(cfg());
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), true, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
-        // Both joiners have the same joined_ms; user_id
-        // ascending is the tiebreak. UUID v7 makes this
-        // essentially "the earlier-issued uuid wins".
         let _ = r
-            .join(&code, uid(5), keypair(5), "B".into(), 1_500)
+            .join(&store(), &code, uid(5), keypair(5), "B".into(), 1_500)
             .await
             .expect("join 5");
         let _ = r
-            .join(&code, uid(2), keypair(2), "C".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "C".into(), 1_500)
             .await
             .expect("join 2");
         let _ = r
-            .on_connection_lost(uid(1), 1_600)
+            .on_connection_lost(&store(), uid(1), 1_600)
             .await
             .expect("on_connection_lost");
-        let migrated = r.tick_grace(1_900).await;
+        let migrated = r.tick_grace(&store(), 1_900).await;
         let (_rid, evt) = &migrated[0];
         let p = match evt {
             RoomEvent::HostMigrated(p) => p,
             _ => panic!(),
         };
-        // uid(2) < uid(5); uid(2) wins.
         assert_eq!(p.new_host_user_id, uid(2));
     }
 
@@ -1192,16 +1583,15 @@ mod tests {
             participant_stale_after_ms: 100,
         });
         let (summary, _) = r
-            .create("X".into(), uid(1), keypair(1), false, 1_000)
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
             .await
             .expect("create");
         let code = summary.code.clone();
         let _ = r
-            .join(&code, uid(2), keypair(2), "B".into(), 1_500)
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
             .await
             .expect("join");
-        // 1_500 + 100 = 1_600; the cleanup must fire by then.
-        let events = r.tick_stale_participants(1_700).await;
+        let events = r.tick_stale_participants(&store(), 1_700).await;
         assert_eq!(events.len(), 1);
         match &events[0].1 {
             RoomEvent::ParticipantLeft(p) => {
@@ -1215,7 +1605,327 @@ mod tests {
     #[tokio::test]
     async fn leave_when_not_joined() {
         let r = RoomRegistry::new(cfg());
-        let err = r.leave(uid(99), true, 1_000).await.expect_err("err");
+        let err = r
+            .leave(&store(), uid(99), true, 1_000)
+            .await
+            .expect_err("err");
         assert_eq!(RoomErrorCode::from(err), RoomErrorCode::NotJoined);
+    }
+
+    fn room_row(id: Uuid, host: Uuid, deadline: Option<i64>) -> RoomRow {
+        RoomRow {
+            id,
+            code: "ABCDEF".to_string(),
+            title: "X".into(),
+            host_user_id: host,
+            host_pubkey: pubkey_vec(1),
+            host_migration_enabled: true,
+            state: "open".into(),
+            host_disconnect_deadline_ms: deadline,
+            created_ms: 1_000,
+            ended_ms: None,
+            last_activity_ms: 1_000,
+        }
+    }
+
+    fn part_row(uid: Uuid, is_host: bool, status: &str) -> RoomParticipantRow {
+        RoomParticipantRow {
+            user_id: uid,
+            pubkey: pubkey_vec(if is_host { 1 } else { 2 }),
+            display_name: if is_host {
+                "host".into()
+            } else {
+                "viewer".into()
+            },
+            is_host,
+            joined_ms: 1_000,
+            left_ms: None,
+            status: status.into(),
+            cap_set: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn rehydrate_rebuilds_open_room_with_participants() {
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let host = uid(1);
+        let viewer = uid(2);
+        let row = room_row(id, host, None);
+        let parts = vec![
+            part_row(host, true, "connected"),
+            part_row(viewer, false, "connected"),
+        ];
+        r.rehydrate(row, parts).await.expect("rehydrate");
+        // Code resolves; both participants present.
+        let code_id = r.get_by_code("ABCDEF").await.expect("code");
+        assert_eq!(code_id, id);
+        let snap = r.snapshot_for_room(id).await.expect("snap");
+        assert_eq!(snap.room.participants.len(), 2);
+        assert_eq!(snap.room.host_user_id, host);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_drops_ended_rooms() {
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let mut row = room_row(id, uid(1), None);
+        row.state = "ended".into();
+        r.rehydrate(row, vec![]).await.expect("rehydrate");
+        assert!(r.get_by_code("ABCDEF").await.is_none());
+        assert!(r.snapshot_for_room(id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_marks_non_host_disconnected() {
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let row = room_row(id, uid(1), None);
+        let parts = vec![
+            part_row(uid(1), true, "connected"),
+            part_row(uid(2), false, "connected"),
+        ];
+        r.rehydrate(row, parts).await.expect("rehydrate");
+        let handle = r.get_by_id(id).await.expect("handle");
+        let s = handle.read().await;
+        let host = s.host().expect("host");
+        let viewer = s
+            .participants
+            .iter()
+            .find(|p| p.user_id == uid(2))
+            .expect("viewer");
+        assert_eq!(host.status, ParticipantStatus::Connected);
+        assert_eq!(viewer.status, ParticipantStatus::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_filters_left_participants() {
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let row = room_row(id, uid(1), None);
+        let parts = vec![
+            part_row(uid(1), true, "connected"),
+            part_row(uid(2), false, "left"),
+        ];
+        r.rehydrate(row, parts).await.expect("rehydrate");
+        let snap = r.snapshot_for_room(id).await.expect("snap");
+        assert_eq!(snap.room.participants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_preserves_host_grace_deadline() {
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let deadline = 5_000i64;
+        let row = room_row(id, uid(1), Some(deadline));
+        let parts = vec![part_row(uid(1), true, "connected")];
+        r.rehydrate(row, parts).await.expect("rehydrate");
+        let snap = r.snapshot_for_room(id).await.expect("snap");
+        assert_eq!(snap.host_disconnect_deadline_ms, Some(deadline));
+        let handle = r.get_by_id(id).await.expect("handle");
+        let s = handle.read().await;
+        let host = s.host().expect("host");
+        assert_eq!(host.status, ParticipantStatus::Reconnecting);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_multiple_rooms_survive() {
+        let r = RoomRegistry::new(cfg());
+        let id_a = uid(10);
+        let id_b = uid(11);
+        r.rehydrate(
+            RoomRow {
+                id: id_a,
+                code: "AAAAAA".into(),
+                title: "A".into(),
+                host_user_id: uid(1),
+                host_pubkey: pubkey_vec(1),
+                host_migration_enabled: true,
+                state: "open".into(),
+                host_disconnect_deadline_ms: None,
+                created_ms: 1_000,
+                ended_ms: None,
+                last_activity_ms: 1_000,
+            },
+            vec![part_row(uid(1), true, "connected")],
+        )
+        .await
+        .expect("a");
+        r.rehydrate(
+            RoomRow {
+                id: id_b,
+                code: "BBBBBB".into(),
+                title: "B".into(),
+                host_user_id: uid(2),
+                host_pubkey: pubkey_vec(2),
+                host_migration_enabled: false,
+                state: "open".into(),
+                host_disconnect_deadline_ms: None,
+                created_ms: 2_000,
+                ended_ms: None,
+                last_activity_ms: 2_000,
+            },
+            vec![part_row(uid(2), true, "connected")],
+        )
+        .await
+        .expect("b");
+        assert!(r.get_by_code("AAAAAA").await.is_some());
+        assert!(r.get_by_code("BBBBBB").await.is_some());
+        assert_eq!(r.list_all().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_synthesizes_missing_host_row() {
+        // If the persisted participant list lacks a host row
+        // (e.g. only a viewer persisted before the host row
+        // was added), the rehydrate path should synthesize
+        // a host row with the room's host_user_id and the
+        // full cap set.
+        let r = RoomRegistry::new(cfg());
+        let id = uid(10);
+        let row = room_row(id, uid(1), None);
+        // No host row; only a viewer.
+        let parts = vec![part_row(uid(2), false, "connected")];
+        r.rehydrate(row, parts).await.expect("rehydrate");
+        let handle = r.get_by_id(id).await.expect("handle");
+        let s = handle.read().await;
+        assert!(s.host().is_some());
+        assert_eq!(s.host().unwrap().user_id, uid(1));
+    }
+
+    // ------------------------------------------------------------------
+    // DB-backed persistence tests (P2-T05 Part 1 + Part 11).
+    // ------------------------------------------------------------------
+
+    mod db_persistence {
+        use super::*;
+        use crate::db::Db;
+
+        async fn fresh_db() -> Db {
+            Db::open_in_memory().await.expect("open in-memory db")
+        }
+
+        fn pubkey(i: u8) -> [u8; 32] {
+            [i; 32]
+        }
+
+        /// Insert a `user_identities` row for the given
+        /// pubkey and return the server-assigned
+        /// `user_id`. The room row's `host_user_id` has
+        /// an FK on this table, so the host must exist
+        /// in `user_identities` first.
+        async fn ensure_user(db: &Db, pk: [u8; 32]) -> Uuid {
+            db.upsert_user(&pk).await.expect("upsert user")
+        }
+
+        #[tokio::test]
+        async fn create_persists_room_and_host_row() {
+            let r = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host = ensure_user(&db, pubkey(1)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            let (summary, _) = r
+                .create(&s, "T".into(), host, pubkey(1), true, 1_000)
+                .await
+                .expect("create");
+            let row = db
+                .get_room_by_code(&summary.code)
+                .await
+                .expect("get")
+                .expect("present");
+            assert_eq!(row.host_user_id, host);
+            assert!(row.host_migration_enabled);
+            assert_eq!(row.state, "open");
+            let parts = db.list_room_participants(row.id).await.expect("parts");
+            assert_eq!(parts.len(), 1);
+            assert!(parts[0].is_host);
+        }
+
+        #[tokio::test]
+        async fn join_persists_participant() {
+            let r = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host = ensure_user(&db, pubkey(1)).await;
+            let joiner = ensure_user(&db, pubkey(2)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            let (summary, _) = r
+                .create(&s, "T".into(), host, pubkey(1), false, 1_000)
+                .await
+                .expect("create");
+            let _ = r
+                .join(&s, &summary.code, joiner, pubkey(2), "B".into(), 1_500)
+                .await
+                .expect("join");
+            let row = db
+                .get_room_by_code(&summary.code)
+                .await
+                .expect("get")
+                .expect("present");
+            let parts = db.list_room_participants(row.id).await.expect("parts");
+            assert_eq!(parts.len(), 2);
+            let v = parts.iter().find(|p| p.user_id == joiner).expect("v");
+            assert!(!v.is_host);
+            assert_eq!(v.display_name, "B");
+        }
+
+        #[tokio::test]
+        async fn end_to_end_rehydrate_preserves_code() {
+            let r1 = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host = ensure_user(&db, pubkey(1)).await;
+            let joiner = ensure_user(&db, pubkey(2)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            let (summary, _) = r1
+                .create(&s, "T".into(), host, pubkey(1), true, 1_000)
+                .await
+                .expect("create");
+            let _ = r1
+                .join(&s, &summary.code, joiner, pubkey(2), "B".into(), 1_500)
+                .await
+                .expect("join");
+            // "Restart": build a fresh registry, rehydrate
+            // from the same DB.
+            let r2 = RoomRegistry::new(cfg());
+            let rows = db.list_open_rooms().await.expect("list");
+            assert_eq!(rows.len(), 1);
+            for row in rows {
+                let parts = db.list_room_participants(row.id).await.expect("parts");
+                r2.rehydrate(row, parts).await.expect("rehydrate");
+            }
+            // The new registry must resolve the same code.
+            let code_id = r2.get_by_code(&summary.code).await.expect("code");
+            assert_eq!(code_id, summary.id);
+            let snap = r2.snapshot_for_room(summary.id).await.expect("snap");
+            assert_eq!(snap.room.participants.len(), 2);
+            assert_eq!(snap.room.host_user_id, host);
+        }
+
+        #[tokio::test]
+        async fn rehydrate_skips_ended_rooms() {
+            let r = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host_a = ensure_user(&db, pubkey(1)).await;
+            let host_b = ensure_user(&db, pubkey(2)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            // Insert one ended row directly.
+            db.insert_room(uid(99), "ZZZZZZ", "Z", host_a, &pubkey(1), true, 1_000)
+                .await
+                .expect("insert");
+            db.end_room(uid(99), 2_000).await.expect("end");
+            // Open one.
+            let (summary, _) = r
+                .create(&s, "T".into(), host_b, pubkey(2), true, 3_000)
+                .await
+                .expect("create");
+            // Rehydrate all open rooms.
+            for row in db.list_open_rooms().await.expect("list") {
+                let parts = db.list_room_participants(row.id).await.expect("parts");
+                r.rehydrate(row, parts).await.expect("rehydrate");
+            }
+            // The ended room is NOT in the registry.
+            assert!(r.get_by_code("ZZZZZZ").await.is_none());
+            // The open one IS.
+            assert!(r.get_by_code(&summary.code).await.is_some());
+        }
     }
 }

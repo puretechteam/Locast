@@ -38,7 +38,6 @@ pub use db::Db;
 pub use metrics::Metrics;
 pub use rooms::{RoomEvent, RoomRegistry, RoomRegistryConfig};
 pub use time::{Clock, SystemClock};
-
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -130,9 +129,21 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
 
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&config)));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let store: Arc<dyn rooms::RoomStore> = Arc::new(rooms::DbRoomStore::new(db.clone()));
+    // P2-T05: rehydrate the in-memory registry from the
+    // persisted room rows. Done BEFORE we install the
+    // ticker and BEFORE we accept WS traffic, so the
+    // ordering on the spec's "Only after rehydration
+    // completes, accept room operations on the WS"
+    // requirement is satisfied by virtue of `serve` not
+    // returning until everything is wired up.
+    if let Err(e) = rehydrate_rooms(&rooms, &db).await {
+        tracing::error!(error = %e, "locast-server room rehydrate failed");
+    }
     // Background grace + stale-participant ticker.
     rooms::spawn_room_ticker(
         rooms.clone(),
+        store,
         clock.clone(),
         std::time::Duration::from_millis(500),
     );
@@ -153,6 +164,27 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+/// P2-T05: at server startup, rehydrate the in-memory
+/// `RoomRegistry` from the persisted SQLite rows. Closed
+/// rooms are skipped; non-host participants are marked
+/// `Disconnected` and will be cleaned up by the
+/// stale-participant ticker or reset on their next
+/// reconnect.
+async fn rehydrate_rooms(rooms: &Arc<RoomRegistry>, db: &Db) -> Result<(), String> {
+    let rows = db.list_open_rooms().await.map_err(|e| e.to_string())?;
+    tracing::info!(count = rows.len(), "locast-server rehydrating rooms");
+    for row in rows {
+        let parts = db
+            .list_room_participants(row.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = rooms.rehydrate(row, parts).await {
+            tracing::warn!(error = %e, "locast-server rehydrate row failed");
+        }
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

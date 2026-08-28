@@ -6,6 +6,6 @@
 // from this module so the rest of the app has a single, stable import path
 // for IPC.
 
-export { commands } from "../bindings";
+export { commands, events } from "../bindings";
 export type Commands = typeof import("../bindings").commands;
 export type GreetResult = Awaited<ReturnType<typeof import("../bindings").commands.greet>>;

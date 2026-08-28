@@ -13,6 +13,8 @@ pub mod dispatch;
 pub mod error;
 pub mod registry;
 pub mod state;
+pub mod store;
+pub mod validation;
 
 pub use codes::{generate_code, is_valid_code, normalize, ALPHABET, CODE_LEN};
 pub use dispatch::{dispatch_room_message, RoomDispatchOutcome};
@@ -21,7 +23,9 @@ pub use registry::{BroadcastItem, RoomEvent, RoomHandle, RoomRegistry, RoomRegis
 pub use state::{ParticipantRecord, RoomLifecycle, RoomState};
 use std::sync::Arc;
 use std::time::Duration;
+pub use store::{DbRoomStore, NoopRoomStore, RoomStore};
 use tracing::warn;
+pub use validation::validate_display_name;
 
 use crate::time::{Clock, MockClock};
 
@@ -35,29 +39,38 @@ use crate::time::{Clock, MockClock};
 /// interval (e.g. 200-500ms) keeps the grace deadline
 /// accurate; a larger one saves CPU at the cost of latency
 /// on the migration announcement.
-pub fn spawn_room_ticker(rooms: Arc<RoomRegistry>, clock: Arc<dyn Clock>, interval: Duration) {
+pub fn spawn_room_ticker(
+    rooms: Arc<RoomRegistry>,
+    store: Arc<dyn store::RoomStore>,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
             let now = clock.now_ms();
-            if let Err(e) = run_tick(&rooms, now).await {
+            if let Err(e) = run_tick(&rooms, store.as_ref(), now).await {
                 warn!(error = %e, "locast-server room ticker iteration failed");
             }
         }
     });
 }
 
-async fn run_tick(rooms: &RoomRegistry, now: i64) -> Result<(), String> {
+async fn run_tick(
+    rooms: &RoomRegistry,
+    store: &dyn store::RoomStore,
+    now: i64,
+) -> Result<(), String> {
     // Grace timer: any room whose `host_disconnect_deadline_ms`
     // has elapsed triggers a host election.
-    let migrations = rooms.tick_grace(now).await;
+    let migrations = rooms.tick_grace(store, now).await;
     if !migrations.is_empty() {
         tracing::debug!(count = migrations.len(), "room grace tick fired");
     }
     // Stale-participant cleanup.
-    let stale = rooms.tick_stale_participants(now).await;
+    let stale = rooms.tick_stale_participants(store, now).await;
     if !stale.is_empty() {
         tracing::debug!(count = stale.len(), "stale participants removed");
     }
@@ -74,6 +87,7 @@ async fn run_tick(rooms: &RoomRegistry, now: i64) -> Result<(), String> {
 /// the runtime drop it when the test ends.
 pub async fn spawn_room_ticker_for_test(
     rooms: Arc<RoomRegistry>,
+    store: Arc<dyn store::RoomStore>,
     clock: Arc<MockClock>,
     interval: Duration,
 ) {
@@ -90,7 +104,7 @@ pub async fn spawn_room_ticker_for_test(
             .unwrap_or(0);
         clock.set(now_wall);
         let now = clock.now_ms();
-        if let Err(e) = run_tick(&rooms, now).await {
+        if let Err(e) = run_tick(&rooms, store.as_ref(), now).await {
             warn!(error = %e, "locast-server test room ticker iteration failed");
         }
     }

@@ -533,7 +533,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         // The free `now_ms()` helper reads wall time and
         // would drift from the test `MockClock`.
         let now = state.clock.now_ms();
-        if let Err(e) = state.rooms.on_connection_lost(user_id, now).await {
+        let store: Arc<dyn crate::rooms::RoomStore> =
+            Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
+        if let Err(e) = state
+            .rooms
+            .on_connection_lost(store.as_ref(), user_id, now)
+            .await
+        {
             debug!(request_id = %request_id, error = %e, "on_connection_lost noop");
         }
     }
@@ -690,9 +696,12 @@ async fn dispatch_authed(
     // are not implemented in v1 / P2-T04 and are silently
     // accepted.
     if envelope.r#type.is_room_lifecycle() {
+        let store: Arc<dyn crate::rooms::RoomStore> =
+            Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
         let outcome = crate::rooms::dispatch_room_message(
             envelope,
             &state.rooms,
+            store.as_ref(),
             state.clock.as_ref(),
             user_id,
             pubkey,
@@ -947,32 +956,36 @@ async fn handle_auth(
     // events to the room's broadcast channel (so other
     // participants see HOST_RECONNECTED) and directly to
     // the new connection.
-    if let Ok(Some(events)) = state
-        .rooms
-        .rejoin(user_id, pubkey, state.clock.now_ms())
-        .await
     {
-        for event in events {
-            let (kind, payload) = match event {
-                crate::rooms::RoomEvent::HostReconnected(p) => (
-                    MessageKind::HostReconnected,
-                    serde_json::to_value(&p).unwrap_or(serde_json::json!({})),
-                ),
-                _ => continue,
-            };
-            if let Some(rid) = state.rooms.get_user_room(user_id).await {
-                let env = Envelope {
-                    v: 1,
-                    r#type: kind,
-                    id: Uuid::now_v7(),
-                    room_id: Some(rid),
-                    sender: None,
-                    ts_ms: now_ms(),
-                    seq: 0,
-                    payload,
+        let store: Arc<dyn crate::rooms::RoomStore> =
+            Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
+        if let Ok(Some(events)) = state
+            .rooms
+            .rejoin(store.as_ref(), user_id, pubkey, state.clock.now_ms())
+            .await
+        {
+            for event in events {
+                let (kind, payload) = match event {
+                    crate::rooms::RoomEvent::HostReconnected(p) => (
+                        MessageKind::HostReconnected,
+                        serde_json::to_value(&p).unwrap_or(serde_json::json!({})),
+                    ),
+                    _ => continue,
                 };
-                if let Ok(msg) = encode_envelope_message(&env) {
-                    out.actions.push(Action::Send(msg));
+                if let Some(rid) = state.rooms.get_user_room(user_id).await {
+                    let env = Envelope {
+                        v: 1,
+                        r#type: kind,
+                        id: Uuid::now_v7(),
+                        room_id: Some(rid),
+                        sender: None,
+                        ts_ms: now_ms(),
+                        seq: 0,
+                        payload,
+                    };
+                    if let Ok(msg) = encode_envelope_message(&env) {
+                        out.actions.push(Action::Send(msg));
+                    }
                 }
             }
         }

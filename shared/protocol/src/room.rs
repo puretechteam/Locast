@@ -197,11 +197,19 @@ pub struct HostReconnectedPayload {
 
 /// HOST_MIGRATED (S -> C). Sent when a new host was elected.
 /// The old host is now a normal viewer.
+///
+/// `summary` carries the authoritative post-migration room
+/// snapshot. Clients should replace their cached state with
+/// it on receipt; if it is `None` (older server build) the
+/// client falls back to the pre-P2-T05 behavior of just
+/// updating `host_user_id` and clearing the grace flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export_to = "ts/index.ts")]
 pub struct HostMigratedPayload {
     pub previous_host_user_id: Uuid,
     pub new_host_user_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<Box<RoomSummary>>,
 }
 
 /// ROOM_CLOSED (S -> C). The room has ended.

@@ -3,8 +3,10 @@
 // Typed wrapper over the Rust room-lifecycle IPC surface.
 // P2-T04: room create / join / leave / state queries over
 // the existing signaling WebSocket.
+// P2-T05: adds typed listeners for the `room://state` and
+// `room://event` Tauri events emitted by the RoomClient.
 
-import { commands } from "./ipc";
+import { commands, events } from "./ipc";
 import type { RoomSummaryIpc } from "../bindings";
 
 export type { RoomSummaryIpc, ParticipantIpc, ParticipantStatusIpc } from "../bindings";
@@ -38,4 +40,23 @@ export async function leaveRoom(): Promise<void> {
 /** Get the cached room summary, if any. */
 export async function getRoomState(): Promise<RoomSummaryIpc | null> {
     return await commands.roomGetState();
+}
+
+/** Subscribe to `room://state`. The handler receives the
+ * current cached `RoomSummaryIpc` (or `null` when the
+ * cache is cleared, e.g. after `RoomClosed`). Returns an
+ * unsubscribe function. */
+export async function onRoomStateChange(
+    handler: (summary: RoomSummaryIpc | null) => void,
+): Promise<() => void> {
+    return await events.roomState(handler);
+}
+
+/** Subscribe to `room://event`. The handler receives the
+ * redacted post-event `RoomSummaryIpc`. Returns an
+ * unsubscribe function. */
+export async function onRoomEvent(
+    handler: (summary: RoomSummaryIpc) => void,
+): Promise<() => void> {
+    return await events.roomEvent(handler);
 }

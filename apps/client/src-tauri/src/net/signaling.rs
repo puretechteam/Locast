@@ -317,6 +317,17 @@ impl SignalingClient {
         self.inner.lock().await.bearer.clone()
     }
 
+    /// **Test-only.** Returns the current count of inbound
+    /// subscribers registered on the signaling client. The
+    /// P2-T05 spec asserts that `RoomClient::request` does
+    /// NOT grow this list; the corresponding test in
+    /// `net::room::tests` exercises 1000 sequential
+    /// requests and asserts the count never exceeds 1.
+    #[cfg(test)]
+    pub async fn subscribers_count_for_test(&self) -> usize {
+        self.inner.lock().await.subscribers.len()
+    }
+
     /// Subscribe to the inbound envelope stream. Every
     /// envelope the connection loop receives (post-handshake)
     /// is forwarded to the returned [`mpsc::UnboundedReceiver`].

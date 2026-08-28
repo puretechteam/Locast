@@ -53,7 +53,7 @@ pub struct Envelope {
 /// The message type tag. Wire field is `type`. The v1 spec only
 /// defines a handful of types; future types (P3+ room lifecycle,
 /// playback, drawing, etc.) will be added as new variants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
 #[ts(export_to = "ts/index.ts")]
 pub enum MessageKind {
     #[serde(rename = "HELLO")]
