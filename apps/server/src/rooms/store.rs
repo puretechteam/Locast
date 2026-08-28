@@ -79,6 +79,13 @@ pub trait RoomStore: Send + Sync {
         room_id: Uuid,
         deadline_ms: Option<i64>,
     ) -> Result<(), String>;
+
+    /// Check whether a room with the given code already
+    /// exists in durable storage. Used by the create-time
+    /// collision loop to close the race where a concurrent
+    /// restart, or a concurrent `create` whose in-memory
+    /// row has not yet been observed, occupies the code.
+    async fn room_code_taken(&self, code: &str) -> Result<bool, String>;
 }
 
 /// Production store. Thin wrapper over [`Db`].
@@ -187,6 +194,17 @@ impl RoomStore for DbRoomStore {
                 e.to_string()
             })
     }
+
+    async fn room_code_taken(&self, code: &str) -> Result<bool, String> {
+        self.db
+            .get_room_by_code(code)
+            .await
+            .map(|r| r.is_some())
+            .map_err(|e| {
+                warn!(error = %e, "locast-server room store room_code_taken failed");
+                e.to_string()
+            })
+    }
 }
 
 /// Test store. Every operation succeeds without touching
@@ -242,6 +260,10 @@ impl RoomStore for NoopRoomStore {
         _deadline_ms: Option<i64>,
     ) -> Result<(), String> {
         Ok(())
+    }
+
+    async fn room_code_taken(&self, _code: &str) -> Result<bool, String> {
+        Ok(false)
     }
 }
 

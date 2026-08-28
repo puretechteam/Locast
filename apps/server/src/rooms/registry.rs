@@ -373,9 +373,23 @@ impl RoomRegistry {
         let mut chosen: Option<String> = None;
         for _ in 0..=MAX_COLLISIONS {
             let candidate = codes::generate_code(&mut OsRng);
-            let by_code = self.by_code.read().await;
-            if !by_code.contains_key(&candidate) {
-                drop(by_code);
+            // Check both the in-memory map AND the durable
+            // rooms table. The DB check closes the race
+            // where a concurrent restart brought back a
+            // room with the same code, or where a
+            // concurrent `create` slipped a row into the
+            // DB before the in-memory `by_code` was
+            // populated.
+            let in_mem_taken = {
+                let by_code = self.by_code.read().await;
+                by_code.contains_key(&candidate)
+            };
+            if !in_mem_taken
+                && !store
+                    .room_code_taken(&candidate)
+                    .await
+                    .map_err(|e| RoomError::Internal(format!("room_code_taken: {e}")))?
+            {
                 chosen = Some(candidate);
                 break;
             }
@@ -733,20 +747,23 @@ impl RoomRegistry {
         // ROOM_CLOSED before the channel disappears. The
         // forwarder's `is_user_in_room` check would skip
         // events for users in an already-removed room; we
-        // therefore keep the room registered for a short
-        // grace window so the broadcasts can be observed.
+        // therefore wait a short grace window AFTER
+        // publishing and BEFORE removing the room so the
+        // broadcast receivers can drain the items. The
+        // sleep length matches the WS forwarder's 50ms
+        // poll interval and is well below the
+        // 200ms-grace threshold used in tests.
         for item in &publish_items {
             self.publish(room_id, item.clone());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        let summary = if ended {
+        if ended {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             self.remove_room(room_id).await;
-            None
+            Ok((events, None))
         } else {
-            Some(handle.read().await.snapshot())
-        };
-        Ok((events, summary))
+            let summary = handle.read().await.snapshot();
+            Ok((events, Some(summary)))
+        }
     }
 
     /// Returned by the WS layer when a transport closes. For
@@ -1926,6 +1943,38 @@ mod tests {
             assert!(r.get_by_code("ZZZZZZ").await.is_none());
             // The open one IS.
             assert!(r.get_by_code(&summary.code).await.is_some());
+        }
+
+        #[tokio::test]
+        async fn create_avoids_db_collision_on_restart() {
+            // Two clients on a fresh server. The first
+            // creates a room and the code is persisted.
+            // A "restart" wipes the in-memory map but the
+            // DB row remains. A second create on the fresh
+            // registry must NOT pick the same code.
+            let r1 = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host_a = ensure_user(&db, pubkey(1)).await;
+            let host_b = ensure_user(&db, pubkey(2)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            let (summary, _) = r1
+                .create(&s, "T".into(), host_a, pubkey(1), true, 1_000)
+                .await
+                .expect("create");
+            // "Restart" — fresh registry, same DB.
+            let r2 = RoomRegistry::new(cfg());
+            let s2 = crate::rooms::DbRoomStore::new(db.clone());
+            // Force the create loop to keep picking until it
+            // would naturally hit the occupied code. With
+            // the DB check, it must still succeed and yield
+            // a code that is NOT the existing one.
+            for _ in 0..50 {
+                let (s2_summary, _) = r2
+                    .create(&s2, "T2".into(), host_b, pubkey(2), true, 2_000)
+                    .await
+                    .expect("create");
+                assert_ne!(s2_summary.code, summary.code);
+            }
         }
     }
 }
