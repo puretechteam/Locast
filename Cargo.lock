@@ -2553,9 +2553,11 @@ dependencies = [
 name = "locast-manifest"
 version = "0.0.0"
 dependencies = [
- "locast-protocol",
+ "locast-crypto",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
+ "unicode-normalization",
 ]
 
 [[package]]
