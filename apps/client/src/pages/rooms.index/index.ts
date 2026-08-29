@@ -1,0 +1,1 @@
+export { RoomsIndexPage } from "./RoomsIndexPage";

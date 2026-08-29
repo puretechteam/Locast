@@ -1,0 +1,1 @@
+export { JoinRoomPage } from "./JoinRoomPage";

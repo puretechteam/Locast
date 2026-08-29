@@ -9,7 +9,12 @@
 import { commands, events } from "./ipc";
 import type { RoomSummaryIpc } from "../bindings";
 
-export type { RoomSummaryIpc, ParticipantIpc, ParticipantStatusIpc } from "../bindings";
+export type {
+    ConnectionState,
+    RoomSummaryIpc,
+    ParticipantIpc,
+    ParticipantStatusIpc,
+} from "../bindings";
 
 /** Idempotent: ensure the signaling WS is open. */
 export async function connectSignaling(): Promise<void> {

@@ -23,7 +23,7 @@
 #![warn(rust_2018_idioms)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_protocol::envelope::{Envelope, MessageKind};
@@ -34,6 +34,7 @@ use locast_protocol::room::{
 use serde::Serialize;
 use specta::Type;
 use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -258,6 +259,12 @@ pub const ROOM_EVENT_EVENT: &str = "room://event";
 /// Default timeout for a single request-reply round trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often the background presence loop sends a
+/// `PRESENCE` envelope while the user is in a room. The
+/// server uses this to refresh `last_seen` so the
+/// stale-participant cleanup does not remove us.
+const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The room-lifecycle client. Holds a reference to the
 /// underlying `SignalingClient`, the cached state, and the
 /// pending request-reply correlations.
@@ -281,6 +288,20 @@ pub struct RoomClient {
     /// `None` (the `handle_inbound` path becomes a
     /// pure-state mutation).
     sink: Mutex<Option<Arc<dyn RoomEventSink>>>,
+    /// Background task that sends a `PRESENCE` envelope
+    /// every [`PRESENCE_INTERVAL`] while the user is in a
+    /// room. Spawned on a successful `room_join`, aborted
+    /// on `room_leave` and on inbound `RoomClosed` /
+    /// `RoomError` envelopes. Aborting (vs awaiting) is
+    /// sufficient because the next iteration would just
+    /// re-send the same `PRESENCE` envelope.
+    ///
+    /// Held in a `std::sync::Mutex` (not `tokio::sync::Mutex`)
+    /// so [`Drop`] can take it without blocking on a runtime
+    /// thread; the lock is only held briefly (take-or-insert
+    /// of the `Option<JoinHandle>`) and never across an
+    /// `.await`.
+    presence_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl RoomClient {
@@ -293,6 +314,7 @@ impl RoomClient {
             inbound: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             sink: Mutex::new(None),
+            presence_task: StdMutex::new(None),
         }
     }
 
@@ -350,6 +372,11 @@ impl RoomClient {
         // new state immediately, without having to
         // re-poll via `room_get_state`.
         self.emit_state(&summary).await;
+        // The host is a participant of the room they
+        // just created; without a presence loop the
+        // server's stale-participant cleanup would
+        // reap the host within the stale window.
+        self.spawn_presence_loop();
         Ok(summary)
     }
 
@@ -367,6 +394,7 @@ impl RoomClient {
         let summary = RoomSummaryIpc::from(joined.room);
         *self.state.lock().await = Some(summary.clone());
         self.emit_state(&summary).await;
+        self.spawn_presence_loop();
         Ok(summary)
     }
 
@@ -384,6 +412,7 @@ impl RoomClient {
         // ROOM_CLOSED and the inbound loop will clear
         // it.
         *self.state.lock().await = None;
+        self.abort_presence_loop().await;
         Ok(())
     }
 
@@ -556,6 +585,7 @@ impl RoomClient {
             MessageKind::RoomClosed | MessageKind::RoomError => {
                 *self.state.lock().await = None;
                 self.emit_state_cleared().await;
+                self.abort_presence_loop().await;
             }
             _ => {}
         }
@@ -675,6 +705,60 @@ impl RoomClient {
             s.emit_event(summary);
         }
     }
+
+    /// Spawn the background presence loop. Aborts any
+    /// previously running loop first so a re-join
+    /// (after a leave) does not leak a stale task.
+    fn spawn_presence_loop(&self) {
+        let signaling = Arc::clone(&self.signaling);
+        let mut g = self.presence_task.lock().expect("presence_task lock");
+        if let Some(prev) = g.take() {
+            prev.abort();
+        }
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PRESENCE_INTERVAL).await;
+                if let Err(e) = signaling
+                    .send_envelope(envelope(
+                        MessageKind::Presence,
+                        None,
+                        PresencePayload {
+                            status: "alive".into(),
+                        },
+                    ))
+                    .await
+                {
+                    warn!(error = %e, "presence send failed; ending loop");
+                    return;
+                }
+            }
+        });
+        *g = Some(handle);
+    }
+
+    /// Abort the background presence loop if one is
+    /// running. Idempotent: a no-op when no loop is
+    /// active.
+    async fn abort_presence_loop(&self) {
+        let mut g = self.presence_task.lock().expect("presence_task lock");
+        if let Some(handle) = g.take() {
+            handle.abort();
+        }
+    }
+
+    /// Test-only: report whether a background presence
+    /// loop is currently scheduled. Used by the
+    /// `presence_loop_propagates_participant_joins_and_leaves`
+    /// integration test to confirm the loop is
+    /// actually spawned on join/create and aborted on
+    /// leave/closed.
+    #[doc(hidden)]
+    pub fn presence_task_active(&self) -> bool {
+        self.presence_task
+            .lock()
+            .expect("presence_task lock")
+            .is_some()
+    }
 }
 
 fn envelope<T: serde::Serialize>(kind: MessageKind, room_id: Option<Uuid>, payload: T) -> Envelope {
@@ -705,6 +789,10 @@ fn now_ms() -> i64 {
 impl Drop for RoomClient {
     fn drop(&mut self) {
         warn!("RoomClient dropped");
+        let mut g = self.presence_task.lock().expect("presence_task lock");
+        if let Some(handle) = g.take() {
+            handle.abort();
+        }
     }
 }
 
