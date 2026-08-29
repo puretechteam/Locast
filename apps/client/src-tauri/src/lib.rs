@@ -142,8 +142,8 @@ pub fn run() {
                 // leave the sink as `None`).
                 #[cfg(not(test))]
                 {
-                    use net::room::TauriEventSink;
                     use net::room::RoomEventSink;
+                    use net::room::TauriEventSink;
                     let sink: std::sync::Arc<dyn RoomEventSink> =
                         std::sync::Arc::new(TauriEventSink::new(app_handle_for_room));
                     room_client.install_event_sink(sink).await;
