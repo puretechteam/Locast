@@ -30,6 +30,7 @@ use crate::core::paths::PathError;
 use crate::core::quota::QuotaError;
 use crate::library::fs::FsError;
 use crate::library::scan::ScanError;
+use crate::storage::rooms::RecentRoomsError;
 use crate::storage::StorageError;
 
 /// Errors raised by every Locast desktop client IPC command and
@@ -355,6 +356,24 @@ impl From<crate::identity::keystore::IdentityServiceError> for AppError {
             I::NotInitialized => AppError::IdentityNotInitialized,
             I::Storage(m) => AppError::Storage { message: m },
             I::Other(m) => AppError::Other { message: m },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P2-T08 (recent_rooms) error mapping
+// ---------------------------------------------------------------------------
+
+/// Map the recents repository's internal `RecentRoomsError` onto
+/// the locked `AppError` variants. The only variant today is `Sqlx`,
+/// which routes to `AppError::Database` (the same destination the
+/// generic `From<sqlx::Error>` impl uses).
+impl From<RecentRoomsError> for AppError {
+    fn from(err: RecentRoomsError) -> Self {
+        match err {
+            RecentRoomsError::Sqlx(s) => AppError::Database {
+                message: s.to_string(),
+            },
         }
     }
 }

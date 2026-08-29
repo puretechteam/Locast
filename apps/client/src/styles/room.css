@@ -139,6 +139,89 @@ code {
     gap: 0.4rem;
 }
 
+.rooms-index__section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+.rooms-index__heading {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #c0c6cd;
+    margin: 0;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.rooms-index__tile {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    background: #101317;
+    border: 1px solid #1f242a;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+}
+
+.rooms-index__tile--ended {
+    opacity: 0.7;
+}
+
+.rooms-index__tile-title {
+    font-size: 1rem;
+    font-weight: 500;
+}
+
+.rooms-index__tile-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+    color: #c0c6cd;
+}
+
+.rooms-index__tile-code {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    background: #1a1f24;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    letter-spacing: 0.15em;
+}
+
+.rooms-index__tile-host {
+    color: #9aa3ad;
+}
+
+.rooms-index__tile-badge {
+    background: #2a64d4;
+    color: #fff;
+    border-radius: 3px;
+    padding: 0 0.4rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.rooms-index__tile-sub {
+    font-size: 0.8rem;
+    color: #6b7480;
+}
+
+.rooms-index__tile-link {
+    align-self: flex-start;
+    font-size: 0.85rem;
+}
+
+.rooms-index__empty {
+    color: #6b7480;
+    font-size: 0.9rem;
+    margin: 0;
+}
+
 .room-page {
     display: flex;
     flex-direction: column;

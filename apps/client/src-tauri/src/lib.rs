@@ -178,6 +178,8 @@ pub fn run() {
             commands::room::room_join,
             commands::room::room_leave,
             commands::room::room_get_state,
+            commands::room::recent_rooms_list,
+            commands::room::recent_room_upsert,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

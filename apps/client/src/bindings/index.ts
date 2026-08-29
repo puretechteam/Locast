@@ -34,6 +34,8 @@
 // and `roomGetState` commands (and the `RoomSummaryIpc` and
 // `ParticipantIpc` types). P2-T05 added the `roomState` and
 // `roomEvent` event listeners (`room://state` and `room://event`).
+// P2-T08 added the `recentRoomsList` and `recentRoomUpsert`
+// commands (and the `RecentRoomEntry` and `RecentRoomRole` types).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -93,6 +95,12 @@ export const commands = {
   },
   async roomGetState(): Promise<RoomSummaryIpc | null> {
     return await __TAURI_INVOKE("room_get_state");
+  },
+  async recentRoomsList(): Promise<RecentRoomEntry[]> {
+    return await __TAURI_INVOKE("recent_rooms_list");
+  },
+  async recentRoomUpsert(entry: RecentRoomEntry): Promise<void> {
+    await __TAURI_INVOKE("recent_room_upsert", { entry });
   },
 };
 
@@ -180,6 +188,20 @@ export type ParticipantStatusIpc =
   | "Reconnecting"
   | "Disconnected"
   | "Left";
+
+export type RecentRoomRole = "host" | "guest";
+
+export type RecentRoomEntry = {
+  room_id: string;
+  code: string;
+  title: string;
+  host_user_id: string;
+  host_display_name: string;
+  role: RecentRoomRole;
+  last_seen_ms: number;
+  last_ended_ms: number | null;
+  created_ms: number;
+};
 
 /* Events */
 // bindings-regen: keep in sync with the hand-maintained

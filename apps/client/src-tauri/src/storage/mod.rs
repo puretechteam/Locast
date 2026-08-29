@@ -28,6 +28,12 @@ use tracing::info;
 /// migration introduced. The `Storage` type itself is unchanged.
 pub mod settings;
 
+/// P2-T08 added the recents repository (`storage::rooms`). It is a
+/// thin typed wrapper over the `recent_rooms` table introduced by
+/// the `0002_recent_rooms` migration. The `Storage` type itself is
+/// unchanged.
+pub mod rooms;
+
 /// Default pool size per `docs/ARCHITECTURE.md` section 7.
 pub const DEFAULT_POOL_SIZE: u32 = 8;
 
