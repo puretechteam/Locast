@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+pub mod caps;
 pub mod codes;
 pub mod dispatch;
 pub mod error;

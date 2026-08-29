@@ -168,6 +168,16 @@ mod tests {
         );
         rendered.push('\n');
         rendered.push_str(
+            &crate::handshake::RateLimitScope::export_to_string(&cfg)
+                .expect("render RateLimitScope bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::RateLimitPayload::export_to_string(&cfg)
+                .expect("render RateLimitPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
             &crate::handshake::Platform::export_to_string(&cfg).expect("render Platform bindings"),
         );
         rendered.push('\n');

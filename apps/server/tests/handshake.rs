@@ -933,16 +933,32 @@ async fn test_rate_limit_throttles_not_disconnects() {
         .expect("hello 3");
     // Drain a few messages. We expect at least one AUTH_FAIL(Rate).
     let mut rate_fail_seen = false;
+    let mut rate_limit_seen = false;
     let read_loop = async {
         for _ in 0..20 {
             if let Some(b) = read_binary(&mut ws).await {
                 let env = decode(&b);
-                if env.r#type.as_str() == "AUTH_FAIL" {
-                    if let Ok(f) = serde_json::from_value::<AuthFailPayload>(env.payload.clone()) {
-                        if f.reason == AuthFailReason::Rate {
-                            rate_fail_seen = true;
+                match env.r#type.as_str() {
+                    "AUTH_FAIL" => {
+                        if let Ok(f) =
+                            serde_json::from_value::<AuthFailPayload>(env.payload.clone())
+                        {
+                            if f.reason == AuthFailReason::Rate {
+                                rate_fail_seen = true;
+                            }
                         }
                     }
+                    "RATE_LIMIT" => {
+                        // P2-T07 split: RATE_LIMIT is the
+                        // post-handshake envelope. During
+                        // the handshake (no bearer yet) the
+                        // server must continue to emit
+                        // AUTH_FAIL(Rate). A RATE_LIMIT here
+                        // would be a regression of the
+                        // handshake / post-handshake split.
+                        rate_limit_seen = true;
+                    }
+                    _ => {}
                 }
             } else {
                 break;
@@ -953,6 +969,10 @@ async fn test_rate_limit_throttles_not_disconnects() {
     assert!(
         rate_fail_seen,
         "expected at least one AUTH_FAIL(Rate) under low-rate config"
+    );
+    assert!(
+        !rate_limit_seen,
+        "RATE_LIMIT must NOT be emitted during the handshake (no bearer yet)"
     );
     // The connection should NOT be closed by the server for the
     // throttle itself. Send a clean close from the client.

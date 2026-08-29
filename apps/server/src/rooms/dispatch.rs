@@ -15,6 +15,7 @@ use locast_protocol::room::{
 };
 use uuid::Uuid;
 
+use super::caps::{self, Command};
 use super::codes;
 use super::error::RoomError;
 use super::registry::{RoomEvent, RoomRegistry};
@@ -49,6 +50,32 @@ pub async fn dispatch_room_message(
     pubkey: [u8; 32],
 ) -> RoomDispatchOutcome {
     let now_ms = clock.now_ms();
+    // P2-T07: capability chokepoint. v1 is permissive; P3+
+    // will plug the real denial cases into the same
+    // function without re-plumbing the dispatcher.
+    let command = match envelope.r#type {
+        MessageKind::RoomCreate => Some(Command::RoomCreate),
+        MessageKind::RoomJoinRequest => Some(Command::RoomJoinRequest),
+        MessageKind::RoomLeave => Some(Command::RoomLeave),
+        MessageKind::Presence => Some(Command::Presence),
+        _ => None,
+    };
+    if let Some(cmd) = command {
+        if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
+            // v1 only emits NotMember (PRESENCE without
+            // room membership). Log the denial and return
+            // a no-op outcome; the user's next
+            // authoritative call (e.g. ROOM_LEAVE) will
+            // surface the real ROOM_ERROR.
+            tracing::warn!(
+                user_id = %user_id,
+                command = ?cmd,
+                error = %e,
+                "capability denied"
+            );
+            return RoomDispatchOutcome::default();
+        }
+    }
     match envelope.r#type {
         MessageKind::RoomCreate => {
             handle_room_create(envelope, registry, store, user_id, pubkey, now_ms).await

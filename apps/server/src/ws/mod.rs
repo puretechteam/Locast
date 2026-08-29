@@ -28,7 +28,7 @@ use futures_util::{SinkExt, StreamExt};
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::handshake::{
     AuthBearer, AuthFailPayload, AuthFailReason, AuthOkPayload, AuthPayload, ChallengePayload,
-    HelloPayload, WelcomeConfig, WelcomePayload, WelcomeRate,
+    HelloPayload, RateLimitPayload, WelcomeConfig, WelcomePayload, WelcomeRate,
 };
 use rand::RngCore;
 use serde_json::json;
@@ -40,6 +40,7 @@ use uuid::Uuid;
 use crate::auth::bearer;
 use crate::auth::state::ConnState;
 use crate::auth::{verify, AuthError};
+use crate::ratelimit::{PerConnLimiter, RateLimitHit};
 use crate::AppState;
 
 /// Per-connection rate limit. Defaults to 100 msg/s sustained, 200
@@ -105,11 +106,16 @@ impl TokenBucket {
     /// Try to consume one token. Returns `true` if the
     /// connection is under the rate limit, `false` otherwise.
     pub fn try_consume(&mut self) -> bool {
+        // Use u64 arithmetic so a long-quiet connection
+        // (large `delta_ms`) does not overflow when
+        // multiplied by `refill_per_sec`.
         let now = now_ms();
-        let delta = (now - self.last_refill_ms).max(0) as u32;
-        let refill = (delta * self.refill_per_sec) / 1000;
+        let delta_ms = (now - self.last_refill_ms).max(0) as u64;
+        let refill_per_sec = self.refill_per_sec as u64;
+        let refill = (delta_ms * refill_per_sec) / 1_000;
         if refill > 0 {
-            self.tokens = (self.tokens + refill).min(self.capacity);
+            let refill = refill.min(self.capacity as u64);
+            self.tokens = (self.tokens as u64 + refill).min(self.capacity as u64) as u32;
             self.last_refill_ms = now;
         }
         if self.tokens == 0 {
@@ -124,11 +130,16 @@ impl TokenBucket {
     /// `false` otherwise.
     pub fn try_consume_n(&mut self, n: u32) -> bool {
         // Refill first so a long-quiet connection can burst.
+        // Use u64 to avoid overflow when `delta` (ms since
+        // last refill) and `refill_per_sec` (e.g. 1_000_000
+        // for the bytes bucket) are both large.
         let now = now_ms();
-        let delta = (now - self.last_refill_ms).max(0) as u32;
-        let refill = (delta * self.refill_per_sec) / 1000;
+        let delta_ms = (now - self.last_refill_ms).max(0) as u64;
+        let refill_per_sec = self.refill_per_sec as u64;
+        let refill = (delta_ms * refill_per_sec) / 1_000;
         if refill > 0 {
-            self.tokens = (self.tokens + refill).min(self.capacity);
+            let refill = refill.min(self.capacity as u64);
+            self.tokens = (self.tokens as u64 + refill).min(self.capacity as u64) as u32;
             self.last_refill_ms = now;
         }
         if self.tokens < n {
@@ -212,13 +223,11 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     let started = Instant::now();
     let (mut sender, mut receiver) = socket.split();
     let conn_state = Arc::new(Mutex::new(ConnState::New));
-    let msg_bucket = Arc::new(Mutex::new(TokenBucket::new_with(
-        state.config.rate_msg_burst,
+    let limiter = Arc::new(Mutex::new(PerConnLimiter::new(
         state.config.rate_msgs_per_sec,
-    )));
-    let byte_bucket = Arc::new(Mutex::new(TokenBucket::new_with(
-        state.config.rate_bytes_burst,
+        state.config.rate_msg_burst,
         state.config.rate_bytes_per_sec,
+        state.config.rate_bytes_burst,
     )));
     // Throttle deadline: while `now < throttle_until_ms`, inbound
     // frames are dropped silently per §20.8 ("throttled for 1 s,
@@ -337,17 +346,38 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         }
 
         // Rate limit: count one message token per inbound frame.
+        // The msg bucket miss short-circuits BEFORE we read
+        // the full frame body, so a flooder cannot inflate
+        // its bytes budget by sending big messages.
         {
-            let mut b = msg_bucket.lock().await;
-            if !b.try_consume() {
+            let mut l = limiter.lock().await;
+            if l.check_msg().is_err() {
                 // Throttle for 1s and notify the client. Do NOT
-                // close the connection (§20.8).
+                // close the connection (§20.8). During the
+                // handshake (no bearer yet) the server emits
+                // AUTH_FAIL(Rate); post-handshake, the new
+                // RATE_LIMIT envelope is the structured
+                // equivalent.
                 warn!(request_id = %request_id, "rate limited (msg/s); throttling");
                 {
                     let mut t = throttle.lock().await;
                     *t = now_ms() + RATE_THROTTLE_MS;
                 }
-                send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                if authed.is_some() {
+                    send_rate_limit_envelope(
+                        &mut sender,
+                        RateLimitHit {
+                            scope: locast_protocol::handshake::RateLimitScope::Conn,
+                            observed: 1,
+                            limit: state.config.rate_msgs_per_sec,
+                            retry_after_ms: RATE_THROTTLE_MS as u32,
+                        },
+                        request_id,
+                    )
+                    .await;
+                } else {
+                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                }
                 continue;
             }
         }
@@ -377,24 +407,41 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             Message::Pong(_) => continue,
         };
 
-        // Bytes-per-second enforcement: the bytes bucket is
-        // refilled at RATE_BYTES_SUSTAINED_PER_SEC and capped at
-        // RATE_BYTES_BURST (§20.6). Each inbound frame consumes
-        // `bytes.len()` tokens.
+        // Bytes-per-second enforcement. Order note (security
+        // finding #5): the bytes bucket is checked AFTER
+        // the frame is fully read into memory, so a single
+        // oversized frame can OOM before the throttle
+        // fires. P2-T07 preserves the existing order;
+        // future work should cap per-frame size at the
+        // transport layer.
         {
-            let mut b = byte_bucket.lock().await;
-            let n = bytes.len() as u32;
-            if !b.try_consume_n(n) {
+            let mut l = limiter.lock().await;
+            let n = bytes.len();
+            if l.check_bytes(n).is_err() {
                 warn!(
                     request_id = %request_id,
-                    frame_bytes = bytes.len(),
+                    frame_bytes = n,
                     "rate limited (bytes/s); throttling"
                 );
                 {
                     let mut t = throttle.lock().await;
                     *t = now_ms() + RATE_THROTTLE_MS;
                 }
-                send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                if authed.is_some() {
+                    send_rate_limit_envelope(
+                        &mut sender,
+                        RateLimitHit {
+                            scope: locast_protocol::handshake::RateLimitScope::Conn,
+                            observed: u32::try_from(n).unwrap_or(u32::MAX),
+                            limit: state.config.rate_bytes_per_sec,
+                            retry_after_ms: RATE_THROTTLE_MS as u32,
+                        },
+                        request_id,
+                    )
+                    .await;
+                } else {
+                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                }
                 continue;
             }
         }
@@ -488,6 +535,21 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     {
                         let mut g = self_user_id.lock().await;
                         *g = Some(user_id);
+                    }
+                    // Security finding #2 (auth-order DoS):
+                    // a successful AUTH earns a clean rate
+                    // budget. Without this, a connection that
+                    // burned its budget on HELLO/AUTH retries
+                    // would start its post-handshake life
+                    // already throttled.
+                    {
+                        let mut l = limiter.lock().await;
+                        l.reset(
+                            state.config.rate_msgs_per_sec,
+                            state.config.rate_msg_burst,
+                            state.config.rate_bytes_per_sec,
+                            state.config.rate_bytes_burst,
+                        );
                     }
                 }
             }
@@ -1015,6 +1077,49 @@ async fn send_auth_fail_bytes(
         }
         Err(e) => {
             warn!(request_id = %request_id, error = %e, "encode AUTH_FAIL failed");
+        }
+    }
+}
+
+/// Send a post-handshake RATE_LIMIT envelope. P2-T07
+/// emit path for the new envelope. The `hit` carries the
+/// scope, the observed rate, the configured limit, and the
+/// retry hint.
+async fn send_rate_limit_envelope(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    hit: crate::ratelimit::RateLimitHit,
+    request_id: Uuid,
+) {
+    let payload = hit.to_payload();
+    let env = Envelope {
+        v: 1,
+        r#type: MessageKind::RateLimit,
+        id: Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: now_ms(),
+        seq: 0,
+        payload: serde_json::to_value(&RateLimitPayload {
+            scope: payload.scope,
+            retry_after_ms: payload.retry_after_ms,
+            observed: payload.observed,
+            limit: payload.limit,
+        })
+        .unwrap_or(json!({})),
+    };
+    match encode_envelope_message(&env) {
+        Ok(msg) => {
+            let _ = sender.send(msg).await;
+            debug!(
+                request_id = %request_id,
+                observed = hit.observed,
+                limit = hit.limit,
+                retry_after_ms = hit.retry_after_ms,
+                "sent RATE_LIMIT"
+            );
+        }
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "encode RATE_LIMIT failed");
         }
     }
 }

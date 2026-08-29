@@ -97,6 +97,15 @@ pub enum MessageKind {
     RoomError,
     #[serde(rename = "PRESENCE")]
     Presence,
+    // ----- P2-T07: per-connection rate-limit envelope -----
+    // Server -> caller only. Emitted when a post-handshake
+    // connection trips the per-conn token bucket (msg/s or
+    // bytes/s). The handshake path continues to use
+    // AUTH_FAIL(Rate) per §20.8; RATE_LIMIT is reserved for
+    // the post-handshake case where the caller has a bearer
+    // and needs a structured retry hint.
+    #[serde(rename = "RATE_LIMIT")]
+    RateLimit,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -129,6 +138,7 @@ impl MessageKind {
             MessageKind::RoomClosed => "ROOM_CLOSED",
             MessageKind::RoomError => "ROOM_ERROR",
             MessageKind::Presence => "PRESENCE",
+            MessageKind::RateLimit => "RATE_LIMIT",
             MessageKind::Other(s) => s,
         }
     }

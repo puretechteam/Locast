@@ -27,6 +27,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod metrics;
+pub mod ratelimit;
 pub mod rooms;
 pub mod time;
 pub mod ws;

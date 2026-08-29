@@ -132,6 +132,44 @@ pub enum AuthFailReason {
     Rate,
 }
 
+// ----- P2-T07: per-connection rate-limit envelope -----
+
+/// The scope of a rate-limit hit. v1 only emits `Conn`; the
+/// `Room` and `Ip` variants are reserved for future tasks
+/// and intentionally NOT implemented in P2-T07 (per the
+/// spec's hard-scope rules).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+#[serde(rename_all = "lowercase")]
+pub enum RateLimitScope {
+    /// The offender's own connection tripped the per-conn
+    /// token bucket. This is the only scope v1 emits.
+    Conn,
+}
+
+/// RATE_LIMIT (S -> C). Sent in response to a post-handshake
+/// frame that exhausted the per-connection msg/s or
+/// bytes/s token bucket. The handshake path continues to
+/// emit `AUTH_FAIL(Rate)` per §20.8; RATE_LIMIT is the
+/// structured post-handshake equivalent.
+///
+/// `retry_after_ms` is the server's hint to the client for
+/// when it can resume sending. v1 always advertises
+/// 1 000 ms (the throttle window).
+///
+/// `observed` is the rate the offender was trying to
+/// consume (msg-count or bytes-count depending on which
+/// bucket missed). `limit` is the configured ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct RateLimitPayload {
+    #[ts(inline)]
+    pub scope: RateLimitScope,
+    pub retry_after_ms: u32,
+    pub observed: u32,
+    pub limit: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +231,27 @@ mod tests {
         assert_eq!(v["config"]["max_room_size"], json!(8));
         let back: WelcomePayload = serde_json::from_value(v).expect("from_value");
         assert_eq!(back, w);
+    }
+
+    #[test]
+    fn rate_limit_scope_serializes_lowercase() {
+        let s = serde_json::to_string(&RateLimitScope::Conn).expect("serialize");
+        assert_eq!(s, "\"conn\"");
+        let back: RateLimitScope = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, RateLimitScope::Conn);
+    }
+
+    #[test]
+    fn rate_limit_payload_round_trips() {
+        let p = RateLimitPayload {
+            scope: RateLimitScope::Conn,
+            retry_after_ms: 1_000,
+            observed: 500,
+            limit: 200,
+        };
+        let s = serde_json::to_string(&p).expect("serialize");
+        assert!(s.contains("\"scope\":\"conn\""));
+        let back: RateLimitPayload = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, p);
     }
 }
