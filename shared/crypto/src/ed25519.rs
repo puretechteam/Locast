@@ -93,6 +93,39 @@ pub fn to_base64(bytes: &[u8]) -> String {
     BASE64.encode(bytes)
 }
 
+/// Derive the 32-byte Ed25519 verifying (public) key from a raw
+/// private seed. The Ed25519 key-derivation step is infallible
+/// (any 32 bytes are a valid seed) so this never fails.
+///
+/// Callers that already hold a public key should use it directly
+/// rather than re-deriving from the seed; this helper exists for
+/// the manifest signing path and the test harness.
+pub fn public_key_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+    let signing = SigningKey::from_bytes(seed);
+    signing.verifying_key().to_bytes()
+}
+
+/// Decode a standard base64 string with `=` padding into its raw
+/// bytes. Returns [`CryptoError::InvalidKey`] on any decode failure
+/// (invalid alphabet, bad padding, or empty input). The variant is
+/// reused because a malformed base64 blob is structurally
+/// indistinguishable from "this is not a valid public key or
+/// signature blob" at the call site, and adding a separate variant
+/// would force every caller to match on two cases for the same
+/// operational outcome: "the input bytes I got are garbage".
+///
+/// Empty input is rejected explicitly. The standard base64 engine
+/// accepts `""` as the empty byte string, but no Locast key or
+/// signature is ever the empty string, so treating it as a
+/// successful decode would let the rest of the pipeline reach a
+/// "wrong length" branch with a confusing error path.
+pub fn from_base64(s: &str) -> Result<Vec<u8>, CryptoError> {
+    if s.is_empty() {
+        return Err(CryptoError::InvalidKey);
+    }
+    BASE64.decode(s).map_err(|_| CryptoError::InvalidKey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,5 +210,39 @@ mod tests {
         let b = sign(&seed, b"deterministic");
         assert_eq!(a, b);
         assert_eq!(a.len(), 64);
+    }
+
+    /// `to_base64` then `from_base64` round-trips to the same bytes.
+    #[test]
+    fn base64_round_trip() {
+        let original = [0x42u8; 32];
+        let encoded = to_base64(&original);
+        let decoded = from_base64(&encoded).expect("valid base64 should decode");
+        assert_eq!(decoded, original.to_vec());
+    }
+
+    /// Empty input is not a valid key blob. The standard base64
+    /// engine accepts empty as "empty bytes" (a valid decoding),
+    /// so we reject empty up front.
+    #[test]
+    fn from_base64_rejects_empty() {
+        let res = from_base64("");
+        assert_eq!(res, Err(CryptoError::InvalidKey));
+    }
+
+    /// Non-base64 alphabet characters are rejected.
+    #[test]
+    fn from_base64_rejects_garbage() {
+        let res = from_base64("not!base64!!!");
+        assert_eq!(res, Err(CryptoError::InvalidKey));
+    }
+
+    /// Base64 that does not decode to a multiple of 4 chars (bad
+    /// padding) is rejected.
+    #[test]
+    fn from_base64_rejects_bad_padding() {
+        // 5 chars: not a multiple of 4, no `=` padding makes it valid.
+        let res = from_base64("AAAAA");
+        assert_eq!(res, Err(CryptoError::InvalidKey));
     }
 }

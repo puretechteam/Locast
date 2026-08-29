@@ -13,12 +13,17 @@
 pub mod canonical;
 pub mod error;
 pub mod model;
+pub mod signing;
 
 pub use canonical::{commit, serialize};
-pub use error::CanonicalError;
+pub use error::{
+    CanonicalError, InvalidPublicKeyReason, InvalidSignatureEncodingReason, SigningResult,
+    VerifyError,
+};
 pub use model::{
     Codecs, Dimensions, HostSignature, MediaEntry, MediaManifest, Source, SubtitleEntry,
 };
+pub use signing::{sign_manifest, verify_manifest, ALGORITHM_ED25519};
 
 /// Library version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

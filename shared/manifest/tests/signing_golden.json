@@ -1,0 +1,40 @@
+{
+  "description": "Golden vector for the manifest signing pipeline. The input is the same single-media-entry manifest used by the signing unit tests; it is signed with the RFC 8032 §7.1 test vector 1 seed and the resulting 64-byte Ed25519 signature is recorded in expected_signature_hex. The expected_pubkey_hex matches RFC 8032 §7.1 test vector 1. The canonical bytes are produced by locast_manifest::serialize(input) and the signature is the Ed25519 signature over those exact bytes, with no domain tag, no prehashing, and no transformation.",
+  "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "expected_pubkey_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+  "expected_signature_hex": "ccf6468a3c04c2e57ec9184e0a98bd5a0a0d7043758840f4a32491da40f07b942d447e1264873d41f87b7fc37335cb6603f29a15d6f91892c94c990ec9f16800",
+  "input": {
+    "manifest_version": 1,
+    "room_id": "22222222-2222-4222-8222-222222222222",
+    "media": [
+      {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "filename": "movie.mp4",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "blake3": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size_bytes": 1024,
+        "mime": "video/mp4",
+        "duration_ms": 60000,
+        "dimensions": {
+          "width": 1920,
+          "height": 1080
+        },
+        "sources": [
+          {
+            "peer_id": "peer-aaaa",
+            "url_hint": null,
+            "priority": 0,
+            "chunk_size": 65536,
+            "total_chunks": 1,
+            "chunk_hashes": [
+              "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            ]
+          }
+        ]
+      }
+    ],
+    "subtitles": [],
+    "created_at": 1700000000000,
+    "host_signature": null
+  }
+}
