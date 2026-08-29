@@ -34,6 +34,12 @@ pub mod settings;
 /// unchanged.
 pub mod rooms;
 
+/// P3-T03 added the manifest repository (`storage::manifests`). It
+/// is a thin typed wrapper over the `room_manifests` table that
+/// the P0-T05 migration introduced. The `Storage` type itself is
+/// unchanged.
+pub mod manifests;
+
 /// Default pool size per `docs/ARCHITECTURE.md` section 7.
 pub const DEFAULT_POOL_SIZE: u32 = 8;
 

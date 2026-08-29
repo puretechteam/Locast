@@ -106,6 +106,16 @@ pub enum MessageKind {
     // and needs a structured retry hint.
     #[serde(rename = "RATE_LIMIT")]
     RateLimit,
+    // ----- P3-T03: signed manifest publication -----
+    // MANIFEST_PUBLISH is host -> server; MANIFEST_PUBLISHED is
+    // server -> all participants. The server is the relay; it
+    // does NOT validate beyond the bearer + the
+    // `PublishManifest` capability check (host-only at the time
+    // of publish).
+    #[serde(rename = "MANIFEST_PUBLISH")]
+    ManifestPublish,
+    #[serde(rename = "MANIFEST_PUBLISHED")]
+    ManifestPublished,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -139,6 +149,8 @@ impl MessageKind {
             MessageKind::RoomError => "ROOM_ERROR",
             MessageKind::Presence => "PRESENCE",
             MessageKind::RateLimit => "RATE_LIMIT",
+            MessageKind::ManifestPublish => "MANIFEST_PUBLISH",
+            MessageKind::ManifestPublished => "MANIFEST_PUBLISHED",
             MessageKind::Other(s) => s,
         }
     }
@@ -153,6 +165,19 @@ impl MessageKind {
                 | MessageKind::RoomJoinRequest
                 | MessageKind::RoomLeave
                 | MessageKind::Presence
+        )
+    }
+
+    /// `true` if this is a manifest-lifecycle message (host
+    /// publishes; server rebroadcasts). The WS layer routes
+    /// these to the room dispatcher the same way
+    /// `is_room_lifecycle` messages are routed, but kept
+    /// separately so a future per-type handler can branch
+    /// without re-plumbing the `is_room_lifecycle` check.
+    pub fn is_manifest_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            MessageKind::ManifestPublish | MessageKind::ManifestPublished
         )
     }
 }

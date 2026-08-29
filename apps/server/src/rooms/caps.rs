@@ -25,6 +25,11 @@ use super::registry::RoomRegistry;
 pub enum CapsError {
     #[error("not a member of the room")]
     NotMember,
+    /// P3-T03: the action is host-only and the caller is
+    /// not the current host. The wire-level equivalent is
+    /// `RoomErrorCode::NotHost`.
+    #[error("not the room host")]
+    NotHost,
 }
 
 /// The four initial room envelopes the capability gate
@@ -36,6 +41,21 @@ pub enum Command {
     RoomJoinRequest,
     RoomLeave,
     Presence,
+    /// P3-T03: the host-only `MANIFEST_PUBLISH` envelope.
+    /// The capability check is two-fold:
+    ///
+    /// 1. The caller must be a participant of the room
+    ///    named in `envelope.room_id` (consistent with
+    ///    the other room-lifecycle commands).
+    /// 2. The caller must be the room's CURRENT host
+    ///    (their `ParticipantRecord::is_host` is true).
+    ///    The host-grant on `cap_set` is automatic for
+    ///    `RoomCreate` (the full bitfield including
+    ///    `cap::PUBLISH_MANIFEST` is assigned at create
+    ///    time) and is re-granted on host election; the
+    ///    explicit host check is what the spec requires
+    ///    so a demoted former host cannot publish.
+    PublishManifest,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -73,6 +93,28 @@ pub async fn check_capability(
                 Ok(())
             }
         }
+        // P3-T03: PublishManifest requires the caller to
+        // be the current host. The check is "is the user
+        // a participant AND marked as host in the CURRENT
+        // room state?" The `get_user_room` + per-room
+        // participant walk covers both branches; if the
+        // user is not in any room, `is_host` defaults to
+        // false. We do NOT trust `cap_set` for the
+        // host-only check because the bitfield is
+        // historical (it may include PUBLISH_MANIFEST
+        // from a previous host election that was later
+        // undone).
+        Command::PublishManifest => {
+            if let Some(rid) = registry.get_user_room(user_id).await {
+                if registry.is_room_host(rid, user_id).await {
+                    Ok(())
+                } else {
+                    Err(CapsError::NotHost)
+                }
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
     }
 }
 
@@ -80,7 +122,7 @@ pub async fn check_capability(
 mod tests {
     use super::*;
     use crate::rooms::registry::RoomRegistryConfig;
-    use crate::time::MockClock;
+    use crate::time::{Clock, MockClock};
 
     fn fresh_registry() -> (RoomRegistry, MockClock) {
         let clock = MockClock::new(1_000_000);
@@ -138,5 +180,45 @@ mod tests {
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_is_denied_when_user_is_not_in_any_room() {
+        let (reg, _clock) = fresh_registry();
+        let err = check_capability(&reg, uid(1), Command::PublishManifest)
+            .await
+            .expect_err("expected NotMember");
+        assert!(matches!(err, CapsError::NotMember));
+    }
+
+    #[tokio::test]
+    async fn publish_manifest_is_denied_when_user_is_not_host() {
+        // Set up: uid(1) creates a room, uid(2) joins it as
+        // a viewer. PublishManifest must succeed for the
+        // host and fail with NotHost for the viewer.
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room");
+        // uid(2) joins as a viewer (not host).
+        let (_joined, _evt) = reg
+            .join(
+                &s,
+                &room.code,
+                uid(2),
+                [2u8; 32],
+                "viewer".into(),
+                clock.now_ms(),
+            )
+            .await
+            .expect("viewer joins");
+        let host_ok = check_capability(&reg, uid(1), Command::PublishManifest).await;
+        assert!(host_ok.is_ok(), "host should be allowed to publish");
+        let viewer_err = check_capability(&reg, uid(2), Command::PublishManifest)
+            .await
+            .expect_err("viewer must be denied");
+        assert!(matches!(viewer_err, CapsError::NotHost));
     }
 }

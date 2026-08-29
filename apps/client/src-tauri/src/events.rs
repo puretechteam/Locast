@@ -14,7 +14,7 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
-pub use crate::net::room::RoomSummaryIpc;
+pub use crate::net::room::{ManifestStateEvent, RoomSummaryIpc};
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
 
 /// The `signaling://state` event payload. Emitted by the
@@ -37,6 +37,15 @@ pub type RoomStateChanged = Option<RoomSummaryIpc>;
 /// (`HostMigrated`, `HostReconnected`, `ParticipantJoined`,
 /// `ParticipantLeft`, `RoomClosed`). The payload mirrors
 /// the redacted `RoomSummaryIpc` shape so the React layer
-/// can both update its cache and react to the delta with a
-/// single listener.
+/// can both update its cache and react to the delta with
+/// a single listener.
 pub type RoomEventEnvelope = RoomSummaryIpc;
+
+/// P3-T03: the `manifest://state` event payload. Emitted
+/// by the `RoomClient` whenever a `MANIFEST_PUBLISHED`
+/// envelope is verified and accepted into the per-room
+/// cache. The full manifest stays in the Rust cache; the
+/// event carries a small descriptor with the BLAKE3 hash
+/// of the canonical bytes and the per-room version (1 in
+/// v1).
+pub type ManifestStateChanged = ManifestStateEvent;

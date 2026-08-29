@@ -722,6 +722,106 @@ impl Db {
         }
         Ok(out)
     }
+
+    // ------------------------------------------------------------------
+    // P3-T03: room_manifests persistence.
+    // ------------------------------------------------------------------
+
+    /// Insert a fresh `room_manifests` row. `version` is
+    /// per-room monotonic (max+1) and is the caller's
+    /// responsibility to compute. The store enforces the
+    /// `UNIQUE (room_id, version)` constraint; a duplicate
+    /// insert is a caller bug and surfaces as a
+    /// `sqlx::Error::Database` with the unique-violation
+    /// message.
+    pub async fn insert_room_manifest(
+        &self,
+        id: Uuid,
+        room_id: Uuid,
+        version: i64,
+        created_at: i64,
+        manifest_json: &str,
+        manifest_hash: &[u8; 32],
+        host_user_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        sqlx::query(
+            "INSERT INTO room_manifests \
+             (id, room_id, version, created_at, manifest_json, manifest_hash, host_user_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(id.to_string())
+        .bind(room_id.to_string())
+        .bind(version)
+        .bind(created_at)
+        .bind(manifest_json)
+        .bind(&manifest_hash[..])
+        .bind(host_user_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up the latest `room_manifests` row for `room_id`.
+    /// Returns the row in the same shape as
+    /// [`insert_room_manifest`] takes so the caller can pass
+    /// the values straight back to a broadcast / persistence
+    /// path. `None` if no manifest has been published for the
+    /// room yet.
+    pub async fn get_latest_room_manifest(
+        &self,
+        room_id: Uuid,
+    ) -> Result<Option<RoomManifestRow>, sqlx::Error> {
+        let row: Option<(String, i64, i64, String, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT id, version, created_at, manifest_json, manifest_hash, host_user_id \
+             FROM room_manifests WHERE room_id = ?1 \
+             ORDER BY version DESC LIMIT 1",
+        )
+        .bind(room_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let (id_s, version, created_at, manifest_json, manifest_hash, host_user_id_s) = match row {
+            None => return Ok(None),
+            Some(t) => t,
+        };
+        let id = Uuid::parse_str(&id_s).map_err(|e| sqlx::Error::ColumnDecode {
+            index: "id".to_string(),
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid manifest id: {e}"),
+            )),
+        })?;
+        let host_user_id =
+            Uuid::parse_str(&host_user_id_s).map_err(|e| sqlx::Error::ColumnDecode {
+                index: "host_user_id".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid host_user_id: {e}"),
+                )),
+            })?;
+        if manifest_hash.len() != 32 {
+            return Err(sqlx::Error::ColumnDecode {
+                index: "manifest_hash".to_string(),
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "manifest_hash is {} bytes, expected 32",
+                        manifest_hash.len()
+                    ),
+                )),
+            });
+        }
+        let mut hash_arr = [0u8; 32];
+        hash_arr.copy_from_slice(&manifest_hash);
+        Ok(Some(RoomManifestRow {
+            id,
+            version,
+            created_at,
+            manifest_json,
+            manifest_hash: hash_arr,
+            host_user_id,
+        }))
+    }
 }
 
 /// A row from the `rooms` table.
@@ -751,6 +851,17 @@ pub struct RoomParticipantRow {
     pub left_ms: Option<i64>,
     pub status: String,
     pub cap_set: u32,
+}
+
+/// A row from the `room_manifests` table.
+#[derive(Debug, Clone)]
+pub struct RoomManifestRow {
+    pub id: Uuid,
+    pub version: i64,
+    pub created_at: i64,
+    pub manifest_json: String,
+    pub manifest_hash: [u8; 32],
+    pub host_user_id: Uuid,
 }
 
 /// Spawn a background task that periodically purges expired

@@ -7,9 +7,11 @@
 //! `docs/ARCHITECTURE.md` section 8 for the authoritative spec.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// A media entry inside a manifest's `media` array.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct MediaEntry {
     /// Stable identifier for this media item (UUIDv4 in v1).
     pub id: String,
@@ -39,7 +41,8 @@ pub struct MediaEntry {
 
 /// Pixel dimensions. Both fields are required when the parent
 /// `Dimensions` value is present.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct Dimensions {
     pub width: u32,
     pub height: u32,
@@ -47,7 +50,8 @@ pub struct Dimensions {
 
 /// Codec metadata for a media entry. Each component is optional so the
 /// caller can describe audio-only, video-only, or container-only streams.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct Codecs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub video: Option<String>,
@@ -58,7 +62,8 @@ pub struct Codecs {
 }
 
 /// A download source. The host is always the first entry in v1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct Source {
     /// Peer identifier. Either a base64 Ed25519 public key or a
     /// `sha256:` hex prefix; the canonicalizer does not normalize
@@ -78,7 +83,8 @@ pub struct Source {
 
 /// A subtitle entry. The `sources` field uses the same `Source` shape
 /// as `MediaEntry`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct SubtitleEntry {
     pub id: String,
     /// BCP-47 language tag.
@@ -98,7 +104,8 @@ pub struct SubtitleEntry {
 /// Host signature block. Present on the wire at runtime; the
 /// canonicalizer always strips the actual value and emits `null` in the
 /// canonical bytes regardless of what the data model holds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct HostSignature {
     /// Public key identifier.
     pub public_key: String,
@@ -109,7 +116,8 @@ pub struct HostSignature {
 }
 
 /// Top-level Locast media manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
 pub struct MediaManifest {
     /// Manifest schema version. Currently 1.
     pub manifest_version: u32,

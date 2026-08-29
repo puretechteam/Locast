@@ -2501,6 +2501,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "locast-crypto",
+ "locast-manifest",
  "locast-protocol",
  "locast-server",
  "log",
@@ -2557,6 +2558,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "ts-rs",
  "unicode-normalization",
 ]
 
@@ -2565,6 +2567,7 @@ name = "locast-protocol"
 version = "0.0.0"
 dependencies = [
  "locast-crypto",
+ "locast-manifest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -2582,6 +2585,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "locast-crypto",
+ "locast-manifest",
  "locast-protocol",
  "prometheus",
  "rand 0.8.8",

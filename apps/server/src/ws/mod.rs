@@ -757,13 +757,14 @@ async fn dispatch_authed(
     // types (future PLAY/PAUSE/SEEK/DRAW/LASER/CHAT/MANIFEST_*)
     // are not implemented in v1 / P2-T04 and are silently
     // accepted.
-    if envelope.r#type.is_room_lifecycle() {
+    if envelope.r#type.is_room_lifecycle() || envelope.r#type.is_manifest_lifecycle() {
         let store: Arc<dyn crate::rooms::RoomStore> =
             Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
         let outcome = crate::rooms::dispatch_room_message(
             envelope,
             &state.rooms,
             store.as_ref(),
+            &state.db,
             state.clock.as_ref(),
             user_id,
             pubkey,

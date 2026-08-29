@@ -18,6 +18,14 @@
 //! P2-T05 also emits `room://state` and `room://event`
 //! Tauri events on every state-changing inbound envelope so
 //! the React layer can subscribe to deltas without polling.
+//!
+//! P3-T03: handles `MANIFEST_PUBLISHED` inbound envelopes
+//! by verifying the signed manifest, persisting it to the
+//! local `room_manifests` table, and emitting a
+//! `manifest://state` Tauri event. The Tauri event carries
+//! `{ room_id, manifest_hash, version }` (a small payload;
+//! the full manifest stays in the Rust cache for the
+//! download planner).
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
@@ -53,6 +61,11 @@ pub trait RoomEventSink: Send + Sync {
     /// Emit `room://state` with `None` to signal the
     /// room has been cleared (RoomClosed / RoomError).
     fn emit_state_cleared(&self);
+    /// P3-T03: emit `manifest://state` with a verified
+    /// manifest descriptor. The default no-op impl is
+    /// `()`; the Tauri-backed sink forwards to the
+    /// webview.
+    fn emit_manifest_state(&self, _ev: &ManifestStateEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -98,6 +111,9 @@ mod tauri_sink {
             let _ = self
                 .handle
                 .emit(ROOM_STATE_EVENT, Option::<RoomSummaryIpc>::None);
+        }
+        fn emit_manifest_state(&self, ev: &ManifestStateEvent) {
+            let _ = self.handle.emit(MANIFEST_STATE_EVENT, ev.clone());
         }
     }
 }
@@ -256,6 +272,29 @@ pub const ROOM_STATE_EVENT: &str = "room://state";
 /// pass.
 pub const ROOM_EVENT_EVENT: &str = "room://event";
 
+/// P3-T03: Tauri event name emitted when a verified
+/// manifest has been accepted into the local cache. The
+/// payload is a small descriptor
+/// (`{ room_id, manifest_hash, version }`); the full
+/// manifest is held in the Rust
+/// [`RoomClient::verified_manifests`] cache for the
+/// download planner (P3-T04) to read. The event is only
+/// emitted for manifests that pass the
+/// `locast_manifest::verify_manifest` check.
+pub const MANIFEST_STATE_EVENT: &str = "manifest://state";
+
+/// P3-T03: the small, IPC-safe descriptor emitted with
+/// the `manifest://state` event. `manifest_hash` is the
+/// 64-char lowercase BLAKE3 of the canonical manifest
+/// bytes. `version` is the server's per-room monotonic
+/// counter (1 on the first publish).
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct ManifestStateEvent {
+    pub room_id: String,
+    pub manifest_hash: String,
+    pub version: i64,
+}
+
 /// Default timeout for a single request-reply round trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -302,6 +341,15 @@ pub struct RoomClient {
     /// of the `Option<JoinHandle>`) and never across an
     /// `.await`.
     presence_task: StdMutex<Option<JoinHandle<()>>>,
+    /// P3-T03: per-room verified-manifest cache. The
+    /// download planner (P3-T04) reads from this. The
+    /// cache is populated by the `MANIFEST_PUBLISHED`
+    /// inbound handler after a successful
+    /// `locast_manifest::verify_manifest`. The map is
+    /// keyed by `room_id` (Uuid). The
+    /// `verified_at_ms` is the server's `published_at_ms`
+    /// from the broadcast envelope.
+    verified_manifests: StdMutex<HashMap<Uuid, locast_manifest::MediaManifest>>,
 }
 
 impl RoomClient {
@@ -315,7 +363,19 @@ impl RoomClient {
             pending: Mutex::new(HashMap::new()),
             sink: Mutex::new(None),
             presence_task: StdMutex::new(None),
+            verified_manifests: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// P3-T03: read the verified manifest for a given
+    /// room, if one has been accepted. The download
+    /// planner (P3-T04) is the primary consumer.
+    pub fn verified_manifest(&self, room_id: Uuid) -> Option<locast_manifest::MediaManifest> {
+        self.verified_manifests
+            .lock()
+            .expect("verified_manifests lock")
+            .get(&room_id)
+            .cloned()
     }
 
     /// Subscribe to the signaling client's inbound envelope
@@ -587,8 +647,74 @@ impl RoomClient {
                 self.emit_state_cleared().await;
                 self.abort_presence_loop().await;
             }
+            MessageKind::ManifestPublished => {
+                self.handle_manifest_published(&env).await;
+            }
             _ => {}
         }
+    }
+
+    /// P3-T03: handle an inbound `MANIFEST_PUBLISHED`
+    /// envelope. Decode the typed payload, verify the
+    /// signature, store the verified manifest in the
+    /// per-room cache, and emit a `manifest://state`
+    /// Tauri event. A verify failure is logged at WARN
+    /// and the event is dropped (the server's defense-in-
+    /// depth `verify_manifest` call should make this
+    /// rare; the viewer's TOFU check against the invite
+    /// `h=` is the real trust boundary).
+    async fn handle_manifest_published(&self, env: &Envelope) {
+        let payload: locast_protocol::room::ManifestPublishedPayload = match decode_payload(env) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: bad payload");
+                return;
+            }
+        };
+        let manifest = payload.manifest;
+        // Verify the Ed25519 signature over the canonical
+        // bytes. This is the P3-T02 contract; the server
+        // already ran the same check as defense in depth.
+        if let Err(e) = locast_manifest::verify_manifest(&manifest) {
+            warn!(error = %e, "ignoring MANIFEST_PUBLISHED: verify_manifest failed");
+            return;
+        }
+        // Parse the room_id.
+        let room_uuid = match Uuid::parse_str(&manifest.room_id) {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: bad room_id");
+                return;
+            }
+        };
+        // Compute the BLAKE3 of the canonical bytes for
+        // the small event payload.
+        let manifest_hash = match locast_manifest::serialize(&manifest) {
+            Ok(bytes) => locast_crypto::blake3::blake3_hex(&bytes),
+            Err(e) => {
+                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: canonicalize failed");
+                return;
+            }
+        };
+        // Insert into the verified-manifest cache. v1 has
+        // exactly one manifest per room; later versions
+        // (P3-T07) will add a version counter.
+        {
+            let mut cache = self
+                .verified_manifests
+                .lock()
+                .expect("verified_manifests lock");
+            cache.insert(room_uuid, manifest.clone());
+        }
+        // Emit the small Tauri event so the React layer
+        // can re-render. The full manifest stays in the
+        // Rust cache.
+        let ev = ManifestStateEvent {
+            room_id: room_uuid.to_string(),
+            manifest_hash,
+            version: 1,
+        };
+        self.emit_manifest_state(&ev).await;
     }
 
     /// Dispatch one inbound envelope to the first
@@ -703,6 +829,17 @@ impl RoomClient {
         let g = self.sink.lock().await;
         if let Some(s) = g.as_ref() {
             s.emit_event(summary);
+        }
+    }
+
+    /// P3-T03: best-effort emit of the `manifest://state`
+    /// event. The payload is the small `ManifestStateEvent`
+    /// descriptor; the full verified manifest stays in
+    /// the Rust cache.
+    async fn emit_manifest_state(&self, ev: &ManifestStateEvent) {
+        let g = self.sink.lock().await;
+        if let Some(s) = g.as_ref() {
+            s.emit_manifest_state(ev);
         }
     }
 
@@ -1165,5 +1302,135 @@ mod tests {
             assert_eq!(received.r#type, MessageKind::RoomJoined);
             let _ = i;
         }
+    }
+
+    /// A recording event sink that captures every
+    /// `emit_*` call so the test can assert the
+    /// `manifest://state` event fires.
+    struct RecordingSink {
+        manifests: std::sync::Mutex<Vec<ManifestStateEvent>>,
+    }
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                manifests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl RoomEventSink for RecordingSink {
+        fn emit_state(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_event(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_state_cleared(&self) {}
+        fn emit_manifest_state(&self, ev: &ManifestStateEvent) {
+            self.manifests.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_published_verifies_and_caches() {
+        // Build a host-side signed manifest, then drive
+        // the MANIFEST_PUBLISHED inbound handler and
+        // assert the cache + the Tauri event fire.
+        let mut m = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: Uuid::now_v7().to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1_700_000_000_000,
+            host_signature: None,
+        };
+        // RFC 8032 §7.1 test 1 vector.
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        m = locast_manifest::sign_manifest(&seed, &m).expect("sign");
+        let room_uuid = Uuid::parse_str(&m.room_id).expect("uuid");
+
+        let rc = fresh_room_client().await;
+        let recorder = Arc::new(RecordingSink::new());
+        rc.install_event_sink(recorder.clone()).await;
+
+        let payload = locast_protocol::room::ManifestPublishedPayload {
+            manifest: m.clone(),
+            published_at_ms: 1_700_000_000_000,
+        };
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestPublished,
+            id: Uuid::now_v7(),
+            room_id: Some(room_uuid),
+            sender: None,
+            ts_ms: 1_700_000_000_000,
+            seq: 0,
+            payload: serde_json::to_value(payload).expect("payload json"),
+        };
+        rc.handle_inbound(env).await;
+
+        // The verified manifest is in the cache.
+        let cached = rc
+            .verified_manifest(room_uuid)
+            .expect("manifest must be cached after verified publish");
+        assert_eq!(cached.room_id, m.room_id);
+        assert!(cached.host_signature.is_some());
+        // The Tauri event fired exactly once.
+        let fired = recorder.manifests.lock().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].room_id, room_uuid.to_string());
+        assert_eq!(fired[0].version, 1);
+        assert_eq!(fired[0].manifest_hash.len(), 64); // 32-byte BLAKE3 hex
+    }
+
+    #[tokio::test]
+    async fn manifest_published_with_tampered_signature_is_dropped() {
+        // Same setup, but tamper with one byte of the
+        // signature. The handler must drop the event
+        // without populating the cache.
+        let mut m = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: Uuid::now_v7().to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1_700_000_000_000,
+            host_signature: None,
+        };
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        m = locast_manifest::sign_manifest(&seed, &m).expect("sign");
+        // Tamper with the signature.
+        if let Some(hs) = m.host_signature.as_mut() {
+            let mut bytes = locast_crypto::ed25519::from_base64(&hs.value).unwrap();
+            bytes[0] ^= 0x01;
+            hs.value = locast_crypto::ed25519::to_base64(&bytes);
+        }
+        let room_uuid = Uuid::parse_str(&m.room_id).expect("uuid");
+
+        let rc = fresh_room_client().await;
+        let recorder = Arc::new(RecordingSink::new());
+        rc.install_event_sink(recorder.clone()).await;
+
+        let payload = locast_protocol::room::ManifestPublishedPayload {
+            manifest: m,
+            published_at_ms: 0,
+        };
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestPublished,
+            id: Uuid::now_v7(),
+            room_id: Some(room_uuid),
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(payload).expect("payload json"),
+        };
+        rc.handle_inbound(env).await;
+        // The cache stays empty.
+        assert!(rc.verified_manifest(room_uuid).is_none());
+        // No Tauri event fired.
+        assert!(recorder.manifests.lock().unwrap().is_empty());
     }
 }

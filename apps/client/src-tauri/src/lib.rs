@@ -22,6 +22,7 @@ pub mod identity;
 pub mod library;
 pub mod net;
 pub mod probe;
+pub mod room;
 pub mod storage;
 
 use identity::keystore::IdentityService;
@@ -180,6 +181,7 @@ pub fn run() {
             commands::room::room_get_state,
             commands::room::recent_rooms_list,
             commands::room::recent_room_upsert,
+            commands::room::manifest_publish,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

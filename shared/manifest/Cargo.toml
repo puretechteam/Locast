@@ -16,3 +16,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 locast-crypto = { workspace = true }
 unicode-normalization = "0.1"
+ts-rs = { version = "12", features = ["serde-compat", "uuid-impl", "serde-json-impl"] }

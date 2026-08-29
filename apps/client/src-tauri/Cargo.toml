@@ -51,6 +51,7 @@ base64 = "0.22"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 async-trait = "0.1"
 locast-protocol = { path = "../../../shared/protocol" }
+locast-manifest = { path = "../../../shared/manifest" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 rmp-serde = "1"
 futures-util = "0.3"

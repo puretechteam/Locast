@@ -9,18 +9,20 @@
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
-    ParticipantJoinedPayload, ParticipantLeftPayload, PresencePayload, RoomCreatePayload,
-    RoomCreatedPayload, RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomJoinedPayload,
-    RoomLeavePayload, RoomStatePayload,
+    ManifestPublishPayload, ParticipantJoinedPayload, ParticipantLeftPayload, PresencePayload,
+    RoomCreatePayload, RoomCreatedPayload, RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload,
+    RoomJoinedPayload, RoomLeavePayload, RoomStatePayload,
 };
 use uuid::Uuid;
 
 use super::caps::{self, Command};
 use super::codes;
 use super::error::RoomError;
+use super::manifest::handle_manifest_publish;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::store::RoomStore;
 use super::validation::validate_display_name;
+use crate::db::Db;
 use crate::time::Clock;
 /// The result of dispatching a single ROOM_* message. The
 /// WS layer applies the `to_caller` envelopes first (in
@@ -45,6 +47,7 @@ pub async fn dispatch_room_message(
     envelope: Envelope,
     registry: &RoomRegistry,
     store: &dyn RoomStore,
+    db: &Db,
     clock: &dyn Clock,
     user_id: Uuid,
     pubkey: [u8; 32],
@@ -58,15 +61,29 @@ pub async fn dispatch_room_message(
         MessageKind::RoomJoinRequest => Some(Command::RoomJoinRequest),
         MessageKind::RoomLeave => Some(Command::RoomLeave),
         MessageKind::Presence => Some(Command::Presence),
+        MessageKind::ManifestPublish => Some(Command::PublishManifest),
         _ => None,
     };
     if let Some(cmd) = command {
         if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
-            // v1 only emits NotMember (PRESENCE without
-            // room membership). Log the denial and return
-            // a no-op outcome; the user's next
-            // authoritative call (e.g. ROOM_LEAVE) will
-            // surface the real ROOM_ERROR.
+            // For PublishManifest, surface the error to the
+            // caller as a ROOM_ERROR(NotHost). Other
+            // commands fall through to the existing v1
+            // behavior (log + no-op).
+            if matches!(cmd, Command::PublishManifest) {
+                let code = match e {
+                    caps::CapsError::NotHost => RoomErrorCode::NotHost,
+                    caps::CapsError::NotMember => RoomErrorCode::NotJoined,
+                };
+                let mut out = RoomDispatchOutcome::default();
+                out.to_caller.push(err_envelope(
+                    MessageKind::RoomError,
+                    code,
+                    e.to_string(),
+                    now_ms,
+                ));
+                return out;
+            }
             tracing::warn!(
                 user_id = %user_id,
                 command = ?cmd,
@@ -85,6 +102,9 @@ pub async fn dispatch_room_message(
         }
         MessageKind::RoomLeave => handle_room_leave(registry, store, user_id, now_ms).await,
         MessageKind::Presence => handle_presence(registry, user_id, now_ms).await,
+        MessageKind::ManifestPublish => {
+            handle_manifest_publish_dispatch(envelope, registry, db, clock, user_id).await
+        }
         _ => RoomDispatchOutcome::default(),
     }
 }
@@ -244,6 +264,42 @@ async fn handle_presence(
     RoomDispatchOutcome::default()
 }
 
+/// P3-T03: the manifest publish dispatch. Decodes the
+/// payload, runs `handle_manifest_publish`, and turns the
+/// resulting `RoomEvent::ManifestPublished` into a
+/// `RoomDispatchOutcome` with the event in the `events`
+/// list (so the WS layer broadcasts it to every other
+/// participant).
+async fn handle_manifest_publish_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    db: &Db,
+    clock: &dyn Clock,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    match handle_manifest_publish(&envelope, registry, db, clock, user_id).await {
+        Ok(event) => {
+            out.events.push(event);
+        }
+        Err(e) => {
+            let code: RoomErrorCode = match e {
+                RoomError::NotHost => RoomErrorCode::NotHost,
+                RoomError::NotJoined => RoomErrorCode::NotJoined,
+                RoomError::InvalidState => RoomErrorCode::InvalidState,
+                _ => RoomErrorCode::Internal,
+            };
+            out.to_caller.push(err_envelope(
+                MessageKind::RoomError,
+                code,
+                e.to_string(),
+                clock.now_ms(),
+            ));
+        }
+    }
+    out
+}
+
 impl RoomDispatchOutcome {
     fn from_room_error(code: RoomError, message: String) -> Self {
         let mut out = Self::default();
@@ -294,6 +350,7 @@ fn _ensure_types_used(
     _rl: RoomLeavePayload,
     _rj: RoomJoinedPayload,
     _rs: RoomStatePayload,
+    _mp: ManifestPublishPayload,
 ) {
 }
 
@@ -328,6 +385,7 @@ mod tests {
     async fn dispatch_room_create_sends_room_created() {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -342,7 +400,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::RoomCreated);
     }
@@ -351,6 +409,7 @@ mod tests {
     async fn dispatch_invalid_code_yields_invalid_code_error() {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomJoinRequest,
@@ -365,7 +424,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidCode);
@@ -375,6 +434,7 @@ mod tests {
     async fn dispatch_invalid_display_name_yields_invalid_state() {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomJoinRequest,
@@ -389,7 +449,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidState);
@@ -399,6 +459,7 @@ mod tests {
     async fn presence_refreshes_last_seen() {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -413,7 +474,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let _ = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        let _ = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
         clock.advance(5_000);
         let env = Envelope {
             v: 1,
@@ -428,7 +489,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
         assert!(out.to_caller.is_empty());
         let snap = reg.list_snapshot(uid(1)).await.expect("snap");
         let me = snap

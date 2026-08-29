@@ -72,6 +72,25 @@ pub enum RoomEvent {
         target: Uuid,
         payload: RoomErrorPayload,
     },
+    /// P3-T03: a host has published a fresh signed
+    /// manifest. Broadcast to every participant in the
+    /// room (the host gets a direct `MANIFEST_PUBLISHED`
+    /// reply in addition to the broadcast; viewers see
+    /// only the broadcast). Viewers verify the signature
+    /// against the host's pubkey (TOFU-anchored to the
+    /// invite's `h=` parameter) and start the P3 download
+    /// flow.
+    ManifestPublished {
+        /// The room id, included so the WS layer does not
+        /// need to look it up by sender.
+        room_id: Uuid,
+        /// The signed manifest, exactly as the host sent
+        /// it (canonicalization is the host's job; the
+        /// server is the relay).
+        manifest: locast_manifest::MediaManifest,
+        /// Server-stamped publication time, unix ms.
+        published_at_ms: i64,
+    },
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -90,7 +109,33 @@ pub struct RoomRegistry {
     /// channel. WS connections subscribe to the channel of
     /// the room their user is in via [`RoomRegistry::subscribe`].
     room_tx: RwLock<HashMap<Uuid, broadcast::Sender<BroadcastItem>>>,
+    /// P3-T03: in-memory cache of the latest manifest per
+    /// room. Kept as a separate map (rather than a field
+    /// on `RoomState`) so the manifest's larger payload
+    /// does not get cloned on every snapshot read.
+    /// Updated on every successful `MANIFEST_PUBLISH`
+    /// (i.e. every `RoomEvent::ManifestPublished`); the
+    /// value is `(version, manifest, host_user_id,
+    /// published_at_ms, manifest_hash)`. The cache is
+    /// process-local and is not persisted across server
+    /// restarts; the durable copy is the
+    /// `room_manifests` table.
+    manifest_cache: RwLock<HashMap<Uuid, CachedManifest>>,
     config: RoomRegistryConfig,
+}
+
+/// One entry in the registry's in-memory manifest cache.
+/// The cached blob is the host's exact signed manifest
+/// (as on the wire), so a viewer that joins mid-room
+/// can request `room_get_state` and get a manifest
+/// without re-canonicalizing.
+#[derive(Debug, Clone)]
+pub struct CachedManifest {
+    pub version: i64,
+    pub manifest: locast_manifest::MediaManifest,
+    pub host_user_id: Uuid,
+    pub published_at_ms: i64,
+    pub manifest_hash: [u8; 32],
 }
 
 /// A single broadcast item. The registry publishes one of
@@ -140,8 +185,27 @@ impl RoomRegistry {
             by_id: RwLock::new(HashMap::new()),
             by_code: RwLock::new(HashMap::new()),
             room_tx: RwLock::new(HashMap::new()),
+            manifest_cache: RwLock::new(HashMap::new()),
             config,
         }
+    }
+
+    /// P3-T03: look up the latest cached manifest for a
+    /// room. Returns `None` if no manifest has been
+    /// published (or if the cache entry was just removed
+    /// because the room ended).
+    pub async fn current_manifest(&self, room_id: Uuid) -> Option<CachedManifest> {
+        let cache = self.manifest_cache.read().await;
+        cache.get(&room_id).cloned()
+    }
+
+    /// P3-T03: install / replace the cached manifest for
+    /// a room. Called by the room dispatcher immediately
+    /// after a successful `insert_room_manifest` row. The
+    /// value is the just-published manifest.
+    pub async fn put_current_manifest(&self, room_id: Uuid, value: CachedManifest) {
+        let mut cache = self.manifest_cache.write().await;
+        cache.insert(room_id, value);
     }
 
     /// Subscribe to the broadcast channel of a room. Returns
@@ -1030,6 +1094,25 @@ impl RoomRegistry {
         false
     }
 
+    /// P3-T03: `true` if `user_id` is the current host of
+    /// `room_id` (the participant record's `is_host` flag is
+    /// set AND the participant's status is not Left). The
+    /// P3-T03 capability gate uses this for the host-only
+    /// `PublishManifest` check. The check is read-only and
+    /// does not require the caller to hold any locks; the
+    /// `RoomHandle` is acquired on demand and released.
+    pub async fn is_room_host(&self, room_id: Uuid, user_id: Uuid) -> bool {
+        let by_id = self.by_id.read().await;
+        if let Some(h) = by_id.get(&room_id) {
+            let s = h.read().await;
+            return s
+                .participants
+                .iter()
+                .any(|p| p.user_id == user_id && p.is_host && p.status != ParticipantStatus::Left);
+        }
+        false
+    }
+
     /// Look up a room by id. Returns the `RoomHandle` so a
     /// caller can read its state.
     pub async fn get_by_id(&self, id: Uuid) -> Option<RoomHandle> {
@@ -1064,6 +1147,15 @@ impl RoomRegistry {
             by_code.remove(&code);
             let mut room_tx = self.room_tx.write().await;
             room_tx.remove(&id);
+        }
+        // P3-T03: also drop the cached manifest so a
+        // future call to `current_manifest` returns None
+        // for this room id. The durable `room_manifests`
+        // rows are NOT touched; the room's history remains
+        // available in the table for the audit log.
+        {
+            let mut cache = self.manifest_cache.write().await;
+            cache.remove(&id);
         }
         handle
     }
@@ -1271,6 +1363,26 @@ fn event_to_broadcast_item(
             locast_protocol::envelope::MessageKind::RoomError,
             serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
         ),
+        RoomEvent::ManifestPublished {
+            manifest,
+            published_at_ms,
+            ..
+        } => {
+            // P3-T03: the server rebroadcasts the host's
+            // signed manifest as a `MANIFEST_PUBLISHED`
+            // envelope. The wire payload is the
+            // protocol-level `ManifestPublishedPayload` so
+            // viewer's `handle_inbound` can decode it
+            // directly.
+            let payload = locast_protocol::room::ManifestPublishedPayload {
+                manifest: manifest.clone(),
+                published_at_ms: *published_at_ms,
+            };
+            (
+                locast_protocol::envelope::MessageKind::ManifestPublished,
+                serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
+            )
+        }
     };
     BroadcastItem {
         kind,

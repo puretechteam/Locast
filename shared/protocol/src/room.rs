@@ -279,6 +279,40 @@ pub struct PresencePayload {
     pub status: String,
 }
 
+/// MANIFEST_PUBLISH (C -> S, host -> server). The host signs
+/// a fresh [`locast_manifest::MediaManifest`] and submits it
+/// to the server for broadcast. The server is the relay; it
+/// does NOT validate beyond the bearer + the `PublishManifest`
+/// capability check (host-only at the time of publish).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct ManifestPublishPayload {
+    /// The signed manifest. The server-side defense-in-depth
+    /// check is a `locast_manifest::verify_manifest` call, but
+    /// it is NOT the trust boundary: the viewer's TOFU check
+    /// against the invite's `h=` parameter is.
+    pub manifest: locast_manifest::MediaManifest,
+}
+
+/// MANIFEST_PUBLISHED (S -> C, server -> all participants).
+/// Broadcast to every participant in the room after a
+/// successful MANIFEST_PUBLISH. Viewers store the verified
+/// manifest locally and kick off the P3 download flow.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct ManifestPublishedPayload {
+    /// The signed manifest, echoed from the host's
+    /// MANIFEST_PUBLISH. Viewers verify the signature against
+    /// the host's pubkey (the manifest's
+    /// `host_signature.public_key`) and TOFU-compare against
+    /// the invite's `h=` parameter.
+    pub manifest: locast_manifest::MediaManifest,
+    /// Server-stamped publication time, unix ms. Used by the
+    /// viewer to track the latest version of the manifest
+    /// (P3-T07 will add a true per-room version counter).
+    pub published_at_ms: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

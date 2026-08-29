@@ -123,3 +123,41 @@ pub async fn recent_room_upsert(
 fn room_err_to_app(e: RoomClientError) -> AppError {
     AppError::other(e.to_string())
 }
+
+/// P3-T03: publish a signed `MediaManifest` to the current
+/// room. The host must already be in a `Connected` room
+/// state; the command reads the cached `room_id` from the
+/// `RoomClient`, builds the manifest from the local
+/// `media_items` table, signs it through the local
+/// identity, and sends a `MANIFEST_PUBLISH` envelope over
+/// the signaling client.
+///
+/// The server enforces the host-only capability. The
+/// command itself does not need to check `is_host` because
+/// the `RoomClient.state().host_user_id == identity.user_id`
+/// invariant is maintained by the room-lifecycle commands;
+/// if the host is wrong, the server returns a
+/// `ROOM_ERROR(NotHost)`.
+#[tauri::command]
+#[specta::specta]
+pub async fn manifest_publish(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    identity: TauriState<'_, std::sync::Arc<crate::identity::keystore::IdentityService>>,
+    signaling: TauriState<'_, std::sync::Arc<SignalingClient>>,
+    storage: TauriState<'_, Storage>,
+) -> Result<(), AppError> {
+    let summary = room
+        .state()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    let room_id = uuid::Uuid::parse_str(&summary.id)
+        .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    crate::room::host::build_sign_and_publish(
+        identity.inner().clone(),
+        signaling.inner().clone(),
+        storage.pool(),
+        room_id,
+    )
+    .await
+    .map_err(|e| AppError::other(e.to_string()))
+}

@@ -274,6 +274,53 @@ mod tests {
                 .expect("render PresencePayload bindings"),
         );
         rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ManifestPublishPayload::export_to_string(&cfg)
+                .expect("render ManifestPublishPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ManifestPublishedPayload::export_to_string(&cfg)
+                .expect("render ManifestPublishedPayload bindings"),
+        );
+        rendered.push('\n');
+        // Render the manifest types so the protocol's
+        // generated ts file declares them inline (the
+        // protocol's `MANIFEST_PUBLISH*` payloads carry
+        // a `MediaManifest` by value).
+        rendered.push_str(
+            &locast_manifest::MediaManifest::export_to_string(&cfg)
+                .expect("render MediaManifest bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::MediaEntry::export_to_string(&cfg)
+                .expect("render MediaEntry bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::Dimensions::export_to_string(&cfg)
+                .expect("render Dimensions bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::Codecs::export_to_string(&cfg).expect("render Codecs bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::Source::export_to_string(&cfg).expect("render Source bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::SubtitleEntry::export_to_string(&cfg)
+                .expect("render SubtitleEntry bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &locast_manifest::HostSignature::export_to_string(&cfg)
+                .expect("render HostSignature bindings"),
+        );
+        rendered.push('\n');
 
         let path = std::path::Path::new("ts/index.ts");
 

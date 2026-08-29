@@ -401,6 +401,38 @@ impl IdentityService {
         .map_err(|e| IdentityServiceError::Storage(e.to_string()))?;
         Ok(())
     }
+
+    /// P3-T03: sign a media manifest and return a fresh
+    /// `MediaManifest` whose `host_signature` is populated.
+    ///
+    /// The host keeps the private key in the OS keyring; this
+    /// helper loads it, calls the P3-T02 canonical/signing
+    /// pipeline, and returns the signed manifest. The keypair
+    /// (and the 32-byte seed derived from it) is dropped as
+    /// soon as the function returns. No private-key bytes
+    /// ever leave this function — only the public key and
+    /// the signature, both embedded in the returned
+    /// `MediaManifest`.
+    ///
+    /// The caller (a Tauri command) is responsible for
+    /// publishing the signed manifest over the room's
+    /// WebSocket.
+    pub async fn sign_manifest(
+        &self,
+        manifest: &locast_manifest::MediaManifest,
+    ) -> Result<locast_manifest::MediaManifest, IdentityServiceError> {
+        let kp = self.load_keypair().await?;
+        // `kp.signing.to_bytes()` returns the 32-byte RFC 8032
+        // seed. This is the ONLY place the raw seed ever
+        // exists in memory for a manifest sign; it is dropped
+        // when the `seed` binding goes out of scope at the
+        // end of this function.
+        let seed = kp.signing.to_bytes();
+        let signed = locast_manifest::sign_manifest(&seed, manifest)
+            .map_err(|e| IdentityServiceError::Other(format!("sign_manifest: {e}")))?;
+        // `kp` and `seed` are dropped here.
+        Ok(signed)
+    }
 }
 
 /// Errors raised by [`IdentityService`]. The variants are the
