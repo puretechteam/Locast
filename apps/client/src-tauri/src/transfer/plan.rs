@@ -421,7 +421,9 @@ mod tests {
 
     #[test]
     fn plan_accepts_multiple_chunks_with_final_partial() {
-        // 600 KiB + 17 -> 3 chunks.
+        // 600 KiB + 17 = 614417 bytes -> 3 chunks: two full
+        // 256 KiB chunks + a 90129-byte trailing chunk
+        // (88 KiB + 17).
         let size = 600 * 1024 + 17;
         let e = entry_with(size as u64, &canonical_peer_id());
         let plan = plan_download("dl-1", "m", 1, &e, &canonical_peer_id()).expect("plan");
@@ -429,7 +431,7 @@ mod tests {
         assert_eq!(plan.chunks[0].length, CHUNK_SIZE as u32);
         assert_eq!(plan.chunks[1].length, CHUNK_SIZE as u32);
         assert_eq!(plan.chunks[2].offset, 2 * CHUNK_SIZE as u64);
-        assert_eq!(plan.chunks[2].length, 17);
+        assert_eq!(plan.chunks[2].length, 90129);
         assert_eq!(
             plan.chunks.iter().map(|c| c.length as u64).sum::<u64>(),
             size as u64
@@ -459,12 +461,18 @@ mod tests {
     #[test]
     fn plan_rejects_bad_chunk_count() {
         let mut e = entry_with(600 * 1024, &canonical_peer_id());
+        // Bump declared total_chunks by 1 without changing
+        // size_bytes: the planner rejects on
+        // TotalChunksMismatch (the declared total disagrees
+        // with ceil(size/chunk_size)), not on
+        // ChunkHashCountMismatch (the hashes vector is
+        // resized to match the new declared total).
         e.sources[0].total_chunks += 1;
         e.sources[0].chunk_hashes = (0..e.sources[0].total_chunks)
             .map(|_| "0".repeat(64))
             .collect();
         let err = plan_download("dl-1", "m", 1, &e, &canonical_peer_id()).unwrap_err();
-        assert_eq!(err.kind(), PlanErrorKind::ChunkHashCountMismatch);
+        assert_eq!(err.kind(), PlanErrorKind::TotalChunksMismatch);
     }
 
     #[test]

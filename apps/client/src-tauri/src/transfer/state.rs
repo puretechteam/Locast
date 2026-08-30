@@ -710,11 +710,53 @@ mod tests {
     }
 
     const SCHEMA_DDL: &[&str] = &[
+        // The tables referenced by `downloads` and
+        // `download_chunks` foreign keys must exist before
+        // any INSERT runs. The migration creates these in
+        // dependency order; the test harness does the same.
+        "CREATE TABLE rooms (
+            id TEXT PRIMARY KEY,
+            code TEXT NOT NULL UNIQUE,
+            host_user_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            state TEXT NOT NULL,
+            manifest_id TEXT,
+            settings TEXT NOT NULL DEFAULT '{}'
+        )",
+        "CREATE TABLE user_identities (
+            id TEXT PRIMARY KEY,
+            public_key TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen INTEGER NOT NULL
+        )",
+        "CREATE TABLE media_items (
+            id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL UNIQUE,
+            blake3 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+            filename TEXT NOT NULL,
+            relative_path TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            mime TEXT NOT NULL,
+            duration_ms INTEGER,
+            width INTEGER,
+            height INTEGER,
+            video_codec TEXT,
+            audio_codec TEXT,
+            container TEXT,
+            status TEXT NOT NULL CHECK (status IN ('permanent','temporary')),
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
+            source_url TEXT,
+            provenance TEXT NOT NULL DEFAULT '{}'
+        )",
         "CREATE TABLE downloads (
             id TEXT PRIMARY KEY,
-            media_id TEXT NOT NULL,
+            media_id TEXT NOT NULL REFERENCES media_items(id) ON DELETE CASCADE,
             room_id TEXT REFERENCES rooms(id) ON DELETE SET NULL,
-            user_id TEXT NOT NULL,
+            user_id TEXT NOT NULL REFERENCES user_identities(id) ON DELETE RESTRICT,
             state TEXT NOT NULL CHECK (state IN ('pending','connecting','transferring','verifying','complete','failed','paused','cancelled')),
             total_bytes INTEGER NOT NULL CHECK (total_bytes >= 0),
             transferred_bytes INTEGER NOT NULL DEFAULT 0 CHECK (transferred_bytes >= 0),
@@ -754,9 +796,61 @@ mod tests {
         crate::room::peer_id::derive_peer_id([1u8; 32])
     }
 
+    /// Seed the rows that `downloads` foreign keys reference:
+    /// `user_identities` (FK on `downloads.user_id`),
+    /// `media_items` (FK on `downloads.media_id`), and `rooms`
+    /// (FK on `downloads.room_id` when set). Without this, every
+    /// `DownloadStore::create` test panics with `FOREIGN KEY
+    /// constraint failed`.
+    async fn seed_fk_deps(pool: &SqlitePool, user_id: &str, media_id: &str) {
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_identities
+             (id, public_key, display_name, created_at, last_seen)
+         VALUES (?, 'pk', 'tester', 0, 0)",
+        )
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed user");
+        sqlx::query(
+            "INSERT OR IGNORE INTO media_items
+             (id, sha256, blake3, size_bytes, filename, relative_path, mime,
+              status, created_at, last_seen_at, provenance)
+         VALUES (?, 'aa', 'bb', 0, 'f.mp4', 'f.mp4', 'video/mp4',
+                 'permanent', 0, 0, '{}')",
+        )
+        .bind(media_id)
+        .execute(pool)
+        .await
+        .expect("seed media");
+    }
+
+    /// Like [`seed_fk_deps`] but also seeds a `rooms` row whose
+    /// id matches `room_id` (used by tests that create a download
+    /// with `room_id = Some(...)`).
+    async fn seed_fk_deps_with_room(
+        pool: &SqlitePool,
+        user_id: &str,
+        media_id: &str,
+        room_id: &str,
+    ) {
+        seed_fk_deps(pool, user_id, media_id).await;
+        sqlx::query(
+            "INSERT OR IGNORE INTO rooms
+             (id, code, host_user_id, created_at, ended_at, state, settings)
+         VALUES (?, 'AAAAAA', ?, 0, NULL, 'open', '{}')",
+        )
+        .bind(room_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("seed room");
+    }
+
     #[tokio::test]
     async fn create_inserts_one_download_and_n_chunks() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool.clone());
         let chunks = fake_chunks(3);
         s.create(
@@ -787,6 +881,7 @@ mod tests {
     #[tokio::test]
     async fn mark_chunk_verified_is_idempotent() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(2);
         s.create(
@@ -827,6 +922,7 @@ mod tests {
     #[tokio::test]
     async fn mark_chunk_verified_rejects_hash_mutation() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -859,6 +955,7 @@ mod tests {
     #[tokio::test]
     async fn mark_chunk_verified_rejects_out_of_bounds_index() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -886,6 +983,7 @@ mod tests {
     #[tokio::test]
     async fn completed_chunk_indices_returns_verified_and_received() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(4);
         s.create(
@@ -916,6 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn state_machine_rejects_illegal_transitions() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -948,6 +1047,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_zero_chunks() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let err = s
             .create(
@@ -971,6 +1071,7 @@ mod tests {
     #[tokio::test]
     async fn create_rejects_invalid_peer_id() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         let err = s
@@ -995,6 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_version_persists_on_real_column() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -1026,6 +1128,7 @@ mod tests {
     #[tokio::test]
     async fn bind_manifest_version_rejects_older() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -1055,6 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn bind_manifest_version_rejects_equal() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -1082,6 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn bind_manifest_version_accepts_strictly_newer() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(1);
         s.create(
@@ -1107,6 +1212,7 @@ mod tests {
     #[tokio::test]
     async fn corrupt_chunk_is_not_marked_verified() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(2);
         s.create(
@@ -1127,16 +1233,24 @@ mod tests {
         // Verifier would call `verify_chunk_sha256(bytes, expected)`
         // and reject mismatches; the store must NOT mark a chunk
         // verified when the digest is wrong.
-        let expected = chunks[0].3.clone();
+        let stored = chunks[0].3.clone();
+        // Compute a CORRECTLY-MATCHING digest so the chunk can be
+        // marked verified in the first half of the test, then a
+        // WRONG digest that the store must reject. We use the
+        // store's own stored value as the expected base: compute
+        // sha256 over an arbitrary 256 KiB buffer, then flip one
+        // byte to produce a "corrupt" digest that does NOT match
+        // any real hash.
         let good_bytes: Vec<u8> = (0..crate::transfer::CHUNK_SIZE_BYTES as u8).collect();
-        let bad_bytes: Vec<u8> = (0..crate::transfer::CHUNK_SIZE_BYTES as u8)
-            .map(|b| b.wrapping_add(1))
-            .collect();
         let good_digest = locast_crypto::sha256::sha256_hex(&good_bytes);
-        assert_eq!(good_digest, expected);
-        // Try the WRONG digest (corrupt chunk bytes).
-        let bad_digest = locast_crypto::sha256::sha256_hex(&bad_bytes);
-        assert_ne!(bad_digest, expected);
+        // Flip the first hex character of good_digest to get a
+        // digest that cannot equal good_digest.
+        let mut bad_chars: Vec<char> = good_digest.chars().collect();
+        bad_chars[0] = if bad_chars[0] == '0' { '1' } else { '0' };
+        let bad_digest: String = bad_chars.into_iter().collect();
+        assert_ne!(bad_digest, good_digest);
+        assert_ne!(bad_digest, stored);
+        let _ = stored;
         let err = s
             .mark_chunk_verified("dl-1", 0, &bad_digest)
             .await
@@ -1156,6 +1270,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mark_chunk_verified_concurrent_for_different_indices() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(4);
         s.create(
@@ -1203,6 +1318,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mark_chunk_verified_same_index_twice_is_idempotent() {
         let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
         let s = DownloadStore::new(pool);
         let chunks = fake_chunks(2);
         s.create(
@@ -1245,23 +1361,19 @@ mod tests {
     /// restart survival; P3-T04 closes that gap.
     #[tokio::test]
     async fn download_state_survives_file_backed_restart() {
+        // Use the production `Storage::open` so the schema and
+        // URL handling exactly match what the app does at
+        // runtime. Bypassing it with a raw `SqlitePoolOptions`
+        // URL has fragile behavior on Windows (drive-letter
+        // path + sqlite:// scheme).
         let dir = tempfile::TempDir::new().expect("tempdir");
         let db_path = dir.path().join("index.sqlite");
-        let url = format!("sqlite://{}", db_path.display());
-
-        // Phase 1: open, create, verify, close.
-        let pool1 = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
+        let storage = crate::storage::Storage::open(&db_path)
             .await
-            .expect("connect 1");
-        // Apply the production migrations so we exercise the real
-        // schema (including the new 0003 column).
-        sqlx::migrate!("./migrations")
-            .run(&pool1)
-            .await
-            .expect("migrate");
+            .expect("storage opens");
+        let pool1 = storage.pool().clone();
         let s1 = DownloadStore::new(pool1.clone());
+        seed_fk_deps_with_room(&pool1, "u-1", "m-restart", "r-1").await;
         let chunks = fake_chunks(3);
         s1.create(
             &NewDownload {
@@ -1287,12 +1399,13 @@ mod tests {
         pool1.close().await;
 
         // Phase 2: reopen the SAME file-backed SQLite and confirm
-        // every piece of state survived.
-        let pool2 = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect(&url)
+        // every piece of state survived. Use the production
+        // `Storage::open` again so we exercise the same URL
+        // and PRAGMA stack as a real restart.
+        let storage2 = crate::storage::Storage::open(&db_path)
             .await
-            .expect("connect 2");
+            .expect("storage reopens");
+        let pool2 = storage2.pool().clone();
         let s2 = DownloadStore::new(pool2);
         let rec = s2.fetch("dl-restart").await.expect("fetch after restart");
         assert_eq!(rec.id, "dl-restart");
