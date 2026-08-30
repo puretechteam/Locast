@@ -517,10 +517,7 @@ mod tests {
             .expect("build");
         let src = &m.media[0].sources[0];
         assert_eq!(src.chunk_size, CHUNK_SIZE as u32);
-        assert_eq!(
-            src.total_chunks as usize,
-            len.div_ceil(CHUNK_SIZE)
-        );
+        assert_eq!(src.total_chunks as usize, len.div_ceil(CHUNK_SIZE));
         assert_eq!(src.chunk_hashes.len(), src.total_chunks as usize);
 
         // Independently re-read the file and recompute
