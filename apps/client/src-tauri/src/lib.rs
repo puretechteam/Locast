@@ -24,6 +24,7 @@ pub mod net;
 pub mod probe;
 pub mod room;
 pub mod storage;
+pub mod transfer;
 
 use identity::keystore::IdentityService;
 use library::protocol::ProtocolHandler;

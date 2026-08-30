@@ -495,6 +495,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_manifest_chunk_hashes_match_independent_sha256() {
+        // 600 KiB + 17 bytes -> 3 chunks: two full 256
+        // KiB chunks and one trailing ~88 KiB + 17 chunk.
+        let dir = TempDir::new().expect("tempdir");
+        let rel_path = "library/ab/abcdef02/movie.bin";
+        let len: usize = 600 * 1024 + 17;
+        write_temp_file(&dir, rel_path, len);
+
+        let pool = fresh_pool_with_row(
+            "movie.bin",
+            rel_path,
+            len as i64,
+            "00".repeat(32).as_str(),
+            "11".repeat(32).as_str(),
+        )
+        .await;
+
+        let m = build_manifest(&pool, dir.path(), Uuid::now_v7(), TEST_PUBKEY)
+            .await
+            .expect("build");
+        let src = &m.media[0].sources[0];
+        assert_eq!(src.chunk_size, CHUNK_SIZE as u32);
+        assert_eq!(
+            src.total_chunks as usize,
+            len.div_ceil(CHUNK_SIZE)
+        );
+        assert_eq!(src.chunk_hashes.len(), src.total_chunks as usize);
+
+        // Independently re-read the file and recompute
+        // per-chunk SHA-256.
+        let abs = dir.path().join(rel_path);
+        let bytes = std::fs::read(&abs).expect("read fixture");
+        let mut expected_chunk = Vec::with_capacity(src.chunk_hashes.len());
+        for chunk_start in (0..bytes.len()).step_by(CHUNK_SIZE) {
+            let end = (chunk_start + CHUNK_SIZE).min(bytes.len());
+            let digest = locast_crypto::sha256::sha256_hex(&bytes[chunk_start..end]);
+            expected_chunk.push(digest);
+        }
+        assert_eq!(src.chunk_hashes, expected_chunk);
+
+        // Full-file BLAKE3 of the manifest matches
+        // independent BLAKE3 of the file bytes.
+        let expected_blake3 = locast_crypto::blake3::blake3_hex(&bytes);
+        assert_eq!(m.media[0].blake3, expected_blake3);
+
+        // Manifest size_bytes agrees with the file.
+        assert_eq!(m.media[0].size_bytes, len as u64);
+    }
+
+    #[tokio::test]
     async fn build_manifest_empty_library_errors() {
         let dir = TempDir::new().expect("tempdir");
         let pool = SqlitePoolOptions::new()

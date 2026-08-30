@@ -209,6 +209,34 @@ pub enum AppError {
     /// `AppError::other` constructor use it.
     #[error("internal error: {message}")]
     Other { message: String },
+
+    // ------------------------------------------------------------------
+    // P3-T04 (chunk planner + bitmap persistence) variants.
+    // ------------------------------------------------------------------
+    /// The chunk planner rejected a manifest input. Carries a
+    /// machine-readable reason so the webview can surface a
+    /// meaningful error without parsing the string.
+    #[error("download plan rejected: {reason}")]
+    InvalidDownloadPlan { reason: String },
+
+    /// The download row's manifest version disagrees with the
+    /// currently-cached manifest version. The caller should drop
+    /// the download plan and re-plan against the latest manifest.
+    #[error("manifest version mismatch: download={download_version}, current={current_version}")]
+    ManifestVersionMismatch {
+        download_version: i64,
+        current_version: i64,
+    },
+
+    /// The chunk index is outside the bounds of the download's
+    /// plan (`[0, total_chunks)`). The chunk must be dropped.
+    #[error("chunk index out of bounds: {index} >= {total}")]
+    ChunkIndexOutOfBounds {
+        #[specta(type = specta_typescript::Number)]
+        index: u32,
+        #[specta(type = specta_typescript::Number)]
+        total: u32,
+    },
 }
 
 /// Convert a `sqlx::Error` into an `AppError::Database` so `?` works

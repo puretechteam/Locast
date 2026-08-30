@@ -256,6 +256,40 @@ pub enum RoomClientError {
     Unexpected(String),
     #[error("signaling error: {0}")]
     Signaling(String),
+    #[error("manifest rejected: {0}")]
+    ManifestRejected(String),
+}
+
+/// Closed set of reasons the verifier pipeline rejects a
+/// manifest. Used by `RoomClient::accept_manifest` and
+/// surfaced (in display form) on the `manifest_fetch`
+/// late-join path.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestAcceptError {
+    #[error("signature verification failed: {0}")]
+    BadSignature(String),
+    #[error("malformed manifest room_id: {0}")]
+    BadRoomId(String),
+    #[error("host_signature.public_key wrong length: {0}")]
+    BadPubkeyLength(usize),
+    #[error("host_signature.public_key not valid base64")]
+    BadPubkeyFormat,
+    #[error("manifest has no host_signature")]
+    NoHostSignature,
+    #[error("no trust anchor installed (set_expected_host_pubkey)")]
+    NoTrustAnchor,
+    #[error("host_signature.public_key does not match invite h=")]
+    TrustAnchorMismatch,
+    #[error("canonical serialization failed: {0}")]
+    Canonicalize(String),
+    #[error("stale version: incoming {incoming} < cached {cached}")]
+    StaleVersion { incoming: i64, cached: i64 },
+}
+
+impl From<ManifestAcceptError> for RoomClientError {
+    fn from(e: ManifestAcceptError) -> Self {
+        RoomClientError::ManifestRejected(e.to_string())
+    }
 }
 
 /// Tauri event name emitted whenever the cached room
@@ -365,6 +399,13 @@ pub struct RoomClient {
     /// `room_manifests` table. `None` in unit tests
     /// that do not set up storage.
     pool: StdMutex<Option<sqlx::SqlitePool>>,
+    /// P3-T04: highest server-assigned `version` per room
+    /// accepted into the in-memory cache. Used by the
+    /// `MANIFEST_PUBLISHED` handler to reject stale
+    /// (out-of-order / replayed) envelopes so a newer
+    /// cached/persisted manifest cannot be downgraded by
+    /// a previously-buffered older one.
+    current_versions: StdMutex<HashMap<Uuid, i64>>,
 }
 
 impl RoomClient {
@@ -381,6 +422,7 @@ impl RoomClient {
             verified_manifests: StdMutex::new(HashMap::new()),
             expected_host_pubkey: StdMutex::new(None),
             pool: StdMutex::new(None),
+            current_versions: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -536,13 +578,16 @@ impl RoomClient {
     /// P3-T04 prerequisite 3: ask the server for the
     /// room's currently-authoritative manifest. Used by
     /// late-joiners to catch up on a manifest that was
-    /// published before the viewer joined. The server
-    /// returns a `MANIFEST_RESPONSE` carrying the
-    /// `MediaManifest`, the per-room `version`, and the
-    /// `published_at_ms`.
+    /// published before the viewer joined.
     ///
-    /// `room_id` must be the caller's current room (the
-    /// server's capability gate checks this).
+    /// The response goes through the SAME verify + TOFU +
+    /// stale-version guard + persist + emit pipeline as
+    /// the `MANIFEST_PUBLISHED` broadcast path, so a late
+    /// joiner is never exposed to a manifest whose host
+    /// signature does not match the invite's `h=` anchor,
+    /// and a hostile server cannot downgrade the cached
+    /// version. On rejection, `Err` is returned and the
+    /// caller surfaces a typed error.
     pub async fn manifest_fetch(
         &self,
         room_id: Uuid,
@@ -551,8 +596,168 @@ impl RoomClient {
         let payload = locast_protocol::room::ManifestRequestPayload { media_id };
         let env = envelope(MessageKind::ManifestRequest, Some(room_id), payload);
         let reply = self.request(env, MessageKind::ManifestResponse).await?;
-        let payload: locast_protocol::room::ManifestResponsePayload = decode_payload(&reply)?;
-        Ok(payload)
+        let response: locast_protocol::room::ManifestResponsePayload = decode_payload(&reply)?;
+        self.accept_manifest(
+            response.manifest.clone(),
+            response.version,
+            response.published_at_ms,
+            "MANIFEST_RESPONSE",
+        )
+        .await?;
+        Ok(response)
+    }
+
+    /// P3-T04 (P3-T03 prerequisite): the verified-manifest
+    /// acceptance pipeline. Called from BOTH the
+    /// `MANIFEST_PUBLISHED` broadcast handler and the
+    /// `MANIFEST_RESPONSE` late-join fetch path so the
+    /// trust boundary is identical on every entry point.
+    ///
+    /// Steps (return `Err` on any failure; the caller
+    /// logs at WARN with the supplied `source`):
+    /// 1. `verify_manifest` (cryptographic signature).
+    /// 2. Parse `manifest.room_id` -> Uuid.
+    /// 3. Decode `host_signature.public_key` to raw 32
+    ///    bytes; compare against the installed
+    ///    `expected_host_pubkey` (TOFU trust anchor).
+    /// 4. Compute the BLAKE3 of canonical bytes for the
+    ///    small event payload.
+    /// 5. Reject stale manifests (`incoming_version <
+    ///    cached_version`).
+    /// 6. Insert into the in-memory cache.
+    /// 7. Persist to `room_manifests` (best-effort; does
+    ///    not roll back the cache on failure).
+    /// 8. Emit `manifest://state`.
+    ///
+    /// Returns the room UUID on success so the broadcast
+    /// path can use it without re-parsing.
+    pub async fn accept_manifest(
+        &self,
+        manifest: locast_manifest::MediaManifest,
+        incoming_version: i64,
+        published_at_ms: i64,
+        source: &'static str,
+    ) -> Result<Uuid, ManifestAcceptError> {
+        // Step 1: cryptographic signature.
+        if let Err(e) = locast_manifest::verify_manifest(&manifest) {
+            return Err(ManifestAcceptError::BadSignature(e.to_string()));
+        }
+        // Step 2: parse room_id.
+        let room_uuid = Uuid::parse_str(&manifest.room_id)
+            .map_err(|e| ManifestAcceptError::BadRoomId(e.to_string()))?;
+        // Step 3: TOFU against the invite h= anchor.
+        let manifest_pubkey_bytes = match manifest.host_signature.as_ref() {
+            Some(hs) => match locast_crypto::ed25519::from_base64(&hs.public_key) {
+                Ok(b) if b.len() == 32 => {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&b);
+                    out
+                }
+                Ok(b) => {
+                    return Err(ManifestAcceptError::BadPubkeyLength(b.len()));
+                }
+                Err(_) => {
+                    return Err(ManifestAcceptError::BadPubkeyFormat);
+                }
+            },
+            None => {
+                return Err(ManifestAcceptError::NoHostSignature);
+            }
+        };
+        let expected = {
+            let g = self
+                .expected_host_pubkey
+                .lock()
+                .expect("expected_host_pubkey lock");
+            *g
+        };
+        let expected = expected.ok_or(ManifestAcceptError::NoTrustAnchor)?;
+        if manifest_pubkey_bytes != expected {
+            return Err(ManifestAcceptError::TrustAnchorMismatch);
+        }
+        // Step 4: BLAKE3 of canonical bytes.
+        let manifest_hash = locast_manifest::serialize(&manifest)
+            .map(|bytes| locast_crypto::blake3::blake3_hex(&bytes))
+            .map_err(|e| ManifestAcceptError::Canonicalize(e.to_string()))?;
+        // Step 5: stale-version guard.
+        {
+            let mut versions = self.current_versions.lock().expect("current_versions lock");
+            if let Some(prev) = versions.get(&room_uuid).copied() {
+                if incoming_version < prev {
+                    return Err(ManifestAcceptError::StaleVersion {
+                        incoming: incoming_version,
+                        cached: prev,
+                    });
+                }
+            }
+            versions.insert(room_uuid, incoming_version);
+        }
+        // Step 6: in-memory cache.
+        {
+            let mut cache = self
+                .verified_manifests
+                .lock()
+                .expect("verified_manifests lock");
+            cache.insert(room_uuid, manifest.clone());
+        }
+        // Step 7: persist.
+        let _ = source;
+        {
+            let pool_opt = self.pool.lock().expect("pool lock").clone();
+            if let Some(pool) = pool_opt {
+                let store = crate::storage::manifests::ManifestStore::new(&pool);
+                let row_id = Uuid::now_v7();
+                if let Err(e) = store
+                    .upsert(
+                        row_id,
+                        room_uuid,
+                        published_at_ms,
+                        &manifest,
+                        incoming_version,
+                    )
+                    .await
+                {
+                    warn!(
+                        error = %e,
+                        source = source,
+                        "manifest accept: ManifestStore::upsert failed; in-memory cache is authoritative for this session"
+                    );
+                }
+            }
+        }
+        // Step 8: emit.
+        let ev = ManifestStateEvent {
+            room_id: room_uuid.to_string(),
+            manifest_hash,
+            version: incoming_version,
+        };
+        self.emit_manifest_state(&ev).await;
+        Ok(room_uuid)
+    }
+
+    async fn handle_manifest_published(&self, env: &Envelope) {
+        let payload: locast_protocol::room::ManifestPublishedPayload = match decode_payload(env) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: bad payload");
+                return;
+            }
+        };
+        let manifest = payload.manifest;
+        match self
+            .accept_manifest(
+                manifest,
+                payload.version,
+                payload.published_at_ms,
+                "MANIFEST_PUBLISHED",
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                warn!(source = "MANIFEST_PUBLISHED", error = %e, "ignoring MANIFEST_PUBLISHED");
+            }
+        }
     }
 
     /// Send a `PRESENCE` envelope. Cheap; the server uses
@@ -731,175 +936,6 @@ impl RoomClient {
             }
             _ => {}
         }
-    }
-
-    /// P3-T03 / P3-T04: handle an inbound `MANIFEST_PUBLISHED`
-    /// envelope. The handler does the following in strict
-    /// order — any failure drops the envelope:
-    ///
-    /// 1. Decode the typed payload.
-    /// 2. `locast_manifest::verify_manifest` (the P3-T02
-    ///    cryptographic signature check; the server already
-    ///    ran the same check as defense in depth).
-    /// 3. **TOFU trust check (P3-T04 prerequisite 2):**
-    ///    decode `manifest.host_signature.public_key`
-    ///    (standard base64 with `=` padding, per P3-T02)
-    ///    to 32 raw bytes, then compare bytes to
-    ///    `self.expected_host_pubkey` (the host's raw
-    ///    32-byte Ed25519 pubkey from the parsed invite
-    ///    URL's `h=` parameter). Mismatch -> reject.
-    ///    No trust anchor installed -> reject.
-    /// 4. Compute the BLAKE3 of the canonical bytes
-    ///    for the small Tauri event payload.
-    /// 5. Insert into the verified-manifest cache
-    ///    (in-memory).
-    /// 6. **Persist to local `room_manifests` (P3-T04
-    ///    prerequisite 4):** if a `SqlitePool` is
-    ///    installed, call `ManifestStore::upsert`.
-    ///    Persistence failure is logged but does not
-    ///    roll back the in-memory cache (the manifest
-    ///    is still authoritative for the rest of the
-    ///    client session).
-    /// 7. Emit the `manifest://state` Tauri event.
-    ///
-    /// Trust-check failures, signature failures, malformed
-    /// payloads, and missing anchors are all logged at
-    /// WARN and result in the envelope being dropped
-    /// without any state update.
-    async fn handle_manifest_published(&self, env: &Envelope) {
-        let payload: locast_protocol::room::ManifestPublishedPayload = match decode_payload(env) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: bad payload");
-                return;
-            }
-        };
-        let manifest = payload.manifest;
-
-        // Step 1: cryptographic signature check (P3-T02).
-        if let Err(e) = locast_manifest::verify_manifest(&manifest) {
-            warn!(error = %e, "ignoring MANIFEST_PUBLISHED: verify_manifest failed");
-            return;
-        }
-
-        // Step 2: parse the room_id.
-        let room_uuid = match Uuid::parse_str(&manifest.room_id) {
-            Ok(u) => u,
-            Err(e) => {
-                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: bad room_id");
-                return;
-            }
-        };
-
-        // Step 3: TOFU trust check against the invite
-        // `h=` anchor. The anchor must be installed (the
-        // viewer should have parsed the invite URL
-        // before joining); the manifest's pubkey, when
-        // decoded to raw 32 bytes, must match exactly.
-        let manifest_pubkey_bytes = match manifest.host_signature.as_ref() {
-            Some(hs) => {
-                match locast_crypto::ed25519::from_base64(&hs.public_key) {
-                    Ok(b) if b.len() == 32 => {
-                        let mut out = [0u8; 32];
-                        out.copy_from_slice(&b);
-                        out
-                    }
-                    Ok(b) => {
-                        warn!(
-                            got_len = b.len(),
-                            "ignoring MANIFEST_PUBLISHED: host_signature.public_key wrong length"
-                        );
-                        return;
-                    }
-                    Err(_) => {
-                        warn!("ignoring MANIFEST_PUBLISHED: host_signature.public_key not valid base64");
-                        return;
-                    }
-                }
-            }
-            None => {
-                warn!("ignoring MANIFEST_PUBLISHED: manifest has no host_signature");
-                return;
-            }
-        };
-        let expected = {
-            let g = self
-                .expected_host_pubkey
-                .lock()
-                .expect("expected_host_pubkey lock");
-            *g
-        };
-        let expected = match expected {
-            Some(e) => e,
-            None => {
-                warn!("ignoring MANIFEST_PUBLISHED: no trust anchor installed (set_expected_host_pubkey)");
-                return;
-            }
-        };
-        if manifest_pubkey_bytes != expected {
-            warn!(
-                room_id = %room_uuid,
-                "ignoring MANIFEST_PUBLISHED: host_signature.public_key does not match invite h="
-            );
-            return;
-        }
-
-        // Step 4: compute the BLAKE3 of the canonical bytes
-        // for the small event payload.
-        let manifest_hash = match locast_manifest::serialize(&manifest) {
-            Ok(bytes) => locast_crypto::blake3::blake3_hex(&bytes),
-            Err(e) => {
-                warn!(error = %e, "ignoring MANIFEST_PUBLISHED: canonicalize failed");
-                return;
-            }
-        };
-
-        // Step 5: in-memory cache. v1 has exactly one
-        // manifest per room; later versions (P3-T07) will
-        // add a version counter.
-        {
-            let mut cache = self
-                .verified_manifests
-                .lock()
-                .expect("verified_manifests lock");
-            cache.insert(room_uuid, manifest.clone());
-        }
-
-        // Step 6: persist to local room_manifests (P3-T04
-        // prerequisite 4). Best-effort: a persistence
-        // failure logs WARN but does NOT undo the
-        // in-memory cache.
-        let version = 1_i64; // P3-T07 will thread the real version
-        {
-            let pool_opt = self.pool.lock().expect("pool lock").clone();
-            if let Some(pool) = pool_opt {
-                let store = crate::storage::manifests::ManifestStore::new(&pool);
-                let row_id = Uuid::now_v7();
-                if let Err(e) = store
-                    .upsert(
-                        row_id,
-                        room_uuid,
-                        payload.published_at_ms,
-                        &manifest,
-                        version,
-                    )
-                    .await
-                {
-                    warn!(
-                        error = %e,
-                        "MANIFEST_PUBLISHED: ManifestStore::upsert failed; in-memory cache is authoritative for this session"
-                    );
-                }
-            }
-        }
-
-        // Step 7: emit the small Tauri event.
-        let ev = ManifestStateEvent {
-            room_id: room_uuid.to_string(),
-            manifest_hash,
-            version,
-        };
-        self.emit_manifest_state(&ev).await;
     }
 
     /// Dispatch one inbound envelope to the first
@@ -1819,5 +1855,135 @@ mod tests {
         assert!(rc.verified_manifest(room_uuid).is_none());
         // No Tauri event fired.
         assert!(recorder.manifests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_manifest_version_is_rejected() {
+        // P3-T04 prerequisite: an older-version MANIFEST_PUBLISHED
+        // (or MANIFEST_RESPONSE arriving on the late-join path)
+        // cannot downgrade the cached manifest. The reject
+        // surfaces as `ManifestAcceptError::StaleVersion`.
+        let mut m = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: Uuid::now_v7().to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1_700_000_000_000,
+            host_signature: None,
+        };
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        m = locast_manifest::sign_manifest(&seed, &m).expect("sign");
+        let room_uuid = Uuid::parse_str(&m.room_id).expect("uuid");
+        let expected_pubkey: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+
+        let rc = fresh_room_client().await;
+        rc.set_expected_host_pubkey(expected_pubkey);
+
+        // Accept version 2 first.
+        rc.accept_manifest(m.clone(), 2, 0, "test")
+            .await
+            .expect("v2 accepted");
+
+        // Now try version 1 (stale) — must be rejected.
+        let err = rc
+            .accept_manifest(m.clone(), 1, 0, "test")
+            .await
+            .expect_err("v1 stale must be rejected");
+        assert!(matches!(
+            err,
+            super::ManifestAcceptError::StaleVersion {
+                incoming: 1,
+                cached: 2
+            }
+        ));
+        // Cache still holds the v2 manifest.
+        let cached = rc.verified_manifest(room_uuid).expect("cached");
+        assert_eq!(cached.room_id, m.room_id);
+
+        // Version 3 (strictly newer) is accepted.
+        rc.accept_manifest(m.clone(), 3, 0, "test")
+            .await
+            .expect("v3 accepted");
+    }
+
+    #[tokio::test]
+    async fn accept_manifest_direct_tofu_mismatch() {
+        // P3-T04 late-join TOFU: the unified `accept_manifest`
+        // helper must reject a manifest whose host_signature
+        // does not match the installed trust anchor, even when
+        // called directly (i.e. outside the MANIFEST_PUBLISHED
+        // broadcast handler). This is the closure of the audit
+        // finding that MANIFEST_RESPONSE previously bypassed
+        // TOFU.
+        let mut m = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: Uuid::now_v7().to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1_700_000_000_000,
+            host_signature: None,
+        };
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        m = locast_manifest::sign_manifest(&seed, &m).expect("sign");
+        let room_uuid = Uuid::parse_str(&m.room_id).expect("uuid");
+
+        let rc = fresh_room_client().await;
+        // Install a WRONG trust anchor (every byte zero'd, not
+        // the RFC 8032 §7.1 test 1 verifying key).
+        rc.set_expected_host_pubkey([0u8; 32]);
+
+        let err = rc
+            .accept_manifest(m.clone(), 1, 0, "MANIFEST_RESPONSE")
+            .await
+            .expect_err("mismatched anchor must reject");
+        assert!(matches!(
+            err,
+            super::ManifestAcceptError::TrustAnchorMismatch
+        ));
+        // No manifest cached.
+        assert!(rc.verified_manifest(room_uuid).is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_manifest_without_trust_anchor_rejects() {
+        // P3-T04 late-join TOFU: a `MANIFEST_RESPONSE` arriving
+        // before the invite has been parsed (no trust anchor
+        // installed) must be rejected. The audit's gap was
+        // that the late-join path returned the typed payload
+        // without this check.
+        let mut m = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: Uuid::now_v7().to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1_700_000_000_000,
+            host_signature: None,
+        };
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        m = locast_manifest::sign_manifest(&seed, &m).expect("sign");
+
+        let rc = fresh_room_client().await;
+        // No `set_expected_host_pubkey` call.
+        let err = rc
+            .accept_manifest(m, 1, 0, "MANIFEST_RESPONSE")
+            .await
+            .expect_err("no anchor must reject");
+        assert!(matches!(err, super::ManifestAcceptError::NoTrustAnchor));
     }
 }

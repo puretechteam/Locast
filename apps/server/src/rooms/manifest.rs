@@ -176,6 +176,7 @@ pub async fn handle_manifest_publish(
 /// if a stale connection is still around).
 pub async fn handle_manifest_fetch(
     envelope: &locast_protocol::envelope::Envelope,
+    user_id: Uuid,
     registry: &RoomRegistry,
 ) -> Result<locast_protocol::room::ManifestResponsePayload, RoomError> {
     // Decode the request payload (the dispatch layer has
@@ -185,6 +186,15 @@ pub async fn handle_manifest_fetch(
     let _payload: locast_protocol::room::ManifestRequestPayload =
         serde_json::from_value(envelope.payload.clone()).map_err(|_| RoomError::InvalidState)?;
     let room_id = envelope.room_id.ok_or(RoomError::InvalidState)?;
+    // P3-T04 prerequisite (authorization gap): the
+    // authenticated user MUST be a participant of THIS
+    // exact room. Membership in a different room is not
+    // sufficient. Bearer-derived `user_id` is
+    // authoritative; client-supplied identity is never
+    // trusted.
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return Err(RoomError::NotJoined);
+    }
     let cached = registry
         .current_manifest(room_id)
         .await

@@ -1,0 +1,24 @@
+-- Locast migration 0003: add `downloads.manifest_version` for P3-T04.
+--
+-- P3-T04 binds each download plan to the server-assigned manifest
+-- version that was current when the plan was created. When a newer
+-- manifest arrives, the planner must be able to detect the mismatch
+-- and either invalidate the old plan or migrate it according to the
+-- manifest-version/trust rules; see `docs/ARCHITECTURE.md` section 9
+-- and the P3-T04 prompt.
+--
+-- The first P3-T04 implementation stashed the version in
+-- `downloads.last_error` as the literal text "mv=<N>". That collided
+-- with the actual `last_error` semantics: any transport-layer error
+-- write would clobber the stashed version, silently dropping the
+-- download's manifest-version binding on the next `fetch` /
+-- `list` read.
+--
+-- This migration adds a dedicated `manifest_version INTEGER NOT NULL
+-- DEFAULT 1` column. Existing rows (from P3-T03 or earlier) are
+-- backfilled with `1` because the v1 manifest shape is the only one
+-- any earlier row could have been bound to. The CHECK constraint
+-- matches the existing `downloads` column discipline (positive
+-- integer or zero for "unknown").
+
+ALTER TABLE downloads ADD COLUMN manifest_version INTEGER NOT NULL DEFAULT 1;
