@@ -57,6 +57,12 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 rmp-serde = "1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }
+# P3-T05: WebRTC peer-connection lifecycle. The
+# runtime-tokio feature is required for compatibility with the
+# existing tokio 1.x runtime; default-features = false keeps
+# smol out of the binary and skips the media stack we do not
+# use (v1 uses only DataChannels, no media tracks).
+webrtc = { version = "0.20", default-features = false, features = ["runtime-tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

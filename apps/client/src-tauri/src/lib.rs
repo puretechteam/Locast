@@ -119,8 +119,10 @@ pub fn run() {
             app.manage(protocol_handler);
             app.manage(identity_service.clone());
             let signaling_config = SignalingConfig::from_env();
-            let signaling_client =
-                std::sync::Arc::new(SignalingClient::new(signaling_config, identity_service));
+            let signaling_client = std::sync::Arc::new(SignalingClient::new(
+                signaling_config,
+                identity_service.clone(),
+            ));
             // P2-T04: the RoomClient piggy-backs on the
             // signaling WS. Subscribe it to the signaling
             // client's inbound envelope stream so the
@@ -160,6 +162,26 @@ pub fn run() {
                 }
                 let rc = room_client.clone();
                 tokio::spawn(async move { rc.run_inbound().await });
+
+                // P3-T05: install the WebRTC PeerConnection
+                // manager. The manager subscribes to the
+                // signaling client's inbound envelope stream
+                // and, on room-state changes (polled at 200 ms
+                // — a deliberate P3-T05 simplification; see
+                // `net::webrtc` module-level docs), creates /
+                // tears down per-peer PeerConnections and
+                // exchanges SDP / ICE over the new SIGNAL
+                // envelope. The handler is dropped here; the
+                // JoinHandle lives only in the local scope.
+                let webrtc_manager = std::sync::Arc::new(
+                    net::webrtc::WebRtcManager::new(
+                        signaling_client.clone(),
+                        identity_service.clone(),
+                        room_client.clone(),
+                    ),
+                );
+                webrtc_manager.clone().start_with_room_client(room_client.clone());
+                let _webrtc_join = webrtc_manager;
             });
             app.manage(signaling_client);
             app.manage(room_client);

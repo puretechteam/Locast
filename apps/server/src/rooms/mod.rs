@@ -14,16 +14,20 @@ pub mod dispatch;
 pub mod error;
 pub mod manifest;
 pub mod registry;
+pub mod signal;
 pub mod state;
 pub mod store;
 pub mod validation;
 
 pub use codes::{generate_code, is_valid_code, normalize, ALPHABET, CODE_LEN};
-pub use dispatch::{dispatch_room_message, RoomDispatchOutcome};
+pub use dispatch::{dispatch_room_message, DispatchContext, RoomDispatchOutcome};
 pub use error::RoomError;
 pub use manifest::{handle_manifest_publish, manifest_published_envelope};
 pub use registry::{
     BroadcastItem, CachedManifest, RoomEvent, RoomHandle, RoomRegistry, RoomRegistryConfig,
+};
+pub use signal::{
+    handle_signal, SignalError, SignalOutcome, SignalRelay, SIGNAL_MAX_BYTES,
 };
 pub use state::{ParticipantRecord, RoomLifecycle, RoomState};
 use std::sync::Arc;

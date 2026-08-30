@@ -353,6 +353,82 @@ pub struct ManifestResponsePayload {
     pub published_at_ms: i64,
 }
 
+/// SIGNAL (C -> S -> C). WebRTC SDP/ICE relay between two room
+/// members. The server is a pure relay: it routes the envelope
+/// from `sender` to `to_user_id` without inspecting the `sdp` or
+/// `candidates` bodies (docs/ARCHITECTURE.md §19.3.3, §18.5.1).
+///
+/// The wire carries three discriminated payloads via the
+/// `kind` field:
+/// - `Offer`: an SDP offer (`sdp` is set, `candidates` is None
+///   at offer time; trickle candidates come in later `Ice`
+///   envelopes).
+/// - `Answer`: an SDP answer (`sdp` is set).
+/// - `Ice`: a single ICE candidate (`candidates` carries one
+///   entry); the server forwards it unchanged. A `candidates`
+///   list of length 1 with an empty-string `candidate` field
+///   signals `end-of-candidates` per §19.3.3.
+///
+/// All three variants carry an Ed25519 signature in
+/// `envelope.sender.sig` over the canonicalized payload bytes
+/// (domain-separated by `locast/v1/SIGNAL`); the server
+/// verifies the signature against the sender's pubkey and
+/// rejects envelopes whose `sender` is missing or whose
+/// `sender.user_id` / `sender.pubkey` do not match the
+/// bearer-derived identity (P3-T05 security model).
+///
+/// The `sdp` blob is base64 NOT encoded: it is the raw SDP
+/// text. The application-layer cap is 64 KiB per envelope
+/// (enforced server-side, not here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct SignalPayload {
+    /// Target peer (the receiving user_id).
+    pub to_user_id: Uuid,
+    /// Which kind of signal this is.
+    pub kind: SignalKind,
+    /// SDP body for Offer / Answer; None for Ice.
+    /// Raw SDP text (not base64).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sdp: Option<String>,
+    /// Single ICE candidate for Ice; None for Offer / Answer.
+    /// The candidate string is the SDP `candidate:` attribute
+    /// value (without the leading `candidate:` prefix is also
+    /// acceptable; the server is a pure relay and does not
+    /// inspect the body). An empty `candidate` signals
+    /// `end-of-candidates`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub candidates: Option<Vec<SignalCandidate>>,
+}
+
+/// The discriminated kind inside a SIGNAL envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum SignalKind {
+    Offer,
+    Answer,
+    Ice,
+}
+
+/// A single ICE candidate entry inside a SIGNAL Ice envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct SignalCandidate {
+    /// The candidate string (SDP `candidate:<...>` value, or
+    /// the full line including the `candidate:` prefix). The
+    /// server does not parse this; it is forwarded verbatim.
+    pub candidate: String,
+    /// The `sdpMid` of the candidate (typically `"0"`). The
+    /// server does not inspect this; it is forwarded verbatim.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sdp_mid: Option<String>,
+    /// The `sdpMLineIndex` of the candidate. The server does
+    /// not inspect this; it is forwarded verbatim.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sdp_m_line_index: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

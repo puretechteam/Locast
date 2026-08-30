@@ -1119,6 +1119,7 @@ async fn end_to_end_with_real_server() {
         db,
         rooms,
         clock,
+        signal_relay: Default::default(),
     };
     let app = router(state);
 

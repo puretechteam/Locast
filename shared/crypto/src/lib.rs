@@ -28,3 +28,24 @@ pub mod sha256;
 
 /// Library version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Produce the canonical signed bytes for a SIGNAL envelope:
+/// `<16-byte domain tag> || <canonical msgpack of payload>`.
+///
+/// This is the single source of truth shared between the
+/// server's `handle_signal` verifier and the client's outbound
+/// `send_signal` signer. Architecture §18.9.
+///
+/// The 16-byte tag is produced by [`domain_tag::build`] with
+/// the type name `"SIGNAL"`. The msgpack is
+/// `rmp_serde::to_vec_named(payload)` (canonical map keys, no
+/// extension types).
+pub fn signal_signed_bytes(
+    payload: &impl serde::Serialize,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut buf = Vec::with_capacity(16 + 256);
+    buf.extend_from_slice(&domain_tag::build("SIGNAL"));
+    let msg = rmp_serde::to_vec_named(payload)?;
+    buf.extend_from_slice(&msg);
+    Ok(buf)
+}

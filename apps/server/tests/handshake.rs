@@ -105,6 +105,7 @@ async fn spawn_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()
         db: db.clone(),
         rooms,
         clock,
+        signal_relay: locast_server::SignalRelay::new(),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

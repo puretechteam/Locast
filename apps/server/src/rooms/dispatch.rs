@@ -20,10 +20,12 @@ use super::codes;
 use super::error::RoomError;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::registry::{RoomEvent, RoomRegistry};
+use super::signal::{handle_signal, SignalOutcome, SignalRelay};
 use super::store::RoomStore;
 use super::validation::validate_display_name;
 use crate::db::Db;
 use crate::time::Clock;
+
 /// The result of dispatching a single ROOM_* message. The
 /// WS layer applies the `to_caller` envelopes first (in
 /// order) and then broadcasts the `events` to the room
@@ -39,19 +41,34 @@ pub struct RoomDispatchOutcome {
     pub close_caller: bool,
 }
 
+/// Bundled dependencies for [`dispatch_room_message`].
+/// Introduced to keep the per-message signature below
+/// `clippy::too_many_arguments` and to give the call site
+/// (currently only `apps/server/src/ws/mod.rs`) one
+/// well-named bag of refs to pass in.
+pub struct DispatchContext<'a> {
+    pub registry: &'a RoomRegistry,
+    pub store: &'a dyn RoomStore,
+    pub db: &'a Db,
+    pub clock: &'a dyn Clock,
+    pub relay: &'a SignalRelay,
+}
+
 /// Dispatch one envelope. `user_id` and `pubkey` come from
 /// the validated bearer (P2-T02). `now_ms` is read from the
 /// injected `clock` so tests can drive the registry's
 /// grace / stale paths deterministically.
 pub async fn dispatch_room_message(
     envelope: Envelope,
-    registry: &RoomRegistry,
-    store: &dyn RoomStore,
-    db: &Db,
-    clock: &dyn Clock,
+    ctx: &DispatchContext<'_>,
     user_id: Uuid,
     pubkey: [u8; 32],
 ) -> RoomDispatchOutcome {
+    let registry = ctx.registry;
+    let store = ctx.store;
+    let db = ctx.db;
+    let clock = ctx.clock;
+    let signal_relay = ctx.relay;
     let now_ms = clock.now_ms();
     // P2-T07: capability chokepoint. v1 is permissive; P3+
     // will plug the real denial cases into the same
@@ -63,15 +80,19 @@ pub async fn dispatch_room_message(
         MessageKind::Presence => Some(Command::Presence),
         MessageKind::ManifestPublish => Some(Command::PublishManifest),
         MessageKind::ManifestRequest => Some(Command::FetchManifest),
+        MessageKind::Signal => Some(Command::Signal),
         _ => None,
     };
     if let Some(cmd) = command {
         if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
-            // For PublishManifest + FetchManifest, surface
-            // the error to the caller as a ROOM_ERROR.
-            // Other commands fall through to the existing
-            // v1 behavior (log + no-op).
-            if matches!(cmd, Command::PublishManifest | Command::FetchManifest) {
+            // For PublishManifest + FetchManifest + Signal,
+            // surface the error to the caller as a
+            // ROOM_ERROR. Other commands fall through to the
+            // existing v1 behavior (log + no-op).
+            if matches!(
+                cmd,
+                Command::PublishManifest | Command::FetchManifest | Command::Signal
+            ) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
                     caps::CapsError::NotMember => RoomErrorCode::NotJoined,
@@ -108,6 +129,9 @@ pub async fn dispatch_room_message(
         }
         MessageKind::ManifestRequest => {
             handle_manifest_fetch_dispatch(envelope, registry, user_id, now_ms).await
+        }
+        MessageKind::Signal => {
+            handle_signal_dispatch(envelope, registry, signal_relay, clock, user_id, pubkey).await
         }
         _ => RoomDispatchOutcome::default(),
     }
@@ -346,6 +370,30 @@ async fn handle_manifest_fetch_dispatch(
     out
 }
 
+/// P3-T05: the SIGNAL dispatch. Hands the envelope to
+/// `handle_signal` (which validates the per-envelope
+/// signature, room membership, and 64 KiB size cap, then
+/// forwards to the recipient's per-user outbound
+/// channel). The wrapper folds any `to_caller` error
+/// envelope into `RoomDispatchOutcome.to_caller`. The
+/// relay-send path is synchronous inside `handle_signal`,
+/// so `out.events` is intentionally not used.
+async fn handle_signal_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    relay: &SignalRelay,
+    clock: &dyn Clock,
+    user_id: Uuid,
+    pubkey: [u8; 32],
+) -> RoomDispatchOutcome {
+    let outcome: SignalOutcome = handle_signal(envelope, registry, relay, clock, user_id, pubkey).await;
+    let mut out = RoomDispatchOutcome::default();
+    if let Some(env) = outcome.to_caller {
+        out.to_caller.push(env);
+    }
+    out
+}
+
 impl RoomDispatchOutcome {
     fn from_room_error(code: RoomError, message: String) -> Self {
         let mut out = Self::default();
@@ -427,11 +475,32 @@ mod tests {
         Uuid::from_bytes(b)
     }
 
+    fn fresh_relay() -> SignalRelay {
+        SignalRelay::new()
+    }
+
+    fn ctx<'a>(
+        reg: &'a RoomRegistry,
+        s: &'a dyn super::super::store::RoomStore,
+        db: &'a Db,
+        clock: &'a MockClock,
+        relay: &'a SignalRelay,
+    ) -> DispatchContext<'a> {
+        DispatchContext {
+            registry: reg,
+            store: s,
+            db,
+            clock,
+            relay,
+        }
+    }
+
     #[tokio::test]
     async fn dispatch_room_create_sends_room_created() {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -446,7 +515,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::RoomCreated);
     }
@@ -456,6 +525,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomJoinRequest,
@@ -470,7 +540,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidCode);
@@ -481,6 +551,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomJoinRequest,
@@ -495,7 +566,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidState);
@@ -506,6 +577,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         let env = Envelope {
             v: 1,
             r#type: MessageKind::RoomCreate,
@@ -520,7 +592,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let _ = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let _ = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         clock.advance(5_000);
         let env = Envelope {
             v: 1,
@@ -535,7 +607,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert!(out.to_caller.is_empty());
         let snap = reg.list_snapshot(uid(1)).await.expect("snap");
         let me = snap
@@ -563,6 +635,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         // Caller is NOT in any room.
         let env = Envelope {
             v: 1,
@@ -577,7 +650,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::NotJoined);
@@ -594,6 +667,7 @@ mod tests {
     async fn dispatch_manifest_request_for_member_returns_response() {
         let (reg, clock) = fresh_registry();
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         // Use the real `DbRoomStore` so the room row is
         // INSERTed into the DB (the FK from
         // `room_manifests.room_id` -> `rooms.id` requires it).
@@ -639,7 +713,7 @@ mod tests {
             .unwrap(),
         };
         let _publish_out =
-            dispatch_room_message(env, &reg, &s, &db, &clock, host_user_id, pubkey()).await;
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_user_id, pubkey()).await;
         // Now fetch.
         let env = Envelope {
             v: 1,
@@ -654,7 +728,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, host_user_id, pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_user_id, pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::ManifestResponse);
         let p: locast_protocol::room::ManifestResponsePayload =
@@ -675,6 +749,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         // uid(1) creates a room; uid(2) joins it.
         let (room, _self_view) = reg
             .create(&s, "T".into(), uid(1), pubkey(), true, clock.now_ms())
@@ -709,7 +784,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(2), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::NotJoined);
@@ -723,6 +798,7 @@ mod tests {
         let (reg, clock) = fresh_registry();
         let s = super::super::store::NoopRoomStore;
         let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
         let (room, _self_view) = reg
             .create(&s, "T".into(), uid(1), pubkey(), true, clock.now_ms())
             .await
@@ -751,7 +827,7 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(2), pubkey()).await;
+        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
         // No manifest is cached for this room -> InvalidState
         // (the room exists but the host hasn't published yet).
         // Critically, NOT NotJoined.

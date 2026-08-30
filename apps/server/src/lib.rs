@@ -37,7 +37,7 @@ pub mod test_support;
 pub use config::Config;
 pub use db::Db;
 pub use metrics::Metrics;
-pub use rooms::{RoomEvent, RoomRegistry, RoomRegistryConfig};
+pub use rooms::{RoomEvent, RoomRegistry, RoomRegistryConfig, SignalRelay};
 pub use time::{Clock, SystemClock};
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -55,6 +55,12 @@ pub struct AppState {
     pub db: Db,
     pub rooms: Arc<RoomRegistry>,
     pub clock: Arc<dyn Clock>,
+    /// P3-T05: per-user outbound channel registry used by
+    /// the SIGNAL dispatcher to route SDP/ICE envelopes to
+    /// the recipient's live WS connection. Registered at
+    /// AUTH_OK (the connection's `outbound_tx`); unregistered
+    /// when the connection's `connection_loop` exits.
+    pub signal_relay: rooms::SignalRelay,
 }
 
 /// Build the axum router. Exposed so tests and integration harnesses can
@@ -155,6 +161,7 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
         db,
         rooms,
         clock,
+        signal_relay: rooms::SignalRelay::new(),
     };
 
     let app = router(state);

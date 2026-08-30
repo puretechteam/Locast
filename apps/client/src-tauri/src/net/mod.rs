@@ -24,6 +24,8 @@ pub mod reconnect;
 pub mod room;
 pub mod signaling;
 pub mod state;
+pub mod webrtc;
+pub mod webrtc_canonical;
 
 pub use config::SignalingConfig;
 pub use locast_protocol::handshake::Platform;

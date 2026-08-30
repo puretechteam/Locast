@@ -66,6 +66,16 @@ pub enum Command {
     /// no host-only check: any room member may fetch
     /// the room's current manifest.
     FetchManifest,
+    /// P3-T05: the per-target WebRTC `SIGNAL` envelope
+    /// (SDP offer/answer, ICE candidates). The capability
+    /// check is "caller is a member of SOME room". The
+    /// per-type handler additionally checks that
+    /// `envelope.room_id` matches the caller's current
+    /// room AND that `to_user_id` is a member of the
+    /// same room (defense against cross-room relay and
+    /// stale peer sessions). Non-members are denied with
+    /// `CapsError::NotMember`.
+    Signal,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -138,6 +148,18 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
+        // P3-T05: Signal. Caller must be a member of SOME
+        // room. The per-type handler additionally checks
+        // that envelope.room_id matches the caller's
+        // current room AND that to_user_id is a member
+        // of the same room.
+        Command::Signal => {
+            if registry.get_user_room(user_id).await.is_some() {
+                Ok(())
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
     }
 }
 
@@ -200,6 +222,19 @@ mod tests {
         let (reg, _clock) = fresh_registry();
         // No room membership -> PRESENCE is rejected.
         let err = check_capability(&reg, uid(1), Command::Presence)
+            .await
+            .expect_err("expected NotMember");
+        assert!(matches!(err, CapsError::NotMember));
+    }
+
+    /// P3-T05: SIGNAL requires the caller to be a member
+    /// of some room (the per-type handler additionally
+    /// checks the same-room + recipient-membership
+    /// invariants). A non-member is denied.
+    #[tokio::test]
+    async fn signal_is_denied_when_user_is_not_in_any_room() {
+        let (reg, _clock) = fresh_registry();
+        let err = check_capability(&reg, uid(1), Command::Signal)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));

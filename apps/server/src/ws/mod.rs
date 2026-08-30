@@ -536,6 +536,15 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                         let mut g = self_user_id.lock().await;
                         *g = Some(user_id);
                     }
+                    // P3-T05: register the connection's
+                    // outbound_tx with the SignalRelay so
+                    // the SIGNAL dispatcher can deliver
+                    // per-target SDP/ICE envelopes to this
+                    // user. Done at AUTH_OK, after the
+                    // bearer has been validated, so an
+                    // unauthenticated transport never
+                    // occupies a relay slot.
+                    state.signal_relay.register(user_id, outbound_tx.clone()).await;
                     // Security finding #2 (auth-order DoS):
                     // a successful AUTH earns a clean rate
                     // budget. Without this, a connection that
@@ -604,6 +613,14 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         {
             debug!(request_id = %request_id, error = %e, "on_connection_lost noop");
         }
+        // P3-T05: drop this user's SignalRelay slot so a
+        // future SIGNAL targeting them surfaces as
+        // RecipientNotInRoom (or no-ops if a fresh
+        // connection registers before the send). The
+        // outbound_tx has already been dropped above
+        // (`drop(outbound_tx)`); the explicit unregister
+        // also keeps the HashMap small.
+        state.signal_relay.unregister(user_id).await;
     }
     debug!(request_id = %request_id, "ws connection closed");
 }
@@ -757,15 +774,22 @@ async fn dispatch_authed(
     // types (future PLAY/PAUSE/SEEK/DRAW/LASER/CHAT/MANIFEST_*)
     // are not implemented in v1 / P2-T04 and are silently
     // accepted.
-    if envelope.r#type.is_room_lifecycle() || envelope.r#type.is_manifest_lifecycle() {
+    if envelope.r#type.is_room_lifecycle()
+        || envelope.r#type.is_manifest_lifecycle()
+        || envelope.r#type.is_signal_lifecycle()
+    {
         let store: Arc<dyn crate::rooms::RoomStore> =
             Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
+        let ctx = crate::rooms::DispatchContext {
+            registry: &state.rooms,
+            store: store.as_ref(),
+            db: &state.db,
+            clock: state.clock.as_ref(),
+            relay: &state.signal_relay,
+        };
         let outcome = crate::rooms::dispatch_room_message(
             envelope,
-            &state.rooms,
-            store.as_ref(),
-            &state.db,
-            state.clock.as_ref(),
+            &ctx,
             user_id,
             pubkey,
         )

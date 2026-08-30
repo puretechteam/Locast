@@ -294,6 +294,20 @@ mod tests {
                 .expect("render ManifestResponsePayload bindings"),
         );
         rendered.push('\n');
+        rendered.push_str(
+            &crate::room::SignalPayload::export_to_string(&cfg)
+                .expect("render SignalPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::SignalKind::export_to_string(&cfg).expect("render SignalKind bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::SignalCandidate::export_to_string(&cfg)
+                .expect("render SignalCandidate bindings"),
+        );
+        rendered.push('\n');
         // Render the manifest types so the protocol's
         // generated ts file declares them inline (the
         // protocol's `MANIFEST_PUBLISH*` payloads carry

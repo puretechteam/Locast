@@ -124,6 +124,15 @@ pub enum MessageKind {
     ManifestRequest,
     #[serde(rename = "MANIFEST_RESPONSE")]
     ManifestResponse,
+    // ----- P3-T05: WebRTC SDP/ICE relay -----
+    // SIGNAL envelopes carry per-target SDP (offer/answer) or ICE
+    // candidate material. The server is a pure relay: it does not
+    // inspect or rewrite SDP or candidate bodies; it only enforces
+    // the per-envelope Ed25519 signature over the canonicalized
+    // payload, sender/recipient room-membership, and a 64 KiB
+    // application-layer size cap (docs/ARCHITECTURE.md §18.5.1).
+    #[serde(rename = "SIGNAL")]
+    Signal,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -161,6 +170,7 @@ impl MessageKind {
             MessageKind::ManifestPublished => "MANIFEST_PUBLISHED",
             MessageKind::ManifestRequest => "MANIFEST_REQUEST",
             MessageKind::ManifestResponse => "MANIFEST_RESPONSE",
+            MessageKind::Signal => "SIGNAL",
             MessageKind::Other(s) => s,
         }
     }
@@ -192,6 +202,15 @@ impl MessageKind {
                 | MessageKind::ManifestRequest
                 | MessageKind::ManifestResponse
         )
+    }
+
+    /// `true` for the per-target WebRTC SDP/ICE relay envelope.
+    /// Routed by the WS layer to the room dispatcher the same way
+    /// `is_room_lifecycle` / `is_manifest_lifecycle` are routed,
+    /// but kept separate so the routing predicate does not have to
+    /// grow a long match arm.
+    pub fn is_signal_lifecycle(&self) -> bool {
+        matches!(self, MessageKind::Signal)
     }
 }
 
