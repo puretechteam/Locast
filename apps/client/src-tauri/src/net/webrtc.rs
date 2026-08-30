@@ -190,11 +190,9 @@ pub enum PeerPhase {
     Closed,
 }
 
-/// A single entry in the per-room peer graph.
+/// A single entry in the per-room peer graph. The remote
+/// `user_id` is the key of the owning `HashMap`, not a field.
 struct PeerEntry {
-    /// The remote user's server-assigned UUID.
-    #[allow(dead_code)]
-    user_id: Uuid,
     /// The PeerConnection trait object. webrtc 0.20 returns
     /// an opaque `impl PeerConnection` from the builder; we
     /// wrap it in `Arc<dyn PeerConnection>` to share across
@@ -378,7 +376,6 @@ impl WebRtcManager {
             }
         };
         let mut entry = PeerEntry {
-            user_id: remote_id,
             pc: pc.clone(),
             dc: None,
             phase: PeerPhase::New,
@@ -906,14 +903,12 @@ async fn build_peer_connection(
 /// network addresses); the candidate body is sent to the
 /// pump task which forwards it to the signaling wire.
 struct PeerHandler {
-    #[allow(dead_code)] // kept for diagnostic identity; events carry the remote id themselves
-    remote: Uuid,
     tx: mpsc::UnboundedSender<PeerEvent>,
 }
 
 impl PeerHandler {
-    fn new(remote: Uuid, tx: mpsc::UnboundedSender<PeerEvent>) -> Self {
-        Self { remote, tx }
+    fn new(_remote: Uuid, tx: mpsc::UnboundedSender<PeerEvent>) -> Self {
+        Self { tx }
     }
 }
 
