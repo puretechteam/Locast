@@ -39,6 +39,17 @@ pub struct SignalRelay {
     inner: Arc<tokio::sync::RwLock<HashMap<Uuid, mpsc::UnboundedSender<Envelope>>>>,
 }
 
+/// Failure to deliver a SIGNAL envelope to a target user.
+/// The envelope is dropped (it is not returned to the
+/// caller) because the only failure case is "recipient has
+/// no active connection", in which case the caller already
+/// maps to `ROOM_ERROR(NotJoined)`.
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("recipient has no active connection")]
+    NoRecipient,
+}
+
 impl SignalRelay {
     pub fn new() -> Self {
         Self::default()
@@ -61,14 +72,16 @@ impl SignalRelay {
     }
 
     /// Send a SIGNAL envelope to `target_user_id`. Returns
-    /// `Ok(())` if the envelope was enqueued; `Err(Envelope)`
-    /// if no connection is registered for the target (caller
-    /// should map this to `ROOM_ERROR(NotJoined)` or similar).
-    pub async fn send(&self, target_user_id: Uuid, envelope: Envelope) -> Result<(), Envelope> {
+    /// `Ok(())` if the envelope was enqueued; `Err(SendError)`
+    /// if no connection is registered for the target, or if
+    /// the recipient's outbound channel has been closed
+    /// (recipient gone). The envelope is dropped on error;
+    /// the caller should map this to `ROOM_ERROR(NotJoined)`.
+    pub async fn send(&self, target_user_id: Uuid, envelope: Envelope) -> Result<(), SendError> {
         let g = self.inner.read().await;
         match g.get(&target_user_id) {
-            Some(tx) => tx.send(envelope).map_err(|e| e.0),
-            None => Err(envelope),
+            Some(tx) => tx.send(envelope).map_err(|_| SendError::NoRecipient),
+            None => Err(SendError::NoRecipient),
         }
     }
 
@@ -216,7 +229,7 @@ pub async fn handle_signal(
     //    SDP / ICE bodies; we forward verbatim.
     match relay.send(payload.to_user_id, envelope).await {
         Ok(()) => SignalOutcome::default(),
-        Err(_env) => {
+        Err(SendError::NoRecipient) => {
             // Recipient has no active connection (disconnected
             // between our membership check and the relay send).
             // Surface as RecipientNotInRoom because the recipient
