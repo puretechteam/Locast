@@ -551,15 +551,20 @@ mod tests {
 
     #[test]
     fn plan_rejects_attacker_controlled_oversized_size() {
-        // size_bytes > u32::MAX would overflow offsets; planner
-        // must still reject gracefully.
+        // size_bytes = u64::MAX with a normal 3-chunk fixture
+        // would overflow offsets; the planner must still
+        // reject gracefully. We deliberately do NOT allocate
+        // u32::MAX hashes here — that alone would consume
+        // ~274 GiB before the planner ever sees it. The test
+        // is about the planner's input validation, not about
+        // allocating billions of strings.
         let mut e = entry_with(1024, &canonical_peer_id());
         e.size_bytes = u64::MAX;
-        e.sources[0].total_chunks = u32::MAX;
-        e.sources[0].chunk_hashes = (0..u32::MAX as usize).map(|_| "0".repeat(64)).collect();
+        // Keep total_chunks small but mismatched so the
+        // planner rejects on TotalChunksMismatch.
+        e.sources[0].total_chunks = 3;
+        e.sources[0].chunk_hashes = vec!["0".repeat(64); 3];
         let err = plan_download("dl-1", "m", 1, &e, &canonical_peer_id()).unwrap_err();
-        // Either total mismatch or just rejected. The point is:
-        // it is rejected, not panicking.
         assert!(matches!(
             err.kind(),
             PlanErrorKind::TotalChunksMismatch | PlanErrorKind::ChunkHashCountMismatch
