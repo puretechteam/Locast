@@ -145,7 +145,6 @@ const STUN_SERVERS: &[&str] = &[
 /// The maximum number of ICE restarts attempted on a single
 /// peer connection before the entry is torn down. Architecture
 /// §19.3.4: one ICE restart before giving up.
-#[allow(dead_code)]
 const ICE_RESTART_LIMIT: u8 = 1;
 
 /// Events emitted by a per-peer [`PeerHandler`] into a
@@ -215,7 +214,6 @@ struct PeerEntry {
     /// ICE-restart counter. `Failed -> restart -> OfferSent`
     /// while `restarts < ICE_RESTART_LIMIT`; the second
     /// `Failed` flips the entry to `Closed`.
-    #[allow(dead_code)]
     restarts: u8,
 }
 
