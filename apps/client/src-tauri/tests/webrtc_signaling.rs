@@ -53,9 +53,7 @@ fn test_config(url: String) -> SignalingConfig {
     )
 }
 
-async fn make_client_and_identity(
-    url: String,
-) -> (Arc<SignalingClient>, Arc<IdentityService>) {
+async fn make_client_and_identity(url: String) -> (Arc<SignalingClient>, Arc<IdentityService>) {
     let storage = open_storage_handle().await;
     let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
     let identity = Arc::new(IdentityService::with_keyring(keyring, storage));
@@ -78,10 +76,7 @@ async fn wait_for_phase(client: &SignalingClient, target: ConnPhase, timeout: Du
     }
 }
 
-async fn wait_for_peer_detected(
-    manager: &WebRtcManager,
-    timeout: Duration,
-) -> Vec<Uuid> {
+async fn wait_for_peer_detected(manager: &WebRtcManager, timeout: Duration) -> Vec<Uuid> {
     let deadline = Instant::now() + timeout;
     loop {
         let ids = manager.peer_ids().await;
@@ -154,8 +149,18 @@ async fn webrtc_signaling_end_to_end() {
     let (signaling_b, identity_b) = make_client_and_identity(url.clone()).await;
     signaling_a.start().await.expect("start a");
     signaling_b.start().await.expect("start b");
-    wait_for_phase(&signaling_a, ConnPhase::Authenticated, Duration::from_secs(5)).await;
-    wait_for_phase(&signaling_b, ConnPhase::Authenticated, Duration::from_secs(5)).await;
+    wait_for_phase(
+        &signaling_a,
+        ConnPhase::Authenticated,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_phase(
+        &signaling_b,
+        ConnPhase::Authenticated,
+        Duration::from_secs(5),
+    )
+    .await;
 
     let room_a = Arc::new(RoomClient::new(signaling_a.clone()));
     let room_b = Arc::new(RoomClient::new(signaling_b.clone()));
@@ -189,20 +194,12 @@ async fn webrtc_signaling_end_to_end() {
         .expect("create");
     let code = summary.code.clone();
 
-    let _b_summary = room_b
-        .room_join(code, "B".into())
-        .await
-        .expect("join");
+    let _b_summary = room_b.room_join(code, "B".into()).await.expect("join");
 
     let _ids_a = wait_for_peer_detected(&manager_a, Duration::from_secs(5)).await;
     let _ids_b = wait_for_peer_detected(&manager_b, Duration::from_secs(5)).await;
 
-    let connected = wait_for_any_connected(
-        &manager_a,
-        &manager_b,
-        Duration::from_secs(15),
-    )
-    .await;
+    let connected = wait_for_any_connected(&manager_a, &manager_b, Duration::from_secs(15)).await;
     assert!(
         connected,
         "no manager reached PeerPhase::Connected within 15s"

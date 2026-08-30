@@ -176,7 +176,10 @@ pub async fn handle_signal(
     if caller_room != signal_room {
         return error_outcome(SignalError::SenderNotInRoom, now_ms);
     }
-    if !registry.is_user_in_room(payload.to_user_id, signal_room).await {
+    if !registry
+        .is_user_in_room(payload.to_user_id, signal_room)
+        .await
+    {
         return error_outcome(SignalError::RecipientNotInRoom, now_ms);
     }
 

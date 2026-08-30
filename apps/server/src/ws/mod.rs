@@ -544,7 +544,10 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     // bearer has been validated, so an
                     // unauthenticated transport never
                     // occupies a relay slot.
-                    state.signal_relay.register(user_id, outbound_tx.clone()).await;
+                    state
+                        .signal_relay
+                        .register(user_id, outbound_tx.clone())
+                        .await;
                     // Security finding #2 (auth-order DoS):
                     // a successful AUTH earns a clean rate
                     // budget. Without this, a connection that
@@ -787,13 +790,7 @@ async fn dispatch_authed(
             clock: state.clock.as_ref(),
             relay: &state.signal_relay,
         };
-        let outcome = crate::rooms::dispatch_room_message(
-            envelope,
-            &ctx,
-            user_id,
-            pubkey,
-        )
-        .await;
+        let outcome = crate::rooms::dispatch_room_message(envelope, &ctx, user_id, pubkey).await;
         let mut actions = Vec::new();
         for env in outcome.to_caller {
             if let Ok(msg) = encode_envelope_message(&env) {

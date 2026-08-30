@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{oneshot, Mutex};
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState};
+use webrtc::data_channel::{
+    DataChannel, DataChannelEvent, RTCDataChannelInit, RTCDataChannelState,
+};
 use webrtc::peer_connection::{
     PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
     RTCIceGatheringState, RTCPeerConnectionIceEvent, RTCPeerConnectionState,
@@ -178,12 +180,8 @@ async fn webrtc_basic_data_channel_open() {
         });
 
         // Peer A: create offer and set as local description.
-        let offer = pc_a
-            .create_offer(None)
-            .await
-            .expect("create_offer");
-        pc_a
-            .set_local_description(offer.clone())
+        let offer = pc_a.create_offer(None).await.expect("create_offer");
+        pc_a.set_local_description(offer.clone())
             .await
             .expect("set_local_description a");
 
@@ -204,10 +202,7 @@ async fn webrtc_basic_data_channel_open() {
 
         // Extract A's final local description (carries the
         // gathered candidates inline, non-trickle).
-        let local_a = pc_a
-            .local_description()
-            .await
-            .expect("local_description a");
+        let local_a = pc_a.local_description().await.expect("local_description a");
         let offer_sdp = local_a.sdp;
 
         // Hand A's offer SDP to B via oneshot; B answers, sends
@@ -256,8 +251,7 @@ async fn webrtc_basic_data_channel_open() {
         let answer_sdp = answer_rx.await.expect("answer rx");
         let remote_answer = webrtc::peer_connection::RTCSessionDescription::answer(answer_sdp)
             .expect("RTCSessionDescription::answer");
-        pc_a
-            .set_remote_description(remote_answer)
+        pc_a.set_remote_description(remote_answer)
             .await
             .expect("set_remote_description a");
 

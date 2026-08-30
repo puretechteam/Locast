@@ -529,8 +529,8 @@ impl WebRtcManager {
             .sender
             .as_ref()
             .ok_or(InboundError::Auth("missing sender"))?;
-        let signed = signal_signed_bytes(&payload)
-            .map_err(|e| InboundError::Decode(e.to_string()))?;
+        let signed =
+            signal_signed_bytes(&payload).map_err(|e| InboundError::Decode(e.to_string()))?;
         if sender.pubkey.len() != 32 {
             return Err(InboundError::Auth("pubkey wrong length"));
         }
@@ -563,8 +563,8 @@ impl WebRtcManager {
                 "initiator received an offer (glare)".into(),
             ));
         }
-        let remote_desc = RTCSessionDescription::offer(sdp)
-            .map_err(|e| InboundError::Protocol(e.to_string()))?;
+        let remote_desc =
+            RTCSessionDescription::offer(sdp).map_err(|e| InboundError::Protocol(e.to_string()))?;
         entry
             .pc
             .set_remote_description(remote_desc)
@@ -580,11 +580,10 @@ impl WebRtcManager {
             .set_local_description(answer)
             .await
             .map_err(|e| InboundError::Protocol(e.to_string()))?;
-        let local = entry
-            .pc
-            .local_description()
-            .await
-            .ok_or_else(|| InboundError::Protocol("no local description after answer".into()))?;
+        let local =
+            entry.pc.local_description().await.ok_or_else(|| {
+                InboundError::Protocol("no local description after answer".into())
+            })?;
         entry.phase = PeerPhase::AnswerReceived;
         let sdp_text = local.sdp.clone();
         drop(state);
@@ -613,9 +612,7 @@ impl WebRtcManager {
             .get_mut(&from_user_id)
             .ok_or_else(|| InboundError::Routing("answer for unknown peer".into()))?;
         if !entry.initiator {
-            return Err(InboundError::Protocol(
-                "answerer received an answer".into(),
-            ));
+            return Err(InboundError::Protocol("answerer received an answer".into()));
         }
         let remote_desc = RTCSessionDescription::answer(sdp)
             .map_err(|e| InboundError::Protocol(e.to_string()))?;
@@ -668,11 +665,7 @@ impl WebRtcManager {
     /// `PeerEntry::phase`, triggers an ICE restart on
     /// `Failed` (up to `ICE_RESTART_LIMIT`), and tears the
     /// entry down on `Closed`.
-    async fn on_connection_state(
-        &self,
-        remote_id: Uuid,
-        state: RTCPeerConnectionState,
-    ) {
+    async fn on_connection_state(&self, remote_id: Uuid, state: RTCPeerConnectionState) {
         match state {
             RTCPeerConnectionState::Connected => {
                 info!(remote = %remote_id, "peer connection connected");
@@ -831,11 +824,7 @@ impl WebRtcManager {
     /// `foundation` — webrtc 0.20's driver sends an
     /// `RTCIceCandidateInit::default()` (which has empty
     /// `foundation`) for that case.
-    async fn handle_local_ice_candidate(
-        &self,
-        remote_id: Uuid,
-        ice_ev: RTCPeerConnectionIceEvent,
-    ) {
+    async fn handle_local_ice_candidate(&self, remote_id: Uuid, ice_ev: RTCPeerConnectionIceEvent) {
         let json = match ice_ev.candidate.to_json() {
             Ok(j) => j,
             Err(e) => {
@@ -897,8 +886,7 @@ async fn build_peer_connection(
         )
         .build();
     let (tx, rx) = mpsc::unbounded_channel::<PeerEvent>();
-    let handler: Arc<dyn PeerConnectionEventHandler> =
-        Arc::new(PeerHandler::new(remote_id, tx));
+    let handler: Arc<dyn PeerConnectionEventHandler> = Arc::new(PeerHandler::new(remote_id, tx));
     let pc = PeerConnectionBuilder::new()
         .with_handler(handler)
         .with_configuration(config)
@@ -1261,9 +1249,6 @@ mod tests {
             last_seen_ms: 2,
             is_host: false,
         });
-        assert_ne!(
-            room_summary_signature(&s1),
-            room_summary_signature(&s2)
-        );
+        assert_ne!(room_summary_signature(&s1), room_summary_signature(&s2));
     }
 }

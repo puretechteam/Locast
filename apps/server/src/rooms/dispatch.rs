@@ -386,7 +386,8 @@ async fn handle_signal_dispatch(
     user_id: Uuid,
     pubkey: [u8; 32],
 ) -> RoomDispatchOutcome {
-    let outcome: SignalOutcome = handle_signal(envelope, registry, relay, clock, user_id, pubkey).await;
+    let outcome: SignalOutcome =
+        handle_signal(envelope, registry, relay, clock, user_id, pubkey).await;
     let mut out = RoomDispatchOutcome::default();
     if let Some(env) = outcome.to_caller {
         out.to_caller.push(env);
@@ -515,7 +516,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::RoomCreated);
     }
@@ -540,7 +542,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidCode);
@@ -566,7 +569,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidState);
@@ -592,7 +596,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let _ = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let _ =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         clock.advance(5_000);
         let env = Envelope {
             v: 1,
@@ -607,7 +612,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert!(out.to_caller.is_empty());
         let snap = reg.list_snapshot(uid(1)).await.expect("snap");
         let me = snap
@@ -650,7 +656,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::NotJoined);
@@ -712,8 +719,13 @@ mod tests {
             })
             .unwrap(),
         };
-        let _publish_out =
-            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_user_id, pubkey()).await;
+        let _publish_out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            host_user_id,
+            pubkey(),
+        )
+        .await;
         // Now fetch.
         let env = Envelope {
             v: 1,
@@ -728,7 +740,13 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_user_id, pubkey()).await;
+        let out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            host_user_id,
+            pubkey(),
+        )
+        .await;
         assert_eq!(out.to_caller.len(), 1);
         assert_eq!(out.to_caller[0].r#type, MessageKind::ManifestResponse);
         let p: locast_protocol::room::ManifestResponsePayload =
@@ -784,7 +802,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::NotJoined);
@@ -827,7 +846,8 @@ mod tests {
             })
             .unwrap(),
         };
-        let out = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(2), pubkey()).await;
         // No manifest is cached for this room -> InvalidState
         // (the room exists but the host hasn't published yet).
         // Critically, NOT NotJoined.

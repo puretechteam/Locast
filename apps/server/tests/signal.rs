@@ -22,17 +22,13 @@ use std::sync::Arc;
 
 use ed25519_dalek::{Signer, SigningKey};
 use locast_protocol::envelope::{Envelope, MessageKind, Sender};
-use locast_protocol::room::{
-    RoomErrorCode, RoomErrorPayload, SignalKind, SignalPayload,
-};
+use locast_protocol::room::{RoomErrorCode, RoomErrorPayload, SignalKind, SignalPayload};
 use locast_server::rooms::{
     dispatch_room_message, DbRoomStore, RoomRegistry, RoomRegistryConfig, SignalRelay,
 };
 use locast_server::time::MockClock;
 use locast_server::Clock;
-use locast_server::{
-    rooms::DispatchContext, Config, Db,
-};
+use locast_server::{rooms::DispatchContext, Config, Db};
 use rand::RngCore;
 use serde_json::json;
 use uuid::Uuid;
@@ -104,7 +100,14 @@ async fn build_room_with_two_users(
         )
         .await
         .expect("viewer joins");
-    (host_sk, host_user_id, host_pk, room.id, viewer_user_id, viewer_pk)
+    (
+        host_sk,
+        host_user_id,
+        host_pk,
+        room.id,
+        viewer_user_id,
+        viewer_pk,
+    )
 }
 
 fn signal_envelope(
@@ -148,8 +151,7 @@ async fn signal_with_bad_signature_returns_invalid_state() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -200,8 +202,7 @@ async fn signal_with_missing_sender_returns_invalid_state() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -238,8 +239,7 @@ async fn signal_with_identity_mismatch_returns_invalid_state() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -286,8 +286,7 @@ async fn signal_to_non_member_returns_not_joined() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -333,8 +332,7 @@ async fn signal_to_self_returns_invalid_state() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -376,8 +374,7 @@ async fn signal_forwarded_to_recipient() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,
@@ -415,7 +412,10 @@ async fn signal_forwarded_to_recipient() {
     );
 
     let out = dispatch_room_message(env, &ctx, host_uid, host_pk).await;
-    assert!(out.to_caller.is_empty(), "no caller-side envelope on success");
+    assert!(
+        out.to_caller.is_empty(),
+        "no caller-side envelope on success"
+    );
 
     // B receives the envelope on its outbound channel.
     let received = tokio::time::timeout(std::time::Duration::from_secs(1), b_rx.recv())
@@ -424,8 +424,7 @@ async fn signal_forwarded_to_recipient() {
         .expect("channel closed");
     assert_eq!(received.r#type, MessageKind::Signal);
     assert_eq!(received.room_id, Some(room_id));
-    let recv_payload: SignalPayload =
-        serde_json::from_value(received.payload.clone()).unwrap();
+    let recv_payload: SignalPayload = serde_json::from_value(received.payload.clone()).unwrap();
     assert_eq!(recv_payload.to_user_id, viewer_uid);
     assert_eq!(recv_payload.kind, SignalKind::Offer);
 }
@@ -436,8 +435,7 @@ async fn signal_oversized_returns_invalid_state() {
     let db = Db::open(&cfg).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
     let clock = MockClock::new(1_000_000);
-    let store: Arc<dyn locast_server::rooms::RoomStore> =
-        Arc::new(DbRoomStore::new(db.clone()));
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
     let relay = SignalRelay::new();
     let ctx = DispatchContext {
         registry: &rooms,

@@ -173,14 +173,14 @@ pub fn run() {
                 // exchanges SDP / ICE over the new SIGNAL
                 // envelope. The handler is dropped here; the
                 // JoinHandle lives only in the local scope.
-                let webrtc_manager = std::sync::Arc::new(
-                    net::webrtc::WebRtcManager::new(
-                        signaling_client.clone(),
-                        identity_service.clone(),
-                        room_client.clone(),
-                    ),
-                );
-                webrtc_manager.clone().start_with_room_client(room_client.clone());
+                let webrtc_manager = std::sync::Arc::new(net::webrtc::WebRtcManager::new(
+                    signaling_client.clone(),
+                    identity_service.clone(),
+                    room_client.clone(),
+                ));
+                webrtc_manager
+                    .clone()
+                    .start_with_room_client(room_client.clone());
                 let _webrtc_join = webrtc_manager;
             });
             app.manage(signaling_client);
