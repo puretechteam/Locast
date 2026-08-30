@@ -284,6 +284,16 @@ mod tests {
                 .expect("render ManifestPublishedPayload bindings"),
         );
         rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ManifestRequestPayload::export_to_string(&cfg)
+                .expect("render ManifestRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ManifestResponsePayload::export_to_string(&cfg)
+                .expect("render ManifestResponsePayload bindings"),
+        );
+        rendered.push('\n');
         // Render the manifest types so the protocol's
         // generated ts file declares them inline (the
         // protocol's `MANIFEST_PUBLISH*` payloads carry

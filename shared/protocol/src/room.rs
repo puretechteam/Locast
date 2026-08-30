@@ -307,9 +307,49 @@ pub struct ManifestPublishedPayload {
     /// `host_signature.public_key`) and TOFU-compare against
     /// the invite's `h=` parameter.
     pub manifest: locast_manifest::MediaManifest,
-    /// Server-stamped publication time, unix ms. Used by the
-    /// viewer to track the latest version of the manifest
-    /// (P3-T07 will add a true per-room version counter).
+    /// Server-assigned per-room monotonic version. `1` on
+    /// the first publish of a room; incremented on each
+    /// subsequent publish. Viewers persist this in
+    /// `room_manifests.version` and use it to ignore
+    /// out-of-order `MANIFEST_PUBLISHED` envelopes.
+    pub version: i64,
+    /// Server-stamped publication time, unix ms. The viewer
+    /// uses this as the row's `created_at` for the local
+    /// `room_manifests` table.
+    pub published_at_ms: i64,
+}
+
+/// MANIFEST_REQUEST (C -> S, any room member -> server).
+/// A late-joiner catch-up request: the server replies with
+/// `MANIFEST_RESPONSE` carrying the room's currently-
+/// authoritative manifest (highest `version` in the
+/// `room_manifests` table). The request is a no-op if no
+/// manifest has been published yet.
+///
+/// The `media_id` field is informational (architecture
+/// §18.4.3). P3-T04's planner will filter the returned
+/// `manifest.media[]` by `media_id` if it is present; in
+/// v1 the request asks for the full manifest and the
+/// client does the filtering.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct ManifestRequestPayload {
+    pub media_id: Uuid,
+}
+
+/// MANIFEST_RESPONSE (S -> C). The server's reply to a
+/// MANIFEST_REQUEST. The payload mirrors the MANIFEST_PUBLISHED
+/// payload (the manifest, the version, the publish time).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct ManifestResponsePayload {
+    /// The signed manifest, identical to what a
+    /// MANIFEST_PUBLISHED would have carried at this
+    /// `version`.
+    pub manifest: locast_manifest::MediaManifest,
+    /// Server-assigned per-room monotonic version.
+    pub version: i64,
+    /// Server-stamped publication time, unix ms.
     pub published_at_ms: i64,
 }
 

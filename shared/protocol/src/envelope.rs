@@ -116,6 +116,14 @@ pub enum MessageKind {
     ManifestPublish,
     #[serde(rename = "MANIFEST_PUBLISHED")]
     ManifestPublished,
+    // MANIFEST_REQUEST is any room member -> server; the
+    // server replies with MANIFEST_RESPONSE carrying the
+    // room's currently-authoritative manifest. This is the
+    // late-joiner catch-up path (architecture §18.4.3).
+    #[serde(rename = "MANIFEST_REQUEST")]
+    ManifestRequest,
+    #[serde(rename = "MANIFEST_RESPONSE")]
+    ManifestResponse,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -151,6 +159,8 @@ impl MessageKind {
             MessageKind::RateLimit => "RATE_LIMIT",
             MessageKind::ManifestPublish => "MANIFEST_PUBLISH",
             MessageKind::ManifestPublished => "MANIFEST_PUBLISHED",
+            MessageKind::ManifestRequest => "MANIFEST_REQUEST",
+            MessageKind::ManifestResponse => "MANIFEST_RESPONSE",
             MessageKind::Other(s) => s,
         }
     }
@@ -177,7 +187,10 @@ impl MessageKind {
     pub fn is_manifest_lifecycle(&self) -> bool {
         matches!(
             self,
-            MessageKind::ManifestPublish | MessageKind::ManifestPublished
+            MessageKind::ManifestPublish
+                | MessageKind::ManifestPublished
+                | MessageKind::ManifestRequest
+                | MessageKind::ManifestResponse
         )
     }
 }

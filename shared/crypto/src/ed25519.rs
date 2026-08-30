@@ -28,7 +28,7 @@ use thiserror::Error;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64URL_NO_PAD};
 use base64::Engine as _;
 
 /// Errors raised by [`sign`] and [`verify`].
@@ -91,6 +91,36 @@ pub fn verify(
 /// client-side identity layer; not used on the server.
 pub fn to_base64(bytes: &[u8]) -> String {
     BASE64.encode(bytes)
+}
+
+/// Encode a 32-byte public or private key as URL-safe base64
+/// WITHOUT padding. Per `docs/ARCHITECTURE.md` section 8
+/// line 804, the room invite's `h=` parameter is the host's
+/// Ed25519 public key encoded this way (`base64-url`). The
+/// standard `to_base64` uses padded standard base64; this
+/// helper is for invite URLs only.
+///
+/// Example: 32 bytes -> 43 characters (no `=` padding).
+pub fn to_base64url_no_pad(bytes: &[u8]) -> String {
+    BASE64URL_NO_PAD.encode(bytes)
+}
+
+/// Decode a URL-safe base64 string WITHOUT padding. Returns
+/// the raw bytes. Returns [`CryptoError::InvalidKey`] on a
+/// decode failure (reusing the "InvalidKey" variant to keep
+/// the public error enum closed; the distinction between
+/// "bad base64" and "wrong-length decoded bytes" is
+/// intentional — the caller's `expected_host_pubkey` /
+/// `manifest_public_key` flow always wants to fail the
+/// trust check on any encoding error, and there is no
+/// meaningful different remediation).
+///
+/// The caller is responsible for asserting the decoded
+/// length matches the expected key/signature length.
+pub fn from_base64url_no_pad(s: &str) -> Result<Vec<u8>, CryptoError> {
+    BASE64URL_NO_PAD
+        .decode(s)
+        .map_err(|_| CryptoError::InvalidKey)
 }
 
 /// Derive the 32-byte Ed25519 verifying (public) key from a raw
@@ -244,5 +274,47 @@ mod tests {
         // 5 chars: not a multiple of 4, no `=` padding makes it valid.
         let res = from_base64("AAAAA");
         assert_eq!(res, Err(CryptoError::InvalidKey));
+    }
+
+    // ---- base64url no-pad (invite `h=`) ----
+
+    /// 32 bytes encode to 43 chars in base64url-no-pad (no `=`
+    /// padding, no `+` or `/`).
+    #[test]
+    fn to_base64url_no_pad_32_bytes_is_43_chars() {
+        let bytes = [0xABu8; 32];
+        let s = to_base64url_no_pad(&bytes);
+        assert_eq!(s.len(), 43);
+        assert!(!s.contains('='));
+        assert!(!s.contains('+'));
+        assert!(!s.contains('/'));
+    }
+
+    /// `to_base64url_no_pad` then `from_base64url_no_pad`
+    /// round-trips to the same bytes.
+    #[test]
+    fn base64url_no_pad_roundtrip() {
+        let original: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let encoded = to_base64url_no_pad(&original);
+        let decoded = from_base64url_no_pad(&encoded).expect("decoded");
+        assert_eq!(decoded, original.to_vec());
+    }
+
+    /// `from_base64url_no_pad` rejects standard base64 strings
+    /// (which use `+/` and may include `=`). This is a safety
+    /// net: the invite trust check must not accept a standard
+    /// base64 blob.
+    #[test]
+    fn from_base64url_no_pad_rejects_standard_base64() {
+        // A 32-byte blob in standard padded base64: 44 chars + 1 `=`.
+        let s = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let res = from_base64url_no_pad(s);
+        // Either the `=` is rejected (likely) or the `+`/`/`
+        // somewhere is, but the result must be `Err`.
+        assert!(res.is_err());
     }
 }

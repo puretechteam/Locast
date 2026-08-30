@@ -88,6 +88,10 @@ pub enum RoomEvent {
         /// it (canonicalization is the host's job; the
         /// server is the relay).
         manifest: locast_manifest::MediaManifest,
+        /// Server-assigned per-room monotonic version. `1`
+        /// on the first publish; incremented on every
+        /// subsequent publish.
+        version: i64,
         /// Server-stamped publication time, unix ms.
         published_at_ms: i64,
     },
@@ -1365,6 +1369,7 @@ fn event_to_broadcast_item(
         ),
         RoomEvent::ManifestPublished {
             manifest,
+            version,
             published_at_ms,
             ..
         } => {
@@ -1376,6 +1381,7 @@ fn event_to_broadcast_item(
             // directly.
             let payload = locast_protocol::room::ManifestPublishedPayload {
                 manifest: manifest.clone(),
+                version: *version,
                 published_at_ms: *published_at_ms,
             };
             (

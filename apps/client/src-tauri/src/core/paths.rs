@@ -197,6 +197,23 @@ pub fn incomplete_chunk_path(
     Ok(p)
 }
 
+/// Derive the library root from a `Storage` path (the
+/// `<root>/index.sqlite` file). The library root is the
+/// parent directory of the storage file, per the layout
+/// in the module-level comment (`<library_root>/library/...`).
+///
+/// This is the canonical helper used by every command
+/// that needs to read or write content-addressed media
+/// (e.g. `media_import`, `library_scan`, `quota_get`,
+/// `manifest_publish`).
+///
+/// Returns `None` if the storage path has no parent
+/// (which should be impossible in practice — the storage
+/// file always has a parent directory).
+pub fn library_root_for(storage_path: &Path) -> Option<PathBuf> {
+    storage_path.parent().map(|p| p.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,7 +453,27 @@ mod tests {
         let _ = incomplete_chunk_path(&missing, "deadbeef", 0).unwrap();
     }
 
-    // ----- different shas map to different prefix dirs
+    #[test]
+    fn library_root_for_returns_parent_of_storage() {
+        // A typical layout: <app_data>/<library>/index.sqlite
+        // -> library_root = <app_data>/<library>.
+        let storage = PathBuf::from("/appdata/mylib/index.sqlite");
+        assert_eq!(
+            library_root_for(&storage),
+            Some(PathBuf::from("/appdata/mylib"))
+        );
+    }
+
+    #[test]
+    fn library_root_for_returns_empty_for_root_relative_storage() {
+        // A relative path like "index.sqlite" has a
+        // parent that is the empty string "" (the current
+        // directory). The helper returns `Some("")` in
+        // that case; callers should treat that as "the
+        // current directory".
+        let storage = PathBuf::from("index.sqlite");
+        assert_eq!(library_root_for(&storage), Some(PathBuf::from("")));
+    }
 
     #[test]
     fn different_shas_use_different_prefix_dirs() {

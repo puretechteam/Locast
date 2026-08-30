@@ -108,17 +108,15 @@ pub fn run() {
             let protocol_handler = ProtocolHandler::new(storage.clone(), library_root);
             let identity_service = std::sync::Arc::new(IdentityService::new(storage.clone()));
 
+            // P3-T04 prerequisite 4: clone the storage pool
+            // BEFORE the `Storage` is moved into
+            // `app.manage` below, so the RoomClient can be
+            // given a copy for persistence.
+            let storage_pool = storage.pool();
             app.manage(storage);
             app.manage(accountant);
             app.manage(protocol_handler);
             app.manage(identity_service.clone());
-
-            // P2-T03: install the `SignalingClient` as managed
-            // state so the `signaling_*` commands can take
-            // `tauri::State<'_, SignalingClient>`. The
-            // connection loop is NOT started here; the React
-            // side calls `signaling_connect` once it has
-            // confirmed the URL.
             let signaling_config = SignalingConfig::from_env();
             let signaling_client =
                 std::sync::Arc::new(SignalingClient::new(signaling_config, identity_service));
@@ -132,6 +130,12 @@ pub fn run() {
             // the client can emit `room://state` and
             // `room://event` events.
             let room_client = std::sync::Arc::new(RoomClient::new(signaling_client.clone()));
+            // P3-T04 prerequisite 4: give the RoomClient the
+            // local SQLite pool so the inbound
+            // MANIFEST_PUBLISHED handler can persist
+            // verified manifests to the local
+            // `room_manifests` table.
+            room_client.set_storage_pool(storage_pool);
             let app_handle_for_room = app.handle().clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
@@ -182,6 +186,7 @@ pub fn run() {
             commands::room::recent_rooms_list,
             commands::room::recent_room_upsert,
             commands::room::manifest_publish,
+            commands::room::manifest_fetch,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

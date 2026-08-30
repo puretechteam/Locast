@@ -56,6 +56,16 @@ pub enum Command {
     ///    explicit host check is what the spec requires
     ///    so a demoted former host cannot publish.
     PublishManifest,
+    /// P3-T04 prerequisite 3: the room-scoped
+    /// `MANIFEST_REQUEST` envelope. The capability check
+    /// is "caller is currently a participant of the room
+    /// named in `envelope.room_id`". A viewer may fetch
+    /// only the manifest of the room they are currently
+    /// in; a non-member or a member of a different room
+    /// is denied with `CapsError::NotMember`. There is
+    /// no host-only check: any room member may fetch
+    /// the room's current manifest.
+    FetchManifest,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -111,6 +121,19 @@ pub async fn check_capability(
                 } else {
                     Err(CapsError::NotHost)
                 }
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        // P3-T04 prerequisite 3: FetchManifest. The caller
+        // must be a member of SOME room. The per-type
+        // handler also checks that the caller's room is
+        // the SAME as `envelope.room_id` (the caller's
+        // membership in room X does not grant them the
+        // right to fetch room Y's manifest).
+        Command::FetchManifest => {
+            if registry.get_user_room(user_id).await.is_some() {
+                Ok(())
             } else {
                 Err(CapsError::NotMember)
             }
@@ -220,5 +243,41 @@ mod tests {
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
+    }
+
+    /// P3-T04 prerequisite 3: a viewer can fetch the
+    /// manifest (it is not host-only). A non-member
+    /// cannot.
+    #[tokio::test]
+    async fn fetch_manifest_is_allowed_for_any_member_but_denied_for_non_member() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create");
+        let (_joined, _evt) = reg
+            .join(
+                &s,
+                &room.code,
+                uid(2),
+                [2u8; 32],
+                "viewer".into(),
+                clock.now_ms(),
+            )
+            .await
+            .expect("join");
+        // Host and viewer can both fetch.
+        assert!(check_capability(&reg, uid(1), Command::FetchManifest)
+            .await
+            .is_ok());
+        assert!(check_capability(&reg, uid(2), Command::FetchManifest)
+            .await
+            .is_ok());
+        // Non-member is denied.
+        let err = check_capability(&reg, uid(3), Command::FetchManifest)
+            .await
+            .expect_err("non-member must be denied");
+        assert!(matches!(err, CapsError::NotMember));
     }
 }

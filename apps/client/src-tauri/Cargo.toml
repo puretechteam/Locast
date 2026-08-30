@@ -52,6 +52,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 async-trait = "0.1"
 locast-protocol = { path = "../../../shared/protocol" }
 locast-manifest = { path = "../../../shared/manifest" }
+url = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 rmp-serde = "1"
 futures-util = "0.3"
@@ -63,8 +64,8 @@ tauri = { version = "2", features = ["test"] }
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
 keyring-core = "0.6"
 blake3 = "1"
+url = "2"
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
 hex = "0.4"
 tokio-tungstenite = "0.24"

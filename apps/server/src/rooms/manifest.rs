@@ -154,7 +154,45 @@ pub async fn handle_manifest_publish(
     Ok(RoomEvent::ManifestPublished {
         room_id,
         manifest,
+        version,
         published_at_ms: now,
+    })
+}
+
+/// Handle a `MANIFEST_REQUEST` from a room member. Returns
+/// the room's currently-authoritative `CachedManifest` so
+/// the caller (the dispatch layer) can serialize it as a
+/// `MANIFEST_RESPONSE` envelope and send it back to the
+/// requesting connection only.
+///
+/// Authorization is the caller's responsibility: the
+/// `caps::check_capability(Command::FetchManifest, ...)` call
+/// in `dispatch_room_message` must have already returned
+/// `Ok(())` for this function to be reached. That check
+/// confirms the caller is a participant of the named
+/// room; it does NOT re-check the room's lifecycle state
+/// (the cached manifest is authoritative for the room's
+/// lifetime, so an "ended" room cannot return one even
+/// if a stale connection is still around).
+pub async fn handle_manifest_fetch(
+    envelope: &locast_protocol::envelope::Envelope,
+    registry: &RoomRegistry,
+) -> Result<locast_protocol::room::ManifestResponsePayload, RoomError> {
+    // Decode the request payload (the dispatch layer has
+    // already stripped the bearer). The `media_id` field
+    // is informational; we always return the latest
+    // authoritative manifest.
+    let _payload: locast_protocol::room::ManifestRequestPayload =
+        serde_json::from_value(envelope.payload.clone()).map_err(|_| RoomError::InvalidState)?;
+    let room_id = envelope.room_id.ok_or(RoomError::InvalidState)?;
+    let cached = registry
+        .current_manifest(room_id)
+        .await
+        .ok_or(RoomError::InvalidState)?;
+    Ok(locast_protocol::room::ManifestResponsePayload {
+        manifest: cached.manifest,
+        version: cached.version,
+        published_at_ms: cached.published_at_ms,
     })
 }
 

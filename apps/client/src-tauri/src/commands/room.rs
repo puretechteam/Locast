@@ -20,6 +20,7 @@
 #![warn(rust_2018_idioms)]
 
 use tauri::State as TauriState;
+use uuid::Uuid;
 
 use crate::commands::error::AppError;
 use crate::net::room::{RoomClient, RoomClientError, RoomSummaryIpc};
@@ -137,6 +138,32 @@ fn room_err_to_app(e: RoomClientError) -> AppError {
 /// the `RoomClient.state().host_user_id == identity.user_id`
 /// invariant is maintained by the room-lifecycle commands;
 /// if the host is wrong, the server returns a
+/// P3-T04 prerequisite 3: fetch the room's current
+/// manifest from the server. Used by late-joiners to
+/// catch up on a manifest published before they joined.
+/// The server returns the manifest with the per-room
+/// `version` and `published_at_ms`; the caller (the
+/// Tauri command's invocation) is expected to feed the
+/// manifest into the local `RoomClient` so the
+/// `MANIFEST_PUBLISHED` handler's TOFU check + persistence
+/// path runs.
+#[tauri::command]
+#[specta::specta]
+pub async fn manifest_fetch(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    media_id: Uuid,
+) -> Result<locast_protocol::room::ManifestResponsePayload, AppError> {
+    let summary = room
+        .state()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    let room_id = Uuid::parse_str(&summary.id)
+        .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    room.manifest_fetch(room_id, media_id)
+        .await
+        .map_err(|e| AppError::other(e.to_string()))
+}
+
 /// `ROOM_ERROR(NotHost)`.
 #[tauri::command]
 #[specta::specta]
@@ -152,10 +179,17 @@ pub async fn manifest_publish(
         .ok_or_else(|| AppError::other("not in a room".to_string()))?;
     let room_id = uuid::Uuid::parse_str(&summary.id)
         .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    // The library root is the parent of the storage file
+    // (per the architecture's `<library_root>/library/...`
+    // layout). The chunk planner needs it to read the
+    // on-disk media file for `Source::chunk_hashes`.
+    let library_root = crate::core::paths::library_root_for(storage.path())
+        .ok_or_else(|| AppError::other("library root has no parent".to_string()))?;
     crate::room::host::build_sign_and_publish(
         identity.inner().clone(),
         signaling.inner().clone(),
         storage.pool(),
+        library_root,
         room_id,
     )
     .await

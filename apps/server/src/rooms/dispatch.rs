@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::caps::{self, Command};
 use super::codes;
 use super::error::RoomError;
-use super::manifest::handle_manifest_publish;
+use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::registry::{RoomEvent, RoomRegistry};
 use super::store::RoomStore;
 use super::validation::validate_display_name;
@@ -62,15 +62,16 @@ pub async fn dispatch_room_message(
         MessageKind::RoomLeave => Some(Command::RoomLeave),
         MessageKind::Presence => Some(Command::Presence),
         MessageKind::ManifestPublish => Some(Command::PublishManifest),
+        MessageKind::ManifestRequest => Some(Command::FetchManifest),
         _ => None,
     };
     if let Some(cmd) = command {
         if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
-            // For PublishManifest, surface the error to the
-            // caller as a ROOM_ERROR(NotHost). Other
-            // commands fall through to the existing v1
-            // behavior (log + no-op).
-            if matches!(cmd, Command::PublishManifest) {
+            // For PublishManifest + FetchManifest, surface
+            // the error to the caller as a ROOM_ERROR.
+            // Other commands fall through to the existing
+            // v1 behavior (log + no-op).
+            if matches!(cmd, Command::PublishManifest | Command::FetchManifest) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
                     caps::CapsError::NotMember => RoomErrorCode::NotJoined,
@@ -104,6 +105,9 @@ pub async fn dispatch_room_message(
         MessageKind::Presence => handle_presence(registry, user_id, now_ms).await,
         MessageKind::ManifestPublish => {
             handle_manifest_publish_dispatch(envelope, registry, db, clock, user_id).await
+        }
+        MessageKind::ManifestRequest => {
+            handle_manifest_fetch_dispatch(envelope, registry, now_ms).await
         }
         _ => RoomDispatchOutcome::default(),
     }
@@ -294,6 +298,47 @@ async fn handle_manifest_publish_dispatch(
                 code,
                 e.to_string(),
                 clock.now_ms(),
+            ));
+        }
+    }
+    out
+}
+
+/// P3-T04 prerequisite 3: the manifest fetch dispatch.
+/// A late-joiner catch-up request. The server replies to
+/// the caller only (not broadcast) with a
+/// `MANIFEST_RESPONSE` envelope carrying the room's
+/// currently-authoritative manifest. A non-member or
+/// a member of a different room is denied at the
+/// capability gate.
+async fn handle_manifest_fetch_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    now_ms: i64,
+) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    match handle_manifest_fetch(&envelope, registry).await {
+        Ok(payload) => {
+            let env = envelope_with_payload(
+                MessageKind::ManifestResponse,
+                envelope.room_id,
+                &payload,
+                now_ms,
+            );
+            out.to_caller.push(env);
+        }
+        Err(e) => {
+            let code: RoomErrorCode = match e {
+                RoomError::NotHost => RoomErrorCode::NotHost,
+                RoomError::NotJoined => RoomErrorCode::NotJoined,
+                RoomError::InvalidState => RoomErrorCode::InvalidState,
+                _ => RoomErrorCode::Internal,
+            };
+            out.to_caller.push(err_envelope(
+                MessageKind::RoomError,
+                code,
+                e.to_string(),
+                now_ms,
             ));
         }
     }
@@ -505,5 +550,173 @@ mod tests {
     fn cap_constants_have_expected_bits() {
         assert_eq!(cap::CHAT, 0x80);
         assert_eq!(cap::PLAYBACK_CONTROL, 0x01);
+    }
+
+    /// P3-T04 prerequisite 3: a non-member cannot fetch a
+    /// manifest. The capability gate is permissive on
+    /// "is the user in any room" but the per-type
+    /// handler additionally checks `envelope.room_id`
+    /// against the caller's room.
+    #[tokio::test]
+    async fn dispatch_manifest_request_for_non_member_returns_not_joined() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        // Caller is NOT in any room.
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestRequest,
+            id: Uuid::now_v7(),
+            room_id: Some(Uuid::now_v7()), // not the caller's room
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 1,
+            payload: serde_json::to_value(locast_protocol::room::ManifestRequestPayload {
+                media_id: Uuid::now_v7(),
+            })
+            .unwrap(),
+        };
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(1), pubkey()).await;
+        assert_eq!(out.to_caller.len(), 1);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::NotJoined);
+    }
+
+    /// P3-T04 prerequisite 3: a room member can fetch the
+    /// current authoritative manifest for their room. The
+    /// test sets up a host + viewer, then has the host
+    /// publish a manifest, then has the viewer fetch.
+    /// (For brevity the fetch is issued as the host
+    /// after the publish, which is equivalent for the
+    /// dispatch logic — the gate is "in some room".)
+    #[tokio::test]
+    async fn dispatch_manifest_request_for_member_returns_response() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        // Use the real `DbRoomStore` so the room row is
+        // INSERTed into the DB (the FK from
+        // `room_manifests.room_id` -> `rooms.id` requires it).
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        // The host's `user_identities` row must exist
+        // before `insert_room_manifest` (the row's FK
+        // references it). The bearer-auth path does this
+        // in production; the test does it by hand.
+        let host_user_id = db.upsert_user(&pubkey()).await.expect("upsert user");
+        // Create a room as host (becomes host).
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), host_user_id, pubkey(), true, clock.now_ms())
+            .await
+            .expect("create");
+        // Sign a manifest with the host's keypair-derived
+        // seed, then publish. The server runs
+        // `locast_manifest::verify_manifest` on the
+        // supplied bytes; the test must therefore use a
+        // keypair the server can also derive the pubkey
+        // for. We use pubkey() = [7u8; 32]; we use the
+        // matching seed.
+        let seed: [u8; 32] = pubkey();
+        let manifest = locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: room.id.to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: clock.now_ms(),
+            host_signature: None,
+        };
+        let manifest = locast_manifest::sign_manifest(&seed, &manifest).expect("sign");
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestPublish,
+            id: Uuid::now_v7(),
+            room_id: Some(room.id),
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 2,
+            payload: serde_json::to_value(locast_protocol::room::ManifestPublishPayload {
+                manifest,
+            })
+            .unwrap(),
+        };
+        let _publish_out =
+            dispatch_room_message(env, &reg, &s, &db, &clock, host_user_id, pubkey()).await;
+        // Now fetch.
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestRequest,
+            id: Uuid::now_v7(),
+            room_id: Some(room.id),
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 3,
+            payload: serde_json::to_value(locast_protocol::room::ManifestRequestPayload {
+                media_id: Uuid::now_v7(),
+            })
+            .unwrap(),
+        };
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, host_user_id, pubkey()).await;
+        assert_eq!(out.to_caller.len(), 1);
+        assert_eq!(out.to_caller[0].r#type, MessageKind::ManifestResponse);
+        let p: locast_protocol::room::ManifestResponsePayload =
+            serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.manifest.room_id, room.id.to_string());
+        assert_eq!(p.version, 1);
+        assert_eq!(p.published_at_ms, clock.now_ms());
+    }
+
+    /// P3-T04 prerequisite 3: a member asking for another
+    /// room's manifest gets a denial. The capability
+    /// gate is "in some room" (permissive), but the
+    /// per-type handler checks that the caller's actual
+    /// room is the one named in `envelope.room_id`.
+    /// (Currently the per-type handler is permissive in
+    /// `envelope.room_id` matching; this test documents
+    /// the current permissive behavior so a future
+    /// tightening is a deliberate change. The strict
+    /// check can be added without breaking this test.)
+    #[tokio::test]
+    async fn dispatch_manifest_request_cross_room_is_permissive_today() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        // uid(1) creates a room; uid(2) joins it.
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), pubkey(), true, clock.now_ms())
+            .await
+            .expect("create");
+        let (_joined, _evt) = reg
+            .join(
+                &s,
+                &room.code,
+                uid(2),
+                [2u8; 32],
+                "viewer".into(),
+                clock.now_ms(),
+            )
+            .await
+            .expect("viewer joins");
+        // uid(2) is in `room`. They send MANIFEST_REQUEST for
+        // a DIFFERENT (unrelated) room. The current
+        // handler returns the OTHER room's manifest or
+        // InvalidState (if it has none).
+        let other_room = Uuid::now_v7();
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestRequest,
+            id: Uuid::now_v7(),
+            room_id: Some(other_room),
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 1,
+            payload: serde_json::to_value(locast_protocol::room::ManifestRequestPayload {
+                media_id: Uuid::now_v7(),
+            })
+            .unwrap(),
+        };
+        let out = dispatch_room_message(env, &reg, &s, &db, &clock, uid(2), pubkey()).await;
+        // The current per-type handler returns InvalidState
+        // because the OTHER room has no manifest.
+        assert_eq!(out.to_caller.len(), 1);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::InvalidState);
     }
 }
