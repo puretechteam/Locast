@@ -74,7 +74,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use thiserror::Error;
@@ -83,6 +83,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::assemble::{assemble_and_finalize, AssembleError};
+use super::events::{
+    sanitize_error_message, DownloadEventEmitter, DownloadProgressEvent, DownloadStateEvent,
+    EMA_ALPHA,
+};
 use super::plan::{DownloadPlan, PlannedChunk};
 use super::state::{DownloadState, DownloadStore};
 use super::transport::{Transport, TransportError};
@@ -404,6 +408,11 @@ pub struct ReceiverSession<'a> {
     /// derive our `peer_id` for the `Hello` frame.
     local_pubkey: [u8; 32],
     cancel: CancellationToken,
+    /// P3-T08: coalesced progress + immediate state emitter.
+    /// Wraps a [`DownloadEventSink`]. Production code wires a
+    /// [`TauriDownloadEventSink`](super::events::TauriDownloadEventSink);
+    /// the default ctor uses a [`NoopSink`].
+    emitter: DownloadEventEmitter,
 }
 
 impl<'a> ReceiverSession<'a> {
@@ -414,6 +423,39 @@ impl<'a> ReceiverSession<'a> {
         library_root: impl Into<PathBuf>,
         local_pubkey: [u8; 32],
     ) -> Self {
+        // P3-T08: wire the receiver to the process-global
+        // emitter installed during `setup()` so `download://state`
+        // and `download://progress` events reach the webview in
+        // production. `get_download_event_emitter` falls back to a
+        // NoopSink-backed emitter in tests, which never install one.
+        // We clone the sink out of the global emitter and build a
+        // fresh `DownloadEventEmitter` around it so the Tauri-backed
+        // sink identity is preserved.
+        let global = crate::get_download_event_emitter();
+        let sink = global.sink_clone();
+        Self::new_with_emitter(
+            plan,
+            transport,
+            store,
+            library_root,
+            local_pubkey,
+            DownloadEventEmitter::new(sink),
+        )
+    }
+
+    /// P3-T08: construct a receiver session with a custom
+    /// [`DownloadEventEmitter`]. Used by the integration tests
+    /// to attach a [`RecordingSink`](super::events::RecordingSink)
+    /// and by production code (via [`crate::transfer`]
+    /// install path) to attach a Tauri-backed sink.
+    pub fn new_with_emitter(
+        plan: &'a DownloadPlan,
+        transport: Arc<dyn Transport>,
+        store: DownloadStore,
+        library_root: impl Into<PathBuf>,
+        local_pubkey: [u8; 32],
+        emitter: DownloadEventEmitter,
+    ) -> Self {
         Self {
             plan,
             transport,
@@ -421,6 +463,7 @@ impl<'a> ReceiverSession<'a> {
             library_root: library_root.into(),
             local_pubkey,
             cancel: CancellationToken::new(),
+            emitter,
         }
     }
 
@@ -439,6 +482,21 @@ impl<'a> ReceiverSession<'a> {
         let store = self.store.clone();
         let library_root = self.library_root.clone();
 
+        // P3-T08: emit the initial `pending` state event so the
+        // frontend sees the row creation immediately. The store
+        // already holds `pending` from `DownloadStore::create`;
+        // this is the row-creation event the Recon spec requires.
+        // `Paused` is intentionally NOT emitted here: there is no
+        // pause command in P3-T08, and a paused state event is
+        // reserved for the future pause-command path (P3-T10+).
+        self.emitter.record_state(DownloadStateEvent {
+            v: 1,
+            id: plan.download_id.clone(),
+            media_id: plan.media_id.clone(),
+            state: DownloadState::Pending.as_str().to_string(),
+            error_message: None,
+        });
+
         // Drive the download state machine forward. If the
         // download is already in a later state (resume from
         // a previous session), skip the early transitions.
@@ -447,11 +505,25 @@ impl<'a> ReceiverSession<'a> {
             store
                 .transition(&plan.download_id, DownloadState::Connecting)
                 .await?;
+            self.emitter.record_state(DownloadStateEvent {
+                v: 1,
+                id: plan.download_id.clone(),
+                media_id: plan.media_id.clone(),
+                state: DownloadState::Connecting.as_str().to_string(),
+                error_message: None,
+            });
         }
         if cur != Some(DownloadState::Transferring) && cur != Some(DownloadState::Verifying) {
             store
                 .transition(&plan.download_id, DownloadState::Transferring)
                 .await?;
+            self.emitter.record_state(DownloadStateEvent {
+                v: 1,
+                id: plan.download_id.clone(),
+                media_id: plan.media_id.clone(),
+                state: DownloadState::Transferring.as_str().to_string(),
+                error_message: None,
+            });
         }
 
         // 1. Send Hello with the resume bitmap.
@@ -494,6 +566,16 @@ impl<'a> ReceiverSession<'a> {
             .collect();
         let mut in_flight: HashMap<u32, InflightChunk> = HashMap::new();
         let mut verified: HashSet<u32> = HashSet::new();
+
+        // P3-T08: progress-tracking locals. Reset every
+        // session because the receiver's view of bytes-
+        // per-second is per-session, not cumulative across
+        // resumes.
+        let mut transferred_bytes: u64 = (plan.size_bytes
+            - have_set.len() as u64 * crate::transfer::CHUNK_SIZE_BYTES as u64)
+            .min(plan.size_bytes);
+        let mut bytes_per_sec_ema: f64 = 0.0;
+        let mut last_chunk_at: Instant = Instant::now();
 
         loop {
             // 1. Fresh chunks: if to_request has items and
@@ -558,6 +640,17 @@ impl<'a> ReceiverSession<'a> {
                 Err(SessionError::Transport(TransportError::Closed))
                 | Err(SessionError::Transport(TransportError::Cancelled)) => {
                     let _ = store
+                        .transition(&plan.download_id, DownloadState::Cancelled)
+                        .await;
+                    self.emitter.record_state(DownloadStateEvent {
+                        v: 1,
+                        id: plan.download_id.clone(),
+                        media_id: plan.media_id.clone(),
+                        state: DownloadState::Cancelled.as_str().to_string(),
+                        error_message: None,
+                    });
+                    self.emitter.shutdown();
+                    let _ = store
                         .set_last_error(&plan.download_id, "peer disappeared mid-transfer")
                         .await;
                     return Err(SessionError::Cancelled);
@@ -577,33 +670,74 @@ impl<'a> ReceiverSession<'a> {
                         &cancel,
                     )
                     .await;
-                    if let Err(e) = outcome {
-                        if !matches!(e, SessionError::ChunkHashMismatch { .. })
-                            && !matches!(e, SessionError::ChunkLengthMismatch { .. })
-                        {
-                            // Max retries or any other terminal
-                            // session error: notify the sender,
-                            // transition the download to Failed,
-                            // and return Ok(Failed) so the caller
-                            // can inspect the final state without
-                            // seeing a `?`-propagated error.
-                            let err_cancel = Frame::Cancel(CancelFrame {
-                                download_id: plan.download_id.clone(),
-                                reason: "hash_mismatch".into(),
+                    match outcome {
+                        Ok(Some((_idx, chunk_bytes))) => {
+                            // P3-T08: refresh the EMA-based
+                            // throughput estimator and emit
+                            // a coalesced progress event.
+                            let now = Instant::now();
+                            let dt = now.duration_since(last_chunk_at).as_secs_f64().max(0.001);
+                            let instant_bps = chunk_bytes as f64 / dt;
+                            bytes_per_sec_ema =
+                                EMA_ALPHA * instant_bps + (1.0 - EMA_ALPHA) * bytes_per_sec_ema;
+                            last_chunk_at = now;
+                            transferred_bytes = transferred_bytes.saturating_add(chunk_bytes);
+                            let eta_seconds =
+                                if bytes_per_sec_ema > 0.0 && plan.size_bytes > transferred_bytes {
+                                    let remaining = plan.size_bytes - transferred_bytes;
+                                    Some((remaining as f64 / bytes_per_sec_ema) as u32)
+                                } else {
+                                    None
+                                };
+                            self.emitter.record_progress(DownloadProgressEvent {
+                                v: 1,
+                                id: plan.download_id.clone(),
+                                state: DownloadState::Transferring.as_str().to_string(),
+                                transferred_bytes,
+                                total_bytes: plan.size_bytes,
+                                bytes_per_sec_ema,
+                                eta_seconds,
                             });
-                            let _ = send_frame(&transport, &err_cancel, &cancel).await;
-                            transport.close().await;
-                            let _ = store
-                                .set_last_error(&plan.download_id, &format!("{e}"))
-                                .await;
-                            let _ = store
-                                .transition(&plan.download_id, DownloadState::Failed)
-                                .await;
-                            return Ok(DownloadState::Failed);
                         }
-                        // Hash / length mismatch: chunk was
-                        // requeued by handle_chunk via Nak; the
-                        // loop continues.
+                        Ok(None) => {
+                            // Duplicate chunk already verified;
+                            // ack-only path; no progress delta.
+                        }
+                        Err(e) => {
+                            if !matches!(e, SessionError::ChunkHashMismatch { .. })
+                                && !matches!(e, SessionError::ChunkLengthMismatch { .. })
+                            {
+                                // Max retries or any other terminal
+                                // session error: notify the sender,
+                                // transition the download to Failed,
+                                // and return Ok(Failed) so the caller
+                                // can inspect the final state without
+                                // seeing a `?`-propagated error.
+                                let err_cancel = Frame::Cancel(CancelFrame {
+                                    download_id: plan.download_id.clone(),
+                                    reason: "hash_mismatch".into(),
+                                });
+                                let _ = send_frame(&transport, &err_cancel, &cancel).await;
+                                transport.close().await;
+                                let sanitized = sanitize_error_message(&format!("{e}"));
+                                let _ = store.set_last_error(&plan.download_id, &sanitized).await;
+                                let _ = store
+                                    .transition(&plan.download_id, DownloadState::Failed)
+                                    .await;
+                                self.emitter.record_state(DownloadStateEvent {
+                                    v: 1,
+                                    id: plan.download_id.clone(),
+                                    media_id: plan.media_id.clone(),
+                                    state: DownloadState::Failed.as_str().to_string(),
+                                    error_message: Some(sanitized),
+                                });
+                                self.emitter.shutdown();
+                                return Ok(DownloadState::Failed);
+                            }
+                            // Hash / length mismatch: chunk was
+                            // requeued by handle_chunk via Nak; the
+                            // loop continues.
+                        }
                     }
                 }
                 Frame::Cancel(c) => {
@@ -612,6 +746,14 @@ impl<'a> ReceiverSession<'a> {
                         reason = %c.reason,
                         "receiver: cancel received"
                     );
+                    self.emitter.record_state(DownloadStateEvent {
+                        v: 1,
+                        id: plan.download_id.clone(),
+                        media_id: plan.media_id.clone(),
+                        state: DownloadState::Cancelled.as_str().to_string(),
+                        error_message: None,
+                    });
+                    self.emitter.shutdown();
                     return Ok(DownloadState::Cancelled);
                 }
                 Frame::Error(e) => {
@@ -620,8 +762,14 @@ impl<'a> ReceiverSession<'a> {
                         reason = %e.reason,
                         "receiver: error frame"
                     );
-                    let _ = store.set_last_error(&plan.download_id, &e.reason).await;
-                    return Err(SessionError::Io(format!("peer error: {}", e.reason)));
+                    let sanitized_peer_error = sanitize_error_message(&e.reason);
+                    let _ = store
+                        .set_last_error(&plan.download_id, &sanitized_peer_error)
+                        .await;
+                    return Err(SessionError::Io(format!(
+                        "peer error: {}",
+                        sanitized_peer_error
+                    )));
                 }
                 Frame::Ack(_) | Frame::Nak(_) => {
                     return Err(SessionError::Wire(WireError::Malformed(
@@ -641,6 +789,13 @@ impl<'a> ReceiverSession<'a> {
         store
             .transition(&plan.download_id, DownloadState::Verifying)
             .await?;
+        self.emitter.record_state(DownloadStateEvent {
+            v: 1,
+            id: plan.download_id.clone(),
+            media_id: plan.media_id.clone(),
+            state: DownloadState::Verifying.as_str().to_string(),
+            error_message: None,
+        });
         let res = assemble_and_finalize(
             &library_root,
             &plan.download_id,
@@ -664,26 +819,49 @@ impl<'a> ReceiverSession<'a> {
                 store
                     .transition(&plan.download_id, DownloadState::Complete)
                     .await?;
+                self.emitter.record_state(DownloadStateEvent {
+                    v: 1,
+                    id: plan.download_id.clone(),
+                    media_id: plan.media_id.clone(),
+                    state: DownloadState::Complete.as_str().to_string(),
+                    error_message: None,
+                });
+                self.emitter.shutdown();
                 transport.close().await;
                 Ok(DownloadState::Complete)
             }
             Err(AssembleError::Blake3Mismatch) => {
-                store
-                    .set_last_error(&plan.download_id, "final blake3 mismatch")
-                    .await?;
+                let sanitized = sanitize_error_message("blake3 mismatch");
+                store.set_last_error(&plan.download_id, &sanitized).await?;
                 store
                     .transition(&plan.download_id, DownloadState::Failed)
                     .await?;
+                self.emitter.record_state(DownloadStateEvent {
+                    v: 1,
+                    id: plan.download_id.clone(),
+                    media_id: plan.media_id.clone(),
+                    state: DownloadState::Failed.as_str().to_string(),
+                    error_message: Some(sanitized),
+                });
+                self.emitter.shutdown();
                 transport.close().await;
                 Ok(DownloadState::Failed)
             }
             Err(e) => {
-                let _ = store
-                    .set_last_error(&plan.download_id, &format!("assemble: {e}"))
-                    .await;
+                let raw = format!("assemble: {e}");
+                let sanitized = sanitize_error_message(&raw);
+                let _ = store.set_last_error(&plan.download_id, &sanitized).await;
                 store
                     .transition(&plan.download_id, DownloadState::Failed)
                     .await?;
+                self.emitter.record_state(DownloadStateEvent {
+                    v: 1,
+                    id: plan.download_id.clone(),
+                    media_id: plan.media_id.clone(),
+                    state: DownloadState::Failed.as_str().to_string(),
+                    error_message: Some(sanitized),
+                });
+                self.emitter.shutdown();
                 transport.close().await;
                 Err(e.into())
             }
@@ -847,7 +1025,7 @@ async fn handle_chunk(
     verified: &mut HashSet<u32>,
     transport: &Arc<dyn Transport>,
     cancel: &CancellationToken,
-) -> Result<(), SessionError> {
+) -> Result<Option<(u32, u64)>, SessionError> {
     let entry = match in_flight.remove(&chunk.chunk_index) {
         Some(e) => e,
         None => {
@@ -860,7 +1038,7 @@ async fn handle_chunk(
                     chunk_index: chunk.chunk_index,
                 });
                 send_frame(transport, &ack, cancel).await?;
-                return Ok(());
+                return Ok(None);
             }
             return Err(SessionError::Wire(WireError::Malformed(format!(
                 "received chunk {} not in flight",
@@ -877,6 +1055,7 @@ async fn handle_chunk(
             index: chunk.chunk_index,
             total: plan.chunks.len() as u32,
         })?;
+    let chunk_bytes = expected.length as u64;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(chunk.bytes_b64.as_bytes())
         .map_err(|e| SessionError::Io(format!("base64 decode: {e}")))?;
@@ -916,7 +1095,7 @@ async fn handle_chunk(
         chunk_index = chunk.chunk_index,
         "receiver: chunk verified and acked"
     );
-    Ok(())
+    Ok(Some((chunk.chunk_index, chunk_bytes)))
 }
 
 async fn send_nak_and_requeue(

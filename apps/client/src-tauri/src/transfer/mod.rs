@@ -53,6 +53,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod assemble;
+pub mod events;
 pub mod plan;
 pub mod scheduler;
 pub mod session;
@@ -61,6 +62,11 @@ pub mod transport;
 pub mod verify;
 pub mod wire;
 
+pub use events::{
+    DownloadEventEmitter, DownloadEventSink, DownloadProgressEvent, DownloadStateEvent, NoopSink,
+    RecordingSink, DOWNLOAD_PROGRESS_EVENT, DOWNLOAD_STATE_EVENT, EMA_ALPHA, PROGRESS_INTERVAL_MS,
+    SANITIZE_LONG_TOKEN_MIN, SANITIZE_MAX_BYTES,
+};
 pub use plan::{
     DownloadPlan, PlanError, PlanErrorKind, PlannedChunk, PlannedSource, SelectedSource,
 };

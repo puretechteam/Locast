@@ -16,6 +16,10 @@
 
 pub use crate::net::room::{ManifestStateEvent, RoomSummaryIpc};
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
+pub use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};
+
+pub type DownloadStateChanged = DownloadStateEvent;
+pub type DownloadProgressChanged = DownloadProgressEvent;
 
 /// The `signaling://state` event payload. Emitted by the
 /// `SignalingClient` whenever the connection state changes;

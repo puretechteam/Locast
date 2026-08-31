@@ -31,6 +31,7 @@ use library::protocol::ProtocolHandler;
 use net::config::SignalingConfig;
 use net::room::RoomClient;
 use net::signaling::SignalingClient;
+use transfer::events::{DownloadEventEmitter, NoopSink};
 
 /// Library version string. Bumped per release alongside the workspace.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +39,35 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Library name. Used by downstream binaries and tests.
 pub fn name() -> &'static str {
     "locast-client"
+}
+
+/// P3-T08: process-global handle to the live download event
+/// emitter. Written exactly once during Tauri `setup()` in
+/// non-test builds; the `ReceiverSession` ctor reads from it
+/// so the transfer layer never has to be re-threaded with a
+/// Tauri handle.
+///
+/// Tests do NOT call `install_download_event_emitter`, so
+/// the `OnceLock` stays empty and the transfer layer falls
+/// back to a [`NoopSink`].
+static DOWNLOAD_EVENT_EMITTER: std::sync::OnceLock<std::sync::Arc<DownloadEventEmitter>> =
+    std::sync::OnceLock::new();
+
+/// P3-T08: install the global download event emitter.
+/// Called once during Tauri `setup()` in non-test builds.
+#[cfg(not(test))]
+pub fn install_download_event_emitter(emitter: std::sync::Arc<DownloadEventEmitter>) {
+    let _ = DOWNLOAD_EVENT_EMITTER.set(emitter);
+}
+
+/// P3-T08: read the global download event emitter, falling
+/// back to a fresh [`NoopSink`]-backed emitter when one has
+/// not been installed. Used by `ReceiverSession` when it
+/// needs to talk to the live `AppHandle`.
+pub fn get_download_event_emitter() -> std::sync::Arc<DownloadEventEmitter> {
+    DOWNLOAD_EVENT_EMITTER.get().cloned().unwrap_or_else(|| {
+        std::sync::Arc::new(DownloadEventEmitter::new(std::sync::Arc::new(NoopSink)))
+    })
 }
 
 /// Build and run the Locast desktop client.
@@ -140,6 +170,7 @@ pub fn run() {
             // `room_manifests` table.
             room_client.set_storage_pool(storage_pool);
             let app_handle_for_room = app.handle().clone();
+            let app_handle_for_downloads = app.handle().clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
                 // P2-T05: install the Tauri `AppHandle` so
@@ -162,6 +193,29 @@ pub fn run() {
                 }
                 let rc = room_client.clone();
                 tokio::spawn(async move { rc.run_inbound().await });
+
+                // P3-T08: install the Tauri-backed download
+                // event emitter so ReceiverSession instances
+                // spawned later (P3-T09+) emit `download://state`
+                // and `download://progress` events to the
+                // webview. The emitter is stored in a
+                // process-global OnceLock that `get_download_
+                // event_emitter` reads.
+                #[cfg(not(test))]
+                {
+                    use transfer::events::TauriDownloadEventSink;
+                    let sink: std::sync::Arc<dyn transfer::events::DownloadEventSink> =
+                        std::sync::Arc::new(TauriDownloadEventSink::new(
+                            app_handle_for_downloads.clone(),
+                        ));
+                    install_download_event_emitter(std::sync::Arc::new(DownloadEventEmitter::new(
+                        sink,
+                    )));
+                }
+                #[cfg(test)]
+                {
+                    let _ = app_handle_for_downloads;
+                }
 
                 // P3-T05: install the WebRTC PeerConnection
                 // manager. The manager subscribes to the

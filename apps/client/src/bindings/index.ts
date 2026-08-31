@@ -36,6 +36,10 @@
 // `roomEvent` event listeners (`room://state` and `room://event`).
 // P2-T08 added the `recentRoomsList` and `recentRoomUpsert`
 // commands (and the `RecentRoomEntry` and `RecentRoomRole` types).
+// P3-T08 added the `downloadState` and `downloadProgress` event
+// listeners (`download://state` and `download://progress`) and
+// the `DownloadState` / `DownloadStateEvent` /
+// `DownloadProgressEvent` types.
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -203,6 +207,40 @@ export type RecentRoomEntry = {
   created_ms: number;
 };
 
+// P3-T08: download progress + state event payload types.
+// The wire format is hand-maintained to mirror the Rust
+// `DownloadStateEvent` / `DownloadProgressEvent` shapes in
+// `apps/client/src-tauri/src/transfer/events.rs`; tauri-specta
+// does not generate them (the events are emitted via
+// `AppHandle::emit`, not registered via `collect_events!`).
+export type DownloadState =
+  | "pending"
+  | "connecting"
+  | "transferring"
+  | "verifying"
+  | "complete"
+  | "failed"
+  | "paused"
+  | "cancelled";
+
+export type DownloadStateEvent = {
+  v: 1;
+  id: string;
+  media_id: string;
+  state: DownloadState;
+  error_message: string | null;
+};
+
+export type DownloadProgressEvent = {
+  v: 1;
+  id: string;
+  state: DownloadState;
+  transferred_bytes: number;
+  total_bytes: number;
+  bytes_per_sec_ema: number;
+  eta_seconds: number | null;
+};
+
 /* Events */
 // bindings-regen: keep in sync with the hand-maintained
 // `events.rs` registrations. These helpers are not in the
@@ -222,8 +260,16 @@ export const events = {
   signalingState: <EventListener<ConnectionState>>((h) => __listenAs__("signaling://state", h)),
   roomState: <EventListener<RoomSummaryIpc | null>>((h) => __listenAs__("room://state", h)),
   roomEvent: <EventListener<RoomSummaryIpc>>((h) => __listenAs__("room://event", h)),
+  downloadState: <EventListener<DownloadStateEvent>>((h) =>
+    __listenAs__("download://state", h)
+  ),
+  downloadProgress: <EventListener<DownloadProgressEvent>>((h) =>
+    __listenAs__("download://progress", h)
+  ),
 };
 
 export const signalingStateChanged = events.signalingState;
 export const roomStateChanged = events.roomState;
 export const roomEventEnvelope = events.roomEvent;
+export const downloadStateChanged = events.downloadState;
+export const downloadProgressChanged = events.downloadProgress;
