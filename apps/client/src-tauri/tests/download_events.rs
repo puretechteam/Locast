@@ -333,12 +333,12 @@ async fn end_to_end_emits_progress_and_state_for_a_small_download() {
     // `progress_inter_event_gap_is_at_least_180ms` in
     // transfer::events. The end-to-end test exercises the
     // full transfer pipeline with a small fixture (8 MiB /
-// 32 chunks); on a fast loopback the rate limiter
-// coalesces everything into a small number of emissions
-// plus one terminal-state flush, so a brittle gap
-// assertion here would flake on slow CI hosts. We only
-// assert progress is non-empty, monotonic, and has a
-// final value > 0.
+    // 32 chunks); on a fast loopback the rate limiter
+    // coalesces everything into a small number of emissions
+    // plus one terminal-state flush, so a brittle gap
+    // assertion here would flake on slow CI hosts. We only
+    // assert progress is non-empty, monotonic, and has a
+    // final value > 0.
     let _ = state_ts;
 }
 
