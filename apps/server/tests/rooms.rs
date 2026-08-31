@@ -322,7 +322,14 @@ async fn expect_envelope(
     >,
     expected: MessageKind,
 ) -> Envelope {
-    let bytes = tokio::time::timeout(Duration::from_secs(10), read_binary(ws))
+    // 30 s budget per call. The original 10 s budget was tight
+    // enough to flake on the GitHub Actions ubuntu-latest image
+    // under concurrent test load (multiple `cargo test` workers
+    // running on a shared host). macOS / Windows CI runners
+    // did not exhibit the flake. Bumped to a generous value so
+    // the suite stays green on every platform without changing
+    // any semantic check.
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_binary(ws))
         .await
         .expect("timeout waiting for envelope")
         .expect("connection closed");
@@ -342,7 +349,9 @@ async fn next_envelope(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
 ) -> Envelope {
-    let bytes = tokio::time::timeout(Duration::from_secs(10), read_binary(ws))
+    // See `expect_envelope` above for why this is 30 s rather
+    // than the previous 10 s.
+    let bytes = tokio::time::timeout(Duration::from_secs(30), read_binary(ws))
         .await
         .expect("timeout waiting for envelope")
         .expect("connection closed");
