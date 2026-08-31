@@ -42,7 +42,9 @@ use tokio_util::sync::CancellationToken;
 use super::wire::{WireError, MAX_FRAME_BYTES};
 
 /// Errors raised by a transport. Closed set mirroring the
-/// other error enums in this module.
+/// other error enums in this module; new variants such as
+/// `BackpressurePaused` have been added additively as the
+/// transport surface evolves.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TransportError {
     /// The peer disconnected cleanly.
@@ -60,6 +62,12 @@ pub enum TransportError {
     /// Inbound queue was closed without delivering a frame.
     #[error("transport channel closed unexpectedly")]
     ChannelClosed,
+    /// The host-side backpressure observer has paused the
+    /// sender (DataChannel `bufferedAmount` exceeded the HIGH
+    /// threshold). The caller is expected to wait for a
+    /// `Resumed` event before retrying.
+    #[error("transport backpressured: paused")]
+    BackpressurePaused,
 }
 
 impl From<WireError> for TransportError {

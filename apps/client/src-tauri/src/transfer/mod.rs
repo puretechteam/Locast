@@ -54,6 +54,7 @@
 
 pub mod assemble;
 pub mod plan;
+pub mod scheduler;
 pub mod session;
 pub mod state;
 pub mod transport;
@@ -62,6 +63,11 @@ pub mod wire;
 
 pub use plan::{
     DownloadPlan, PlanError, PlanErrorKind, PlannedChunk, PlannedSource, SelectedSource,
+};
+pub use scheduler::{
+    backpressure_pair, BackpressureHandle, BackpressureTransport, Scheduler, SchedulerError,
+    SchedulerEvent, TokenBucket, BUFFERED_AMOUNT_HIGH, BUFFERED_AMOUNT_LOW,
+    PER_PEER_BUCKET_CAPACITY, PER_PEER_REFILL_PER_SEC,
 };
 pub use session::{
     cancel_session, ReceiverSession, SenderSession, SessionError, MAX_CHUNK_RETRIES, WINDOW_SIZE,
