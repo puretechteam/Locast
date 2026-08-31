@@ -124,8 +124,7 @@ pub async fn assemble_and_finalize(
 ) -> Result<AssembleResult, AssembleError> {
     // Validate identifiers up front so a bad path cannot
     // surface halfway through a multi-gigabyte copy.
-    paths::validate_sha(sha256)
-        .map_err(|e| AssembleError::Path(format!("sha: {e}")))?;
+    paths::validate_sha(sha256).map_err(|e| AssembleError::Path(format!("sha: {e}")))?;
     let staging = paths::staging_partial_path(library_root, download_id, sha256)
         .map_err(|e| AssembleError::Path(format!("staging: {e}")))?;
     let staging_dir = staging
@@ -187,30 +186,26 @@ pub async fn assemble_and_finalize(
         .await
         .map_err(|e| match e {
             ChunkVerifyError::Blake3Mismatch { .. } => AssembleError::Blake3Mismatch,
-            ChunkVerifyError::LengthMismatch { .. } => AssembleError::Io(
-                "staging partial size changed between passes".into(),
-            ),
-            ChunkVerifyError::Sha256Mismatch { .. } => AssembleError::Io(
-                "verify_full_blake3 returned Sha256Mismatch (impossible)".into(),
-            ),
+            ChunkVerifyError::LengthMismatch { .. } => {
+                AssembleError::Io("staging partial size changed between passes".into())
+            }
+            ChunkVerifyError::Sha256Mismatch { .. } => {
+                AssembleError::Io("verify_full_blake3 returned Sha256Mismatch (impossible)".into())
+            }
         })?;
 
     // Atomic rename into the library. `complete_download`
     // re-validates every component + canonicalizes +
     // asserts containment.
-    let final_path = library_fs::complete_download(
-        library_root,
-        sha256,
-        &staging,
-        sanitized_filename,
-    )
-    .await
-    .map_err(|e| match e {
-        library_fs::FsError::PathEscapesLibrary => {
-            AssembleError::PathEscapesLibrary("staging -> library".into())
-        }
-        other => AssembleError::Completion(other.to_string()),
-    })?;
+    let final_path =
+        library_fs::complete_download(library_root, sha256, &staging, sanitized_filename)
+            .await
+            .map_err(|e| match e {
+                library_fs::FsError::PathEscapesLibrary => {
+                    AssembleError::PathEscapesLibrary("staging -> library".into())
+                }
+                other => AssembleError::Completion(other.to_string()),
+            })?;
 
     Ok(AssembleResult {
         final_path,
@@ -228,20 +223,25 @@ async fn verify_full_blake3_via_file(
     expected_blake3: &str,
 ) -> Result<String, ChunkVerifyError> {
     use crate::core::hashing::Blake3Hasher;
-    let meta = tokio::fs::metadata(path).await.map_err(|_| ChunkVerifyError::LengthMismatch {
-        got: 0,
-        expected: expected_size,
-    })?;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|_| ChunkVerifyError::LengthMismatch {
+            got: 0,
+            expected: expected_size,
+        })?;
     if meta.len() != expected_size {
         return Err(ChunkVerifyError::LengthMismatch {
             got: meta.len(),
             expected: expected_size,
         });
     }
-    let mut f = tokio::fs::File::open(path).await.map_err(|_| ChunkVerifyError::LengthMismatch {
-        got: 0,
-        expected: expected_size,
-    })?;
+    let mut f =
+        tokio::fs::File::open(path)
+            .await
+            .map_err(|_| ChunkVerifyError::LengthMismatch {
+                got: 0,
+                expected: expected_size,
+            })?;
     let mut h = Blake3Hasher::new();
     let mut scratch = vec![0u8; IO_SCRATCH];
     loop {
@@ -363,8 +363,12 @@ mod tests {
         let stage_dir = root.join("tmp").join("staging").join(id);
         tokio::fs::create_dir_all(&inc_dir).await.unwrap();
         tokio::fs::create_dir_all(&stage_dir).await.unwrap();
-        tokio::fs::write(inc_dir.join("anything"), b"x").await.unwrap();
-        tokio::fs::write(stage_dir.join("anything"), b"x").await.unwrap();
+        tokio::fs::write(inc_dir.join("anything"), b"x")
+            .await
+            .unwrap();
+        tokio::fs::write(stage_dir.join("anything"), b"x")
+            .await
+            .unwrap();
         cleanup_incomplete(root, id).await.expect("clean");
         assert!(!inc_dir.exists());
         assert!(!stage_dir.exists());

@@ -38,7 +38,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use locast_client_lib::core::hashing::{Blake3Hasher, Sha256Hasher, CHUNK_SIZE};
@@ -212,8 +212,7 @@ async fn build_plan(
             chunk_hashes: chunk_hashes.clone(),
         }],
     };
-    let plan = plan_download(download_id, "media-uuid", 1, &entry, &peer_id)
-        .expect("plan");
+    let plan = plan_download(download_id, "media-uuid", 1, &entry, &peer_id).expect("plan");
     (plan, blake3, chunk_hashes)
 }
 
@@ -253,7 +252,10 @@ async fn seed_fk_deps(store: &DownloadStore, user_id: &str, media_id: &str) {
 /// `DownloadStore::create` but bypasses the validation (we
 /// know our plan is valid because we built it from the same
 /// fixture).
-async fn create_download(store: &DownloadStore, plan: &locast_client_lib::transfer::plan::DownloadPlan) {
+async fn create_download(
+    store: &DownloadStore,
+    plan: &locast_client_lib::transfer::plan::DownloadPlan,
+) {
     let n = &plan;
     let mut tx = store.pool().begin().await.expect("tx");
     sqlx::query(
@@ -336,8 +338,7 @@ async fn e2e_transfer_50mib_with_loss_and_jitter() {
     // transport" smoke test. The session's per-chunk
     // retry budget (5) plus the sliding-window resend
     // path together cover this loss rate for 200 chunks.
-    let (host_side, recv_side): (LoopbackTransport, LoopbackTransport) =
-        loopback_pair(5, 50);
+    let (host_side, recv_side): (LoopbackTransport, LoopbackTransport) = loopback_pair(5, 50);
 
     // Run the two halves concurrently. `plan` is cloned for
     // each spawn so the outer `plan` remains usable for
@@ -368,7 +369,11 @@ async fn e2e_transfer_50mib_with_loss_and_jitter() {
     let recv_res = receiver_handle.await.expect("recv join");
     sender_res.expect("sender ok");
     let final_state = recv_res.expect("recv ok");
-    assert_eq!(final_state, DownloadState::Complete, "receiver must report Complete");
+    assert_eq!(
+        final_state,
+        DownloadState::Complete,
+        "receiver must report Complete"
+    );
 
     // 1. Every chunk's sha256 verifies — derive them from
     // the original fixture. The session only persists
@@ -458,19 +463,15 @@ async fn e2e_bad_chunk_hash_is_rejected() {
             .await
             .expect("open host source");
         use tokio::io::AsyncSeekExt;
-        f.seek(std::io::SeekFrom::Start(
-            (7 * CHUNK_SIZE + 100) as u64,
-        ))
-        .await
-        .expect("seek");
+        f.seek(std::io::SeekFrom::Start((7 * CHUNK_SIZE + 100) as u64))
+            .await
+            .expect("seek");
         let mut buf = [0u8; 1];
         f.read_exact(&mut buf).await.expect("read");
         buf[0] ^= 0xFF;
-        f.seek(std::io::SeekFrom::Start(
-            (7 * CHUNK_SIZE + 100) as u64,
-        ))
-        .await
-        .expect("seek back");
+        f.seek(std::io::SeekFrom::Start((7 * CHUNK_SIZE + 100) as u64))
+            .await
+            .expect("seek back");
         f.write_all(&buf).await.expect("write");
         f.flush().await.expect("flush");
     }
@@ -563,7 +564,6 @@ async fn e2e_cancellation_does_not_commit() {
     let sender_plan = plan.clone();
     let sender_lib_root = host_lib_root.clone();
     let recv_store = store.clone();
-    let recv_lib_root_for_run = recv_lib_root.clone();
 
     // Start the sessions.
     let sender_handle = tokio::spawn(async move {
@@ -713,10 +713,8 @@ async fn e2e_offer_filename_is_sanitized() {
         },
     );
     let mut buf = Vec::new();
-    locast_client_lib::transfer::wire::codec::encode(&bad_offer, &mut buf)
-        .expect("encode");
-    let err = locast_client_lib::transfer::wire::codec::decode(&buf)
-        .unwrap_err();
+    locast_client_lib::transfer::wire::codec::encode(&bad_offer, &mut buf).expect("encode");
+    let err = locast_client_lib::transfer::wire::codec::decode(&buf).unwrap_err();
     assert!(matches!(
         err,
         locast_client_lib::transfer::wire::WireError::InvalidFilename(_)
@@ -844,8 +842,7 @@ async fn e2e_resume_from_persisted_bitmap() {
     assert!(final_path.exists());
     let bytes = tokio::fs::read(&final_path).await.expect("read final");
     assert_eq!(bytes.len(), TOTAL_SIZE);
-    verify_full_blake3(&bytes, TOTAL_SIZE as u64, &expected_blake3)
-        .expect("verify_full_blake3");
+    verify_full_blake3(&bytes, TOTAL_SIZE as u64, &expected_blake3).expect("verify_full_blake3");
 
     let rec = store.fetch(&plan.download_id).await.expect("fetch");
     assert_eq!(rec.state, DownloadState::Complete);
@@ -871,8 +868,8 @@ fn _planned_chunk_pin(c: &PlannedChunk) -> u32 {
 }
 
 #[allow(dead_code)]
-fn _pathbuf_pin(p: &PathBuf) -> &std::path::Path {
-    p.as_path()
+fn _pathbuf_pin(p: &Path) -> &std::path::Path {
+    p
 }
 
 #[allow(dead_code)]

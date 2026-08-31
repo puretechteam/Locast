@@ -363,9 +363,7 @@ fn check_download_id(s: &str) -> Result<(), WireError> {
         return Err(WireError::InvalidDownloadId(s.to_string()));
     }
     for c in s.chars() {
-        let ok = c.is_ascii_digit()
-            || ('a'..='f').contains(&c)
-            || c == '-';
+        let ok = c.is_ascii_digit() || ('a'..='f').contains(&c) || c == '-';
         if !ok {
             return Err(WireError::InvalidDownloadId(s.to_string()));
         }
@@ -411,7 +409,7 @@ pub(crate) fn validate(f: &Frame) -> Result<(), WireError> {
                 return Err(WireError::InvalidManifestVersion(x.manifest_version));
             }
             for &i in &x.have_chunks {
-                if i >= u32::MAX {
+                if i == u32::MAX {
                     return Err(WireError::ChunkIndexOutOfRange {
                         index: i,
                         total: u32::MAX,
@@ -493,8 +491,8 @@ pub mod codec {
     /// NOT cleared; callers append as many frames as they
     /// like.
     pub fn encode(f: &Frame, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let payload = serde_json::to_vec(f)
-            .map_err(|e| WireError::Malformed(format!("encode: {e}")))?;
+        let payload =
+            serde_json::to_vec(f).map_err(|e| WireError::Malformed(format!("encode: {e}")))?;
         if payload.len() > MAX_FRAME_BYTES as usize {
             return Err(WireError::InvalidLength(payload.len() as u32));
         }
@@ -545,9 +543,7 @@ pub mod codec {
     /// buffer. Stops at the first parse error and returns the
     /// remaining bytes. Used by the loopback transport's
     /// reader.
-    pub fn decode_stream(
-        bytes: &[u8],
-    ) -> Result<(Vec<Frame>, usize), WireError> {
+    pub fn decode_stream(bytes: &[u8]) -> Result<(Vec<Frame>, usize), WireError> {
         let mut out = Vec::new();
         let mut cursor = 0usize;
         while cursor < bytes.len() {

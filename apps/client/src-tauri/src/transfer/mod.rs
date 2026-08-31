@@ -63,7 +63,9 @@ pub mod wire;
 pub use plan::{
     DownloadPlan, PlanError, PlanErrorKind, PlannedChunk, PlannedSource, SelectedSource,
 };
-pub use session::{cancel_session, ReceiverSession, SenderSession, SessionError, MAX_CHUNK_RETRIES, WINDOW_SIZE};
+pub use session::{
+    cancel_session, ReceiverSession, SenderSession, SessionError, MAX_CHUNK_RETRIES, WINDOW_SIZE,
+};
 pub use state::{
     ChunkState, DownloadRecord, DownloadStore, DownloadSummary, NewDownload, RESUME_MAX_AGE_HOURS,
     SCHEMA_VERSION,
@@ -73,9 +75,9 @@ pub use transport::{
 };
 pub use verify::{verify_chunk_sha256, verify_full_blake3, ChunkVerifyError};
 pub use wire::{
-    codec as wire_codec, peer_id_from_pubkey, AckFrame, CancelFrame, ChunkFrame, ErrorFrame,
-    Frame, FrameKind, HelloFrame, MAX_ERROR_LEN, MAX_FRAME_BYTES, NakFrame, OfferFrame,
-    RequestFrame, WireError,
+    codec as wire_codec, peer_id_from_pubkey, AckFrame, CancelFrame, ChunkFrame, ErrorFrame, Frame,
+    FrameKind, HelloFrame, NakFrame, OfferFrame, RequestFrame, WireError, MAX_ERROR_LEN,
+    MAX_FRAME_BYTES,
 };
 
 /// The canonical chunk size used by the planner, verifier,

@@ -128,10 +128,7 @@ pub enum SessionError {
         actual: u32,
     },
     #[error("peer identity mismatch: expected {expected}, got {actual}")]
-    PeerMismatch {
-        expected: String,
-        actual: String,
-    },
+    PeerMismatch { expected: String, actual: String },
     #[error("manifest binding mismatch: plan v{plan}, frame v{frame}")]
     ManifestVersionMismatch { plan: i64, frame: i64 },
     #[error("total_bytes mismatch: plan {plan}, frame {frame}")]
@@ -292,98 +289,96 @@ impl<'a> SenderSession<'a> {
                     Err(e) => return Err(e),
                 };
                 match frame {
-                Frame::Request(req) => {
-                    if have.contains(&req.chunk_index) {
-                        let ack = Frame::Ack(AckFrame {
+                    Frame::Request(req) => {
+                        if have.contains(&req.chunk_index) {
+                            let ack = Frame::Ack(AckFrame {
+                                download_id: plan.download_id.clone(),
+                                chunk_index: req.chunk_index,
+                            });
+                            send_frame(&transport, &ack, &cancel).await?;
+                            continue;
+                        }
+                        let chunk = plan
+                            .chunks
+                            .iter()
+                            .find(|c| c.index == req.chunk_index)
+                            .ok_or(SessionError::ChunkOutOfRange {
+                                index: req.chunk_index,
+                                total: plan.chunks.len() as u32,
+                            })?
+                            .clone();
+                        let (bytes, sha256) = read_chunk_at(&src_path, &chunk).await?;
+                        let frame = Frame::Chunk(ChunkFrame {
                             download_id: plan.download_id.clone(),
-                            chunk_index: req.chunk_index,
+                            chunk_index: chunk.index,
+                            bytes_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            sha256,
                         });
-                        send_frame(&transport, &ack, &cancel).await?;
-                        continue;
+                        send_frame(&transport, &frame, &cancel).await?;
                     }
-                    let chunk = plan
-                        .chunks
-                        .iter()
-                        .find(|c| c.index == req.chunk_index)
-                        .ok_or(SessionError::ChunkOutOfRange {
-                            index: req.chunk_index,
-                            total: plan.chunks.len() as u32,
-                        })?
-                        .clone();
-                    let (bytes, sha256) =
-                        read_chunk_at(&src_path, &chunk).await?;
-                    let frame = Frame::Chunk(ChunkFrame {
-                        download_id: plan.download_id.clone(),
-                        chunk_index: chunk.index,
-                        bytes_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        sha256,
-                    });
-                    send_frame(&transport, &frame, &cancel).await?;
-                }
-                Frame::Ack(ack) => {
-                    have.insert(ack.chunk_index);
-                    debug!(
-                        download_id = %plan.download_id,
-                        chunk_index = ack.chunk_index,
-                        "sender: ack received"
-                    );
-                    if have.len() as u32 >= plan.source_meta.total_chunks {
+                    Frame::Ack(ack) => {
+                        have.insert(ack.chunk_index);
+                        debug!(
+                            download_id = %plan.download_id,
+                            chunk_index = ack.chunk_index,
+                            "sender: ack received"
+                        );
+                        if have.len() as u32 >= plan.source_meta.total_chunks {
+                            info!(
+                                download_id = %plan.download_id,
+                                "sender: receiver reported complete"
+                            );
+                            return Ok(());
+                        }
+                    }
+                    Frame::Nak(nak) => {
+                        debug!(
+                            download_id = %plan.download_id,
+                            chunk_index = nak.chunk_index,
+                            "sender: nak received; resending"
+                        );
+                        let chunk = plan
+                            .chunks
+                            .iter()
+                            .find(|c| c.index == nak.chunk_index)
+                            .ok_or(SessionError::ChunkOutOfRange {
+                                index: nak.chunk_index,
+                                total: plan.chunks.len() as u32,
+                            })?
+                            .clone();
+                        let (bytes, sha256) = read_chunk_at(&src_path, &chunk).await?;
+                        let frame = Frame::Chunk(ChunkFrame {
+                            download_id: plan.download_id.clone(),
+                            chunk_index: chunk.index,
+                            bytes_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            sha256,
+                        });
+                        send_frame(&transport, &frame, &cancel).await?;
+                    }
+                    Frame::Cancel(c) => {
                         info!(
                             download_id = %plan.download_id,
-                            "sender: receiver reported complete"
+                            reason = %c.reason,
+                            "sender: cancel received"
                         );
                         return Ok(());
                     }
-                }
-                Frame::Nak(nak) => {
-                    debug!(
-                        download_id = %plan.download_id,
-                        chunk_index = nak.chunk_index,
-                        "sender: nak received; resending"
-                    );
-                    let chunk = plan
-                        .chunks
-                        .iter()
-                        .find(|c| c.index == nak.chunk_index)
-                        .ok_or(SessionError::ChunkOutOfRange {
-                            index: nak.chunk_index,
-                            total: plan.chunks.len() as u32,
-                        })?
-                        .clone();
-                    let (bytes, sha256) =
-                        read_chunk_at(&src_path, &chunk).await?;
-                    let frame = Frame::Chunk(ChunkFrame {
-                        download_id: plan.download_id.clone(),
-                        chunk_index: chunk.index,
-                        bytes_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                        sha256,
-                    });
-                    send_frame(&transport, &frame, &cancel).await?;
-                }
-                Frame::Cancel(c) => {
-                    info!(
-                        download_id = %plan.download_id,
-                        reason = %c.reason,
-                        "sender: cancel received"
-                    );
-                    return Ok(());
-                }
-                Frame::Error(e) => {
-                    warn!(
-                        download_id = %plan.download_id,
-                        reason = %e.reason,
-                        "sender: error frame"
-                    );
-                    return Err(SessionError::Io(format!("peer error: {}", e.reason)));
-                }
-                other => {
-                    return Err(SessionError::Wire(WireError::Malformed(format!(
-                        "unexpected frame kind: {:?}",
-                        other.kind()
-                    ))));
+                    Frame::Error(e) => {
+                        warn!(
+                            download_id = %plan.download_id,
+                            reason = %e.reason,
+                            "sender: error frame"
+                        );
+                        return Err(SessionError::Io(format!("peer error: {}", e.reason)));
+                    }
+                    other => {
+                        return Err(SessionError::Wire(WireError::Malformed(format!(
+                            "unexpected frame kind: {:?}",
+                            other.kind()
+                        ))));
+                    }
                 }
             }
-        }
         }
         .await;
         // Treat receiver-initiated shutdown (Cancel or close)
@@ -437,10 +432,7 @@ impl<'a> ReceiverSession<'a> {
     /// final `DownloadState` (`Complete` or `Failed`). On
     /// any error, the store is left in `Failed` so the user
     /// can inspect `last_error`.
-    pub async fn run(
-        &self,
-        sanitized_filename: String,
-    ) -> Result<DownloadState, SessionError> {
+    pub async fn run(&self, sanitized_filename: String) -> Result<DownloadState, SessionError> {
         let cancel = self.cancel.clone();
         let transport = Arc::clone(&self.transport);
         let plan = self.plan;
@@ -450,21 +442,13 @@ impl<'a> ReceiverSession<'a> {
         // Drive the download state machine forward. If the
         // download is already in a later state (resume from
         // a previous session), skip the early transitions.
-        let cur = store
-            .fetch(&plan.download_id)
-            .await
-            .ok()
-            .map(|r| r.state);
-        if cur != Some(DownloadState::Transferring)
-            && cur != Some(DownloadState::Verifying)
-        {
+        let cur = store.fetch(&plan.download_id).await.ok().map(|r| r.state);
+        if cur != Some(DownloadState::Transferring) && cur != Some(DownloadState::Verifying) {
             store
                 .transition(&plan.download_id, DownloadState::Connecting)
                 .await?;
         }
-        if cur != Some(DownloadState::Transferring)
-            && cur != Some(DownloadState::Verifying)
-        {
+        if cur != Some(DownloadState::Transferring) && cur != Some(DownloadState::Verifying) {
             store
                 .transition(&plan.download_id, DownloadState::Transferring)
                 .await?;
@@ -574,56 +558,53 @@ impl<'a> ReceiverSession<'a> {
                 Err(SessionError::Transport(TransportError::Closed))
                 | Err(SessionError::Transport(TransportError::Cancelled)) => {
                     let _ = store
-                        .set_last_error(
-                            &plan.download_id,
-                            "peer disappeared mid-transfer",
-                        )
+                        .set_last_error(&plan.download_id, "peer disappeared mid-transfer")
                         .await;
                     return Err(SessionError::Cancelled);
                 }
                 Err(e) => return Err(e),
             };
             match frame {
-Frame::Chunk(chunk) => {
+                Frame::Chunk(chunk) => {
                     let outcome = handle_chunk(
-                    plan,
-                    &store,
-                    &library_root,
-                    &chunk,
-                    &mut in_flight,
-                    &mut verified,
-                    &transport,
-                    &cancel,
-                )
-                .await;
-                if let Err(e) = outcome {
-                    if !matches!(e, SessionError::ChunkHashMismatch { .. })
-                        && !matches!(e, SessionError::ChunkLengthMismatch { .. })
-                    {
-                        // Max retries or any other terminal
-                        // session error: notify the sender,
-                        // transition the download to Failed,
-                        // and return Ok(Failed) so the caller
-                        // can inspect the final state without
-                        // seeing a `?`-propagated error.
-                        let err_cancel = Frame::Cancel(CancelFrame {
-                            download_id: plan.download_id.clone(),
-                            reason: "hash_mismatch".into(),
-                        });
-                        let _ = send_frame(&transport, &err_cancel, &cancel).await;
-                        transport.close().await;
-                        let _ = store
-                            .set_last_error(&plan.download_id, &format!("{e}"))
-                            .await;
-                        let _ = store
-                            .transition(&plan.download_id, DownloadState::Failed)
-                            .await;
-                        return Ok(DownloadState::Failed);
+                        plan,
+                        &store,
+                        &library_root,
+                        &chunk,
+                        &mut in_flight,
+                        &mut verified,
+                        &transport,
+                        &cancel,
+                    )
+                    .await;
+                    if let Err(e) = outcome {
+                        if !matches!(e, SessionError::ChunkHashMismatch { .. })
+                            && !matches!(e, SessionError::ChunkLengthMismatch { .. })
+                        {
+                            // Max retries or any other terminal
+                            // session error: notify the sender,
+                            // transition the download to Failed,
+                            // and return Ok(Failed) so the caller
+                            // can inspect the final state without
+                            // seeing a `?`-propagated error.
+                            let err_cancel = Frame::Cancel(CancelFrame {
+                                download_id: plan.download_id.clone(),
+                                reason: "hash_mismatch".into(),
+                            });
+                            let _ = send_frame(&transport, &err_cancel, &cancel).await;
+                            transport.close().await;
+                            let _ = store
+                                .set_last_error(&plan.download_id, &format!("{e}"))
+                                .await;
+                            let _ = store
+                                .transition(&plan.download_id, DownloadState::Failed)
+                                .await;
+                            return Ok(DownloadState::Failed);
+                        }
+                        // Hash / length mismatch: chunk was
+                        // requeued by handle_chunk via Nak; the
+                        // loop continues.
                     }
-                    // Hash / length mismatch: chunk was
-                    // requeued by handle_chunk via Nak; the
-                    // loop continues.
-                }
                 }
                 Frame::Cancel(c) => {
                     info!(
@@ -658,8 +639,8 @@ Frame::Chunk(chunk) => {
 
         // 4. Final verify + atomic completion.
         store
-        .transition(&plan.download_id, DownloadState::Verifying)
-        .await?;
+            .transition(&plan.download_id, DownloadState::Verifying)
+            .await?;
         let res = assemble_and_finalize(
             &library_root,
             &plan.download_id,
@@ -679,34 +660,30 @@ Frame::Chunk(chunk) => {
                 // Best-effort cleanup of the per-download
                 // chunk staging dir. The final library
                 // file is now in place.
-                let _ = super::assemble::cleanup_incomplete(
-                    &library_root,
-                    &plan.download_id,
-                )
-                .await;
+                let _ = super::assemble::cleanup_incomplete(&library_root, &plan.download_id).await;
                 store
-                .transition(&plan.download_id, DownloadState::Complete)
-                .await?;
+                    .transition(&plan.download_id, DownloadState::Complete)
+                    .await?;
                 transport.close().await;
                 Ok(DownloadState::Complete)
             }
             Err(AssembleError::Blake3Mismatch) => {
                 store
-                .set_last_error(&plan.download_id, "final blake3 mismatch")
-                .await?;
+                    .set_last_error(&plan.download_id, "final blake3 mismatch")
+                    .await?;
                 store
-                .transition(&plan.download_id, DownloadState::Failed)
-                .await?;
+                    .transition(&plan.download_id, DownloadState::Failed)
+                    .await?;
                 transport.close().await;
                 Ok(DownloadState::Failed)
             }
             Err(e) => {
                 let _ = store
-                .set_last_error(&plan.download_id, &format!("assemble: {e}"))
-                .await;
+                    .set_last_error(&plan.download_id, &format!("assemble: {e}"))
+                    .await;
                 store
-                .transition(&plan.download_id, DownloadState::Failed)
-                .await?;
+                    .transition(&plan.download_id, DownloadState::Failed)
+                    .await?;
                 transport.close().await;
                 Err(e.into())
             }
@@ -742,10 +719,7 @@ pub async fn cancel_session(
 /// (caller must rename the source). For tests, the
 /// `SenderSession` is given a `library_root` whose layout is
 /// `tmp/source/<sha>` (see the integration test harness).
-fn plan_source_path(
-    library_root: &Path,
-    plan: &DownloadPlan,
-) -> Result<PathBuf, SessionError> {
+fn plan_source_path(library_root: &Path, plan: &DownloadPlan) -> Result<PathBuf, SessionError> {
     // The host-side source layout is `library_root/<sha>`
     // for the integration test. The production host uses
     // `complete_download`'s layout but writes are handled
@@ -772,10 +746,7 @@ async fn read_chunk_at(
         if n == 0 {
             return Err(SessionError::Io(format!(
                 "short read on chunk {} at offset {}: wanted {}, got {}",
-                chunk.index,
-                chunk.offset,
-                chunk.length,
-                read
+                chunk.index, chunk.offset, chunk.length, read
             )));
         }
         read += n;
@@ -788,10 +759,7 @@ async fn read_chunk_at(
 /// Validate every field of an inbound `Offer` frame against
 /// the bound plan. Returns `SessionError` on the first
 /// mismatch.
-fn verify_offer_against_plan(
-    offer: &OfferFrame,
-    plan: &DownloadPlan,
-) -> Result<(), SessionError> {
+fn verify_offer_against_plan(offer: &OfferFrame, plan: &DownloadPlan) -> Result<(), SessionError> {
     if offer.peer_id != plan.source.peer_id {
         return Err(SessionError::PeerMismatch {
             expected: plan.source.peer_id.clone(),
@@ -914,15 +882,7 @@ async fn handle_chunk(
         .map_err(|e| SessionError::Io(format!("base64 decode: {e}")))?;
 
     if bytes.len() != expected.length as usize {
-        send_nak_and_requeue(
-            plan,
-            entry,
-            chunk.chunk_index,
-            in_flight,
-            transport,
-            cancel,
-        )
-        .await?;
+        send_nak_and_requeue(plan, entry, chunk.chunk_index, in_flight, transport, cancel).await?;
         return Err(SessionError::ChunkLengthMismatch {
             index: chunk.chunk_index,
             expected: expected.length,
@@ -933,15 +893,7 @@ async fn handle_chunk(
     if let Err(ChunkVerifyError::Sha256Mismatch { .. }) =
         verify_chunk_sha256(&bytes, &expected.sha256)
     {
-        send_nak_and_requeue(
-            plan,
-            entry,
-            chunk.chunk_index,
-            in_flight,
-            transport,
-            cancel,
-        )
-        .await?;
+        send_nak_and_requeue(plan, entry, chunk.chunk_index, in_flight, transport, cancel).await?;
         return Err(SessionError::ChunkHashMismatch {
             index: chunk.chunk_index,
             expected: expected.sha256.clone(),
@@ -975,14 +927,14 @@ async fn send_nak_and_requeue(
     transport: &Arc<dyn Transport>,
     cancel: &CancellationToken,
 ) -> Result<(), SessionError> {
-    let expected = plan
-        .chunks
-        .iter()
-        .find(|c| c.index == index)
-        .ok_or(SessionError::ChunkOutOfRange {
-            index,
-            total: plan.chunks.len() as u32,
-        })?;
+    let expected =
+        plan.chunks
+            .iter()
+            .find(|c| c.index == index)
+            .ok_or(SessionError::ChunkOutOfRange {
+                index,
+                total: plan.chunks.len() as u32,
+            })?;
     let retries = entry.retries + 1;
     if retries > MAX_CHUNK_RETRIES {
         return Err(SessionError::MaxRetriesExceeded {
@@ -1173,6 +1125,7 @@ mod tests {
                 chunk_hashes: vec!["3".repeat(64); total_chunks as usize],
             }],
         };
-        crate::transfer::plan::plan_download("dl-fake", "media-uuid", 1, &entry, &peer_id).expect("plan")
+        crate::transfer::plan::plan_download("dl-fake", "media-uuid", 1, &entry, &peer_id)
+            .expect("plan")
     }
 }

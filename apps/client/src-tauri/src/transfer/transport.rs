@@ -372,8 +372,8 @@ mod tests {
     }
 
     fn codec_round_trip_payload() -> Vec<u8> {
-        use crate::transfer::wire::{codec, Frame, HelloFrame, MAX_FRAME_BYTES};
         use crate::transfer::wire::peer_id_from_pubkey;
+        use crate::transfer::wire::{codec, Frame, HelloFrame, MAX_FRAME_BYTES};
         let f = Frame::Hello(HelloFrame {
             peer_id: peer_id_from_pubkey(&[3u8; 32]),
             download_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
