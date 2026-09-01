@@ -113,8 +113,10 @@ fn check_download_id(id: &str) -> Result<(), PathError> {
 }
 
 /// Validate that a sanitized filename is a single segment: no `/`, no
-/// `\`, no NUL.
-fn check_sanitized(name: &str) -> Result<(), PathError> {
+/// `\`, no NUL. Public so callers that already hold a sanitized filename
+/// (e.g. `library::dedup::exists_at_canonical_path`) can re-validate it
+/// without re-running the full sanitizer.
+pub fn check_sanitized(name: &str) -> Result<(), PathError> {
     if name.is_empty() {
         return Err(PathError::InvalidSanitizedFilename(name.to_string()));
     }

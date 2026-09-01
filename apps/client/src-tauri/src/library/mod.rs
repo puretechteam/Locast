@@ -8,9 +8,11 @@
 //! P1-T08 adds the `locast://` custom protocol module
 //! (`library::protocol::ProtocolHandler`).
 
+pub mod dedup;
 pub mod fs;
 pub mod protocol;
 pub mod scan;
 
+pub use dedup::{dedup_on_download, exists_at_canonical_path, DedupError, DedupOutcome};
 pub use protocol::{resolve_media_url, resolve_subtitle_url, ProtocolHandler};
 pub use scan::{scan as scan_library, ScanError, ScanResult};
