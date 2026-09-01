@@ -402,6 +402,44 @@ impl IdentityService {
         Ok(())
     }
 
+    /// P3-T12: ensure a `user_identities` row exists for the
+    /// current keypair, WITHOUT touching the `display_name` on
+    /// conflict. Returns the `user_id` (sha256 of public key,
+    /// hex). This is the additive sibling of `get_or_create`:
+    /// `get_or_create` UPDATEs `display_name = excluded.display_name`
+    /// on conflict (the first-launch creation path), which is the
+    /// wrong behavior when a download needs to satisfy the FK on
+    /// `downloads.user_id` without clobbering a name the user
+    /// already set.
+    pub async fn ensure_user_row(&self) -> Result<String, IdentityServiceError> {
+        let kp = self.load_keypair().await?;
+        let pk_bytes = kp.signing.verifying_key().to_bytes();
+        let user_id = crate::identity::derive_user_id(pk_bytes);
+        let pk_b64 = {
+            use base64::engine::general_purpose::STANDARD as BASE64;
+            use base64::Engine as _;
+            BASE64.encode(pk_bytes)
+        };
+        let now_ms: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| IdentityServiceError::Other(e.to_string()))?
+            .as_millis()
+            .try_into()
+            .map_err(|e: std::num::TryFromIntError| IdentityServiceError::Other(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
+             VALUES (?1, ?2, '', ?3, ?3) \
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&user_id)
+        .bind(&pk_b64)
+        .bind(now_ms)
+        .execute(&self.storage.pool())
+        .await
+        .map_err(|e| IdentityServiceError::Storage(e.to_string()))?;
+        Ok(user_id)
+    }
+
     /// P3-T03: sign a media manifest and return a fresh
     /// `MediaManifest` whose `host_signature` is populated.
     ///

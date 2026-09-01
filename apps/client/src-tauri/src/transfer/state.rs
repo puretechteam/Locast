@@ -653,6 +653,92 @@ impl DownloadStore {
         Ok(())
     }
 
+    /// P3-T12: atomically mark a download complete with all chunks
+    /// verified. This is the dedup-on-download shortcut path.
+    /// Walks the state machine
+    /// `pending -> connecting -> transferring -> verifying -> complete`
+    /// and inserts / updates a `download_chunks` row for every
+    /// `(index, expected_sha256)` in `chunk_sha256s` as `verified`.
+    /// Idempotent: if the row is already complete, returns `Ok`
+    /// without modification.
+    ///
+    /// On dedup completion:
+    /// - `transferred_bytes` is set to `total_bytes`.
+    /// - `completed_at` is stamped with the current unix ms.
+    /// - `source_peer_id` is left unchanged if already set,
+    ///   otherwise set to the value supplied (typically the
+    ///   room's host `user_id`).
+    pub async fn mark_complete(
+        &self,
+        download_id: &str,
+        total_bytes: u64,
+        source_peer_id: Option<&str>,
+        chunk_sha256s: &[(u32, String)],
+    ) -> Result<(), ChunkStateError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE downloads SET state = 'connecting' \
+             WHERE id = ?1 AND state = 'pending'",
+        )
+        .bind(download_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE downloads SET state = 'transferring' \
+             WHERE id = ?1 AND state = 'connecting'",
+        )
+        .bind(download_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE downloads SET state = 'verifying' \
+             WHERE id = ?1 AND state = 'transferring'",
+        )
+        .bind(download_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE downloads \
+             SET state = 'complete', \
+                 transferred_bytes = ?2, \
+                 completed_at = ?3, \
+                 total_bytes = ?4, \
+                 source_peer_id = COALESCE(source_peer_id, ?5) \
+             WHERE id = ?1 AND state = 'verifying'",
+        )
+        .bind(download_id)
+        .bind(total_bytes as i64)
+        .bind(unix_millis_now())
+        .bind(total_bytes as i64)
+        .bind(source_peer_id)
+        .execute(&mut *tx)
+        .await?;
+        for (index, sha) in chunk_sha256s {
+            let offset = (*index as i64) * (crate::transfer::CHUNK_SIZE_BYTES as i64);
+            let length = std::cmp::min(
+                crate::transfer::CHUNK_SIZE_BYTES as i64,
+                (total_bytes as i64) - offset,
+            )
+            .max(1);
+            sqlx::query(
+                "INSERT INTO download_chunks \
+                     (id, download_id, \"index\", offset, length, sha256, state) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'verified') \
+                 ON CONFLICT(download_id, \"index\") DO UPDATE SET state = 'verified'",
+            )
+            .bind(format!("{download_id}-{index}"))
+            .bind(download_id)
+            .bind(*index as i64)
+            .bind(offset)
+            .bind(length)
+            .bind(sha)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// P3-T09: update the `downloads.source_peer_id` column
     /// with the peer that just served a chunk. Best-effort,
     /// additive; no schema change. The column was created in
@@ -703,6 +789,19 @@ fn is_valid_transition(from: DownloadState, to: DownloadState) -> bool {
 }
 
 fn chrono_unix_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// P3-T12: second time helper. The existing
+/// `chrono_unix_ms_now` is kept for parity with the other
+/// call sites; the new helper exists so the
+/// `mark_complete` API is self-contained and the
+/// implementation doesn't share a private helper with
+/// other call sites by accident.
+fn unix_millis_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -1287,6 +1386,110 @@ mod tests {
         .await
         .expect("state");
         assert_eq!(state, "pending");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mark_complete_walks_state_and_marks_all_chunks_verified() {
+        let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
+        let s = DownloadStore::new(pool.clone());
+        s.create(
+            &NewDownload {
+                download_id: "dl-1".into(),
+                media_id: "m-1".into(),
+                room_id: None,
+                user_id: "u-1".into(),
+                total_bytes: crate::transfer::CHUNK_SIZE_BYTES as u64 * 3,
+                source_peer_id: peer_id(),
+                chunk_size_bytes: crate::transfer::CHUNK_SIZE_BYTES as u32,
+                manifest_version: 1,
+            },
+            &fake_chunks(3),
+        )
+        .await
+        .expect("create");
+
+        let chunks: Vec<(u32, String)> =
+            (0..3).map(|i| (i, format!("{:064x}", i as u128))).collect();
+        s.mark_complete(
+            "dl-1",
+            crate::transfer::CHUNK_SIZE_BYTES as u64 * 3,
+            Some(&peer_id()),
+            &chunks,
+        )
+        .await
+        .expect("mark_complete");
+
+        let rec = s.fetch("dl-1").await.expect("fetch");
+        assert_eq!(rec.state, DownloadState::Complete);
+        assert_eq!(
+            rec.transferred_bytes as u64,
+            crate::transfer::CHUNK_SIZE_BYTES as u64 * 3
+        );
+        let verified: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM download_chunks \
+             WHERE download_id = ?1 AND state = 'verified'",
+        )
+        .bind("dl-1")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(verified, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mark_complete_is_idempotent() {
+        let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
+        let s = DownloadStore::new(pool.clone());
+        s.create(
+            &NewDownload {
+                download_id: "dl-1".into(),
+                media_id: "m-1".into(),
+                room_id: None,
+                user_id: "u-1".into(),
+                total_bytes: crate::transfer::CHUNK_SIZE_BYTES as u64,
+                source_peer_id: peer_id(),
+                chunk_size_bytes: crate::transfer::CHUNK_SIZE_BYTES as u32,
+                manifest_version: 1,
+            },
+            &fake_chunks(1),
+        )
+        .await
+        .expect("create");
+
+        let chunks = vec![(0u32, format!("{:064x}", 0u128))];
+        s.mark_complete(
+            "dl-1",
+            crate::transfer::CHUNK_SIZE_BYTES as u64,
+            Some(&peer_id()),
+            &chunks,
+        )
+        .await
+        .expect("mark_complete 1");
+        // Second call must not panic and must not duplicate
+        // rows: the chunk upsert's ON CONFLICT clause keeps
+        // the row count at 1.
+        s.mark_complete(
+            "dl-1",
+            crate::transfer::CHUNK_SIZE_BYTES as u64,
+            Some(&peer_id()),
+            &chunks,
+        )
+        .await
+        .expect("mark_complete 2");
+
+        let verified: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM download_chunks \
+             WHERE download_id = ?1 AND state = 'verified'",
+        )
+        .bind("dl-1")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(verified, 1);
+        let rec = s.fetch("dl-1").await.expect("fetch");
+        assert_eq!(rec.state, DownloadState::Complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

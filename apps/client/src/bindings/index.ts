@@ -39,7 +39,9 @@
 // P3-T08 added the `downloadState` and `downloadProgress` event
 // listeners (`download://state` and `download://progress`) and
 // the `DownloadState` / `DownloadStateEvent` /
-// `DownloadProgressEvent` types.
+// `DownloadProgressEvent` types. P3-T12 added the
+// `downloadOpen` command (and the `DownloadSessionIpc` return
+// type).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -105,6 +107,9 @@ export const commands = {
   },
   async recentRoomUpsert(entry: RecentRoomEntry): Promise<void> {
     await __TAURI_INVOKE("recent_room_upsert", { entry });
+  },
+  async downloadOpen(mediaId: string): Promise<DownloadSessionIpc> {
+    return await __TAURI_INVOKE("download_open", { mediaId });
   },
 };
 
@@ -239,6 +244,17 @@ export type DownloadProgressEvent = {
   total_bytes: number;
   bytes_per_sec_ema: number;
   eta_seconds: number | null;
+};
+
+// P3-T12: return type for the `downloadOpen` command.
+export type DownloadSessionIpc = {
+  download_id: string;
+  media_id: string;
+  state: string;
+  dedup_hit: boolean;
+  total_bytes: number;
+  transferred_bytes: number;
+  on_disk_path: string | null;
 };
 
 /* Events */

@@ -13,6 +13,7 @@
 //! `commands::import::AppError` re-export is preserved so every
 //! existing caller keeps compiling unchanged.
 
+pub mod download;
 pub mod error;
 pub mod identity;
 pub mod import;
@@ -22,6 +23,7 @@ pub mod room;
 pub mod scan;
 pub mod signaling;
 
+pub use download::{download_open, DownloadSessionIpc};
 pub use error::AppError;
 pub use identity::{identity_get, identity_rotate, identity_set_display_name};
 pub use import::{media_import, AppError as _AppErrorCompat, ImportedMedia};
