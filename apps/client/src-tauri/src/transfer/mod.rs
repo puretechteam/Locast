@@ -32,6 +32,10 @@
 //!   it, comparing to the manifest, and on match invoking
 //!   [`crate::library::fs::complete_download`] to atomically
 //!   rename into the library.
+//! - [`multi_source`]: P3-T09 multi-source selection +
+//!   bitmap-merge. Drives one `DownloadPlan` end-to-end
+//!   across N peer sources with NAK + RTT-driven rotation,
+//!   reusing every other component in this module.
 //!
 //! Quota integration: every public surface goes through
 //! [`crate::core::quota::QuotaAccountant`]; nothing in this
@@ -54,6 +58,7 @@
 
 pub mod assemble;
 pub mod events;
+pub mod multi_source;
 pub mod plan;
 pub mod scheduler;
 pub mod session;
@@ -66,6 +71,10 @@ pub use events::{
     DownloadEventEmitter, DownloadEventSink, DownloadProgressEvent, DownloadStateEvent, NoopSink,
     RecordingSink, DOWNLOAD_PROGRESS_EVENT, DOWNLOAD_STATE_EVENT, EMA_ALPHA, PROGRESS_INTERVAL_MS,
     SANITIZE_LONG_TOKEN_MIN, SANITIZE_MAX_BYTES,
+};
+pub use multi_source::{
+    run_multi_source, InflightRecord, MultiSourceError, MultiSourceReceiver, SourceHandle,
+    SourceSelector, NAK_THRESHOLD, RTT_COOLDOWN, RTT_P95_LIMIT_MS, RTT_P95_WINDOW, RTT_WINDOW_CAP,
 };
 pub use plan::{
     DownloadPlan, PlanError, PlanErrorKind, PlannedChunk, PlannedSource, SelectedSource,

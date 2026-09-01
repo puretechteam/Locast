@@ -652,6 +652,28 @@ impl DownloadStore {
             .await?;
         Ok(())
     }
+
+    /// P3-T09: update the `downloads.source_peer_id` column
+    /// with the peer that just served a chunk. Best-effort,
+    /// additive; no schema change. The column was created in
+    /// P3-T04 and is the only authoritative record of which
+    /// peer delivered the most recent chunk to the viewer.
+    /// Returns `Err` on `sqlx` failure; the caller
+    /// (`MultiSourceReceiver`) treats any error as a soft
+    /// no-op so a transient DB write never aborts the
+    /// transfer.
+    pub async fn set_source_peer_id(
+        &self,
+        download_id: &str,
+        peer_id: &str,
+    ) -> Result<(), ChunkStateError> {
+        sqlx::query("UPDATE downloads SET source_peer_id = ?2 WHERE id = ?1")
+            .bind(download_id)
+            .bind(peer_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// A simple state-machine predicate. The full P3-T06 set adds
