@@ -60,11 +60,13 @@ pub mod assemble;
 pub mod events;
 pub mod multi_source;
 pub mod plan;
+pub mod registry;
 pub mod scheduler;
 pub mod session;
 pub mod state;
 pub mod transport;
 pub mod verify;
+pub mod webrtc_transport;
 pub mod wire;
 
 pub use events::{
@@ -79,6 +81,7 @@ pub use multi_source::{
 pub use plan::{
     DownloadPlan, PlanError, PlanErrorKind, PlannedChunk, PlannedSource, SelectedSource,
 };
+pub use registry::TransferRegistry;
 pub use scheduler::{
     backpressure_pair, BackpressureHandle, BackpressureTransport, Scheduler, SchedulerError,
     SchedulerEvent, TokenBucket, BUFFERED_AMOUNT_HIGH, BUFFERED_AMOUNT_LOW,

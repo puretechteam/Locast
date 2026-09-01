@@ -86,6 +86,17 @@ pub fn run() {
         .level(log::LevelFilter::Info)
         .build();
 
+    // P3-T13 review fix H#28: when the main window is closing,
+    // cancel every in-flight transfer so the spawned
+    // orchestrators exit before the process tears down.
+    // Stash the registry handle (created below inside
+    // `setup`) in a closure-captured cell so the
+    // `Builder::on_window_event` hook can reach it.
+    let registry_cell: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<transfer::TransferRegistry>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let registry_cell_for_setup = registry_cell.clone();
+    let registry_cell_for_event = registry_cell.clone();
     tauri::Builder::default()
         .plugin(log_plugin)
         .plugin(tauri_plugin_dialog::init())
@@ -94,7 +105,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_process::init())
-        .setup(|app| {
+        .setup(move |app| {
+            let _registry_cell = registry_cell_for_setup;
             let _main = app
                 .get_webview_window("main")
                 .expect("main window missing from tauri.conf.json");
@@ -171,6 +183,16 @@ pub fn run() {
             room_client.set_storage_pool(storage_pool);
             let app_handle_for_room = app.handle().clone();
             let app_handle_for_downloads = app.handle().clone();
+            // P3-T13: build the WebRtcManager BEFORE the block_on so
+            // we can register it with `app.manage` afterward. The
+            // inbound loop and any peer-connection lifecycle is
+            // started from inside the block_on.
+            let webrtc_manager = std::sync::Arc::new(net::webrtc::WebRtcManager::new(
+                signaling_client.clone(),
+                identity_service.clone(),
+                room_client.clone(),
+            ));
+            let webrtc_for_state = webrtc_manager.clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
                 // P2-T05: install the Tauri `AppHandle` so
@@ -217,30 +239,61 @@ pub fn run() {
                     let _ = app_handle_for_downloads;
                 }
 
-                // P3-T05: install the WebRTC PeerConnection
-                // manager. The manager subscribes to the
-                // signaling client's inbound envelope stream
-                // and, on room-state changes (polled at 200 ms
-                // — a deliberate P3-T05 simplification; see
-                // `net::webrtc` module-level docs), creates /
+                // P3-T05: start the WebRTC PeerConnection
+                // manager's inbound loop. The manager subscribes
+                // to the signaling client's inbound envelope
+                // stream and, on room-state changes (polled at
+                // 200 ms -- a deliberate P3-T05 simplification;
+                // see `net::webrtc` module-level docs), creates /
                 // tears down per-peer PeerConnections and
                 // exchanges SDP / ICE over the new SIGNAL
-                // envelope. The handler is dropped here; the
-                // JoinHandle lives only in the local scope.
-                let webrtc_manager = std::sync::Arc::new(net::webrtc::WebRtcManager::new(
-                    signaling_client.clone(),
-                    identity_service.clone(),
-                    room_client.clone(),
-                ));
+                // envelope.
                 webrtc_manager
                     .clone()
                     .start_with_room_client(room_client.clone());
-                let _webrtc_join = webrtc_manager;
             });
             app.manage(signaling_client);
             app.manage(room_client);
+            // P3-T13: register the WebRtcManager + TransferRegistry
+            // as managed state so `download_open` (and future
+            // commands) can reach them. The manager itself is
+            // already alive (the inbound loop was spawned above);
+            // `app.manage` is a Tauri-side alias that only sets a
+            // `tauri::State` lookup key.
+            app.manage(webrtc_for_state);
+            // P3-T13: a fresh TransferRegistry. Spawning a transfer
+            // registers it here; `cancel_all()` is wired into
+            // future shutdown / room_leave paths.
+            let registry = std::sync::Arc::new(transfer::TransferRegistry::new());
+            app.manage(registry.clone());
+
+            // P3-T13 review fix H#28: when the main window is
+            // closing, cancel every in-flight transfer so the
+            // spawned orchestrators exit before the process
+            // tears down. Stash the registry handle in the
+            // closure-captured cell so the `Builder::on_window_
+            // event` hook (registered outside `setup`) can
+            // reach it.
+            {
+                let mut slot = _registry_cell.lock().expect("registry_cell mutex poisoned");
+                *slot = Some(registry.clone());
+            }
 
             Ok(())
+        })
+        .on_window_event(move |_window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                let slot = registry_cell_for_event
+                    .lock()
+                    .expect("registry_cell mutex poisoned");
+                if let Some(r) = slot.as_ref() {
+                    let r = r.clone();
+                    drop(slot);
+                    tauri::async_runtime::spawn(async move {
+                        r.cancel_all().await;
+                    });
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::greet,

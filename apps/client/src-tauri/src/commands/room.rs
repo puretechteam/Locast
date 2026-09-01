@@ -27,6 +27,7 @@ use crate::net::room::{RoomClient, RoomClientError, RoomSummaryIpc};
 use crate::net::signaling::SignalingClient;
 use crate::storage::rooms::{self, RecentRoomEntry};
 use crate::storage::Storage;
+use crate::transfer::registry::TransferRegistry;
 
 /// Idempotent: ensure the signaling WS is open. Mirrors
 /// `signaling_connect` for callers that prefer the
@@ -72,10 +73,23 @@ pub async fn room_join(
 /// Leave the current room. The server broadcasts
 /// ROOM_CLOSED / PARTICIPANT_LEFT in response; the webview
 /// observes the cached state clear.
+///
+/// P3-T13 review fix H#28: also cancel every in-flight
+/// transfer registered with the [`TransferRegistry`]. The v1
+/// model is single-room-per-process: leaving the room
+/// invalidates the file-transfer addressing, so any open
+/// download becomes moot and should be torn down. Cancellation
+/// happens AFTER the server confirms the leave so a slow
+/// server does not orphan a successful transfer.
 #[tauri::command]
 #[specta::specta]
-pub async fn room_leave(room: TauriState<'_, RoomClient>) -> Result<(), AppError> {
-    room.room_leave().await.map_err(room_err_to_app)
+pub async fn room_leave(
+    room: TauriState<'_, RoomClient>,
+    registry: TauriState<'_, std::sync::Arc<TransferRegistry>>,
+) -> Result<(), AppError> {
+    let res = room.room_leave().await.map_err(room_err_to_app);
+    registry.cancel_all().await;
+    res
 }
 
 /// Return the most recent cached room summary.

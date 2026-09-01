@@ -27,13 +27,20 @@
 //! `Scheduler::new` and asserts each is absent.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use locast_client_lib::commands::download::{open_download_inner, DownloadSessionIpc};
 use locast_client_lib::core::paths;
+use locast_client_lib::identity::keystore::IdentityService;
 use locast_client_lib::library::dedup::dedup_on_download;
+use locast_client_lib::net::config::SignalingConfig;
+use locast_client_lib::net::room::RoomClient;
+use locast_client_lib::net::signaling::SignalingClient;
+use locast_client_lib::net::webrtc::WebRtcManager;
 use locast_client_lib::storage::Storage;
+use locast_client_lib::transfer::TransferRegistry;
 use locast_manifest::{MediaEntry, MediaManifest, Source};
+use locast_protocol::handshake::Platform;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -180,6 +187,46 @@ fn make_manifest(room_id: Uuid, version: u32, entries: Vec<MediaEntry>) -> Media
     }
 }
 
+/// Build a [`WebRtcManager`] wired to a fresh in-memory
+/// SignalingClient / IdentityService / RoomClient. The manager
+/// starts with an empty peer table; tests that need a
+/// connected peer must inject one via
+/// `WebRtcManager::on_inbound_data_channel` (P3-T13) or by
+/// driving `on_room_state_changed` with a stub summary.
+fn make_webrtc_manager(storage: &Storage) -> Arc<WebRtcManager> {
+    let identity = Arc::new(IdentityService::new(storage.clone()));
+    let cfg = SignalingConfig::new_for_test(
+        "ws://localhost:0/test",
+        std::time::Duration::from_secs(1),
+        16 * 1024,
+        Platform::Linux,
+    );
+    let signaling = Arc::new(SignalingClient::new(cfg, identity.clone()));
+    let room = Arc::new(RoomClient::new(signaling.clone()));
+    Arc::new(WebRtcManager::new(signaling, identity, room))
+}
+
+fn make_transfer_registry() -> Arc<TransferRegistry> {
+    Arc::new(TransferRegistry::new())
+}
+
+/// P3-T13 review fix A#25: the inner helper now takes the
+/// `IdentityService` (not a pre-derived local pubkey) so the
+/// keypair is loaded lazily inside the Missing arm. Build the
+/// service against the test storage, inject a `MockKeyring`,
+/// and warm the keystore so `load_keypair` succeeds — the
+/// Missing path requires a keypair to authenticate against
+/// the WebRTC transport.
+async fn make_identity(storage: &Storage) -> Arc<IdentityService> {
+    let keyring: Arc<dyn locast_client_lib::identity::keystore::IdentityKeyring> =
+        Arc::new(locast_client_lib::identity::keystore::MockKeyring::new());
+    let svc = Arc::new(IdentityService::with_keyring(keyring, storage.clone()));
+    svc.get_or_create("u-test")
+        .await
+        .expect("initialize identity for download_open_e2e");
+    svc
+}
+
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
@@ -247,6 +294,9 @@ async fn dedup_hit_returns_complete_without_transfer() {
         &lib_root,
         &entry.id,
         &download_id,
+        &make_webrtc_manager(&storage),
+        &make_transfer_registry(),
+        make_identity(&storage).await,
     )
     .await
     .expect("download_open_inner");
@@ -301,6 +351,9 @@ async fn missing_path_creates_download_row_in_pending_state() {
         &lib_root,
         &entry.id,
         &download_id,
+        &make_webrtc_manager(&storage),
+        &make_transfer_registry(),
+        make_identity(&storage).await,
     )
     .await
     .expect("download_open_inner missing");
@@ -333,75 +386,31 @@ async fn missing_path_creates_download_row_in_pending_state() {
 }
 
 /// Static proof that the `download_open` command source does
-/// not import any transfer-pipeline type. This is the
-/// strongest guarantee that a future regression which
-/// accidentally wires the dedup path through a transfer
-/// session would be caught here. Mirrors the
-/// `dedup_module_does_not_depend_on_transfer` test in
-/// `tests/dedup_e2e.rs`.
+/// not import `transfer::session` (the per-peer
+/// single-source `ReceiverSession`). P3-T13 legitimately
+/// imports `multi_source` and `scheduler` for the missing
+/// path's transfer wiring; what it MUST NOT import is the
+/// legacy P3-T06 `ReceiverSession`/`SenderSession`, which
+/// would re-introduce the single-source code path the
+/// orchestrator was designed to replace.
 #[test]
-fn download_command_does_not_construct_transfer_types() {
-    // P3-T12 acceptance: the dedup path must NOT open a transfer
-    // session. The strongest static check we can do from a test
-    // is to verify the command source does not import the
-    // transfer-pipeline submodules in any form.
+fn download_command_does_not_import_receiver_session() {
+    // P3-T13: the dedup path must NOT use the per-peer
+    // ReceiverSession (the P3-T06 single-source receiver).
+    // The strongest static check we can do from a test is to
+    // verify the command source does not import that
+    // specific type.
     const SRC: &str = include_str!("../src/commands/download.rs");
-    // Reject any reference to the transfer-pipeline submodules
-    // by full path. A glob import (`use crate::transfer::*`)
-    // would expand into one of these in the body.
     assert!(
         !SRC.contains("crate::transfer::session"),
-        "download.rs must not depend on transfer::session"
+        "download.rs must not depend on transfer::session (ReceiverSession)"
     );
-    assert!(
-        !SRC.contains("crate::transfer::multi_source"),
-        "download.rs must not depend on transfer::multi_source"
-    );
-    assert!(
-        !SRC.contains("crate::transfer::scheduler"),
-        "download.rs must not depend on transfer::scheduler"
-    );
-    // Reject glob imports from the transfer crate.
+    // Reject glob imports from the transfer crate that
+    // could pull `session` in by accident.
     assert!(
         !SRC.contains("use crate::transfer::*"),
         "download.rs must not glob-import from crate::transfer"
     );
-    assert!(
-        !SRC.contains("use crate::transfer::{"),
-        "download.rs must not import from crate::transfer at all"
-    );
-    // The command IS allowed to depend on:
-    //   crate::transfer::{events, state, CHUNK_SIZE_BYTES, plan}
-    //   (events for emit, state for DownloadStore, plan for plan_download)
-    // Verify the allowlist is the ONLY transfer import.
-    let has_transfer_import = SRC.contains("use crate::transfer");
-    if has_transfer_import {
-        // If there is an import, verify it is on the allowlist.
-        // Allowlist regex: `use crate::transfer::{...allowed...}`
-        let allowed_submodules = ["events", "state", "plan"];
-        // The implementation should use module-qualified paths for
-        // these (not import lines). Find any use of crate::transfer
-        // outside the allowlist.
-        for line in SRC.lines() {
-            if line.trim_start().starts_with("use crate::transfer") {
-                let trimmed = line
-                    .trim_start()
-                    .trim_end_matches(',')
-                    .trim_end_matches(';');
-                let mut ok = false;
-                for sub in &allowed_submodules {
-                    if trimmed.contains(&format!("transfer::{}", sub))
-                        || trimmed.contains(&format!("transfer::{{{}}}", sub))
-                        || trimmed.contains(&format!("transfer::{{ {} ", sub))
-                    {
-                        ok = true;
-                        break;
-                    }
-                }
-                assert!(ok, "disallowed transfer submodule import: {}", line);
-            }
-        }
-    }
 }
 
 /// P3-T12: a 0-byte media item must complete without any
@@ -432,6 +441,9 @@ async fn zero_byte_media_completes_without_chunks() {
         &lib_root,
         &entry.id,
         &download_id,
+        &make_webrtc_manager(&storage),
+        &make_transfer_registry(),
+        make_identity(&storage).await,
     )
     .await
     .expect("download_open_inner zero-byte");

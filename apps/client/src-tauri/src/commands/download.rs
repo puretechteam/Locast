@@ -1,4 +1,4 @@
-//! P3-T12: `download_open` Tauri command.
+//! P3-T12 / P3-T13: `download_open` Tauri command.
 //!
 //! Wires the viewer's "I want this media" click into:
 //!   1. verified-manifest / media resolution (`RoomClient` cache)
@@ -6,33 +6,90 @@
 //!   3. `AlreadyLocal` / `PromotedFromTemporary` -> mark complete,
 //!      emit `download://state` + `download://progress`, no transfer
 //!   4. `Missing` -> create the `downloads` row in `pending`,
-//!      emit a `download://state=pending` event so the P3-T10
-//!      modal appears. The actual transport-bound transfer start
-//!      (which requires WebRTC transports) is wired in P3-T13+.
+//!      build a `DownloadPlan`, attach a per-source WebRTC
+//!      transport (via the `WebRtcManager`), and spawn
+//!      `MultiSourceReceiver::run_multi_source` against those
+//!      transports. The orchestrator's `JoinHandle` and
+//!      `CancellationToken` are registered with the
+//!      `TransferRegistry` so room_leave / shutdown can cancel
+//!      them cleanly.
 //!
-//! The transfer machinery (the receiver/sender session layer, the
-//! multi-source orchestrator, and the per-source scheduler) is NOT
-//! referenced from this module. The proof that the dedup path
-//! bypasses those types lives in
-//! `tests/download_open_e2e.rs`.
+//! The dedup path does NOT touch any of the transfer-pipeline
+//! types; the missing path goes through
+//! `transfer::plan / multi_source / scheduler / webrtc_transport`.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State as TauriState;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::commands::error::AppError;
 use crate::identity::keystore::IdentityService;
 use crate::library::dedup::{dedup_on_download, DedupOutcome};
 use crate::net::room::RoomClient;
+use crate::net::webrtc::WebRtcManager;
 use crate::storage::Storage;
 use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};
+use crate::transfer::multi_source::{run_multi_source, MultiSourceReceiver, SourceHandle};
+use crate::transfer::plan::plan_download;
+use crate::transfer::registry::TransferRegistry;
+use crate::transfer::scheduler::Scheduler;
 use crate::transfer::state::{DownloadStore, NewDownload};
+use crate::transfer::transport::Transport;
+use crate::transfer::webrtc_transport::WebRtcTransport;
+
+use sqlx::error::ErrorKind;
+
+/// SQLITE_CONSTRAINT_UNIQUE (matches libsqlite3's primary
+/// error code for unique-index violations). Used as a
+/// belt-and-suspenders fallback when the sqlx [`ErrorKind`]
+/// enum does not name the variant (older sqlx releases).
+#[allow(dead_code)]
+const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
+
+/// P3-T13 review fix F#23: detect a UNIQUE-index violation on
+/// the partial `ux_downloads_active` index without relying on
+/// fragile string matching. First tries the structured
+/// [`ErrorKind::UniqueViolation`] discriminator; falls back to
+/// either the SQLSTATE code (SQLITE_CONSTRAINT_UNIQUE = 2067)
+/// or the human-readable message text.
+///
+/// The `DownloadStore::create` API wraps the underlying
+/// [`sqlx::Error`] into a `ChunkStateError::Sqlx(String)`,
+/// so the structured `sqlx::Error` is not available at the
+/// call site. To preserve the structured error for
+/// robustness we expose both shapes:
+///
+/// * `is_unique_violation_sqlx(&sqlx::Error)` -- structured
+///   match against `sqlx::Error::Database`.
+/// * `is_unique_violation_chunk(&ChunkStateError)` -- Display
+///   fallback for the wrapped error string.
+#[allow(dead_code)]
+fn is_unique_violation_sqlx(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = e {
+        if matches!(db_err.kind(), ErrorKind::UniqueViolation) {
+            return true;
+        }
+        if db_err.code().as_deref() == Some(SQLITE_CONSTRAINT_UNIQUE) {
+            return true;
+        }
+        let msg = db_err.message();
+        return msg.contains("UNIQUE constraint failed") || msg.contains("ux_downloads_active");
+    }
+    false
+}
+
+fn is_unique_violation_chunk(e: &crate::transfer::state::ChunkStateError) -> bool {
+    let msg = e.to_string();
+    msg.contains("UNIQUE constraint failed") || msg.contains("ux_downloads_active")
+}
 
 /// Public result type returned to the webview.
 ///
@@ -68,6 +125,8 @@ pub async fn download_open(
     room: TauriState<'_, Arc<RoomClient>>,
     identity: TauriState<'_, Arc<IdentityService>>,
     storage: TauriState<'_, Storage>,
+    webrtc: TauriState<'_, Arc<WebRtcManager>>,
+    registry: TauriState<'_, Arc<TransferRegistry>>,
     media_id: String,
 ) -> Result<DownloadSessionIpc, AppError> {
     // 1. Verify caller is in a room.
@@ -94,7 +153,16 @@ pub async fn download_open(
         .ok_or_else(|| AppError::other("library root has no parent".to_string()))?
         .to_path_buf();
 
-    // 4. Compute a fresh download_id.
+    // 4. P3-T13: pull the local pubkey only on the
+    //    Missing-path. Review fix A#25: the dedup hits
+    //    (AlreadyLocal / PromotedFromTemporary) and the
+    //    zero-byte shortcut never need a keypair, so defer
+    //    the load into the Missing arm of `open_download_inner`.
+    //    The `identity` arg is still passed through so the
+    //    inner helper can load it when it actually needs it.
+    let _ = &identity;
+
+    // 5. Compute a fresh download_id.
     let download_id = Uuid::new_v4().to_string();
 
     open_download_inner(
@@ -106,6 +174,9 @@ pub async fn download_open(
         &library_root,
         &media_id,
         &download_id,
+        &webrtc,
+        &registry,
+        identity.inner().clone(),
     )
     .await
 }
@@ -116,11 +187,15 @@ pub async fn download_open(
 /// command above is a thin wrapper that pulls the verified
 /// manifest from `RoomClient` and calls this function.
 ///
-/// This function never constructs any of the transfer-pipeline
-/// types (the per-session receiver, the multi-source
-/// orchestrator, or the per-source scheduler); the missing-path
-/// branch leaves the download in `pending` for P3-T13 to
-/// wire into the transfer pipeline.
+/// P3-T13: the `Missing` branch now also wires the actual
+/// transfer. The dedup-bypass branches still do NOT construct
+/// any transfer-pipeline types.
+///
+/// P3-T13 review fix A#25: the keypair is loaded lazily
+/// inside the `Missing` arm only. The outer signature now
+/// takes `identity: Arc<IdentityService>` instead of a
+/// pre-derived `local_pubkey: [u8; 32]` so the load happens
+/// only on the path that actually needs it.
 #[allow(clippy::too_many_arguments)]
 pub async fn open_download_inner(
     manifest: locast_manifest::MediaManifest,
@@ -131,6 +206,9 @@ pub async fn open_download_inner(
     library_root: &std::path::Path,
     media_id: &str,
     download_id: &str,
+    webrtc: &Arc<WebRtcManager>,
+    registry: &Arc<TransferRegistry>,
+    identity: Arc<IdentityService>,
 ) -> Result<DownloadSessionIpc, AppError> {
     // 1. Resolve the verified MediaEntry from the manifest.
     let entry = manifest
@@ -269,6 +347,15 @@ pub async fn open_download_inner(
             })
         }
         DedupOutcome::Missing => {
+            // P3-T13 review fix A#25: load the keypair here,
+            // only on the path that needs it (the dedup hits
+            // never touch transport-layer code, so they don't
+            // need the pubkey).
+            let kp = identity
+                .load_keypair()
+                .await
+                .map_err(|e| AppError::other(format!("identity load_keypair: {e}")))?;
+            let local_pubkey: [u8; 32] = kp.signing.verifying_key().to_bytes();
             // No local content. Find-or-create the downloads row
             // (P3-T12 idempotence) so a concurrent second call
             // for the same media collapses onto this row instead
@@ -284,6 +371,150 @@ pub async fn open_download_inner(
                 manifest_version,
             )
             .await?;
+            // P3-T13: wire the actual transfer on the Missing
+            // path. We need:
+            //   1. a `user_id -> [u8;32] pubkey` lookup table
+            //      (built from `user_identities.public_key` for
+            //      every room participant);
+            //   2. a `WebRtcTransport` per `entry.sources[]`
+            //      whose DataChannel can be located by the
+            //      manifest `peer_id`;
+            //   3. a `DownloadPlan` for `entry`;
+            //   4. a `MultiSourceReceiver` and a spawn-and-register
+            //      step.
+            //
+            // If we end up with zero authenticated transports
+            // (the room is empty, all peers are still
+            // negotiating, or the manifest references an
+            // unknown participant) we transition the row to
+            // `failed` and surface a structured error so the
+            // webview can show the failure to the user.
+            let participant_user_ids: Vec<String> =
+                load_room_participant_user_ids(storage, room_id).await?;
+            let user_pubkey_cache = build_user_pubkey_cache(storage, &participant_user_ids).await?;
+            let mut source_handles: Vec<SourceHandle> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for src in &entry.sources {
+                if !crate::room::peer_id::is_canonical_peer_id(&src.peer_id) {
+                    skipped.push(src.peer_id.clone());
+                    continue;
+                }
+                let lookup_cache = user_pubkey_cache.clone();
+                let dc = webrtc
+                    .lookup_dc_by_peer_id(&src.peer_id, move |uid| lookup_cache.get(&uid).copied())
+                    .await;
+                let Some(dc) = dc else {
+                    skipped.push(src.peer_id.clone());
+                    continue;
+                };
+                let cancel_token = tokio_util::sync::CancellationToken::new();
+                let transport: Arc<dyn Transport> =
+                    Arc::new(WebRtcTransport::new(dc, cancel_token.clone()));
+                let scheduler = Arc::new(Scheduler::new(transport.clone(), cancel_token.clone()));
+                source_handles.push(SourceHandle {
+                    peer_id: src.peer_id.clone(),
+                    transport,
+                    priority: src.priority,
+                    sched: scheduler,
+                    demotion_count: 0,
+                    unavailable: false,
+                    unavailable_since: None,
+                    cancel: cancel_token,
+                    rtt_samples: std::collections::VecDeque::new(),
+                });
+            }
+
+            if source_handles.is_empty() {
+                // P3-T13: no transport available right now. The
+                // row stays in `pending` (the peer may still be
+                // negotiating) but we record the reason on
+                // `last_error` for the webview modal. Cancelling
+                // / transitioning to Failed would force the user
+                // to re-open the download from scratch every time
+                // a peer is briefly disconnected; v1 lets the row
+                // wait for a future retry path.
+                let msg = format!(
+                    "no authenticated source transport available yet (manifest references peers {:?} but none are currently connected); download left in pending and will be retried by the follow-up path",
+                    skipped
+                );
+                warn!(
+                    download_id = %active_download_id,
+                    sha256 = %entry.sha256,
+                    skipped = ?skipped,
+                    "missing path: zero transports"
+                );
+                if let Err(e) = store.set_last_error(&active_download_id, &msg).await {
+                    warn!(error = %e, "set_last_error on no-source failed");
+                }
+                emit_state_and_progress(
+                    &active_download_id,
+                    &resolved_media_id,
+                    "pending",
+                    0,
+                    entry.size_bytes,
+                );
+                return Ok(DownloadSessionIpc {
+                    download_id: active_download_id,
+                    media_id: resolved_media_id,
+                    state: "pending".into(),
+                    dedup_hit: false,
+                    total_bytes: entry.size_bytes,
+                    transferred_bytes: 0,
+                    on_disk_path: None,
+                });
+            }
+
+            let primary_peer_id = pick_primary_source_peer(&entry);
+            let plan = plan_download(
+                &active_download_id,
+                &resolved_media_id,
+                manifest_version,
+                &entry,
+                &primary_peer_id,
+            )
+            .map_err(|e| AppError::other(format!("plan_download: {e}")))?;
+            let plan = Arc::new(plan);
+            let receiver = MultiSourceReceiver::new(
+                plan.clone(),
+                store.clone(),
+                library_root.to_path_buf(),
+                local_pubkey,
+                source_handles,
+            )
+            .map_err(|e| AppError::other(format!("MultiSourceReceiver::new: {e}")))?;
+            let receiver = Arc::new(receiver);
+
+            // Spawn the orchestrator. Register the
+            // CancellationToken with the TransferRegistry so
+            // room_leave / app shutdown can cancel_all. After
+            // the orchestrator returns (Ok or Err) the spawn
+            // closure unregisters the id, so the registry does
+            // not leak entries for transfers that completed
+            // gracefully. P3-T13 review fix A#4/D#19: the
+            // JoinHandle is now owned by the closure (not the
+            // registry), which makes the unregister step
+            // straightforward.
+            let registry_for_task = registry.clone();
+            let download_id_for_task = active_download_id.clone();
+            let cancel_for_registry = receiver.cancel_handle();
+            let filename_for_task = entry.filename.clone();
+            tokio::spawn(async move {
+                registry_for_task
+                    .register(download_id_for_task.clone(), cancel_for_registry)
+                    .await;
+                let result = run_multi_source(receiver, filename_for_task).await;
+                registry_for_task.unregister(&download_id_for_task).await;
+                match result {
+                    Ok(state) => {
+                        info!(?state, download_id = %download_id_for_task, "download complete")
+                    }
+                    Err(e) => {
+                        warn!(download_id = %download_id_for_task, error = %e, "download failed")
+                    }
+                }
+            });
+            let _ = registry_for_task;
+
             emit_state_and_progress(
                 &active_download_id,
                 &resolved_media_id,
@@ -306,41 +537,60 @@ pub async fn open_download_inner(
 
 // ----- helpers below -----
 
-#[allow(clippy::too_many_arguments)]
-async fn create_download_row(
-    store: &DownloadStore,
-    download_id: &str,
-    media_id: &str,
-    room_id: Option<&str>,
-    user_id: &str,
-    total_bytes: u64,
-    source_peer_id: &str,
-    manifest_version: i64,
-) -> Result<(), AppError> {
-    let chunks: Vec<(u32, u64, u32, String)> = (0..total_chunks_for(total_bytes))
-        .map(|i| {
-            let offset = (i as u64) * (crate::transfer::CHUNK_SIZE_BYTES as u64);
-            let length = std::cmp::min(
-                crate::transfer::CHUNK_SIZE_BYTES as u64,
-                total_bytes - offset,
-            ) as u32;
-            (i, offset, length, format!("{:064x}", i as u128))
-        })
-        .collect();
-    let nd = NewDownload {
-        download_id: download_id.to_string(),
-        media_id: media_id.to_string(),
-        room_id: room_id.map(|s| s.to_string()),
-        user_id: user_id.to_string(),
-        total_bytes,
-        source_peer_id: source_peer_id.to_string(),
-        chunk_size_bytes: crate::transfer::CHUNK_SIZE_BYTES as u32,
-        manifest_version,
-    };
-    store
-        .create(&nd, &chunks)
-        .await
-        .map_err(|e| AppError::other(format!("create downloads row: {e}")))
+/// P3-T13: load the `user_id` (string) of every participant in
+/// `room_id`. We need this list to fetch each participant's
+/// Ed25519 pubkey from `user_identities`, which is what lets the
+/// WebRtcManager turn a manifest `peer_id` (sha256(pubkey) hex)
+/// into a participant `user_id` and then into a connected
+/// DataChannel.
+async fn load_room_participant_user_ids(
+    storage: &Storage,
+    room_id: Uuid,
+) -> Result<Vec<String>, AppError> {
+    let rows: Vec<(String,)> =
+        sqlx::query_as("SELECT user_id FROM room_participants WHERE room_id = ?1")
+            .bind(room_id.to_string())
+            .fetch_all(&storage.pool())
+            .await
+            .map_err(|e| AppError::other(format!("room_participants SELECT: {e}")))?;
+    Ok(rows.into_iter().map(|(u,)| u).collect())
+}
+
+/// P3-T13: build the `user_id -> [u8;32] pubkey` cache the
+/// `WebRtcManager::lookup_dc_by_peer_id` closure needs. The
+/// `user_identities.public_key` column is base64-encoded 32
+/// bytes; we decode it here. Participants without a row
+/// (e.g. we never met them) are silently skipped.
+async fn build_user_pubkey_cache(
+    storage: &Storage,
+    user_ids: &[String],
+) -> Result<HashMap<Uuid, [u8; 32]>, AppError> {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine as _;
+    let mut out: HashMap<Uuid, [u8; 32]> = HashMap::new();
+    for uid_str in user_ids {
+        let Ok(uid) = Uuid::parse_str(uid_str) else {
+            continue;
+        };
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT public_key FROM user_identities WHERE id = ?1")
+                .bind(uid_str)
+                .fetch_optional(&storage.pool())
+                .await
+                .map_err(|e| AppError::other(format!("user_identities SELECT: {e}")))?;
+        let Some((pk_b64,)) = row else { continue };
+        let pk_bytes = match BASE64.decode(pk_b64.as_bytes()) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if pk_bytes.len() != 32 {
+            continue;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&pk_bytes);
+        out.insert(uid, arr);
+    }
+    Ok(out)
 }
 
 /// P3-T12 (per-call idempotence): SELECT-first then CREATE for
@@ -355,10 +605,15 @@ async fn create_download_row(
 /// boolean `true` when a new row was created, `false` when an
 /// existing one was reused.
 ///
-/// The SELECT-then-CREATE pattern has a small race window
-/// between the two queries. Documented as a v1 limitation; a
-/// future migration can add a partial UNIQUE index over the
-/// active state set as the canonical guard.
+/// P3-T13: a partial UNIQUE index
+/// `ux_downloads_active(media_id, COALESCE(room_id,''), user_id)
+/// WHERE state IN ('pending', 'connecting', 'transferring',
+/// 'verifying', 'paused')` is the canonical guard against two
+/// in-flight active rows. The SELECT-then-CREATE pattern still
+/// has a small race window between the two queries; on a race,
+/// the INSERT raises a `UNIQUE constraint failed:
+/// ux_downloads_active` error, which we catch and SELECT the
+/// existing row.
 #[allow(clippy::too_many_arguments)]
 async fn find_or_create_download_row(
     store: &DownloadStore,
@@ -385,18 +640,57 @@ async fn find_or_create_download_row(
     if let Some((id,)) = existing {
         return Ok((id, false));
     }
-    create_download_row(
-        store,
-        new_download_id,
-        media_id,
-        room_id,
-        user_id,
+    // Build the NewDownload / chunks and try to insert. If the
+    // partial UNIQUE index fires (another caller won the race
+    // between our SELECT and our INSERT), fall through to the
+    // race-recovery SELECT.
+    let chunks: Vec<(u32, u64, u32, String)> = (0..total_chunks_for(total_bytes))
+        .map(|i| {
+            let offset = (i as u64) * (crate::transfer::CHUNK_SIZE_BYTES as u64);
+            let length = std::cmp::min(
+                crate::transfer::CHUNK_SIZE_BYTES as u64,
+                total_bytes - offset,
+            ) as u32;
+            (i, offset, length, format!("{:064x}", i as u128))
+        })
+        .collect();
+    let nd = NewDownload {
+        download_id: new_download_id.to_string(),
+        media_id: media_id.to_string(),
+        room_id: room_id.map(|s| s.to_string()),
+        user_id: user_id.to_string(),
         total_bytes,
-        source_peer_id,
+        source_peer_id: source_peer_id.to_string(),
+        chunk_size_bytes: crate::transfer::CHUNK_SIZE_BYTES as u32,
         manifest_version,
-    )
-    .await?;
-    Ok((new_download_id.to_string(), true))
+    };
+    match store.create(&nd, &chunks).await {
+        Ok(()) => Ok((new_download_id.to_string(), true)),
+        Err(e) if is_unique_violation_chunk(&e) => {
+            // Race: another caller created the active row
+            // between our SELECT and our INSERT. SELECT it.
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT id FROM downloads
+                 WHERE media_id = ?1 AND COALESCE(room_id, '') = ?2 AND user_id = ?3
+                   AND state IN ('pending','connecting','transferring','verifying','paused','complete','failed','cancelled')
+                 ORDER BY started_at DESC LIMIT 1",
+            )
+            .bind(media_id)
+            .bind(room_key)
+            .bind(user_id)
+            .fetch_optional(store.pool())
+            .await
+            .map_err(|e| AppError::other(format!("downloads SELECT post-race: {e}")))?;
+            if let Some((id,)) = existing {
+                Ok((id, false))
+            } else {
+                Err(AppError::other(format!(
+                    "UNIQUE violated but no existing row found: {e}"
+                )))
+            }
+        }
+        Err(e) => Err(AppError::other(format!("create downloads row: {e}"))),
+    }
 }
 
 fn total_chunks_for(total_bytes: u64) -> u32 {

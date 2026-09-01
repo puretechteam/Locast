@@ -63,6 +63,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # smol out of the binary and skips the media stack we do not
 # use (v1 uses only DataChannels, no media tracks).
 webrtc = { version = "0.20", default-features = false, features = ["runtime-tokio"] }
+bytes = "1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -80,3 +81,5 @@ futures-util = "0.3"
 locast-server = { path = "../../../apps/server" }
 axum = { version = "0.7", features = ["ws", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+webrtc = { version = "0.20", default-features = false, features = ["runtime-tokio"] }

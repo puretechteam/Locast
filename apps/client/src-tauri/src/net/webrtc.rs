@@ -101,7 +101,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use webrtc::data_channel::{DataChannel, RTCDataChannelInit};
+use webrtc::data_channel::{DataChannel, RTCDataChannelInit, RTCDataChannelState};
 use webrtc::error::Error as WebRtcError;
 use webrtc::peer_connection::{
     PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
@@ -767,6 +767,85 @@ impl WebRtcManager {
     /// iterate without owning the manager.
     pub async fn peer_ids(&self) -> Vec<Uuid> {
         self.state.lock().await.peers.keys().copied().collect()
+    }
+
+    /// The connected `files` DataChannel for `remote_id`, or
+    /// `None` if the peer entry is missing / not yet connected /
+    /// has no adopted DC. P3-T13: this is the accessor the
+    /// `download_open` command uses to look up the per-source
+    /// transport.
+    pub async fn data_channel_for_user_id(&self, remote_id: Uuid) -> Option<Arc<dyn DataChannel>> {
+        let g = self.state.lock().await;
+        g.peers.get(&remote_id).and_then(|p| p.dc.clone())
+    }
+
+    /// P3-T13: look up the connected DataChannel whose
+    /// participant's canonical `peer_id` matches `peer_id_hex`.
+    /// The caller supplies a `pubkey_lookup` closure that maps a
+    /// participant's `user_id` (Uuid) to the 32-byte Ed25519
+    /// pubkey; the manager hashes each candidate pubkey with
+    /// `derive_peer_id` and returns the first match. Returns
+    /// `None` if `peer_id_hex` is not canonical, if no
+    /// participant matches, if the matching peer has no
+    /// adopted DC yet, or if the DC has not reached the
+    /// `Open` state (review fix C#10 — the prior version
+    /// returned any stored DC, even if it was still
+    /// `Connecting`, which caused the orchestrator to build a
+    /// transport on a dead channel and immediately fail).
+    pub async fn lookup_dc_by_peer_id<F>(
+        &self,
+        peer_id_hex: &str,
+        pubkey_lookup: F,
+    ) -> Option<Arc<dyn DataChannel>>
+    where
+        F: Fn(Uuid) -> Option<[u8; 32]>,
+    {
+        if !crate::room::peer_id::is_canonical_peer_id(peer_id_hex) {
+            return None;
+        }
+        // Collect candidates while holding the lock; the
+        // ready_state() check must NOT hold the manager lock
+        // because the trait method is async.
+        let candidates: Vec<(Uuid, Arc<dyn DataChannel>)> = {
+            let g = self.state.lock().await;
+            g.peers
+                .iter()
+                .filter_map(|(uid, p)| p.dc.clone().map(|dc| (*uid, dc)))
+                .collect()
+        };
+        for (user_id, dc) in candidates {
+            let Some(pubkey) = pubkey_lookup(user_id) else {
+                continue;
+            };
+            if derive_peer_id(pubkey) != peer_id_hex {
+                continue;
+            }
+            let state = match dc.ready_state().await {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if state == RTCDataChannelState::Open {
+                return Some(dc);
+            }
+        }
+        None
+    }
+
+    /// P3-T13 review fix C#10: convenience accessor that
+    /// returns the connected `files` DataChannel for a
+    /// specific participant user_id, but only if the DC has
+    /// reached the `Open` state. Mirrors the readiness gate
+    /// in [`Self::lookup_dc_by_peer_id`].
+    pub async fn open_files_dc_for_user_id(&self, remote_id: Uuid) -> Option<Arc<dyn DataChannel>> {
+        let dc = {
+            let g = self.state.lock().await;
+            g.peers.get(&remote_id).and_then(|p| p.dc.clone())?
+        };
+        let state = dc.ready_state().await.ok()?;
+        if state != RTCDataChannelState::Open {
+            return None;
+        }
+        Some(dc)
     }
 
     /// Current lifecycle phase for a peer. `None` if the peer

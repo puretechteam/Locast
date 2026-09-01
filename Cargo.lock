@@ -2868,6 +2868,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "digest",
  "dirs 5.0.1",
  "ed25519-dalek",
