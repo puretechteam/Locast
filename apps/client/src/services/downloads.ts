@@ -5,10 +5,10 @@
 // `download://progress` Tauri events emitted by the
 // receiver-side transfer session.
 
-import { events } from "./ipc";
-import type { DownloadStateEvent, DownloadProgressEvent } from "../bindings";
+import { listenEvent } from "./_eventTransport";
+import type { DownloadStateEvent, DownloadProgressEvent, DownloadState } from "../bindings";
 
-export type { DownloadStateEvent, DownloadProgressEvent };
+export type { DownloadStateEvent, DownloadProgressEvent, DownloadState };
 
 /** Subscribe to `download://state`. The handler receives the
  *  immediate state-transition event. Returns an unsubscribe
@@ -16,7 +16,7 @@ export type { DownloadStateEvent, DownloadProgressEvent };
 export async function onDownloadState(
     handler: (e: DownloadStateEvent) => void,
 ): Promise<() => void> {
-    return await events.downloadState(handler);
+    return await listenEvent<DownloadStateEvent>("download://state", handler);
 }
 
 /** Subscribe to `download://progress`. The handler receives
@@ -25,5 +25,5 @@ export async function onDownloadState(
 export async function onDownloadProgress(
     handler: (e: DownloadProgressEvent) => void,
 ): Promise<() => void> {
-    return await events.downloadProgress(handler);
+    return await listenEvent<DownloadProgressEvent>("download://progress", handler);
 }

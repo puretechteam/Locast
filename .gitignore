@@ -88,3 +88,7 @@ credentials.*
 **/.nyc_output/
 **/lcov.info
 **/tarpaulin-report.html
+
+# Playwright
+apps/client/tests/playwright/test-results/
+apps/client/tests/playwright/playwright-report/

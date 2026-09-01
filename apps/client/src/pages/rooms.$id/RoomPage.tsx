@@ -94,7 +94,7 @@ export function RoomPage(): JSX.Element {
 
     if (summary === null) {
         return (
-            <div className="room-page room-page--empty">
+            <div className="room-page room-page--empty" data-testid="room-empty">
                 <p>Not in a room.</p>
                 <p>
                     <Link to="/rooms/new">Create a room</Link> or{" "}

@@ -6,10 +6,12 @@
   "description": "Locast desktop client (Tauri 2 + React).",
   "scripts": {
     "dev": "vite",
+    "dev:test": "vite --mode test --port 1420 --strictPort",
     "build": "tsc -b --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test": "echo \"locast-client: no test runner yet (Vitest lands in P0-T04)\" && exit 0",
+    "test:e2e": "playwright test --config=tests/playwright/playwright.config.ts",
     "lint": "echo \"locast-client: no linter yet (eslint lands in P0-T04)\" && exit 0",
     "tauri": "tauri"
   },
@@ -21,6 +23,7 @@
     "zustand": "^4.5.4"
   },
   "devDependencies": {
+    "@playwright/test": "^1.49.0",
     "@tauri-apps/cli": "^2.11.4",
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.29",
