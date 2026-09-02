@@ -345,13 +345,13 @@ async fn e2e_transfer_50mib_with_loss_and_jitter() {
     // post-transfer assertions.
     let sender_plan = plan.clone();
     let receiver_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
     let recv_store = store.clone();
     let recv_lib_root_for_run = recv_lib_root.clone();
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
         session.run("fixture.bin".to_string()).await
     });
     let receiver_handle = tokio::spawn(async move {
@@ -487,7 +487,7 @@ async fn e2e_bad_chunk_hash_is_rejected() {
     let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
     let sender_plan = plan.clone();
     let receiver_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let recv_store = store.clone();
     let recv_lib_root_for_run = recv_lib_root.clone();
 
@@ -495,7 +495,7 @@ async fn e2e_bad_chunk_hash_is_rejected() {
     // the loopback does not cleanly resolve. We assert the
     // final state is Failed.
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             session.run("fixture.bin".to_string()),
@@ -562,12 +562,12 @@ async fn e2e_cancellation_does_not_commit() {
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let recv_store = store.clone();
 
     // Start the sessions.
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
         let _ = session.run("fixture.bin".to_string()).await;
     });
     let receiver_plan = plan.clone();
@@ -633,11 +633,11 @@ async fn e2e_peer_mismatch_is_rejected() {
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let recv_store = store.clone();
 
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
         let r = session.run("fixture.bin".to_string()).await;
         // The sender's expected failure mode is PeerMismatch
         // surfaced as an Err; the transport close is what
@@ -753,11 +753,11 @@ async fn e2e_resume_from_persisted_bitmap() {
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let recv_store = store.clone();
 
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
         let _ = session.run("fixture.bin".to_string()).await;
     });
     let recv_transport_clone = Arc::clone(&recv_transport);
@@ -805,11 +805,11 @@ async fn e2e_resume_from_persisted_bitmap() {
     let host_transport2 = Arc::new(host_side2) as Arc<dyn Transport>;
     let recv_transport2 = Arc::new(recv_side2) as Arc<dyn Transport>;
     let sender_plan2 = plan.clone();
-    let sender_lib_root2 = host_lib_root.clone();
+    let sender_source2 = host_source.clone();
     let recv_store2 = store.clone();
 
     let sender_handle2 = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan2, host_transport2, sender_lib_root2);
+        let session = SenderSession::new(&sender_plan2, host_transport2, sender_source2);
         session.run("fixture.bin".to_string()).await
     });
     let plan_for_resume = plan.clone();

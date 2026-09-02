@@ -58,6 +58,7 @@
 
 pub mod assemble;
 pub mod events;
+pub mod host_dispatch;
 pub mod multi_source;
 pub mod plan;
 pub mod registry;
@@ -74,6 +75,7 @@ pub use events::{
     RecordingSink, DOWNLOAD_PROGRESS_EVENT, DOWNLOAD_STATE_EVENT, EMA_ALPHA, PROGRESS_INTERVAL_MS,
     SANITIZE_LONG_TOKEN_MIN, SANITIZE_MAX_BYTES,
 };
+pub use host_dispatch::{HostDispatchContext, HostSenderDispatcher};
 pub use multi_source::{
     run_multi_source, InflightRecord, MultiSourceError, MultiSourceReceiver, SourceHandle,
     SourceSelector, NAK_THRESHOLD, RTT_COOLDOWN, RTT_P95_LIMIT_MS, RTT_P95_WINDOW, RTT_WINDOW_CAP,

@@ -813,7 +813,20 @@ async fn upsert_media_item_from_manifest(
     if let Some((id,)) = existing {
         return Ok(id);
     }
-    let new_id = Uuid::new_v4().to_string();
+    // P3-T15: use the manifest entry's `id` as the new
+    // row's primary key so the viewer's local `media_id`
+    // matches the host's manifest entry `id`. The
+    // host-side sender dispatch looks up the source file
+    // by `media_items.id` and matches it against the
+    // inbound `Hello.media_id`, which the viewer derives
+    // from `plan.media_id` (which is the row's id). If
+    // the two sides used different ids, the host's
+    // `manifest.media[i].iter().find(|m| m.id == hello.media_id)`
+    // would never match. The host's id is itself a
+    // `Uuid::new_v4()` minted at scan time and is
+    // guaranteed to be unique; using it on the viewer
+    // side preserves the round-trip identity.
+    let new_id = entry.id.clone();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

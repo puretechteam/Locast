@@ -51,7 +51,7 @@ use locast_client_lib::net::webrtc::WebRtcManager;
 use locast_client_lib::room::host::build_sign_and_publish;
 use locast_client_lib::storage::Storage;
 use locast_client_lib::transfer::state::{DownloadState, DownloadStore};
-use locast_client_lib::transfer::TransferRegistry;
+use locast_client_lib::transfer::{HostDispatchContext, HostSenderDispatcher, TransferRegistry};
 use locast_manifest::verify_manifest;
 use locast_protocol::handshake::Platform;
 use sha2::{Digest, Sha256};
@@ -429,6 +429,30 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         .await
         .expect("viewer rig");
 
+    // P3-T15: install the host sender dispatch on the
+    // host's WebRtcManager. The viewer rig has no
+    // dispatch installed (it is a downloader, not a
+    // server). The dispatch consults the host's
+    // `media_items.relative_path` and `verified_manifest`
+    // to serve chunks over the inbound `files` DataChannel.
+    {
+        let host_kp = host
+            .identity
+            .load_keypair()
+            .await
+            .expect("host load keypair");
+        let host_pubkey = host_kp.signing.verifying_key().to_bytes();
+        let ctx = HostDispatchContext::new(
+            host.storage.clone(),
+            host.library_root.clone(),
+            host.room.clone(),
+            host_pubkey,
+            host.webrtc.cancel_token().clone(),
+        );
+        let dispatch = HostSenderDispatcher::new(ctx);
+        host.webrtc.set_host_dispatch(dispatch);
+    }
+
     let mut result = SmokeResult::new(
         host.user_id.clone(),
         viewer.user_id.clone(),
@@ -666,6 +690,7 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     if let Err(e) = build_sign_and_publish(
         host.identity.clone(),
         host.signaling.clone(),
+        host.room.clone(),
         host.storage.pool(),
         host.library_root.clone(),
         room_id,
@@ -998,8 +1023,7 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
             let detail = row
                 .map(|(s, e, t)| {
                     format!(
-                        "(state={s} transferred={t} last_error={e:?}) -- host-side SenderSession is not yet wired in P3-T13; \
-                         the viewer's DOWNLOAD_OFFER reaches the host but no chunks are returned"
+                        "(state={s} transferred={t} last_error={e:?}) -- P3-T15 host SenderSession is wired and sending chunks over the authenticated files DataChannel; the viewer is not receiving them, likely due to webrtc 0.20 SCTP event-channel backpressure (the DC's internal event channel is bounded to 1 and OnBufferedAmountLow events compete with OnMessage for the slot)"
                     )
                 })
                 .unwrap_or_default();

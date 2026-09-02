@@ -202,6 +202,7 @@ pub async fn manifest_publish(
     crate::room::host::build_sign_and_publish(
         identity.inner().clone(),
         signaling.inner().clone(),
+        room.inner().clone(),
         storage.pool(),
         library_root,
         room_id,

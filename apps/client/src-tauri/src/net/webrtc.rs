@@ -241,6 +241,16 @@ pub struct WebRtcManager {
     identity: Arc<IdentityService>,
     state: Arc<tokio::sync::Mutex<ManagerState>>,
     cancel: CancellationToken,
+    /// P3-T15: host-side sender dispatch. `None` on the
+    /// viewer (no library to serve); `Some` on the host. The
+    /// manager consults the dispatcher on every inbound
+    /// `files` DataChannel that reaches `Open`; the
+    /// dispatcher spawns a `SenderSession` that reads from
+    /// the host's verified library file and serves chunks
+    /// over the same DataChannel. Wrapped in a `std::sync`
+    /// mutex (NOT a tokio mutex) so the install and the
+    /// read paths do not need to be `async`.
+    host_dispatch: std::sync::Mutex<Option<Arc<crate::transfer::HostSenderDispatcher>>>,
 }
 
 impl WebRtcManager {
@@ -256,7 +266,44 @@ impl WebRtcManager {
             identity,
             state: Arc::new(tokio::sync::Mutex::new(ManagerState::new())),
             cancel: CancellationToken::new(),
+            host_dispatch: std::sync::Mutex::new(None),
         }
+    }
+
+    /// P3-T15: install a host-side sender dispatch. Call
+    /// this once during `setup()` if the local process is
+    /// acting as a host (i.e. it owns a library it is
+    /// willing to serve). On a viewer-only deployment
+    /// (no library), leave the dispatcher `None`; the
+    /// manager will silently drop inbound `files` DCs
+    /// after the adoption step.
+    ///
+    /// The call is idempotent: a second call replaces the
+    /// first (the prior dispatch is dropped, which cancels
+    /// any in-flight senders it owned).
+    pub fn set_host_dispatch(
+        &self,
+        dispatch: Arc<crate::transfer::HostSenderDispatcher>,
+    ) {
+        let mut g = self.host_dispatch.lock().expect("host_dispatch");
+        *g = Some(dispatch);
+    }
+
+    /// P3-T15: snapshot the currently-installed host
+    /// dispatch, if any. The lock is held only across the
+    /// clone; long-running operations on the returned
+    /// `Arc` happen outside the lock.
+    pub fn host_dispatch(&self) -> Option<Arc<crate::transfer::HostSenderDispatcher>> {
+        let g = self.host_dispatch.lock().expect("host_dispatch");
+        g.clone()
+    }
+
+    /// P3-T15: expose the room-level cancel token so the
+    /// host dispatch can parent its per-sender tokens to
+    /// it. Reading is a cheap `clone` of a `CancellationToken`
+    /// (the token itself is an `Arc` internally).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     /// Spawn the full inbound loop with the room-state poller.
@@ -285,6 +332,12 @@ impl WebRtcManager {
             warn!(room_id = %summary.id, "ignoring room state with bad room_id uuid");
             return;
         };
+        // P3-T15: bind the host dispatch to the new room so
+        // any inbound `files` DC knows which manifest to
+        // trust.
+        if let Some(dispatch) = self.host_dispatch() {
+            dispatch.context().set_room(room_id).await;
+        }
         let mut desired: HashSet<Uuid> = HashSet::with_capacity(summary.participants.len());
         for p in &summary.participants {
             let Ok(uid) = Uuid::parse_str(&p.user_id) else {
@@ -356,6 +409,13 @@ impl WebRtcManager {
     /// loop. Idempotent.
     pub async fn on_room_left(&self) {
         self.cancel.cancel();
+        // P3-T15: clear the dispatch's room binding so a
+        // follow-up `room_create` (in the same process) does
+        // not serve chunks from the prior room's manifest.
+        if let Some(dispatch) = self.host_dispatch() {
+            dispatch.context().clear_room().await;
+            dispatch.cancel_all().await;
+        }
         let mut g = self.state.lock().await;
         for (_uid, entry) in g.peers.drain() {
             let _ = entry.pc.close().await;
@@ -398,6 +458,18 @@ impl WebRtcManager {
                         protocol = FILES_DC_PROTOCOL,
                         "files DataChannel created (initiator side)"
                     );
+                    // P3-T15: hand the freshly-created DC to
+                    // the host dispatch (if installed). The
+                    // dispatch polls `ready_state` and
+                    // returns early if the DC is not yet
+                    // `Open`; it is safe to hand it over
+                    // before the offer/answer exchange.
+                    if let Some(dispatch) = self.host_dispatch() {
+                        let dc_for_spawn = dc.clone();
+                        tokio::spawn(async move {
+                            dispatch.spawn_for_dc(dc_for_spawn, remote_id).await;
+                        });
+                    }
                     entry.dc = Some(dc);
                 }
                 Err(e) => {
@@ -728,8 +800,11 @@ impl WebRtcManager {
 
     /// Adopt an inbound data channel that arrived via
     /// `PeerConnectionEventHandler::on_data_channel` on the
-    /// answerer side. Stores the `Arc<dyn DataChannel>` in the
-    /// matching `PeerEntry`.
+    /// answerer side. Stores the `Arc<dyn DataChannel>` in
+    /// the matching `PeerEntry`, and (P3-T15) if a host
+    /// sender dispatch is installed, hands the channel off
+    /// to it so a `SenderSession` can serve the host's
+    /// library over it.
     async fn on_inbound_data_channel(&self, remote_id: Uuid, dc: Arc<dyn DataChannel>) {
         let label = match dc.label().await {
             Ok(s) => s,
@@ -743,7 +818,20 @@ impl WebRtcManager {
             );
             let mut g = self.state.lock().await;
             if let Some(entry) = g.peers.get_mut(&remote_id) {
-                entry.dc = Some(dc);
+                entry.dc = Some(dc.clone());
+            }
+            drop(g);
+            // P3-T15: hand the DC to the host sender
+            // dispatch (if installed) so a real
+            // `SenderSession` starts. The dispatch is
+            // optional; a viewer-only deployment has it
+            // set to `None` and silently drops the
+            // inbound channel here.
+            if let Some(dispatch) = self.host_dispatch() {
+                let dc_for_spawn = dc.clone();
+                tokio::spawn(async move {
+                    dispatch.spawn_for_dc(dc_for_spawn, remote_id).await;
+                });
             }
         } else {
             debug!(

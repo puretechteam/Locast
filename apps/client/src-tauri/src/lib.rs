@@ -156,7 +156,7 @@ pub fn run() {
             // `app.manage` below, so the RoomClient can be
             // given a copy for persistence.
             let storage_pool = storage.pool();
-            app.manage(storage);
+            app.manage(storage.clone());
             app.manage(accountant);
             app.manage(protocol_handler);
             app.manage(identity_service.clone());
@@ -253,19 +253,62 @@ pub fn run() {
                     .start_with_room_client(room_client.clone());
             });
             app.manage(signaling_client);
-            app.manage(room_client);
+            app.manage(room_client.clone());
             // P3-T13: register the WebRtcManager + TransferRegistry
             // as managed state so `download_open` (and future
             // commands) can reach them. The manager itself is
             // already alive (the inbound loop was spawned above);
             // `app.manage` is a Tauri-side alias that only sets a
             // `tauri::State` lookup key.
-            app.manage(webrtc_for_state);
+            app.manage(webrtc_for_state.clone());
             // P3-T13: a fresh TransferRegistry. Spawning a transfer
             // registers it here; `cancel_all()` is wired into
             // future shutdown / room_leave paths.
             let registry = std::sync::Arc::new(transfer::TransferRegistry::new());
             app.manage(registry.clone());
+
+            // P3-T15: install the host-side sender dispatch
+            // on the WebRtcManager. The dispatch consults the
+            // host's verified manifest and serves chunks over
+            // the inbound `files` DataChannel. The local
+            // pubkey is derived from the OS keyring; if the
+            // keyring read fails (e.g. on a fresh install
+            // where the keypair has not been generated yet),
+            // the dispatch is skipped and the manager falls
+            // back to the viewer-only path. The next
+            // `identity_get` will create the keypair, and a
+            // future setup-hook replay will re-install the
+            // dispatch.
+            {
+                let webrtc_for_dispatch = webrtc_for_state.clone();
+                let identity_for_dispatch = identity_service.clone();
+                let storage_for_dispatch = storage.clone();
+                let library_root_for_dispatch = data_dir.clone();
+                let room_client_for_dispatch = room_client.clone();
+                let cancel_for_dispatch = webrtc_for_dispatch.cancel_token();
+                tauri::async_runtime::spawn(async move {
+                    match identity_for_dispatch.load_keypair().await {
+                        Ok(kp) => {
+                            let pubkey = kp.signing.verifying_key().to_bytes();
+                            let ctx = transfer::HostDispatchContext::new(
+                                storage_for_dispatch,
+                                library_root_for_dispatch,
+                                room_client_for_dispatch,
+                                pubkey,
+                                cancel_for_dispatch,
+                            );
+                            let dispatch = transfer::HostSenderDispatcher::new(ctx);
+                            webrtc_for_dispatch.set_host_dispatch(dispatch);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "host dispatch: load_keypair failed; manager is viewer-only"
+                            );
+                        }
+                    }
+                });
+            }
 
             // P3-T13 review fix H#28: when the main window is
             // closing, cancel every in-flight transfer so the

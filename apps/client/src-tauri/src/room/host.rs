@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use crate::core::hashing::CHUNK_SIZE;
 use crate::identity::keystore::{IdentityService, IdentityServiceError};
+use crate::net::room::RoomClient;
 use crate::net::signaling::{SignalingClient, SignalingError};
 use crate::room::chunk_plan::{self, ChunkPlan, ChunkPlanError};
 use crate::room::peer_id::derive_peer_id;
@@ -336,9 +337,19 @@ fn now_ms_i64() -> i64 {
 /// High-level entry point used by the `manifest_publish`
 /// Tauri command. Looks up the host's pubkey from the
 /// identity, builds the manifest, signs it, and sends it.
+///
+/// P3-T15: also seeds the local `RoomClient`'s
+/// `expected_host_pubkey` (so the host's own manifest
+/// passes the TOFU check on the late-join path) and
+/// populates the `verified_manifests` cache via
+/// `accept_manifest`, so the host-side sender dispatch
+/// can read it without waiting for the server's broadcast
+/// (which the server may or may not echo to the host).
+#[allow(clippy::too_many_arguments)]
 pub async fn build_sign_and_publish(
     identity: Arc<IdentityService>,
     signaling: Arc<SignalingClient>,
+    room_client: Arc<RoomClient>,
     storage_pool: SqlitePool,
     library_root: std::path::PathBuf,
     room_id: Uuid,
@@ -348,7 +359,24 @@ pub async fn build_sign_and_publish(
         kp.signing.verifying_key().to_bytes()
     };
     let manifest = build_manifest(&storage_pool, &library_root, room_id, host_pubkey).await?;
-    sign_and_publish(&identity, &signaling, &manifest).await
+    sign_and_publish(&identity, &signaling, &manifest).await?;
+    // P3-T15: the host is its own trust anchor. Install
+    // the local pubkey as the expected host pubkey, then
+    // accept our own manifest into the verified cache.
+    // Without this, the host dispatch's
+    // `room.verified_manifest(room_id)` returns `None`
+    // and the sender cannot serve chunks.
+    room_client.set_expected_host_pubkey(host_pubkey);
+    if let Err(e) = room_client
+        .accept_manifest(manifest.clone(), 1, manifest.created_at, "LOCAL_PUBLISH")
+        .await
+    {
+        warn!(
+            error = ?e,
+            "host: failed to accept own manifest into RoomClient cache; sender dispatch will be unable to serve chunks"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

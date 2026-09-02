@@ -193,24 +193,36 @@ struct InflightChunk {
 pub struct SenderSession<'a> {
     plan: &'a DownloadPlan,
     transport: Arc<dyn Transport>,
-    /// Absolute path to the content-addressed library file
-    /// the host will read chunks from. The library root is
-    /// validated at construction; chunks are read via
-    /// `tokio::fs::File::read_at` so memory stays bounded.
-    library_root: PathBuf,
+    /// Absolute path to the host's on-disk file that chunks
+    /// are read from. The caller (the production host wire-up
+    /// or an integration test) resolves this from the
+    /// verified manifest's `relative_path` plus the library
+    /// root. Storing the resolved path keeps the sender
+    /// purely an I/O driver — it never picks the file based
+    /// on a path the viewer supplied, so there is no risk of
+    /// a malicious peer steering the sender to an arbitrary
+    /// host file. Chunks are read via `tokio::fs::File::read`
+    /// after a seek so memory stays bounded to one chunk.
+    source_path: PathBuf,
     cancel: CancellationToken,
 }
 
 impl<'a> SenderSession<'a> {
+    /// Construct a sender session that reads chunks from
+    /// `source_path`. The caller MUST resolve the file from
+    /// authoritative, host-local metadata (e.g. the verified
+    /// manifest's `relative_path` joined with the library
+    /// root). Never construct a sender with a path that
+    /// originated from a peer.
     pub fn new(
         plan: &'a DownloadPlan,
         transport: Arc<dyn Transport>,
-        library_root: impl Into<PathBuf>,
+        source_path: impl Into<PathBuf>,
     ) -> Self {
         Self {
             plan,
             transport,
-            library_root: library_root.into(),
+            source_path: source_path.into(),
             cancel: CancellationToken::new(),
         }
     }
@@ -227,12 +239,8 @@ impl<'a> SenderSession<'a> {
         let cancel = self.cancel.clone();
         let transport = Arc::clone(&self.transport);
         let plan = self.plan;
-        let library_root = self.library_root.clone();
+        let src_path = self.source_path.clone();
 
-        // Resolve the on-disk source file. The plan's
-        // `download_id` is unused on the sender; the source
-        // path is the content-addressed library file.
-        let src_path = plan_source_path(&library_root, plan)?;
         // 1. Await Hello.
         let hello_frame = await_frame(&transport, &cancel, "hello").await?;
         let Frame::Hello(hello) = hello_frame else {
@@ -250,11 +258,42 @@ impl<'a> SenderSession<'a> {
             || hello.media_id != plan.media_id
             || hello.manifest_version != plan.manifest_version
         {
-            return Err(SessionError::ManifestVersionMismatch {
-                plan: plan.manifest_version,
-                frame: hello.manifest_version,
-            });
+            return Err(SessionError::Wire(WireError::Malformed(format!(
+                "Hello/download_id/media_id/manifest_version mismatch (plan {} / {} / {}, hello {} / {} / {})",
+                plan.download_id,
+                plan.media_id,
+                plan.manifest_version,
+                hello.download_id,
+                hello.media_id,
+                hello.manifest_version
+            ))));
         }
+        Self::run_after_hello(plan, transport, src_path, hello, sanitized_filename, cancel).await
+    }
+
+    /// Sender-side main loop after the inbound `Hello` has
+    /// already been read and validated. Used by the host
+    /// wire-up (P3-T15) which performs extra authorization
+    /// checks (manifest binding, source path resolution)
+    /// before constructing the session, and by the
+    /// constructor-bound `run` above. The transport must
+    /// already be positioned past the `Hello` (i.e. the next
+    /// inbound frame is a `Request` / `Nak` / `Cancel` /
+    /// `Error`).
+    ///
+    /// `sanitized_filename` is the manifest entry's
+    /// `filename` (the value the host intends to publish to
+    /// the viewer via the `Offer.frame`). The host wire-up
+    /// passes the manifest's `filename`; the loopback test
+    /// path passes a literal supplied by the test.
+    pub async fn run_after_hello(
+        plan: &DownloadPlan,
+        transport: Arc<dyn Transport>,
+        src_path: PathBuf,
+        hello: HelloFrame,
+        sanitized_filename: String,
+        cancel: CancellationToken,
+    ) -> Result<(), SessionError> {
         // 2. Send Offer.
         let offer = Frame::Offer(OfferFrame {
             peer_id: plan.source.peer_id.clone(),
@@ -885,27 +924,6 @@ pub async fn cancel_session(
     transport.send(bytes).await.map_err(SessionError::from)?;
     transport.close().await;
     Ok(())
-}
-
-/// Resolve the host-side source file for a plan. The plan
-/// does not carry the filename in P3-T06, so the caller
-/// supplies it via `SenderSession::new` -> `library_root`
-/// plus an optional helper; for the P3-T06 test harness
-/// the source path is built by reading the on-disk fixture
-/// directly, so this returns the content-addressed path
-/// derived from `plan.sha256` and an empty filename
-/// (caller must rename the source). For tests, the
-/// `SenderSession` is given a `library_root` whose layout is
-/// `tmp/source/<sha>` (see the integration test harness).
-fn plan_source_path(library_root: &Path, plan: &DownloadPlan) -> Result<PathBuf, SessionError> {
-    // The host-side source layout is `library_root/<sha>`
-    // for the integration test. The production host uses
-    // `complete_download`'s layout but writes are handled
-    // upstream; the sender never reads from the library on
-    // production. For P3-T06 the integration test creates
-    // the source file at `library_root/<sha>`.
-    let p = library_root.join(&plan.sha256);
-    Ok(p)
 }
 
 /// Read a single chunk from the host's source file. The
