@@ -221,7 +221,10 @@ impl RoomRegistry {
 
     /// Publish one `RoomEvent` to the room's broadcast
     /// channel. If the room has no subscribers (or has
-    /// been removed), the publish is a no-op.
+    /// been removed), the publish is a no-op. P3-T14:
+    /// callers normally use [`RoomRegistry::publish_events`]
+    /// which converts a batch of `RoomEvent`s into
+    /// `BroadcastItem`s.
     fn publish(&self, room_id: Uuid, item: BroadcastItem) {
         // Use try_send so we don't await while holding
         // locks; the broadcast::Sender is internally
@@ -230,6 +233,41 @@ impl RoomRegistry {
             if let Some(tx) = map.get(&room_id) {
                 let _ = tx.send(item);
             }
+        }
+    }
+
+    /// P3-T14: publish every `RoomEvent` in `events` to the
+    /// per-room broadcast channel. `room_id_for_event` is
+    /// consulted for variants whose payload does not
+    /// carry a room_id (ParticipantJoined, HostMigrated,
+    /// etc.) -- the registry passes a closure that returns
+    /// the room_id extracted from the dispatch context.
+    /// Before P3-T14 the WS layer dropped
+    /// `RoomDispatchOutcome.events` entirely, which
+    /// silently broke every cross-participant broadcast
+    /// (ROOM_STATE, MANIFEST_PUBLISHED, PARTICIPANT_JOINED,
+    /// etc.).
+    pub fn publish_events<F>(&self, events: &[RoomEvent], room_id_for_event: F)
+    where
+        F: Fn(&RoomEvent) -> Uuid,
+    {
+        for event in events {
+            let originator = match event {
+                RoomEvent::ParticipantJoined(p) => Some(p.participant.user_id),
+                RoomEvent::ParticipantLeft(p) => Some(p.user_id),
+                RoomEvent::HostDisconnected(p) => Some(p.previous_host_user_id),
+                RoomEvent::HostReconnected(p) => Some(p.host_user_id),
+                RoomEvent::HostMigrated(p) => Some(p.new_host_user_id),
+                RoomEvent::RoomClosed(_) => None,
+                RoomEvent::Error { target, .. } => Some(*target),
+                RoomEvent::ManifestPublished { .. } => None,
+            };
+            let room_id = match event {
+                RoomEvent::ManifestPublished { room_id, .. } => *room_id,
+                _ => room_id_for_event(event),
+            };
+            let item = event_to_broadcast_item(event, room_id, originator);
+            self.publish(room_id, item);
         }
     }
 

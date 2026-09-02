@@ -480,23 +480,40 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             }
             continue;
         }
-
         if envelope.room_id.is_some() {
-            warn!(
-                request_id = %request_id,
-                kind = %envelope.r#type.as_str(),
-                "rejected non-null room_id outside a room"
-            );
-            if record_bad_msg(&bad_msgs, started).await {
-                let _ = sender
-                    .send(Message::Close(Some(CloseFrame {
-                        code: 1008,
-                        reason: "bad_msg".into(),
-                    })))
-                    .await;
-                break;
+            // P3-T14: a non-null `room_id` is only valid when
+            // the authenticated user is currently a member of
+            // that room. ROOM_CREATE / ROOM_JOIN_REQUEST carry
+            // `room_id = None` (the server assigns / looks up
+            // the room by code), so this check rejects every
+            // room-scoped envelope from a caller who has not
+            // successfully joined. The capability gate inside
+            // dispatch still runs the per-type membership check
+            // (e.g. "must be host" for ManifestPublish); this
+            // is the front-line membership check that catches
+            // stale sessions and cross-room relay attempts
+            // before any handler runs.
+            let caller_in_room = match (authed, envelope.room_id) {
+                (Some((uid, _)), Some(rid)) => state.rooms.is_user_in_room(uid, rid).await,
+                _ => false,
+            };
+            if !caller_in_room {
+                warn!(
+                    request_id = %request_id,
+                    kind = %envelope.r#type.as_str(),
+                    "rejected non-null room_id outside a room"
+                );
+                if record_bad_msg(&bad_msgs, started).await {
+                    let _ = sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: 1008,
+                            reason: "bad_msg".into(),
+                        })))
+                        .await;
+                    break;
+                }
+                continue;
             }
-            continue;
         }
 
         // Dispatch.
@@ -790,6 +807,51 @@ async fn dispatch_authed(
             clock: state.clock.as_ref(),
             relay: &state.signal_relay,
         };
+        // Capture the room_id before dispatching so we can
+        // publish_room_events against it (manifest events
+        // carry their own room_id; every other variant
+        // gets the dispatch context's room_id). This is
+        // only meaningful for envelopes that already
+        // passed the membership check above (i.e. carry a
+        // non-null room_id). ROOM_CREATE / ROOM_JOIN_REQUEST
+        // carry room_id=None and the events they produce
+        // carry their own room_id (ManifestPublished does;
+        // others don't apply to ROOM_CREATE).
+        if let Some(dispatch_room_id) = envelope.room_id {
+            let outcome =
+                crate::rooms::dispatch_room_message(envelope, &ctx, user_id, pubkey).await;
+            // P3-T14: publish every `RoomEvent` in the
+            // dispatch outcome to the room's broadcast
+            // channel so the other participants' forwarders
+            // see them (ROOM_STATE, PARTICIPANT_JOINED,
+            // MANIFEST_PUBLISHED, etc.). Prior to P3-T14
+            // the WS layer dropped these events silently --
+            // the per-connection RPC replies in `to_caller`
+            // were delivered, but every cross-participant
+            // broadcast was lost, which silently broke
+            // WebRTC negotiation and manifest delivery.
+            // ManifestPublished carries its own room_id;
+            // every other variant gets the dispatch
+            // envelope's room_id.
+            state
+                .rooms
+                .publish_events(&outcome.events, |_| dispatch_room_id);
+            let mut actions = Vec::new();
+            for env in outcome.to_caller {
+                if let Ok(msg) = encode_envelope_message(&env) {
+                    actions.push(Action::Send(msg));
+                }
+            }
+            if outcome.close_caller {
+                actions.push(Action::Close("room_close"));
+            }
+            return DispatchOutcome { actions };
+        }
+        // No room_id on the envelope: this is a ROOM_CREATE
+        // or ROOM_JOIN_REQUEST. The dispatch handles both
+        // without needing our event-broadcast helper (their
+        // events are emitted by `registry.create`/`join`
+        // into the per-room broadcast channel internally).
         let outcome = crate::rooms::dispatch_room_message(envelope, &ctx, user_id, pubkey).await;
         let mut actions = Vec::new();
         for env in outcome.to_caller {

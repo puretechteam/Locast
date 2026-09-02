@@ -1,0 +1,10 @@
+{
+  "name": "locast",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Locast root package.json (workspace metadata; per-app package.json files live in apps/*).",
+  "type": "module",
+  "scripts": {
+    "smoke": "powershell -ExecutionPolicy Bypass -File ./scripts/smoke.ps1"
+  }
+}
