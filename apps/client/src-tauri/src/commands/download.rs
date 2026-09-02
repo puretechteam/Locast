@@ -394,11 +394,11 @@ pub async fn open_download_inner(
             let user_pubkey_cache = build_user_pubkey_cache(storage, &participant_user_ids).await?;
             let mut source_handles: Vec<SourceHandle> = Vec::new();
             let mut skipped: Vec<String> = Vec::new();
-            for src in &entry.sources {
-                if !crate::room::peer_id::is_canonical_peer_id(&src.peer_id) {
-                    skipped.push(src.peer_id.clone());
-                    continue;
-                }
+                for src in &entry.sources {
+                    if !crate::room::peer_id::is_canonical_peer_id(&src.peer_id) {
+                        skipped.push(src.peer_id.clone());
+                        continue;
+                    }
                 let lookup_cache = user_pubkey_cache.clone();
                 let dc = webrtc
                     .lookup_dc_by_peer_id(&src.peer_id, move |uid| lookup_cache.get(&uid).copied())

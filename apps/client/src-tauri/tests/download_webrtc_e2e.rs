@@ -162,7 +162,14 @@ async fn webrtc_transport_send_round_trips_through_stub_datachannel() {
     let (stub, transport) = make_stub_transport();
 
     // 1. `send` writes through the DataChannel::send API
-    //    (BytesMut). Verify the captured bytes match.
+    //    (BytesMut). Verify the captured bytes match. P3-T15:
+    //    WebRtcTransport prepends a 4-byte segmentation header
+    //    [2B total_segments][2B segment_index] to every frame
+    //    so that frames > 16 KiB can be reassembled on the
+    //    receive side (the webrtc 0.20 DataChannel silently
+    //    drops messages larger than 16 KiB without the detach
+    //    API). For a 13-byte payload, total_segments=1 and
+    //    segment_index=0.
     let payload = b"hello webrtc".to_vec();
     transport
         .send(payload.clone())
@@ -170,12 +177,26 @@ async fn webrtc_transport_send_round_trips_through_stub_datachannel() {
         .expect("WebRtcTransport::send must succeed against a stub DC");
     let captured = stub.take_sent().await;
     assert_eq!(captured.len(), 1, "expected exactly one send");
-    assert_eq!(captured[0], payload, "send bytes must be untouched");
+    let mut expected_segmented = Vec::with_capacity(4 + payload.len());
+    expected_segmented.extend_from_slice(&1u16.to_be_bytes()); // total_segments = 1
+    expected_segmented.extend_from_slice(&0u16.to_be_bytes()); // segment_index = 0
+    expected_segmented.extend_from_slice(&payload);
+    assert_eq!(
+        captured[0], expected_segmented,
+        "send bytes must include the 4-byte segmentation header followed by the payload"
+    );
 
     // 2. Inject an OnMessage on the stub's event queue and
-    //    verify recv() surfaces those bytes unchanged.
+    //    verify recv() surfaces those bytes unchanged. P3-T15:
+    //    WebRtcTransport prepends a 4-byte segmentation header
+    //    (total_segments=1, segment_index=0) to every frame.
+    //    The test injects a single-segment frame.
     let incoming = b"inbound frame".to_vec();
-    stub.inject_message(incoming.clone()).await;
+    let mut segmented = Vec::with_capacity(4 + incoming.len());
+    segmented.extend_from_slice(&1u16.to_be_bytes());
+    segmented.extend_from_slice(&0u16.to_be_bytes());
+    segmented.extend_from_slice(&incoming);
+    stub.inject_message(segmented).await;
     let received = transport
         .recv()
         .await
@@ -398,6 +419,103 @@ impl DataChannel for ErroringStub {
     }
 }
 
+/// P3-T15 regression: the webrtc 0.20 DataChannel silently drops
+/// `OnMessage` events larger than 16 KiB (per the doc comment on
+/// `webrtc::data_channel::DataChannelEvent::OnMessage`). The
+/// production chunk payload is ~350 KiB, which is way over the
+/// cap. `WebRtcTransport` works around this by splitting each
+/// frame into <= 16 KiB segments with a 4-byte header
+/// `[2B total_segments][2B segment_index]` and reassembling them
+/// on the receive side. This test proves the segmentation +
+/// reassembly round-trips for a frame that would otherwise be
+/// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_segmentation_round_trips_large_frames() {
+    let (stub, transport) = make_stub_transport();
+    // 1. Send a frame larger than the 16 KiB webrtc 0.20 cap.
+    //    64 KiB guarantees multiple segments.
+    let payload = vec![0xABu8; 64 * 1024];
+    transport
+        .send(payload.clone())
+        .await
+        .expect("send must succeed");
+    let captured = stub.take_sent().await;
+    // The frame should be split into ceil(65536 / 16380) = 5
+    // segments. First 4 are 16384 bytes each (4-byte header +
+    // 16380 payload). The last is 20 bytes (4-byte header + 16
+    // bytes of residual payload).
+    assert_eq!(
+        captured.len(),
+        5,
+        "64 KiB frame must be split into 5 segments"
+    );
+    for (i, seg) in captured.iter().enumerate() {
+        let expected_len = if i < 4 { 16384 } else { 20 };
+        assert_eq!(seg.len(), expected_len, "segment {i} must be {expected_len} bytes");
+        let total_segments =
+            u16::from_be_bytes([seg[0], seg[1]]);
+        let segment_index = u16::from_be_bytes([seg[2], seg[3]]);
+        assert_eq!(total_segments, 5, "total_segments header");
+        assert_eq!(segment_index, i as u16, "segment_index header");
+    }
+    // 2. Feed all segments back into the stub's inbound event
+    //    queue. The transport's blocking poll thread should
+    //    reassemble them into the original frame.
+    for seg in captured {
+        stub.inject_message(seg).await;
+    }
+    let received = transport
+        .recv()
+        .await
+        .expect("recv ok")
+        .expect("recv some");
+    assert_eq!(
+        received.len(),
+        64 * 1024,
+        "reassembled frame must be the full 64 KiB"
+    );
+    assert_eq!(received, payload, "reassembled frame must match exactly");
+}
+
+/// P3-T15 regression: interleaving segments from two different
+/// frames must not confuse the reassembly state. Two frames are
+/// sent; the segments of the first are injected in order, then
+/// the segments of the second. Each `recv()` must return the
+/// correct, complete frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_segmentation_handles_concurrent_frames() {
+    let (stub, transport) = make_stub_transport();
+    let frame_a = vec![0x11u8; 32 * 1024];
+    let frame_b = vec![0x22u8; 32 * 1024];
+    transport.send(frame_a.clone()).await.expect("a");
+    transport.send(frame_b.clone()).await.expect("b");
+    let captured = stub.take_sent().await;
+    // First 3 segments are frame A (32K / 16380 = 2 full + 1
+    // partial = 3 segments), next 3 are frame B.
+    assert_eq!(captured.len(), 6);
+    for seg in &captured[..3] {
+        assert_eq!(u16::from_be_bytes([seg[0], seg[1]]), 3);
+    }
+    for seg in &captured[3..] {
+        assert_eq!(u16::from_be_bytes([seg[0], seg[1]]), 3);
+    }
+    for seg in captured {
+        stub.inject_message(seg).await;
+    }
+    let r1 = transport.recv().await.expect("r1").expect("some1");
+    let r2 = transport.recv().await.expect("r2").expect("some2");
+    // The blocking poll thread processes segments in arrival
+    // order, so frame A's segments arrive first and r1 should
+    // be frame A. But with concurrent frames, the reassembly
+    // uses a single shared `next_frame_id` counter and the
+    // segment_index==0 heuristic, which assumes segments from
+    // the same frame are contiguous. This test documents the
+    // current single-frame-in-flight behavior: r1 == frame_a.
+    // (Multi-frame pipelining is out of scope for P3-T15.)
+    assert_eq!(r1, frame_a, "first reassembled frame must be frame A");
+    assert_eq!(r2, frame_b, "second reassembled frame must be frame B");
+}
+
 /// P3-T13 review fix I#30: end-to-end type-adapter smoke
 /// test. Wires a `WebRtcTransport` (stub-backed) into the
 /// orchestrator's [`SourceHandle`] struct and confirms the
@@ -444,11 +562,20 @@ async fn web_rtc_transport_satisfies_source_handle_transport_type() {
     };
     // The compile itself is the assertion. Sanity: the stub
     // is Open, so we can also verify the adapter still
-    // round-trips a send.
+    // round-trips a send. P3-T15: WebRtcTransport prepends
+    // a 4-byte segmentation header (total_segments=1,
+    // segment_index=0) to every frame so that frames larger
+    // than 16 KiB can be reassembled on the receive side
+    // (the webrtc 0.20 DataChannel silently drops messages
+    // larger than 16 KiB without the detach API).
     transport
         .send(b"probe".to_vec())
         .await
         .expect("WebRtcTransport::send must succeed against the Open stub DC");
     let captured = stub.take_sent().await;
-    assert_eq!(captured, vec![b"probe".to_vec()]);
+    let mut expected_segmented = Vec::with_capacity(4 + 5);
+    expected_segmented.extend_from_slice(&1u16.to_be_bytes());
+    expected_segmented.extend_from_slice(&0u16.to_be_bytes());
+    expected_segmented.extend_from_slice(b"probe");
+    assert_eq!(captured, vec![expected_segmented]);
 }

@@ -1023,7 +1023,7 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
             let detail = row
                 .map(|(s, e, t)| {
                     format!(
-                        "(state={s} transferred={t} last_error={e:?}) -- P3-T15 host SenderSession is wired and sending chunks over the authenticated files DataChannel; the viewer is not receiving them, likely due to webrtc 0.20 SCTP event-channel backpressure (the DC's internal event channel is bounded to 1 and OnBufferedAmountLow events compete with OnMessage for the slot)"
+                        "(state={s} transferred={t} last_error={e:?}) -- P3-T15: host SenderSession sends chunk frames over the authenticated files DataChannel, and the viewer's WebRtcTransport segmentation/reassembly receives them, but the multi-source main loop is starving on a tokio worker thread and not draining the inbound frame queue fast enough. Increase worker_threads or add a dedicated I/O thread."
                     )
                 })
                 .unwrap_or_default();
