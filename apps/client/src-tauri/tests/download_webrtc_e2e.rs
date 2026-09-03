@@ -451,9 +451,12 @@ async fn webrtc_transport_segmentation_round_trips_large_frames() {
     );
     for (i, seg) in captured.iter().enumerate() {
         let expected_len = if i < 4 { 16384 } else { 20 };
-        assert_eq!(seg.len(), expected_len, "segment {i} must be {expected_len} bytes");
-        let total_segments =
-            u16::from_be_bytes([seg[0], seg[1]]);
+        assert_eq!(
+            seg.len(),
+            expected_len,
+            "segment {i} must be {expected_len} bytes"
+        );
+        let total_segments = u16::from_be_bytes([seg[0], seg[1]]);
         let segment_index = u16::from_be_bytes([seg[2], seg[3]]);
         assert_eq!(total_segments, 5, "total_segments header");
         assert_eq!(segment_index, i as u16, "segment_index header");
@@ -464,11 +467,7 @@ async fn webrtc_transport_segmentation_round_trips_large_frames() {
     for seg in captured {
         stub.inject_message(seg).await;
     }
-    let received = transport
-        .recv()
-        .await
-        .expect("recv ok")
-        .expect("recv some");
+    let received = transport.recv().await.expect("recv ok").expect("recv some");
     assert_eq!(
         received.len(),
         64 * 1024,

@@ -222,11 +222,7 @@ impl HostSenderDispatcher {
     /// library in v1) and the inbound `Hello.media_id` /
     /// `download_id` / `manifest_version` are checked
     /// against the bound plan instead.
-    pub async fn spawn_for_dc(
-        self: &Arc<Self>,
-        dc: Arc<dyn DataChannel>,
-        peer_user_id: Uuid,
-    ) {
+    pub async fn spawn_for_dc(self: &Arc<Self>, dc: Arc<dyn DataChannel>, peer_user_id: Uuid) {
         // 1. Allocate the per-sender cancel token first so
         //    the open-wait loop can check it.
         let sender_cancel = self.ctx.master_cancel.child_token();

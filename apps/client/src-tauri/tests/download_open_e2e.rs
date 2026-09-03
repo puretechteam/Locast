@@ -575,8 +575,7 @@ async fn missing_path_persists_real_manifest_chunk_hashes() {
     for (i, (idx, stored_sha)) in rows.iter().enumerate() {
         assert_eq!(*idx, i as i64, "chunk index ordering");
         assert_eq!(
-            stored_sha,
-            &real_hashes[i],
+            stored_sha, &real_hashes[i],
             "chunk {i} stored sha256 must equal the manifest hash"
         );
         // Sanity: the stored hash must NOT be the placeholder

@@ -281,10 +281,7 @@ impl WebRtcManager {
     /// The call is idempotent: a second call replaces the
     /// first (the prior dispatch is dropped, which cancels
     /// any in-flight senders it owned).
-    pub fn set_host_dispatch(
-        &self,
-        dispatch: Arc<crate::transfer::HostSenderDispatcher>,
-    ) {
+    pub fn set_host_dispatch(&self, dispatch: Arc<crate::transfer::HostSenderDispatcher>) {
         let mut g = self.host_dispatch.lock().expect("host_dispatch");
         *g = Some(dispatch);
     }
