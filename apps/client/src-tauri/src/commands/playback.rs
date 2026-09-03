@@ -100,9 +100,7 @@ pub async fn playback_send(
         "pause" => locast_protocol::room::PlaybackAction::Pause,
         "seek" => locast_protocol::room::PlaybackAction::Seek,
         other => {
-            return Err(AppError::other(format!(
-                "invalid playback action: {other}"
-            )));
+            return Err(AppError::other(format!("invalid playback action: {other}")));
         }
     };
     let payload = locast_protocol::room::PlaybackCommandPayload {

@@ -402,12 +402,7 @@ pub struct PlaybackStateEvent {
 }
 
 impl From<(Uuid, &locast_protocol::room::PlaybackAcceptedEvent)> for PlaybackStateEvent {
-    fn from(
-        (room_id, evt): (
-            Uuid,
-            &locast_protocol::room::PlaybackAcceptedEvent,
-        ),
-    ) -> Self {
+    fn from((room_id, evt): (Uuid, &locast_protocol::room::PlaybackAcceptedEvent)) -> Self {
         Self {
             room_id: room_id.to_string(),
             server_seq: evt.server_seq,
@@ -1066,12 +1061,7 @@ impl RoomClient {
             // but we defend in depth).
             MessageKind::PlaybackCmd => {
                 if let Some(room_id) = env.room_id {
-                    let current_room = self
-                        .state
-                        .lock()
-                        .await
-                        .as_ref()
-                        .map(|s| s.id.clone());
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
                     let room_id_str = room_id.to_string();
                     // Only forward if the event belongs
                     // to the user's current room. If the
@@ -1079,9 +1069,8 @@ impl RoomClient {
                     // we just left), the event is from
                     // a stale subscription; drop it.
                     if current_room.as_deref() == Some(room_id_str.as_str()) {
-                        if let Ok(evt) = decode_payload::<
-                            locast_protocol::room::PlaybackAcceptedEvent,
-                        >(&env)
+                        if let Ok(evt) =
+                            decode_payload::<locast_protocol::room::PlaybackAcceptedEvent>(&env)
                         {
                             let ipc = PlaybackStateEvent::from((room_id, &evt));
                             let g = self.sink.lock().await;
