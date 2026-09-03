@@ -435,11 +435,17 @@ async fn multi_source_failover_rotates_from_lossy_a_to_healthy_b() {
 
     // 7. Run the two senders concurrently. They each
     //    `await hello` from the orchestrator.
+    //
+    //    P3-T16 follow-up: `SenderSession::new` requires
+    //    the resolved *file* path (the host-side source
+    //    file), not the library root. Both senders share
+    //    the same fixture file; they differ only in the
+    //    transport they speak over.
     let sender_plan_a = plan.clone();
-    let sender_lib_root_a = host_lib_root.clone();
+    let sender_source_a = host_source.clone();
     let host_a_for_sender = host_a.clone();
     let sender_handle_a = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan_a, host_a_for_sender, sender_lib_root_a);
+        let session = SenderSession::new(&sender_plan_a, host_a_for_sender, sender_source_a);
         let _ = tokio::time::timeout(
             Duration::from_secs(60),
             session.run("fixture.bin".to_string()),
@@ -447,10 +453,10 @@ async fn multi_source_failover_rotates_from_lossy_a_to_healthy_b() {
         .await;
     });
     let sender_plan_b = plan.clone();
-    let sender_lib_root_b = host_lib_root.clone();
+    let sender_source_b = host_source.clone();
     let host_b_for_sender = host_b.clone();
     let sender_handle_b = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan_b, host_b_for_sender, sender_lib_root_b);
+        let session = SenderSession::new(&sender_plan_b, host_b_for_sender, sender_source_b);
         let _ = tokio::time::timeout(
             Duration::from_secs(60),
             session.run("fixture.bin".to_string()),

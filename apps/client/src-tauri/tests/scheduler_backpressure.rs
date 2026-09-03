@@ -261,10 +261,10 @@ async fn scheduler_pauses_on_high_buffered_amount_and_resumes_on_low() {
     ));
 
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source = host_source.clone();
     let sender_wrapper: Arc<dyn Transport> = Arc::new(bp_wrapper);
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, sender_wrapper, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, sender_wrapper, sender_source);
         session.run("fixture.bin".to_string()).await
     });
     let receiver_plan = plan.clone();

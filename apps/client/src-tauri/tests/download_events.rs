@@ -244,10 +244,10 @@ async fn end_to_end_emits_progress_and_state_for_a_small_download() {
     let emitter = DownloadEventEmitter::new(recorder.clone());
 
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source_path = host_source.clone();
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source_path);
         session.run("fixture.bin".to_string()).await
     });
     let receiver_plan = plan.clone();
@@ -368,10 +368,10 @@ async fn cancellation_during_inflight_does_not_emit_progress_after_cancel() {
     let emitter = DownloadEventEmitter::new(recorder.clone());
 
     let sender_plan = plan.clone();
-    let sender_lib_root = host_lib_root.clone();
+    let sender_source_path = host_source.clone();
     let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
     let sender_handle = tokio::spawn(async move {
-        let session = SenderSession::new(&sender_plan, host_transport, sender_lib_root);
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source_path);
         let _ = session.run("fixture.bin".to_string()).await;
     });
     let receiver_plan = plan.clone();

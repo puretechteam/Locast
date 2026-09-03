@@ -677,7 +677,8 @@ impl<'a> ReceiverSession<'a> {
             let frame = match await_frame(&transport, &cancel, "chunk").await {
                 Ok(f) => f,
                 Err(SessionError::Transport(TransportError::Closed))
-                | Err(SessionError::Transport(TransportError::Cancelled)) => {
+                | Err(SessionError::Transport(TransportError::Cancelled))
+                | Err(SessionError::Cancelled) => {
                     let _ = store
                         .transition(&plan.download_id, DownloadState::Cancelled)
                         .await;
