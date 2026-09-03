@@ -111,6 +111,12 @@ export const commands = {
   async downloadOpen(mediaId: string): Promise<DownloadSessionIpc> {
     return await __TAURI_INVOKE("download_open", { mediaId });
   },
+  // P4-T02: host playback command send. Wraps the
+  // PLAYBACK_CMD envelope in the host process and
+  // forwards it through the signaling WebSocket.
+  async playbackSend(cmd: PlaybackCommandInput): Promise<PlaybackSendResult> {
+    return await __TAURI_INVOKE("playback_send", { cmd });
+  },
 };
 
 /* Types */
@@ -247,6 +253,28 @@ export type DownloadProgressEvent = {
 };
 
 // P3-T12: return type for the `downloadOpen` command.
+// P4-T02: the host playback command send + the
+// `playback://state` event payload.
+export type PlaybackCommandInput = {
+    action: "play" | "pause" | "seek";
+    monotonic_seq: number;
+    media_position_ms: number;
+};
+
+export type PlaybackSendResult = {
+    envelope_id: string;
+    monotonic_seq: number;
+};
+
+export type PlaybackStateEvent = {
+    room_id: string;
+    server_seq: number;
+    server_ts_ms: number;
+    sender_id: string;
+    monotonic_seq: number;
+    kind: "play" | "pause" | "seek";
+    media_position_ms: number;
+};
 export type DownloadSessionIpc = {
   download_id: string;
   media_id: string;
@@ -282,6 +310,17 @@ export const events = {
   downloadProgress: <EventListener<DownloadProgressEvent>>((h) =>
     __listenAs__("download://progress", h)
   ),
+  // P4-T02: server-authoritative playback state. Emitted
+  // every time the server accepts a host PLAYBACK_CMD
+  // (PLAY / PAUSE / SEEK) and rebroadcasts it. The
+  // `server_seq` is monotonic per room; the React
+  // `usePlaybackStore` drops events with
+  // `server_seq <= lastAppliedServerSeq` for the same
+  // room and buffers the most recent event for the
+  // case where the <video> element is not yet ready.
+  playbackState: <EventListener<PlaybackStateEvent>>((h) =>
+    __listenAs__("playback://state", h)
+  ),
 };
 
 export const signalingStateChanged = events.signalingState;
@@ -289,3 +328,4 @@ export const roomStateChanged = events.roomState;
 export const roomEventEnvelope = events.roomEvent;
 export const downloadStateChanged = events.downloadState;
 export const downloadProgressChanged = events.downloadProgress;
+export const playbackStateChanged = events.playbackState;

@@ -14,12 +14,13 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
-pub use crate::net::room::{ManifestStateEvent, RoomSummaryIpc};
+pub use crate::net::room::{ManifestStateEvent, PlaybackStateEvent, RoomSummaryIpc};
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
 pub use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};
 
 pub type DownloadStateChanged = DownloadStateEvent;
 pub type DownloadProgressChanged = DownloadProgressEvent;
+pub type PlaybackStateChanged = PlaybackStateEvent;
 
 /// The `signaling://state` event payload. Emitted by the
 /// `SignalingClient` whenever the connection state changes;

@@ -1,0 +1,182 @@
+import { useEffect, useRef, useState, useCallback } from "react";
+import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
+
+/**
+ * P4-T02: the room media player.
+ *
+ * Renders a single `<video>` element inside the
+ * `room-page__player` section. The player is driven by
+ * the server-authoritative `playback://state` event
+ * stream (P4-T01 + this task's Rust bridge).
+ *
+ * Authoritative ordering
+ * ----------------------
+ * The `usePlaybackStore` already enforces strict
+ * `server_seq` ordering and a media-readiness buffer
+ * (the most recent accepted event is parked in
+ * `pending` until the `<video>` element fires
+ * `canplay` or `loadedmetadata`). This component
+ * reads `lastApplied` from the store and applies it
+ * to the DOM via a `useEffect`.
+ *
+ * Media-readiness handling
+ * ------------------------
+ * The `<video>` element's `src` is whatever the parent
+ * has written into `usePlaybackStore.mediaSrc` (a
+ * `locast://...` URL or any other URL the parent can
+ * resolve). When `src` changes, the element fires
+ * `loadedmetadata` (or `canplay`) which flips
+ * `mediaReady` to true. While `mediaReady` is false,
+ * accepted events are parked; when it flips true, the
+ * most recent parked event is applied.
+ *
+ * Feedback-loop prevention
+ * ------------------------
+ * The `<video>` element's `play` / `pause` / `seeked`
+ * DOM event handlers MUST NOT bubble into a new
+ * `PLAYBACK_CMD` envelope. This component does NOT
+ * install any such handler. The host's UI controls
+ * (see `PlaybackControls.tsx`) are the only legitimate
+ * path that calls `sendPlaybackCommand`.
+ *
+ * Host echo suppression
+ * ---------------------
+ * When the host's client receives its own
+ * `playback://state` event (the server rebroadcasts
+ * to every participant), this component ignores the
+ * event if the originating `sender_id` matches the
+ * `localUserId` prop AND the local user is the host
+ * (per the `isHost` prop). The host applied the
+ * command locally before sending; the rebroadcast
+ * is just the server's confirmation. This is purely
+ * a no-op (we still record `lastAppliedServerSeq` so
+ * stale events from a future host are dropped).
+ */
+export interface PlayerProps {
+    /** The local user's user_id, used to detect host
+     * echo. Pass `null` to disable host-echo
+     * suppression. */
+    localUserId?: string | null;
+    /** Whether the local user is the current host. If
+     * `false`, host-echo suppression is disabled. */
+    isHost?: boolean;
+}
+
+export function Player({
+    localUserId = null,
+    isHost = false,
+}: PlayerProps): React.ReactNode {
+    const ref = useRef<HTMLVideoElement | null>(null);
+    const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+    const lastApplied = usePlaybackStore((s) => s.lastApplied);
+    const mediaReady = usePlaybackStore((s) => s.mediaReady);
+    const mediaSrc = usePlaybackStore((s) => s.mediaSrc);
+    const setMediaReady = usePlaybackStore((s) => s.setMediaReady);
+    const markApplied = usePlaybackStore((s) => s.markApplied);
+
+    // Wire the `<video>` element's `canplay` /
+    // `loadedmetadata` events to `mediaReady = true`.
+    const onCanPlay = useCallback(() => {
+        setMediaReady(true);
+    }, [setMediaReady]);
+    const onLoadedMetadata = useCallback(() => {
+        setMediaReady(true);
+    }, [setMediaReady]);
+    const onError = useCallback(() => {
+        const v = ref.current;
+        const msg = v?.error
+            ? `media load failed (code ${v.error.code})`
+            : "media load failed";
+        setErrorMessage(msg);
+    }, []);
+
+    // Apply the latest accepted event to the
+    // `<video>` element. The store already enforces
+    // `server_seq` ordering, so the only work this
+    // effect does is map the event into a DOM call.
+    useEffect(() => {
+        if (!lastApplied) return;
+        const v = ref.current;
+        if (!v) return;
+        if (isHost && localUserId && lastApplied.sender_id === localUserId) {
+            // Host echo: the host applied the change
+            // locally before sending. Record the
+            // server_seq and skip DOM mutation; the
+            // <video> is already in the correct state.
+            markApplied(lastApplied.server_seq);
+            return;
+        }
+        // The wire unit is milliseconds; the DOM unit
+        // is seconds. P4-T02 only deals with positions
+        // in ms (the spec is ms end-to-end).
+        const targetSec = lastApplied.media_position_ms / 1000;
+        if (Math.abs(v.currentTime - targetSec) > 0.01) {
+            v.currentTime = targetSec;
+        }
+        const kind: PlaybackKind = lastApplied.kind as PlaybackKind;
+        if (kind === "play") {
+            const res = v.play();
+            if (res && typeof (res as Promise<void>).then === "function") {
+                (res as Promise<void>).catch((err: unknown) => {
+                    setErrorMessage(
+                        err instanceof Error
+                            ? `local play() rejected: ${err.message}`
+                            : "local play() rejected",
+                    );
+                });
+            }
+        } else if (kind === "pause") {
+            v.pause();
+        }
+        markApplied(lastApplied.server_seq);
+    }, [lastApplied, localUserId, isHost, markApplied]);
+
+    // Drain the `pending` slot when `mediaReady` flips
+    // true.
+    useEffect(() => {
+        if (!mediaReady) return;
+        const state = usePlaybackStore.getState();
+        if (state.pending === null) return;
+        if (state.lastApplied !== null) return;
+        // Promote the parked event to `lastApplied`
+        // AND clear the parked slot. Without the
+        // clear, `pending` lingers forever in the
+        // store (the drain guard `if
+        // (state.lastApplied !== null) return` hides
+        // the leak but does not free it).
+        usePlaybackStore.setState({
+            lastApplied: state.pending.event,
+            pending: null,
+        });
+    }, [mediaReady]);
+
+    return (
+        <div className="room-page__player" data-testid="locast-player">
+            {mediaSrc === null ? (
+                <p className="room-page__player-empty">No media loaded yet.</p>
+            ) : (
+                <video
+                    ref={ref}
+                    data-testid="locast-player-video"
+                    src={mediaSrc}
+                    controls
+                    playsInline
+                    onCanPlay={onCanPlay}
+                    onLoadedMetadata={onLoadedMetadata}
+                    onError={onError}
+                    style={{ maxWidth: "100%", maxHeight: "100%" }}
+                />
+            )}
+            {errorMessage !== null && (
+                <p
+                    className="room-page__player-empty"
+                    role="status"
+                    data-testid="locast-player-error"
+                >
+                    {errorMessage}
+                </p>
+            )}
+        </div>
+    );
+}

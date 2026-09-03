@@ -66,6 +66,11 @@ pub trait RoomEventSink: Send + Sync {
     /// `()`; the Tauri-backed sink forwards to the
     /// webview.
     fn emit_manifest_state(&self, _ev: &ManifestStateEvent) {}
+    /// P4-T02: emit `playback://state` with the
+    /// authoritative room playback state. The default
+    /// no-op impl is `()`; the Tauri-backed sink
+    /// forwards to the webview.
+    fn emit_playback_state(&self, _ev: &PlaybackStateEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -114,6 +119,9 @@ mod tauri_sink {
         }
         fn emit_manifest_state(&self, ev: &ManifestStateEvent) {
             let _ = self.handle.emit(MANIFEST_STATE_EVENT, ev.clone());
+        }
+        fn emit_playback_state(&self, ev: &PlaybackStateEvent) {
+            let _ = self.handle.emit(PLAYBACK_STATE_EVENT, ev.clone());
         }
     }
 }
@@ -324,6 +332,103 @@ pub const ROOM_EVENT_EVENT: &str = "room://event";
 /// emitted for manifests that pass the
 /// `locast_manifest::verify_manifest` check.
 pub const MANIFEST_STATE_EVENT: &str = "manifest://state";
+
+/// P4-T02: Tauri event name emitted whenever the server
+/// accepts a host `PLAYBACK_CMD` and rebroadcasts it as
+/// a [`PlaybackAcceptedEvent`]. The payload is the
+/// authoritative room playback state: the server's
+/// `server_seq`, the server-stamped `server_ts_ms`, the
+/// original sender's `monotonic_seq`, the action, the
+/// `media_position_ms`, and the originator's
+/// `sender_id`. The React client drives its local
+/// `<video>` element from this event; the originating
+/// host's local UI should ignore the rebroadcast for
+/// its own commands (the host applied the change
+/// locally before sending the command).
+pub const PLAYBACK_STATE_EVENT: &str = "playback://state";
+
+/// P4-T02: the IPC-safe playback event payload. Mirrors
+/// `locast_protocol::room::PlaybackAcceptedEvent` with
+/// the same field names; the wire field `action`
+/// becomes `kind` here so the TypeScript event payload
+/// has a stable name across the two protocol types
+/// (PLAYBACK_CMD uses `action` because that matches the
+/// PLAY/PAUSE/SEEK wire spec; this IPC event uses
+/// `kind` because `playback://state.action` would be
+/// ambiguous in the React layer).
+///
+/// `media_id` is intentionally absent: the v1 wire has
+/// no per-asset `media_id` on the playback command (the
+/// room has a single shared cursor per the §11 design).
+/// When P5+ adds per-asset playback, the wire will gain
+/// a `media_id` field and this struct will mirror it.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct PlaybackStateEvent {
+    /// The room id, set as `Envelope::room_id` when the
+    /// event is delivered. Subscribers MUST verify this
+    /// matches the user's current room before applying.
+    pub room_id: String,
+    /// Server-assigned per-room monotonic sequence.
+    /// Strictly increasing across all accepted
+    /// PLAYBACK_CMD broadcasts for the lifetime of the
+    /// room. Subscribers drop events with
+    /// `server_seq <= last_applied_server_seq` for the
+    /// same room.
+    pub server_seq: u64,
+    /// Server-stamped wall-clock at acceptance, unix ms.
+    /// The client does NOT use this for ordering
+    /// (`server_seq` is authoritative) but the React
+    /// store surfaces it for UI display.
+    pub server_ts_ms: i64,
+    /// The original sender's `user_id` (UUID as string).
+    /// After host migration the originator changes; the
+    /// React store uses this only to decide whether
+    /// the event is an echo of the local user's own
+    /// command (and should be ignored).
+    pub sender_id: String,
+    /// Per-sender monotonic sequence, preserved from the
+    /// original `PlaybackCommandPayload`. The client
+    /// may use this for its own per-sender dedup; the
+    /// server has already validated this number.
+    pub monotonic_seq: u64,
+    /// The action that was accepted. Wire: `play` |
+    /// `pause` | `seek`.
+    pub kind: String,
+    /// Media position the command applies to. For
+    /// `pause` this is the room's last PLAY/SEEK
+    /// position (preserved by the server, not
+    /// modified by PAUSE).
+    pub media_position_ms: u64,
+}
+
+impl From<(Uuid, &locast_protocol::room::PlaybackAcceptedEvent)> for PlaybackStateEvent {
+    fn from(
+        (room_id, evt): (
+            Uuid,
+            &locast_protocol::room::PlaybackAcceptedEvent,
+        ),
+    ) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            server_seq: evt.server_seq,
+            server_ts_ms: evt.server_ts_ms,
+            sender_id: evt.sender_id.to_string(),
+            monotonic_seq: evt.monotonic_seq,
+            // The protocol's `PlaybackAction` is
+            // `#[serde(rename_all = "lowercase")]`, so
+            // the wire string is already lowercase.
+            // We re-derive it here to keep this struct
+            // free of the protocol type in the wire
+            // shape (and to survive a future rename
+            // without breaking the IPC surface).
+            kind: serde_json::to_value(evt.action)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "play".to_string()),
+            media_position_ms: evt.media_position_ms,
+        }
+    }
+}
 
 /// P3-T03: the small, IPC-safe descriptor emitted with
 /// the `manifest://state` event. `manifest_hash` is the
@@ -941,6 +1046,51 @@ impl RoomClient {
             }
             MessageKind::ManifestPublished => {
                 self.handle_manifest_published(&env).await;
+            }
+            // P4-T02: a server-accepted playback event
+            // arrived. Decode the payload, scope-check
+            // against the user's current room, and
+            // forward the authoritative state to the
+            // React layer via `playback://state`. The
+            // React store applies `server_seq` ordering
+            // + media-readiness buffering; the Rust
+            // side does NOT maintain playback state
+            // (the server is the only authority) and
+            // does NOT cache a per-room `last_seq` (the
+            // store + `<video>` element own that).
+            //
+            // If `env.room_id` is None or does not
+            // match the user's current room, the event
+            // is dropped (the server should not be
+            // sending us a different room's playback,
+            // but we defend in depth).
+            MessageKind::PlaybackCmd => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self
+                        .state
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|s| s.id.clone());
+                    let room_id_str = room_id.to_string();
+                    // Only forward if the event belongs
+                    // to the user's current room. If the
+                    // cache is empty (room just closed /
+                    // we just left), the event is from
+                    // a stale subscription; drop it.
+                    if current_room.as_deref() == Some(room_id_str.as_str()) {
+                        if let Ok(evt) = decode_payload::<
+                            locast_protocol::room::PlaybackAcceptedEvent,
+                        >(&env)
+                        {
+                            let ipc = PlaybackStateEvent::from((room_id, &evt));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_playback_state(&ipc);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }

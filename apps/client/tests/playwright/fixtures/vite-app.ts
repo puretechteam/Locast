@@ -29,9 +29,45 @@ export type DownloadProgressEvent = {
     eta_seconds: number | null;
 };
 
+export type RoomSummaryIpc = {
+    id: string;
+    code: string;
+    title: string;
+    host_user_id: string;
+    host_migration_enabled: boolean;
+    created_ms: number;
+    participants: Array<{
+        user_id: string;
+        display_name: string;
+        joined_ms: number;
+        status:
+            | "Joining"
+            | "Connected"
+            | "Reconnecting"
+            | "Disconnected"
+            | "Left";
+        last_seen_ms: number;
+        is_host: boolean;
+    }>;
+    host_disconnected: boolean;
+    host_disconnect_deadline_ms: number | null;
+};
+
+export type PlaybackStateEvent = {
+    room_id: string;
+    server_seq: number;
+    server_ts_ms: number;
+    sender_id: string;
+    monotonic_seq: number;
+    kind: "play" | "pause" | "seek";
+    media_position_ms: number;
+};
+
 type LocastApi = {
     emitDownloadState: (p: DownloadStateEvent) => Promise<void>;
     emitDownloadProgress: (p: DownloadProgressEvent) => Promise<void>;
+    emitRoomState: (p: RoomSummaryIpc | null) => Promise<void>;
+    emitPlaybackState: (p: PlaybackStateEvent) => Promise<void>;
     waitForBridge: () => Promise<void>;
 };
 
@@ -44,6 +80,28 @@ declare global {
 const SHIM_SOURCE = `
     (function() {
         var w = window;
+        /*
+         * Stub the Tauri invoke() surface so the React
+         * app's getRoomState() / getSignalingState()
+         * calls resolve with null instead of throwing
+         * in the Vite-only harness. This is a test-only
+         * shim; production code is invoked through the
+         * real Tauri runtime.
+         */
+        w.__TAURI_INVOKE = function(name, args) {
+            if (name === "room_get_state") return Promise.resolve(null);
+            if (name === "signaling_get_state") return Promise.resolve({
+                phase: "Disconnected",
+                server_url: "",
+                session_id: null,
+                user_id: null,
+                connected: false,
+                attempt: 0,
+                last_error: null,
+                last_error_at_ms: null,
+            });
+            return Promise.resolve(null);
+        };
         var api = {
             emitDownloadState: function(payload) {
                 var p = payload;
@@ -69,6 +127,16 @@ const SHIM_SOURCE = `
                         bytes_per_sec_ema: p.bytes_per_sec_ema,
                         eta_seconds: p.eta_seconds,
                     });
+                });
+            },
+            emitRoomState: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("room://state", payload);
+                });
+            },
+            emitPlaybackState: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("playback://state", payload);
                 });
             },
         };
@@ -99,6 +167,24 @@ export const test = base.extend<{ locast: LocastApi }>({
                         throw new Error("__locast not present on window");
                     }
                     return w.__locast.emitDownloadProgress(payload);
+                }, p);
+            },
+            emitRoomState: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitRoomState: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitRoomState(payload);
+                }, p);
+            },
+            emitPlaybackState: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitPlaybackState: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitPlaybackState(payload);
                 }, p);
             },
             waitForBridge: async () => {

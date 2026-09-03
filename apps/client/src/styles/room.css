@@ -259,6 +259,41 @@ code {
     margin: 0;
 }
 
+/* P4-T02: host playback controls */
+.playback-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0;
+    border-top: 1px solid #1f242a;
+    flex-wrap: wrap;
+}
+
+.playback-controls button {
+    background: #1a1f25;
+    color: #d4d8de;
+    border: 1px solid #2a313a;
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 120ms ease;
+}
+
+.playback-controls button:hover:not(:disabled) {
+    background: #232a32;
+}
+
+.playback-controls button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.playback-controls__hint {
+    color: #6b7480;
+    font-size: 0.8rem;
+}
+
 .participant-strip {
     display: flex;
     flex-direction: column;
