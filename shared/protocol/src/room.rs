@@ -6,6 +6,8 @@
 //! SEEK), drawing (DRAW / LASER), chat, and manifest publishing
 //! remain out of scope here.
 //!
+//! P4-T01: PLAYBACK_CMD envelopes live at the bottom of this file.
+//!
 //! The room code uses the 32-character unambiguous alphabet defined
 //! in `docs/ARCHITECTURE.md` §21.2: `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`
 //! (no `0`, `O`, `1`, `I`, `L`). Codes are 6 characters; the
@@ -266,6 +268,13 @@ pub enum RoomErrorCode {
     MigrationDisabled,
     /// 11: An internal error. The client should retry.
     Internal,
+    /// 12: P4-T01. A PLAYBACK_CMD arrived with a
+    /// per-sender `monotonic_seq` outside the valid
+    /// window (`<= last_acked_seq` or `> last_acked_seq + 1`).
+    /// The wire reply is single-caller; the command is NOT
+    /// broadcast. The client should reconnect / reset its
+    /// sender-side sequence counter.
+    StaleCommand,
 }
 
 /// PRESENCE (C -> S). The client periodically re-sends a
@@ -423,10 +432,108 @@ pub struct SignalCandidate {
     /// server does not inspect this; it is forwarded verbatim.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sdp_mid: Option<String>,
-    /// The `sdpMLineIndex` of the candidate. The server does
+    /// the `sdpMLineIndex` of the candidate. The server does
     /// not inspect this; it is forwarded verbatim.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub sdp_m_line_index: Option<u32>,
+}
+
+// ===== P4-T01: PLAYBACK_CMD wire types =====
+//
+// The room playback surface (docs/ARCHITECTURE.md §13). PLAY /
+// PAUSE / SEEK all ride on a single envelope kind (PLAYBACK_CMD)
+// whose `action` field discriminates between the three. The
+// server is the single arbiter: it validates host authority,
+// per-room lifecycle state (PLAY requires Ready/Paused, PAUSE
+// requires Playing, SEEK requires Playing/Paused), and the
+// per-sender `monotonic_seq`; rejects are sent back as a
+// single-caller ROOM_ERROR and are NOT broadcast.
+//
+// `server_seq` (per-room monotonic, assigned by the server) and
+// `server_ts_ms` (server wall clock at acceptance) are stamped
+// ONLY on the server-side broadcast payload; the client-supplied
+// `monotonic_seq` is per-sender and is what the dedup logic
+// (docs/ARCHITECTURE.md §13.2) uses to drop late commands.
+//
+// `media_position_ms` is u64 because media durations can exceed
+// i64::MAX on very long content (the §13.4 encoding requirement is
+// big-endian u64 on the wire). For v1 the server-side validator
+// only checks the value is well-formed JSON; per-asset bounds
+// checking against `media[].duration_ms` happens on the client.
+
+/// PLAYBACK_CMD (C -> S, S -> all).
+///
+/// The single envelope kind for playback control. The
+/// discriminant is `action`. The server stamps `server_seq` and
+/// `server_ts_ms` on the rebroadcast payload; the original
+/// sender-side payload carries only the per-sender
+/// `monotonic_seq` and the playback fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct PlaybackCommandPayload {
+    /// Discriminant: which playback action this command
+    /// represents.
+    #[serde(rename = "type")]
+    pub action: PlaybackAction,
+    /// Per-sender monotonic sequence. Must be exactly
+    /// `last_acked_seq[sender_id] + 1` per docs/ARCHITECTURE.md
+    /// §13.2. `monotonic_seq <= last_acked_seq[sender_id]` is
+    /// dropped as a duplicate; `monotonic_seq >
+    /// last_acked_seq[sender_id] + 1` is rejected as a gap.
+    pub monotonic_seq: u64,
+    /// Media position the command applies to (PLAY/SEEK).
+    /// Always present; ignored for PAUSE (the room's last PLAY /
+    /// SEEK position remains authoritative).
+    pub media_position_ms: u64,
+    /// Sender's wall clock at send (unix ms). Informational
+    /// only; the server stamps its own `server_ts_ms` on
+    /// acceptance.
+    pub client_ts_ms: i64,
+}
+
+/// The discriminated playback action.
+///
+/// §13.4 defines `PLAY`, `PAUSE`, `SEEK` as the v1 action set.
+/// We send the discriminant as `"play" | "pause" | "seek"` so
+/// the wire shape stays stable if a future task adds more
+/// actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackAction {
+    Play,
+    Pause,
+    Seek,
+}
+
+/// PLAYBACK_CMD (S -> all). The rebroadcast payload after the
+/// server has accepted a command. The per-sender `monotonic_seq`
+/// is preserved; the server stamps `server_seq` and
+/// `server_ts_ms`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct PlaybackAcceptedEvent {
+    /// Original sender's user_id. Mirrors §13.1 PLAY's
+    /// `sender_id` field; the per-room broadcast carries it so
+    /// the receiving client can drop late commands
+    /// (docs/ARCHITECTURE.md §13.2).
+    pub sender_id: Uuid,
+    /// The action that was accepted.
+    pub action: PlaybackAction,
+    /// Sender's monotonic_seq (verbatim from the command).
+    pub monotonic_seq: u64,
+    /// Media position the command applies to. Always present;
+    /// ignored for PAUSE.
+    pub media_position_ms: u64,
+    /// Sender's wall clock at send (verbatim from the command).
+    pub client_ts_ms: i64,
+    /// Per-room server-assigned monotonic sequence. First
+    /// accepted command after room creation is `1`; increments
+    /// strictly per accepted command. NOT incremented for
+    /// rejected commands.
+    pub server_seq: u64,
+    /// Server-stamped wall clock at acceptance, unix ms.
+    pub server_ts_ms: i64,
 }
 
 #[cfg(test)]

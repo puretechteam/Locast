@@ -133,6 +133,17 @@ pub enum MessageKind {
     // application-layer size cap (docs/ARCHITECTURE.md §18.5.1).
     #[serde(rename = "SIGNAL")]
     Signal,
+    // ----- P4-T01: playback commands (PLAY / PAUSE / SEEK) -----
+    // Single envelope kind carrying a discriminated `PlaybackAction`
+    // payload. The server is the authority: it validates host
+    // authority, room lifecycle, and per-sender monotonic
+    // sequencing, assigns a per-room `server_seq` and a server
+    // wall-clock `server_ts_ms`, then rebroadcasts the accepted
+    // command to every room participant. Non-host senders, stale
+    // commands, and out-of-state commands get a single-caller
+    // `ROOM_ERROR` reply and are NOT broadcast.
+    #[serde(rename = "PLAYBACK_CMD")]
+    PlaybackCmd,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -171,6 +182,7 @@ impl MessageKind {
             MessageKind::ManifestRequest => "MANIFEST_REQUEST",
             MessageKind::ManifestResponse => "MANIFEST_RESPONSE",
             MessageKind::Signal => "SIGNAL",
+            MessageKind::PlaybackCmd => "PLAYBACK_CMD",
             MessageKind::Other(s) => s,
         }
     }
@@ -211,6 +223,15 @@ impl MessageKind {
     /// grow a long match arm.
     pub fn is_signal_lifecycle(&self) -> bool {
         matches!(self, MessageKind::Signal)
+    }
+
+    /// `true` for host-only PLAYBACK_CMD envelopes (PLAY / PAUSE /
+    /// SEEK). Routed through the same WS-layer entry point as
+    /// `is_signal_lifecycle`, but kept separate so the host-only
+    // capability check + per-sender monotonic-seq check stay
+    // localized to the playback dispatcher (P4-T01).
+    pub fn is_playback_lifecycle(&self) -> bool {
+        matches!(self, MessageKind::PlaybackCmd)
     }
 }
 

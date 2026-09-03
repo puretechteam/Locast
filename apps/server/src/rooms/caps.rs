@@ -76,6 +76,19 @@ pub enum Command {
     /// stale peer sessions). Non-members are denied with
     /// `CapsError::NotMember`.
     Signal,
+    /// P4-T01: host-only PLAYBACK_CMD envelope (PLAY / PAUSE /
+    /// SEEK per docs/ARCHITECTURE.md §13). The capability
+    /// check is identical in shape to `PublishManifest`: the
+    /// caller must be a participant of the room named in
+    /// `envelope.room_id` AND must be marked as host in the
+    /// CURRENT room state. We do not trust `cap_set` for the
+    /// host check (the bitfield is historical). The per-type
+    /// handler additionally validates the room lifecycle
+    /// state (PLAY requires Ready/Paused, PAUSE requires
+    /// Playing, SEEK requires Playing/Paused) and the
+    /// per-sender `monotonic_seq` (must equal
+    /// `last_acked_seq[sender] + 1`).
+    PlaybackControl,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -156,6 +169,25 @@ pub async fn check_capability(
         Command::Signal => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        // P4-T01: PlaybackControl. Host-only. Mirrors
+        // the PublishManifest shape: caller must be a
+        // participant of the room named in
+        // envelope.room_id AND must be marked as host in
+        // the CURRENT room state. Per-sender monotonic_seq
+        // and room-lifecycle checks happen in the per-type
+        // handler (handle_playback_command in
+        // rooms/playback.rs).
+        Command::PlaybackControl => {
+            if let Some(rid) = registry.get_user_room(user_id).await {
+                if registry.is_room_host(rid, user_id).await {
+                    Ok(())
+                } else {
+                    Err(CapsError::NotHost)
+                }
             } else {
                 Err(CapsError::NotMember)
             }
@@ -314,5 +346,52 @@ mod tests {
             .await
             .expect_err("non-member must be denied");
         assert!(matches!(err, CapsError::NotMember));
+    }
+
+    /// P4-T01: PlaybackControl is host-only. A viewer cannot
+    /// issue PLAYBACK_CMD. A non-member is denied with
+    /// NotMember (mirrors the FetchManifest case).
+    #[tokio::test]
+    async fn playback_control_is_denied_when_user_is_not_in_any_room() {
+        let (reg, _clock) = fresh_registry();
+        let err = check_capability(&reg, uid(1), Command::PlaybackControl)
+            .await
+            .expect_err("expected NotMember");
+        assert!(matches!(err, CapsError::NotMember));
+    }
+
+    /// P4-T01: PlaybackControl requires the caller to be the
+    /// current host. A viewer (non-host member) is denied
+    /// with NotHost even though they pass membership.
+    #[tokio::test]
+    async fn playback_control_is_denied_when_user_is_not_host() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room");
+        let (_joined, _evt) = reg
+            .join(
+                &s,
+                &room.code,
+                uid(2),
+                [2u8; 32],
+                "viewer".into(),
+                clock.now_ms(),
+            )
+            .await
+            .expect("viewer joins");
+        // Host is allowed.
+        let host_ok = check_capability(&reg, uid(1), Command::PlaybackControl).await;
+        assert!(
+            host_ok.is_ok(),
+            "host should be allowed to playback-control"
+        );
+        // Viewer is denied with NotHost (not NotMember) because they ARE a room member.
+        let viewer_err = check_capability(&reg, uid(2), Command::PlaybackControl)
+            .await
+            .expect_err("viewer must be denied");
+        assert!(matches!(viewer_err, CapsError::NotHost));
     }
 }

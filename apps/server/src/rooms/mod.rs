@@ -13,6 +13,7 @@ pub mod codes;
 pub mod dispatch;
 pub mod error;
 pub mod manifest;
+pub mod playback;
 pub mod registry;
 pub mod signal;
 pub mod state;
@@ -23,13 +24,14 @@ pub use codes::{generate_code, is_valid_code, normalize, ALPHABET, CODE_LEN};
 pub use dispatch::{dispatch_room_message, DispatchContext, RoomDispatchOutcome};
 pub use error::RoomError;
 pub use manifest::{handle_manifest_publish, manifest_published_envelope};
+pub use playback::{handle_playback_cmd, PlaybackError};
 pub use registry::{
     BroadcastItem, CachedManifest, RoomEvent, RoomHandle, RoomRegistry, RoomRegistryConfig,
 };
 pub use signal::{
     handle_signal, SendError, SignalError, SignalOutcome, SignalRelay, SIGNAL_MAX_BYTES,
 };
-pub use state::{ParticipantRecord, RoomLifecycle, RoomState};
+pub use state::{ParticipantRecord, PlaybackBookkeeping, RoomLifecycle, RoomState};
 use std::sync::Arc;
 use std::time::Duration;
 pub use store::{DbRoomStore, NoopRoomStore, RoomStore};

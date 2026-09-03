@@ -218,6 +218,13 @@ pub enum RoomErrorCodeIpc {
     InvalidState,
     NotHost,
     MigrationDisabled,
+    /// P4-T01: server rejected a playback command
+    /// because the per-sender `monotonic_seq` was
+    /// outside the valid window (duplicate replay or
+    /// gap). The client should reconnect and re-sync
+    /// its sender-side sequence counter before
+    /// issuing further playback commands.
+    StaleCommand,
     Internal,
 }
 
@@ -234,6 +241,7 @@ impl From<RoomErrorCode> for RoomErrorCodeIpc {
             RoomErrorCode::InvalidState => Self::InvalidState,
             RoomErrorCode::NotHost => Self::NotHost,
             RoomErrorCode::MigrationDisabled => Self::MigrationDisabled,
+            RoomErrorCode::StaleCommand => Self::StaleCommand,
             RoomErrorCode::Internal => Self::Internal,
         }
     }

@@ -308,6 +308,21 @@ mod tests {
                 .expect("render SignalCandidate bindings"),
         );
         rendered.push('\n');
+        rendered.push_str(
+            &crate::room::PlaybackCommandPayload::export_to_string(&cfg)
+                .expect("render PlaybackCommandPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::PlaybackAction::export_to_string(&cfg)
+                .expect("render PlaybackAction bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::PlaybackAcceptedEvent::export_to_string(&cfg)
+                .expect("render PlaybackAcceptedEvent bindings"),
+        );
+        rendered.push('\n');
         // Render the manifest types so the protocol's
         // generated ts file declares them inline (the
         // protocol's `MANIFEST_PUBLISH*` payloads carry

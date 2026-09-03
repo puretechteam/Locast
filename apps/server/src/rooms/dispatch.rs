@@ -19,6 +19,7 @@ use super::caps::{self, Command};
 use super::codes;
 use super::error::RoomError;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
+use super::playback::handle_playback_cmd;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
 use super::store::RoomStore;
@@ -81,17 +82,21 @@ pub async fn dispatch_room_message(
         MessageKind::ManifestPublish => Some(Command::PublishManifest),
         MessageKind::ManifestRequest => Some(Command::FetchManifest),
         MessageKind::Signal => Some(Command::Signal),
+        MessageKind::PlaybackCmd => Some(Command::PlaybackControl),
         _ => None,
     };
     if let Some(cmd) = command {
         if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
-            // For PublishManifest + FetchManifest + Signal,
-            // surface the error to the caller as a
-            // ROOM_ERROR. Other commands fall through to the
-            // existing v1 behavior (log + no-op).
+            // For PublishManifest + FetchManifest + Signal +
+            // PlaybackControl (P4-T01), surface the error to
+            // the caller as a ROOM_ERROR. Other commands fall
+            // through to the existing v1 behavior (log + no-op).
             if matches!(
                 cmd,
-                Command::PublishManifest | Command::FetchManifest | Command::Signal
+                Command::PublishManifest
+                    | Command::FetchManifest
+                    | Command::Signal
+                    | Command::PlaybackControl
             ) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
@@ -132,6 +137,9 @@ pub async fn dispatch_room_message(
         }
         MessageKind::Signal => {
             handle_signal_dispatch(envelope, registry, signal_relay, clock, user_id, pubkey).await
+        }
+        MessageKind::PlaybackCmd => {
+            handle_playback_cmd_dispatch(envelope, registry, clock, user_id).await
         }
         _ => RoomDispatchOutcome::default(),
     }
@@ -326,6 +334,85 @@ async fn handle_manifest_publish_dispatch(
         }
     }
     out
+}
+
+/// P4-T01: the playback command dispatch. Decodes the
+/// payload, runs `handle_playback_cmd` (which validates the
+/// room lifecycle, per-sender monotonic_seq, and assigns the
+/// server-side server_seq + server_ts_ms), and turns the
+/// resulting `RoomEvent::PlaybackCommand` into a
+/// `RoomDispatchOutcome` with the event in the `events` list
+/// (so the WS layer broadcasts it to every other participant).
+/// On rejection the event is NOT added to `events` and a
+/// single-caller ROOM_ERROR is returned via `to_caller`.
+async fn handle_playback_cmd_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    clock: &dyn Clock,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    // The dispatch site extracts pubkey from the bearer; we
+    // re-derive it from the room's host record so a stale
+    // bearer (post-migration) cannot issue commands.
+    let host_pubkey = {
+        let user_room = registry.get_user_room(user_id).await;
+        match user_room {
+            Some(rid) if registry.is_room_host(rid, user_id).await => {
+                registry_host_pubkey(registry, rid).await
+            }
+            _ => None,
+        }
+    };
+    let Some(pubkey) = host_pubkey else {
+        out.to_caller.push(err_envelope(
+            MessageKind::RoomError,
+            RoomErrorCode::NotHost,
+            "playback sender has no host pubkey on file".to_string(),
+            clock.now_ms(),
+        ));
+        return out;
+    };
+    match handle_playback_cmd(&envelope, registry, clock, user_id, pubkey).await {
+        Ok(event) => {
+            out.events.push(event);
+        }
+        Err(e) => {
+            let code: RoomErrorCode = RoomError::from(e).into();
+            out.to_caller.push(err_envelope(
+                MessageKind::RoomError,
+                code,
+                format!("playback rejected: {}", code_for_message(code)),
+                clock.now_ms(),
+            ));
+        }
+    }
+    out
+}
+
+/// Helper: read the host pubkey off the current host's
+/// `ParticipantRecord`. Used by `handle_playback_cmd_dispatch`
+/// to bind the command to a pubkey so a post-migration stale
+/// bearer cannot forge commands.
+async fn registry_host_pubkey(registry: &RoomRegistry, room_id: Uuid) -> Option<[u8; 32]> {
+    let handle = registry.get_by_id(room_id).await?;
+    let s = handle.read().await;
+    s.participants
+        .iter()
+        .find(|p| p.user_id == s.host_user_id)
+        .map(|p| p.pubkey)
+}
+
+fn code_for_message(code: RoomErrorCode) -> &'static str {
+    match code {
+        RoomErrorCode::Unauthorized => "not authorized",
+        RoomErrorCode::NotHost => "caller is not the host",
+        RoomErrorCode::NotJoined => "caller is not a room member",
+        RoomErrorCode::RoomClosed => "room is closed",
+        RoomErrorCode::InvalidState => "playback command is not valid in the current room state",
+        RoomErrorCode::StaleCommand => "playback monotonic_seq is out of window",
+        _ => "playback rejected",
+    }
 }
 
 /// P3-T04 prerequisite 3: the manifest fetch dispatch.
@@ -854,5 +941,305 @@ mod tests {
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidState);
+    }
+
+    // ----- P4-T01: PLAYBACK_CMD end-to-end through dispatch -----
+
+    /// Build a fresh room with a host (uid(1)) and a viewer
+    /// joined. Returns the room_id and pubkey helpers used by
+    /// the playback tests. The host and viewer user_ids are
+    /// the ones the DB actually assigned via `upsert_user`,
+    /// not synthetic ones.
+    async fn room_with_host_and_viewer(
+        reg: &RoomRegistry,
+        db: &crate::db::Db,
+        clock: &MockClock,
+    ) -> (Uuid, Uuid, [u8; 32], Uuid, [u8; 32]) {
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let host_pk = pubkey();
+        let host_uid = db.upsert_user(&host_pk).await.expect("upsert host");
+        let viewer_pk = [8u8; 32];
+        let viewer_uid = db.upsert_user(&viewer_pk).await.expect("upsert viewer");
+        let (room, _self_view) = reg
+            .create(&s, "P4-T01".into(), host_uid, host_pk, true, clock.now_ms())
+            .await
+            .expect("create");
+        let (_joined, _evt) = reg
+            .join(
+                &s,
+                &room.code,
+                viewer_uid,
+                viewer_pk,
+                "viewer".into(),
+                clock.now_ms(),
+            )
+            .await
+            .expect("viewer joins");
+        (room.id, host_uid, host_pk, viewer_uid, viewer_pk)
+    }
+
+    fn playback_envelope(
+        room_id: Uuid,
+        sender_uid: Uuid,
+        sender_pk: [u8; 32],
+        action: locast_protocol::room::PlaybackAction,
+        monotonic_seq: u64,
+        position_ms: u64,
+    ) -> Envelope {
+        Envelope {
+            v: 1,
+            r#type: MessageKind::PlaybackCmd,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: Some(locast_protocol::envelope::Sender {
+                user_id: sender_uid,
+                pubkey: sender_pk.to_vec(),
+                sig: vec![],
+            }),
+            ts_ms: 0,
+            seq: monotonic_seq,
+            payload: serde_json::json!(locast_protocol::room::PlaybackCommandPayload {
+                action,
+                monotonic_seq,
+                media_position_ms: position_ms,
+                client_ts_ms: 0,
+            }),
+        }
+    }
+
+    /// Host PLAY is accepted and lands in the broadcast
+    /// `events` list with `server_seq = 1`. Nothing is
+    /// sent to the caller (the host's own client applies
+    /// the command locally).
+    #[tokio::test]
+    async fn dispatch_host_play_is_broadcast_with_server_seq_one() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, host_pk, _, _) = room_with_host_and_viewer(&reg, &db, &clock).await;
+        let env = playback_envelope(
+            room_id,
+            host_uid,
+            host_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+                .await;
+        // Nothing back to the caller.
+        assert!(
+            out.to_caller.is_empty(),
+            "host PLAY should not echo to_caller; got {:?}",
+            out.to_caller
+        );
+        // One broadcast event with the accepted command.
+        assert_eq!(out.events.len(), 1, "expected exactly one broadcast event");
+        match &out.events[0] {
+            RoomEvent::PlaybackCommand(accepted) => {
+                assert_eq!(accepted.server_seq, 1);
+                assert_eq!(accepted.action, locast_protocol::room::PlaybackAction::Play);
+                assert_eq!(accepted.sender_id, host_uid);
+            }
+            other => panic!("expected PlaybackCommand event, got {other:?}"),
+        }
+    }
+
+    /// Non-host viewer PLAY is rejected with a single-caller
+    /// ROOM_ERROR(NotHost). The command is NOT broadcast.
+    #[tokio::test]
+    async fn dispatch_viewer_playback_is_rejected_with_not_host() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, host_pk, viewer_uid, viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        let env = playback_envelope(
+            room_id,
+            viewer_uid,
+            viewer_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            viewer_uid,
+            viewer_pk,
+        )
+        .await;
+        // One single-caller ROOM_ERROR.
+        assert_eq!(out.to_caller.len(), 1, "expected one error to caller");
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::NotHost);
+        // No broadcast events.
+        assert!(
+            out.events.is_empty(),
+            "non-host PLAY must not be broadcast; got {:?}",
+            out.events
+        );
+        // Sanity: the host's user_id was used to create the
+        // room; assert host_uid matches (so a future
+        // refactor that swaps the helpers does not silently
+        // change the test shape).
+        let _ = host_uid;
+        let _ = host_pk;
+    }
+
+    /// Three sequential host commands (PLAY, PAUSE, SEEK) are
+    /// accepted, broadcast in arrival order, and assigned
+    /// server_seq 1, 2, 3.
+    #[tokio::test]
+    async fn dispatch_host_playback_sequence_is_ordered_by_server_seq() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, host_pk, _, _) = room_with_host_and_viewer(&reg, &db, &clock).await;
+        let mut collected: Vec<RoomEvent> = Vec::new();
+        for (seq, action, pos) in [
+            (1u64, locast_protocol::room::PlaybackAction::Play, 0u64),
+            (2u64, locast_protocol::room::PlaybackAction::Pause, 1_000u64),
+            (3u64, locast_protocol::room::PlaybackAction::Seek, 5_000u64),
+        ] {
+            let env = playback_envelope(room_id, host_uid, host_pk, action, seq, pos);
+            let out =
+                dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+                    .await;
+            assert!(out.to_caller.is_empty(), "host cmd {seq} echoed to caller");
+            assert_eq!(out.events.len(), 1, "host cmd {seq} missing broadcast");
+            collected.push(out.events.into_iter().next().unwrap());
+        }
+        for (i, evt) in collected.iter().enumerate() {
+            let RoomEvent::PlaybackCommand(accepted) = evt else {
+                panic!("event {i} not PlaybackCommand: {evt:?}");
+            };
+            assert_eq!(accepted.server_seq, (i as u64) + 1, "event {i} server_seq");
+        }
+    }
+
+    /// A command with a gap in `monotonic_seq` is rejected
+    /// without broadcast. The previously-acked `server_seq`
+    /// must NOT advance.
+    #[tokio::test]
+    async fn dispatch_gap_in_monotonic_seq_is_rejected_without_broadcast() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, host_pk, _, _) = room_with_host_and_viewer(&reg, &db, &clock).await;
+        // First PLAY with seq 1.
+        let env = playback_envelope(
+            room_id,
+            host_uid,
+            host_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let _ = dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+            .await;
+        // Second PLAY with seq 5 (gap from 1 -> 5).
+        let env = playback_envelope(
+            room_id,
+            host_uid,
+            host_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            5,
+            2_000,
+        );
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+                .await;
+        // Single-caller ROOM_ERROR(StaleCommand). Not broadcast.
+        assert_eq!(out.to_caller.len(), 1);
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::StaleCommand);
+        assert!(out.events.is_empty());
+        // Authoritative server_seq must still be 1 (gap
+        // command did not advance).
+        let handle = reg.get_by_id(room_id).await.expect("room");
+        let st = handle.read().await;
+        assert_eq!(
+            st.playback.server_seq, 1,
+            "server_seq must NOT advance on rejected command"
+        );
+    }
+
+    /// A host PLAYBACK_CMD after a post-migration is
+    /// rejected with NotHost. (Reviewer S1.)
+    /// Simulates the case where the host was migrated
+    /// between the WS layer's bearer validation and the
+    /// dispatcher's per-type handler. We model migration as
+    /// the real `elect_new_host` path does: the old host
+    /// remains in the participants list (with `is_host =
+    /// false`); a different participant is now the host.
+    #[tokio::test]
+    async fn dispatch_playback_with_stale_post_migration_pubkey_is_rejected() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, host_pk, viewer_uid, viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        // Model migration: flip is_host from the host to
+        // the viewer. Both remain in the participants list;
+        // only the host_user_id + is_host flag change. This
+        // mirrors what `elect_new_host` does in production.
+        {
+            let handle = reg.get_by_id(room_id).await.expect("room");
+            let mut st = handle.write().await;
+            st.host_user_id = viewer_uid;
+            for p in st.participants.iter_mut() {
+                if p.user_id == host_uid {
+                    p.is_host = false;
+                } else if p.user_id == viewer_uid {
+                    p.is_host = true;
+                }
+            }
+        }
+        // The OLD host (no longer host) sends a PLAYBACK_CMD
+        // with their original pubkey. The cap gate returns
+        // NotHost because `is_room_host` is now false.
+        let env = playback_envelope(
+            room_id,
+            host_uid,
+            host_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+                .await;
+        assert_eq!(out.to_caller.len(), 1);
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::NotHost);
+        assert!(out.events.is_empty());
+        // Sanity: the NEW host is allowed.
+        let env = playback_envelope(
+            room_id,
+            viewer_uid,
+            viewer_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            viewer_uid,
+            viewer_pk,
+        )
+        .await;
+        assert!(out.to_caller.is_empty(), "new host must be allowed");
+        assert_eq!(out.events.len(), 1);
     }
 }

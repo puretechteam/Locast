@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 use locast_protocol::room::{Participant, ParticipantSelf, ParticipantStatus, RoomSummary};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// The mutable per-room state. Lives behind a
@@ -33,15 +34,67 @@ pub struct RoomState {
     /// `true` is the current host; the original creator is
     /// still the first joined).
     pub participants: Vec<ParticipantRecord>,
+    /// P4-T01: per-room playback bookkeeping. The current
+    /// lifecycle is `RoomLifecycle::Open` for the pre-play
+    /// steady state, `Playing` after a host PLAY is accepted,
+    /// and `Paused` after a host PAUSE is accepted (or after
+    /// the first PLAY in a room whose host paused before any
+    /// play). `server_seq` is the per-room monotonic counter
+    /// of accepted playback commands; it is assigned by the
+    /// server (see docs/ARCHITECTURE.md §13.1 step 2). It is
+    /// not persisted across server restarts; v1 in-memory
+    /// only.
+    ///
+    /// `last_acked_seq` tracks the last monotonic_seq the
+    /// server has accepted from each sender (`user_id`). A
+    /// command with `monotonic_seq <= last_acked_seq[sender]`
+    /// is dropped as a duplicate; a command with
+    /// `monotonic_seq > last_acked_seq[sender] + 1` is
+    /// rejected as a gap. `last_acked_seq` is keyed by
+    /// `user_id` (not `pubkey`) because the spec tracks the
+    /// sender as `sender_id`; it survives host migration
+    /// (a former host's stale commands remain in the table
+    /// and continue to be rejected as duplicates, which is
+    /// the simplest correct semantic — a demoted host's
+    /// post-migration PLAYs cannot poison the new host's
+    /// authoritative sequence).
+    pub playback: PlaybackBookkeeping,
 }
 
-/// The room lifecycle. `Open` is the steady state. `Closing`
-/// is the brief period between the server deciding to end
-/// the room and the ROOM_CLOSED broadcast being flushed.
+/// P4-T01: the per-room playback bookkeeping fields.
+#[derive(Debug, Default)]
+pub struct PlaybackBookkeeping {
+    /// Per-room monotonic counter. Strictly increasing.
+    /// First accepted command increments from 0 to 1.
+    pub server_seq: u64,
+    /// Per-sender last-acked monotonic_seq. Empty for a
+    /// fresh room.
+    pub last_acked_seq: HashMap<Uuid, u64>,
+    /// Last accepted playback position (the room's
+    /// authoritative playback position). `0` until the
+    /// first PLAY or SEEK is accepted.
+    pub last_position_ms: u64,
+}
+
+/// The room lifecycle. v1 had only `Open`/`Ended`; P4-T01
+/// adds `Playing`/`Paused` to track the authoritative room
+/// playback state machine (docs/ARCHITECTURE.md §11.1). The
+/// transitions are:
+///
+/// - `Open -> Playing` on host `PLAY` accepted
+/// - `Playing -> Paused` on host `PAUSE` accepted
+/// - `Paused -> Playing` on host `PLAY` accepted
+/// - `Playing -> Playing` on host `SEEK` accepted
+/// - `Paused -> Paused` on host `SEEK` accepted
+/// - any state -> `Ended` on `ROOM_CLOSED` / host migration
+///   failure / etc.
+///
 /// `Ended` is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoomLifecycle {
     Open,
+    Playing,
+    Paused,
     Ended,
 }
 
@@ -79,6 +132,7 @@ impl RoomState {
             state: RoomLifecycle::Open,
             host_disconnect_deadline_ms: None,
             participants: vec![host],
+            playback: PlaybackBookkeeping::default(),
         }
     }
 

@@ -95,6 +95,14 @@ pub enum RoomEvent {
         /// Server-stamped publication time, unix ms.
         published_at_ms: i64,
     },
+    /// P4-T01: a host playback command was accepted and
+    /// stamped with `server_seq` / `server_ts_ms`. Broadcast
+    /// to every participant in the room. The WS forwarder
+    /// excludes the originator (the host) from the broadcast
+    /// so the host does not echo a PLAYBACK_CMD it just sent.
+    /// The host's own client applies the command locally
+    /// before the envelope arrives.
+    PlaybackCommand(locast_protocol::room::PlaybackAcceptedEvent),
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -261,6 +269,11 @@ impl RoomRegistry {
                 RoomEvent::RoomClosed(_) => None,
                 RoomEvent::Error { target, .. } => Some(*target),
                 RoomEvent::ManifestPublished { .. } => None,
+                // P4-T01: the playback command originator
+                // is the host that issued it; the WS
+                // forwarder excludes them so the host does
+                // not echo back a PLAYBACK_CMD it just sent.
+                RoomEvent::PlaybackCommand(evt) => Some(evt.sender_id),
             };
             let room_id = match event {
                 RoomEvent::ManifestPublished { room_id, .. } => *room_id,
@@ -400,7 +413,12 @@ impl RoomRegistry {
             let by_id = self.by_id.read().await;
             for (rid, h) in by_id.iter() {
                 let mut state = h.write().await;
-                if state.state != RoomLifecycle::Open {
+                // P4-T01: stale-participant cleanup must run
+                // in Playing / Paused too (a participant who
+                // vanishes mid-playback is still stale; the
+                // cleanup is the same). Only the terminal
+                // `Ended` state skips the sweep.
+                if state.state == RoomLifecycle::Ended {
                     continue;
                 }
                 let stale: Vec<usize> = state
@@ -591,7 +609,11 @@ impl RoomRegistry {
             by_id.get(&id).cloned().ok_or(RoomError::RoomNotFound)?
         };
         let mut state = handle.write().await;
-        if state.state != RoomLifecycle::Open {
+        // P4-T01: a viewer can join a room that is mid-playback
+        // (they'll see the host's current playback position
+        // from the room state). Only the terminal `Ended`
+        // state blocks new joiners.
+        if state.state == RoomLifecycle::Ended {
             return Err(RoomError::RoomClosed);
         }
         if state
@@ -691,8 +713,13 @@ impl RoomRegistry {
             None => return Err(RoomError::NotJoined),
         };
         let mut state = handle.write().await;
-        if state.state != RoomLifecycle::Open {
-            return Err(RoomError::RoomClosed);
+        // P4-T01: a participant can leave a room at any point
+        // during playback (the host cannot trap viewers). The
+        // terminal `Ended` state means the room is already
+        // gone; treat as NotJoined so the caller's leave is
+        // a no-op rather than an error.
+        if state.state == RoomLifecycle::Ended {
+            return Err(RoomError::NotJoined);
         }
         // Find the participant's index.
         let idx = state
@@ -928,8 +955,11 @@ impl RoomRegistry {
                 .await
                 .map_err(|e| RoomError::Internal(format!("update_participant_status: {e}")))?;
             let mut state = handle.write().await;
-            if state.state != RoomLifecycle::Open {
-                return Err(RoomError::RoomClosed);
+            // P4-T01: a participant can be marked disconnected
+            // during playback. Only the terminal `Ended` state
+            // makes this a no-op.
+            if state.state == RoomLifecycle::Ended {
+                return Ok(vec![]);
             }
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.status = ParticipantStatus::Disconnected;
@@ -1348,6 +1378,7 @@ impl RoomRegistry {
             state: RoomLifecycle::Open,
             host_disconnect_deadline_ms: deadline,
             participants: rebuilt,
+            playback: super::state::PlaybackBookkeeping::default(),
         };
         let handle = Arc::new(RwLock::new(state));
         {
@@ -1427,6 +1458,16 @@ fn event_to_broadcast_item(
                 serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
             )
         }
+        // P4-T01: rebroadcast the accepted playback command
+        // as a PLAYBACK_CMD envelope with the
+        // server-stamped server_seq + server_ts_ms. The wire
+        // payload is the protocol-level
+        // `PlaybackAcceptedEvent` so the receiving client's
+        // handle_inbound can decode it directly.
+        RoomEvent::PlaybackCommand(evt) => (
+            locast_protocol::envelope::MessageKind::PlaybackCmd,
+            serde_json::to_value(evt).unwrap_or(serde_json::json!({})),
+        ),
     };
     BroadcastItem {
         kind,
