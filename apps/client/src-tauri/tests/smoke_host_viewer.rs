@@ -986,29 +986,18 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     result.stages_passed.push("open_download".to_string());
 
     // 9. Poll downloads.state + transferred_bytes until
-    //    complete, with a 15s hard budget. The budget is
-    //    short because the rest of the path is proven
-    //    synchronously and a Transferring-with-0-bytes
-    //    state at this point means the host-side
-    //    SenderSession spawn is not yet wired (a known
-    //    gap surfaced by this smoke test); we want to
-    //    surface that quickly rather than wait the full
-    //    60s budget.
+    //    complete, with a 15s hard budget. On a typical
+    //    workstation the full 1 MiB transfer finishes in
+    //    under 8 seconds; the budget exists to surface
+    //    stalls quickly.
     let store = DownloadStore::new(viewer.storage.pool());
     let final_record = match wait_for_complete(&store, &download_id, Duration::from_secs(15)).await
     {
         Ok(r) => r,
         Err(e) => {
-            // The P3-T13 wire layer wires the viewer's
-            // MultiSourceReceiver + Scheduler but does NOT
-            // wire the host's SenderSession spawn point
-            // (no code in `WebRtcManager::on_inbound_data_channel`
-            // builds a `DownloadPlan` from the verified
-            // manifest and spawns a `SenderSession`). The
-            // smoke test therefore reliably reaches
-            // `state = Transferring` but no bytes move.
-            // Surface this clearly so the next roadmap
-            // task can address it; the test must NOT
+            // Transfer did not complete in the budget.
+            // Surface the last DB state so the failure
+            // mode is unambiguous. The test must NOT
             // silently report success without a verified
             // on-disk file.
             let row: Option<(String, Option<String>, i64)> = sqlx::query_as(
@@ -1023,7 +1012,7 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
             let detail = row
                 .map(|(s, e, t)| {
                     format!(
-                        "(state={s} transferred={t} last_error={e:?}) -- P3-T15: host SenderSession sends chunk frames over the authenticated files DataChannel, and the viewer's WebRtcTransport segmentation/reassembly receives them, but the multi-source main loop is starving on a tokio worker thread and not draining the inbound frame queue fast enough. Increase worker_threads or add a dedicated I/O thread."
+                        "(state={s} transferred={t} last_error={e:?}) -- transfer stalled before completion; check the orchestrator logs for the underlying cause."
                     )
                 })
                 .unwrap_or_default();

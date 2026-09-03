@@ -474,3 +474,117 @@ async fn zero_byte_media_completes_without_chunks() {
             .expect("chunk count");
     assert_eq!(chunk_count, 0);
 }
+
+/// P3-T16 regression: the missing path of `open_download_inner`
+/// MUST persist the host-signed manifest's per-chunk SHA-256
+/// hashes into the `download_chunks` table. Earlier the
+/// implementation wrote placeholder hashes of the form
+/// `format!("{:064x}", i)` so the test fixture (which happened
+/// to use the same placeholder scheme) matched by accident.
+/// Real manifests carry computed per-chunk hashes (e.g. over
+/// `sha2::Sha256`), so the placeholder path made every verified
+/// chunk fail `mark_chunk_verified`'s idempotence guard and
+/// silently aborted the transfer before the first chunk could
+/// be marked complete. This test reproduces the exact shape
+/// the smoke test sees (real hashes, real fixture) and asserts
+/// that the persisted row hash equals the manifest hash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_path_persists_real_manifest_chunk_hashes() {
+    use sha2::{Digest, Sha256};
+
+    let (storage, lib_root_dir) = open_storage().await;
+    let lib_root = make_library_root(&lib_root_dir);
+
+    seed_user(&storage.pool(), "u-test").await;
+
+    let room_id = Uuid::new_v4();
+    let host_peer_id = canonical_peer_id(0xAA);
+    seed_room(&storage.pool(), room_id, &host_peer_id).await;
+
+    // Compute REAL per-chunk SHA-256 hashes from a synthetic
+    // 512 KiB payload (two 256 KiB chunks). This is the shape
+    // a host's manifest builder produces at run time.
+    let chunk_size = locast_client_lib::transfer::CHUNK_SIZE_BYTES as u32;
+    let total_bytes = (chunk_size as u64) * 2;
+    let payload: Vec<u8> = (0..total_bytes).map(|i| (i % 251) as u8).collect();
+    let mut real_hashes: Vec<String> = Vec::new();
+    for i in 0..2u32 {
+        let start = (i as usize) * (chunk_size as usize);
+        let end = start + (chunk_size as usize);
+        let mut h = Sha256::new();
+        h.update(&payload[start..end]);
+        real_hashes.push(hex::encode(h.finalize()));
+    }
+
+    // Build the manifest entry by hand with real hashes,
+    // mirroring what the host's manifest builder emits.
+    let entry = MediaEntry {
+        id: Uuid::new_v4().to_string(),
+        filename: FILENAME.to_string(),
+        sha256: hex::encode(Sha256::digest(&payload)),
+        blake3: BLAKE3.to_string(),
+        size_bytes: total_bytes,
+        mime: "video/mp4".to_string(),
+        duration_ms: 1000,
+        dimensions: None,
+        codecs: None,
+        sources: vec![Source {
+            peer_id: host_peer_id.clone(),
+            url_hint: None,
+            priority: 0,
+            chunk_size,
+            total_chunks: 2,
+            chunk_hashes: real_hashes.clone(),
+        }],
+    };
+    let manifest = make_manifest(room_id, 1, vec![entry.clone()]);
+    let download_id = Uuid::new_v4().to_string();
+
+    let result: DownloadSessionIpc = open_download_inner(
+        manifest,
+        room_id,
+        &host_peer_id,
+        "u-test",
+        &storage,
+        &lib_root,
+        &entry.id,
+        &download_id,
+        &make_webrtc_manager(&storage),
+        &make_transfer_registry(),
+        make_identity(&storage).await,
+    )
+    .await
+    .expect("open_download_inner missing with real hashes");
+
+    assert_eq!(result.state, "pending");
+    assert!(!result.dedup_hit);
+
+    // For each chunk row, the persisted sha256 MUST equal the
+    // manifest hash. The pre-fix placeholder scheme stored
+    // `format!("{:064x}", i)`, which never matches a real
+    // SHA-256 and therefore fails `mark_chunk_verified`.
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT \"index\", sha256 FROM download_chunks \
+         WHERE download_id = ?1 ORDER BY \"index\" ASC",
+    )
+    .bind(&download_id)
+    .fetch_all(&storage.pool())
+    .await
+    .expect("fetch chunk rows");
+    assert_eq!(rows.len(), 2, "expected exactly 2 chunk rows");
+    for (i, (idx, stored_sha)) in rows.iter().enumerate() {
+        assert_eq!(*idx, i as i64, "chunk index ordering");
+        assert_eq!(
+            stored_sha,
+            &real_hashes[i],
+            "chunk {i} stored sha256 must equal the manifest hash"
+        );
+        // Sanity: the stored hash must NOT be the placeholder
+        // zero-padded index (the bug we're guarding against).
+        assert_ne!(
+            stored_sha,
+            &format!("{:064x}", i as u128),
+            "chunk {i} still uses placeholder zero-padded index hash"
+        );
+    }
+}

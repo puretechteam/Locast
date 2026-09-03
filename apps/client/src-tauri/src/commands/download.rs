@@ -268,6 +268,7 @@ pub async fn open_download_inner(
             // If a prior downloads row already exists for this
             // (media, room, user), reuse it instead of creating a
             // duplicate.
+            let chunk_hashes = pick_chunk_hashes_from_entry(&entry);
             let (active_download_id, _created) = find_or_create_download_row(
                 &store,
                 download_id,
@@ -277,9 +278,9 @@ pub async fn open_download_inner(
                 entry.size_bytes,
                 room_host_user_id,
                 manifest_version,
+                &chunk_hashes,
             )
             .await?;
-            let chunk_hashes = pick_chunk_hashes_from_entry(&entry);
             store
                 .mark_complete(
                     &active_download_id,
@@ -308,6 +309,7 @@ pub async fn open_download_inner(
             })
         }
         DedupOutcome::PromotedFromTemporary { on_disk_path, .. } => {
+            let chunk_hashes = pick_chunk_hashes_from_entry(&entry);
             let (active_download_id, _created) = find_or_create_download_row(
                 &store,
                 download_id,
@@ -317,9 +319,9 @@ pub async fn open_download_inner(
                 entry.size_bytes,
                 room_host_user_id,
                 manifest_version,
+                &chunk_hashes,
             )
             .await?;
-            let chunk_hashes = pick_chunk_hashes_from_entry(&entry);
             store
                 .mark_complete(
                     &active_download_id,
@@ -360,6 +362,7 @@ pub async fn open_download_inner(
             // (P3-T12 idempotence) so a concurrent second call
             // for the same media collapses onto this row instead
             // of creating a duplicate.
+            let chunk_hashes = pick_chunk_hashes_from_entry(&entry);
             let (active_download_id, _created) = find_or_create_download_row(
                 &store,
                 download_id,
@@ -369,6 +372,7 @@ pub async fn open_download_inner(
                 entry.size_bytes,
                 &pick_primary_source_peer(&entry),
                 manifest_version,
+                &chunk_hashes,
             )
             .await?;
             // P3-T13: wire the actual transfer on the Missing
@@ -624,6 +628,7 @@ async fn find_or_create_download_row(
     total_bytes: u64,
     source_peer_id: &str,
     manifest_version: i64,
+    chunk_hashes: &[(u32, String)],
 ) -> Result<(String, bool), AppError> {
     let room_key = room_id.unwrap_or("");
     let existing: Option<(String,)> = sqlx::query_as(
@@ -644,14 +649,32 @@ async fn find_or_create_download_row(
     // partial UNIQUE index fires (another caller won the race
     // between our SELECT and our INSERT), fall through to the
     // race-recovery SELECT.
-    let chunks: Vec<(u32, u64, u32, String)> = (0..total_chunks_for(total_bytes))
+    //
+    // P3-T16 review: the `chunk_hashes` slice is `(index,
+    // sha256_hex)` from the host-signed manifest. Each row's
+    // sha256 MUST be the real per-chunk SHA-256 so the
+    // subsequent `mark_chunk_verified` idempotence check
+    // matches the manifest hash the host actually shipped.
+    // Placeholder hashes (e.g. `format!("{:064x}", i)`) made
+    // `mark_chunk_verified` reject every verified chunk as a
+    // `ChunkHashMismatch`, which silently aborted the transfer
+    // before the first chunk could be marked complete.
+    let chunk_size = crate::transfer::CHUNK_SIZE_BYTES as u64;
+    let total_chunks = total_chunks_for(total_bytes);
+    if chunk_hashes.len() != total_chunks as usize {
+        return Err(AppError::other(format!(
+            "manifest chunk_hashes length {} does not match expected total_chunks {} for size {}",
+            chunk_hashes.len(),
+            total_chunks,
+            total_bytes
+        )));
+    }
+    let chunks: Vec<(u32, u64, u32, String)> = (0..total_chunks)
         .map(|i| {
-            let offset = (i as u64) * (crate::transfer::CHUNK_SIZE_BYTES as u64);
-            let length = std::cmp::min(
-                crate::transfer::CHUNK_SIZE_BYTES as u64,
-                total_bytes - offset,
-            ) as u32;
-            (i, offset, length, format!("{:064x}", i as u128))
+            let offset = (i as u64) * chunk_size;
+            let length = std::cmp::min(chunk_size, total_bytes - offset) as u32;
+            let sha = chunk_hashes[i as usize].1.clone();
+            (i, offset, length, sha)
         })
         .collect();
     let nd = NewDownload {
