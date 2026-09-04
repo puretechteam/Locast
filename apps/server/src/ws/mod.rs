@@ -798,6 +798,7 @@ async fn dispatch_authed(
         || envelope.r#type.is_manifest_lifecycle()
         || envelope.r#type.is_signal_lifecycle()
         || envelope.r#type.is_playback_lifecycle()
+        || envelope.r#type.is_position_report()
     {
         let store: Arc<dyn crate::rooms::RoomStore> =
             Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));

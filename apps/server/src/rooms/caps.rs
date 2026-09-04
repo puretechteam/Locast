@@ -89,6 +89,18 @@ pub enum Command {
     /// per-sender `monotonic_seq` (must equal
     /// `last_acked_seq[sender] + 1`).
     PlaybackControl,
+    /// P4-T03: non-authoritative POSITION_REPORT envelope
+    /// (1 Hz local-playback snapshot per
+    /// docs/ARCHITECTURE.md §13.1). The capability check is
+    /// "caller is a member of some room" (mirrors
+    /// `FetchManifest` / `Signal` shape). The per-type
+    /// handler additionally checks that `envelope.room_id`
+    /// matches the caller's current room so cross-room
+    /// injection is denied. Non-members are denied with
+    /// `CapsError::NotMember`. There is no host-only check:
+    /// every participant (host or viewer) reports its own
+    /// local state at 1 Hz.
+    PositionReport,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -188,6 +200,18 @@ pub async fn check_capability(
                 } else {
                     Err(CapsError::NotHost)
                 }
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        // P4-T03: PositionReport. The caller must be a
+        // member of some room. The per-type handler
+        // additionally verifies envelope.room_id matches
+        // the caller's current room so cross-room injection
+        // is denied. No host check.
+        Command::PositionReport => {
+            if registry.get_user_room(user_id).await.is_some() {
+                Ok(())
             } else {
                 Err(CapsError::NotMember)
             }

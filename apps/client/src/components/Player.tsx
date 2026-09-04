@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
+import { useRoomStore } from "../stores/useRoomStore";
+import { sendPositionReport } from "../services/playback";
 
 /**
  * P4-T02: the room media player.
@@ -150,6 +152,52 @@ export function Player({
             pending: null,
         });
     }, [mediaReady]);
+
+    // P4-T03: 1 Hz POSITION_REPORT reporter.
+    // Lifecycle is bound to: mediaReady AND a stable
+    // room id (summaryId). Room change / leave / unmount
+    // / media-not-ready all stop the loop cleanly. The
+    // timer source-of-truth is the live <video> element
+    // (ref.current). Receiving a forwarded
+    // POSITION_REPORT from another peer does NOT feed
+    // back into this effect (it does not subscribe to
+    // the position://report event); only the local
+    // lifecycle + timer drive outbound reports.
+    const summaryId = useRoomStore((s) => s.summary?.id ?? null);
+    useEffect(() => {
+        if (!mediaReady) return;
+        if (summaryId === null) return;
+        const v = ref.current;
+        if (!v) return;
+        const myRoom = summaryId;
+        let stopped = false;
+        const send = () => {
+            if (stopped) return;
+            // Bail out if the room changed since this
+            // timer was scheduled.
+            const cur = useRoomStore.getState().summary?.id ?? null;
+            if (cur !== myRoom) {
+                stopped = true;
+                return;
+            }
+            const live = ref.current;
+            if (!live) return;
+            const media_position_ms = Math.max(0, Math.round(live.currentTime * 1000));
+            const playing = !live.paused;
+            sendPositionReport({ media_position_ms, playing }).catch((err: unknown) => {
+                if (stopped) return;
+                console.warn("position_report send failed", err);
+            });
+        };
+        // First tick fires after 1 s. Approximate
+        // cadence is acceptable for non-authoritative
+        // telemetry.
+        const handle = window.setInterval(send, 1000);
+        return () => {
+            stopped = true;
+            window.clearInterval(handle);
+        };
+    }, [mediaReady, summaryId]);
 
     return (
         <div className="room-page__player" data-testid="locast-player">

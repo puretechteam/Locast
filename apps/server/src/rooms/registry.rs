@@ -103,6 +103,27 @@ pub enum RoomEvent {
     /// The host's own client applies the command locally
     /// before the envelope arrives.
     PlaybackCommand(locast_protocol::room::PlaybackAcceptedEvent),
+    /// P4-T03: a non-authoritative 1 Hz position report from
+    /// a participant. Broadcast to every participant in the
+    /// room (the WS forwarder excludes the originator via
+    /// the `BroadcastItem::originator` field so the sender
+    /// does not see its own report echoed back). The payload
+    /// is forwarded verbatim per the roadmap's "server
+    /// forwards without modification" requirement; the
+    /// server does NOT mutate `server_seq`,
+    /// `last_position_ms`, the room lifecycle, or any other
+    /// authoritative state.
+    PositionReport {
+        /// The room id (echoed here so the WS layer does
+        /// not need to look it up).
+        room_id: Uuid,
+        /// The sender's user_id (set on the
+        /// `BroadcastItem::originator` so the forwarder
+        /// suppresses the echo to the sender).
+        sender_id: Uuid,
+        /// The original payload, verbatim (cloned).
+        payload: locast_protocol::room::PositionReportPayload,
+    },
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -274,9 +295,20 @@ impl RoomRegistry {
                 // forwarder excludes them so the host does
                 // not echo back a PLAYBACK_CMD it just sent.
                 RoomEvent::PlaybackCommand(evt) => Some(evt.sender_id),
+                // P4-T03: the position report originator is
+                // the participant who sent the report; the
+                // WS forwarder excludes them so the sender
+                // does not see its own 1 Hz report echoed
+                // back at itself.
+                RoomEvent::PositionReport { sender_id, .. } => Some(*sender_id),
             };
             let room_id = match event {
                 RoomEvent::ManifestPublished { room_id, .. } => *room_id,
+                // P4-T03: same pattern as ManifestPublished
+                // -- the room_id is carried on the event so
+                // the WS layer does not need to look it up
+                // via the dispatch closure.
+                RoomEvent::PositionReport { room_id, .. } => *room_id,
                 _ => room_id_for_event(event),
             };
             let item = event_to_broadcast_item(event, room_id, originator);
@@ -1467,6 +1499,18 @@ fn event_to_broadcast_item(
         RoomEvent::PlaybackCommand(evt) => (
             locast_protocol::envelope::MessageKind::PlaybackCmd,
             serde_json::to_value(evt).unwrap_or(serde_json::json!({})),
+        ),
+        // P4-T03: rebroadcast the position report as a
+        // POSITION_REPORT envelope carrying the ORIGINAL
+        // payload verbatim (no server_ts stamping; the
+        // roadmap says "server forwards without
+        // modification"). The wire payload is the
+        // protocol-level `PositionReportPayload` so the
+        // receiving client's handle_inbound can decode it
+        // directly.
+        RoomEvent::PositionReport { payload, .. } => (
+            locast_protocol::envelope::MessageKind::PositionReport,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
         ),
     };
     BroadcastItem {

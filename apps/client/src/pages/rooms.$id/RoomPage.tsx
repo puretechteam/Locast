@@ -9,6 +9,8 @@ import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
 import { PlaybackControls } from "../../components/PlaybackControls";
 import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
+import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
+import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
 import { ParticipantStrip } from "./ParticipantStrip";
 import { RoomFooter } from "./RoomFooter";
 
@@ -30,8 +32,11 @@ export function RoomPage(): JSX.Element {
     // store's `clear` additionally resets
     // `mediaReady` + `mediaSrc` + `suppressLocalEcho`
     // so a re-join starts from a clean slate.
-    const handleLeft = useCallback(() => {
+const handleLeft = useCallback(() => {
         usePlaybackStore.getState().clear();
+        // P4-T03: clear the per-viewer position cache
+        // on leave so a re-join starts fresh.
+        useViewerPositionStore.getState().clear();
         clear();
     }, [clear]);
 
@@ -57,6 +62,11 @@ export function RoomPage(): JSX.Element {
     // into it. The hook returns `null` (no JSX).
     usePlaybackEventBridge();
 
+    // P4-T03: bridge position://report events into the
+    // per-viewer position store. The hook returns
+    // `null` (no JSX).
+    usePositionReportBridge();
+
     // P4-T02: derive `isHost` and `localUserId` from
     // the cached room summary. The "local user" is
     // the participant whose `user_id` matches
@@ -74,8 +84,18 @@ export function RoomPage(): JSX.Element {
             hostPositionMs: pos,
         };
     }, [summary]);
-    const lastApplied = usePlaybackStore((s) => s.lastApplied);
+const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const displayPositionMs = lastApplied?.media_position_ms ?? hostPositionMs;
+
+    // P4-T03: per-viewer position snapshot for the
+    // host's UI. Each row is keyed by the viewer's
+    // user_id; the host can see all viewers in the
+    // room (participants minus the host). We exclude
+    // the host's own user_id so the host does not
+    // appear in its own "viewers" list -- the host's
+    // position is shown via the server-authoritative
+    // `displayPositionMs` above.
+    const viewerPositions = useViewerPositionStore((s) => s.byUserId);
 
     useEffect(() => {
         let cancelled = false;
@@ -174,9 +194,66 @@ export function RoomPage(): JSX.Element {
         expectedId !== undefined && expectedId.length > 0 && expectedId !== summary.id;
 
     return (
-        <div className="room-page">
+<div className="room-page">
             <Player localUserId={localUserId} isHost={isHost} />
             <ParticipantStrip summary={summary} />
+            {isHost && (
+                <section
+                    className="room-page__viewer-positions"
+                    data-testid="viewer-positions"
+                    aria-label="Viewer positions"
+                >
+                    <h3 className="room-page__viewer-positions-title">
+                        Viewer positions
+                    </h3>
+                    <ul className="room-page__viewer-positions-list">
+                        {Object.values(viewerPositions)
+                            .filter((v) => v.userId !== localUserId)
+                            .map((v) => {
+                                const ageSec = Math.max(
+                                    0,
+                                    Math.round(
+                                        (Date.now() - v.receivedAtMs) / 1000,
+                                    ),
+                                );
+                                const posSec = (v.mediaPositionMs / 1000).toFixed(
+                                    1,
+                                );
+                                return (
+                                    <li
+                                        key={v.userId}
+                                        className="room-page__viewer-position-row"
+                                        data-testid="viewer-position-row"
+                                        data-sender-id={v.userId}
+                                    >
+                                        <span className="room-page__viewer-position-user">
+                                            {v.userId.slice(0, 8)}
+                                        </span>
+                                        <span className="room-page__viewer-position-time">
+                                            {posSec}s
+                                        </span>
+                                        <span className="room-page__viewer-position-state">
+                                            {v.playing ? "playing" : "paused"}
+                                        </span>
+                                        <span className="room-page__viewer-position-age">
+                                            {ageSec}s ago
+                                        </span>
+                                    </li>
+                                );
+                            })}
+                        {Object.values(viewerPositions).filter(
+                            (v) => v.userId !== localUserId,
+                        ).length === 0 && (
+                            <li
+                                className="room-page__viewer-position-empty"
+                                data-testid="viewer-positions-empty"
+                            >
+                                No viewer position reports yet.
+                            </li>
+                        )}
+                    </ul>
+                </section>
+            )}
             <PlaybackControls
                 isHost={isHost}
                 positionMs={displayPositionMs}

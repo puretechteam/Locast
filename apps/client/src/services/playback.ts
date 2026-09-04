@@ -9,6 +9,16 @@
 //   `playback_send` Tauri command. Only the room's
 //   current host should call this. The server's
 //   cap gate (P4-T01) rejects non-host callers.
+//
+// P4-T03 additions:
+// - `onPositionReport(handler)` subscribes to the
+//   `position://report` Tauri event emitted whenever a
+//   remote participant's POSITION_REPORT arrives at the
+//   client (after the server forwards it).
+// - `sendPositionReport(input)` calls the per-participant
+//   `position_report` Tauri command; any room member may
+//   call it (the cadence is owned by the React layer;
+//   see `apps/client/src/components/Player.tsx`).
 
 import { listenEvent } from "./_eventTransport";
 import { commands } from "./ipc";
@@ -16,9 +26,19 @@ import type {
     PlaybackCommandInput,
     PlaybackSendResult,
     PlaybackStateEvent,
+    PositionReportEvent,
+    PositionReportInput,
+    PositionReportResult,
 } from "../bindings";
 
-export type { PlaybackStateEvent, PlaybackCommandInput, PlaybackSendResult };
+export type {
+    PlaybackStateEvent,
+    PlaybackCommandInput,
+    PlaybackSendResult,
+    PositionReportEvent,
+    PositionReportInput,
+    PositionReportResult,
+};
 
 /**
  * Subscribe to `playback://state`. The handler receives
@@ -56,4 +76,46 @@ export async function sendPlaybackCommand(
     cmd: PlaybackCommandInput,
 ): Promise<PlaybackSendResult> {
     return await commands.playbackSend(cmd);
+}
+
+/**
+ * P4-T03: subscribe to `position://report`. The handler
+ * receives every forwarded POSITION_REPORT from a
+ * remote participant. The server stamps the originator's
+ * `user_id` into the event's `sender_id` field so the
+ * React layer can key positions by sender and keep
+ * multiple viewers distinguishable. The local 1 Hz
+ * reporter does NOT subscribe to this event (it only
+ * emits); receiving a report never produces another
+ * outbound report.
+ *
+ * Returns an unsubscribe function.
+ */
+export async function onPositionReport(
+    handler: (e: PositionReportEvent) => void,
+): Promise<() => void> {
+    return await listenEvent<PositionReportEvent>("position://report", handler);
+}
+
+/**
+ * P4-T03: send one POSITION_REPORT envelope. Any room
+ * member (host or viewer) may call this; the server's
+ * cap gate requires only that the caller is currently
+ * a member of the named room (see
+ * `apps/server/src/rooms/caps.rs::Command::PositionReport`).
+ * The server forwards the report to every other
+ * participant; the WS layer's originator filter
+ * suppresses the echo to the sender so the local
+ * client never sees its own report.
+ *
+ * The cadence is owned by the React layer (the 1 Hz
+ * `useEffect` in `Player.tsx`); this is a single-shot
+ * call. Errors from the Tauri command surface to the
+ * caller via the rejected Promise; the caller may log
+ * or swallow at its discretion.
+ */
+export async function sendPositionReport(
+    input: PositionReportInput,
+): Promise<PositionReportResult> {
+    return await commands.positionReport(input);
 }

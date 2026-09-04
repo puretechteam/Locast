@@ -144,6 +144,20 @@ pub enum MessageKind {
     // `ROOM_ERROR` reply and are NOT broadcast.
     #[serde(rename = "PLAYBACK_CMD")]
     PlaybackCmd,
+    // ----- P4-T03: non-authoritative 1 Hz position telemetry -----
+    // POSITION_REPORT is sent by every participant (host or
+    // viewer) at ~1 Hz while connected. It is the local
+    // `<video>` element's current state. The server is a
+    // pure relay: it does NOT validate playback timing, it
+    // does NOT stamp `server_ts` on the rebroadcast
+    // (architecture §12.8 + roadmap P4-T03: "server
+    // forwards without modification"), and the report does
+    // NOT alter `server_seq`, `last_position_ms`, or the
+    // room lifecycle. The WS forwarder's originator filter
+    // suppresses the report for the sender so a client does
+    // not see its own position echoed back.
+    #[serde(rename = "POSITION_REPORT")]
+    PositionReport,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -183,6 +197,7 @@ impl MessageKind {
             MessageKind::ManifestResponse => "MANIFEST_RESPONSE",
             MessageKind::Signal => "SIGNAL",
             MessageKind::PlaybackCmd => "PLAYBACK_CMD",
+            MessageKind::PositionReport => "POSITION_REPORT",
             MessageKind::Other(s) => s,
         }
     }
@@ -232,6 +247,16 @@ impl MessageKind {
     // localized to the playback dispatcher (P4-T01).
     pub fn is_playback_lifecycle(&self) -> bool {
         matches!(self, MessageKind::PlaybackCmd)
+    }
+
+    /// `true` for the 1 Hz non-authoritative POSITION_REPORT
+    /// envelopes (P4-T03). Routed through the same WS-layer
+    /// entry point as the lifecycle predicates so the
+    /// per-connection bearer check + the per-room membership
+    /// gate both apply; the per-type handler then forwards
+    /// the payload verbatim without mutation.
+    pub fn is_position_report(&self) -> bool {
+        matches!(self, MessageKind::PositionReport)
     }
 }
 

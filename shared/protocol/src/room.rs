@@ -506,6 +506,79 @@ pub enum PlaybackAction {
     Seek,
 }
 
+// ===== P4-T03: POSITION_REPORT wire type =====
+//
+// docs/ARCHITECTURE.md §13.1: POSITION_REPORT is a passive,
+// non-authoritative snapshot of what a participant's local
+// player is doing. It is NOT a command and the server MUST NOT
+// interpret it as one (it does not mutate playback state,
+// does not increment `server_seq`, and does not transition the
+// room lifecycle). The server is a relay: it forwards the
+// original payload verbatim to every other room participant
+// (the originator is filtered out by the WS broadcast layer).
+//
+// The payload is intentionally minimal so the wire rate stays
+// well within budget at 1 Hz / participant:
+//
+//   {
+//     "media_position_ms": <u64>,  // local <video>.currentTime * 1000, rounded
+//     "playing":           <bool>, // local <video>.paused (inverted)
+//     "client_ts_ms":      <i64>,  // sender wall clock at send (informational)
+//   }
+//
+// `user_id` is NOT on the wire: the server uses the bearer-derived
+// identity to attribute the report to a participant and sets
+// the broadcast item's `originator` so the WS layer can suppress
+// echoes back to the sender. Receivers get the sender's identity
+// from the `Envelope` they see on the wire (the server stamps
+// the `sender` field on rebroadcast; for now we use the
+// originator pattern from `MANIFEST_PUBLISHED`).
+//
+// Replay window: the architecture (§21.10) calls for a 5 s
+// replay window on POSITION_REPORT vs. the standard 30 s. The
+// server applies this drop at the WS layer (existing logic;
+// P2-T04 sets the per-socket window).
+
+/// POSITION_REPORT (C -> S -> other room members).
+///
+/// 1 Hz non-authoritative snapshot of the sender's local
+/// playback state. The server is a pure relay: it does NOT
+/// validate the playback position (no bounds check against
+/// media duration; that is the host's job at PUBLISH time).
+/// The server only validates that the sender is currently a
+/// member of the named room and forwards the payload
+/// verbatim. See module docs above for the architecture
+/// references.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct PositionReportPayload {
+    /// Originating participant's `user_id`. Set by the
+    /// server from the validated bearer so the receiver
+    /// can attribute the report to a sender without
+    /// trusting an unverified client field. The wire
+    /// shape mirrors architecture §13.1 (the JSON
+    /// example includes `user_id`).
+    pub user_id: Uuid,
+    /// Local `<video>` position in milliseconds (rounded from
+    /// the floating-point `currentTime` seconds). The wire
+    /// unit is integer ms so the server can re-emit the
+    /// value verbatim without precision drift. `0` is a
+    /// valid value (the very first frame); negative values
+    /// are not produced by any conforming client.
+    pub media_position_ms: u64,
+    /// `true` when the local `<video>.paused === false` (i.e.
+    /// the media element is actively playing); `false` when
+    /// the element is paused. `playing` is observed locally
+    /// and is not asserted by the server.
+    pub playing: bool,
+    /// Sender's wall clock at send (unix ms). Informational
+    /// only; the server does not stamp `server_ts_ms` on the
+    /// rebroadcast (the roadmap explicitly says "server
+    /// forwards without modification"). Receivers may use
+    /// this for display only.
+    pub client_ts_ms: i64,
+}
+
 /// PLAYBACK_CMD (S -> all). The rebroadcast payload after the
 /// server has accepted a command. The per-sender `monotonic_seq`
 /// is preserved; the server stamps `server_seq` and

@@ -323,6 +323,18 @@ mod tests {
                 .expect("render PlaybackAcceptedEvent bindings"),
         );
         rendered.push('\n');
+        // P4-T03: POSITION_REPORT payload. The server
+        // is a pure relay per architecture §12.8 +
+        // roadmap P4-T03 ("server forwards without
+        // modification"). The payload is the local
+        // viewer's media observation; the server stamps
+        // `user_id` from the validated bearer but does
+        // not add `server_ts_ms`.
+        rendered.push_str(
+            &crate::room::PositionReportPayload::export_to_string(&cfg)
+                .expect("render PositionReportPayload bindings"),
+        );
+        rendered.push('\n');
         // Render the manifest types so the protocol's
         // generated ts file declares them inline (the
         // protocol's `MANIFEST_PUBLISH*` payloads carry

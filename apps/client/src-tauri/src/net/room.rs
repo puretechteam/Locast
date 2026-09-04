@@ -71,6 +71,14 @@ pub trait RoomEventSink: Send + Sync {
     /// no-op impl is `()`; the Tauri-backed sink
     /// forwards to the webview.
     fn emit_playback_state(&self, _ev: &PlaybackStateEvent) {}
+    /// P4-T03: emit `position://report` with a viewer's
+    /// POSITION_REPORT observation (the server forwards
+    /// the original payload verbatim). The default no-op
+    /// impl is `()`; the Tauri-backed sink forwards to the
+    /// webview. The receiving client (typically the host)
+    /// uses this to render the per-viewer position
+    /// indicator.
+    fn emit_position_report(&self, _ev: &PositionReportEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -122,6 +130,9 @@ mod tauri_sink {
         }
         fn emit_playback_state(&self, ev: &PlaybackStateEvent) {
             let _ = self.handle.emit(PLAYBACK_STATE_EVENT, ev.clone());
+        }
+        fn emit_position_report(&self, ev: &PositionReportEvent) {
+            let _ = self.handle.emit(POSITION_REPORT_EVENT, ev.clone());
         }
     }
 }
@@ -347,6 +358,17 @@ pub const MANIFEST_STATE_EVENT: &str = "manifest://state";
 /// locally before sending the command).
 pub const PLAYBACK_STATE_EVENT: &str = "playback://state";
 
+/// P4-T03: Tauri event name emitted whenever the server
+/// forwards a non-authoritative POSITION_REPORT from a
+/// participant. The payload is a small IPC-safe struct
+/// with the report's `media_position_ms` + `playing`
+/// flag + the originator's `user_id`. The server forwards
+/// the original payload verbatim; the Rust side just
+/// decorates it with the room id and the originating
+/// `user_id` so the React layer can key positions by
+/// sender (multi-viewer distinction).
+pub const POSITION_REPORT_EVENT: &str = "position://report";
+
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
 /// the same field names; the wire field `action`
@@ -435,6 +457,62 @@ pub struct ManifestStateEvent {
     pub room_id: String,
     pub manifest_hash: String,
     pub version: i64,
+}
+
+/// P4-T03: the IPC-safe position report payload emitted
+/// with the `position://report` event. Carries the
+/// viewer's reported local state (verbatim from the wire
+/// payload, per the roadmap's "server forwards without
+/// modification" requirement) plus the originator's
+/// `user_id` so the React layer can key positions by
+/// sender and keep multiple viewers distinct.
+///
+/// The struct deliberately does NOT carry a server
+/// `server_seq` / `server_ts_ms` -- the server does NOT
+/// stamp these on the rebroadcast (architecture §12.8:
+/// "Relays POSITION_REPORT messages without
+/// modification"). The host's UI uses the report only
+/// for display, not for ordering; the position's freshness
+/// is inferred from `client_ts_ms` (the sender's local
+/// wall clock at send time).
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct PositionReportEvent {
+    /// The room id, set as `Envelope::room_id` when the
+    /// event is delivered. Subscribers MUST verify this
+    /// matches the user's current room before applying.
+    pub room_id: String,
+    /// The originating participant's `user_id` (UUID as
+    /// string). The React layer keys its position map by
+    /// this so multiple viewers' positions remain
+    /// distinguishable.
+    pub sender_id: String,
+    /// The viewer's local `<video>` position in integer
+    /// milliseconds. Verbatim from the wire payload.
+    pub media_position_ms: u64,
+    /// `true` when the viewer's local `<video>.paused
+    /// === false`. Verbatim from the wire payload.
+    pub playing: bool,
+    /// The sender's wall clock at send (unix ms).
+    /// Verbatim from the wire payload (the server does
+    /// NOT stamp `server_ts_ms`). The React layer uses
+    /// this only for display (e.g. "last seen 3 s ago");
+    /// ordering is by `sender_id` + arrival time on the
+    /// client.
+    pub client_ts_ms: i64,
+}
+
+impl From<(Uuid, Uuid, &locast_protocol::room::PositionReportPayload)> for PositionReportEvent {
+    fn from(
+        (room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::PositionReportPayload),
+    ) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            media_position_ms: payload.media_position_ms,
+            playing: payload.playing,
+            client_ts_ms: payload.client_ts_ms,
+        }
+    }
 }
 
 /// Default timeout for a single request-reply round trip.
@@ -1076,6 +1154,46 @@ impl RoomClient {
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
                                 s.emit_playback_state(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
+            // P4-T03: a non-authoritative POSITION_REPORT
+            // arrived. The server forwarded the payload
+            // verbatim (per the roadmap's "forwards without
+            // modification" requirement); the wire's
+            // `user_id` is set by the server from the
+            // validated bearer. Decode, scope-check against
+            // the user's current room, and emit
+            // `position://report` so the React layer can
+            // update its per-viewer position map.
+            //
+            // This handler does NOT mutate any local state
+            // -- POSITION_REPORT is telemetry, not a
+            // command. The local `<video>` element is NOT
+            // seeked / paused / played from a position
+            // report (architecture §12.3: "Affects local
+            // playback: No").
+            //
+            // The originator filter on the WS layer
+            // suppresses the sender's own report so the
+            // sender does not see its own report echoed
+            // back at itself; receivers never have to
+            // filter on their side.
+            MessageKind::PositionReport => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    let room_id_str = room_id.to_string();
+                    if current_room.as_deref() == Some(room_id_str.as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::PositionReportPayload>(&env)
+                        {
+                            let ipc =
+                                PositionReportEvent::from((room_id, payload.user_id, &payload));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_position_report(&ipc);
                             }
                         }
                     }

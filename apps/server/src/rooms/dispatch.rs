@@ -20,6 +20,7 @@ use super::codes;
 use super::error::RoomError;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::playback::handle_playback_cmd;
+use super::presence::handle_position_report;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
 use super::store::RoomStore;
@@ -83,6 +84,7 @@ pub async fn dispatch_room_message(
         MessageKind::ManifestRequest => Some(Command::FetchManifest),
         MessageKind::Signal => Some(Command::Signal),
         MessageKind::PlaybackCmd => Some(Command::PlaybackControl),
+        MessageKind::PositionReport => Some(Command::PositionReport),
         _ => None,
     };
     if let Some(cmd) = command {
@@ -97,6 +99,7 @@ pub async fn dispatch_room_message(
                     | Command::FetchManifest
                     | Command::Signal
                     | Command::PlaybackControl
+                    | Command::PositionReport
             ) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
@@ -140,6 +143,9 @@ pub async fn dispatch_room_message(
         }
         MessageKind::PlaybackCmd => {
             handle_playback_cmd_dispatch(envelope, registry, clock, user_id).await
+        }
+        MessageKind::PositionReport => {
+            handle_position_report_dispatch(envelope, registry, user_id).await
         }
         _ => RoomDispatchOutcome::default(),
     }
@@ -403,6 +409,44 @@ async fn registry_host_pubkey(registry: &RoomRegistry, room_id: Uuid) -> Option<
         .map(|p| p.pubkey)
 }
 
+/// P4-T03: the position report dispatch. Hands the envelope
+/// to `handle_position_report` (which validates sender
+/// membership + payload shape, then returns a
+/// `RoomEvent::PositionReport` carrying the original payload
+/// verbatim). The wrapper folds the resulting `RoomEvent`
+/// into `RoomDispatchOutcome.events` so the WS layer publishes
+/// it to the room's broadcast channel. On reject the event is
+/// NOT produced and a single-caller `ROOM_ERROR` is returned
+/// via `to_caller`.
+async fn handle_position_report_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    match handle_position_report(&envelope, registry, user_id).await {
+        Ok(event) => {
+            out.events.push(event);
+        }
+        Err(e) => {
+            let code: RoomErrorCode = RoomError::from(e).into();
+            out.to_caller.push(err_envelope(
+                MessageKind::RoomError,
+                code,
+                format!(
+                    "position report rejected: {}",
+                    position_code_for_message(code)
+                ),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0),
+            ));
+        }
+    }
+    out
+}
+
 fn code_for_message(code: RoomErrorCode) -> &'static str {
     match code {
         RoomErrorCode::Unauthorized => "not authorized",
@@ -412,6 +456,18 @@ fn code_for_message(code: RoomErrorCode) -> &'static str {
         RoomErrorCode::InvalidState => "playback command is not valid in the current room state",
         RoomErrorCode::StaleCommand => "playback monotonic_seq is out of window",
         _ => "playback rejected",
+    }
+}
+
+/// P4-T03: messages used by the position report dispatch
+/// when a reject reason needs a human-readable summary.
+/// Mirrors the playback variants but keeps the strings
+/// distinct so log readers can grep for the right kind.
+fn position_code_for_message(code: RoomErrorCode) -> &'static str {
+    match code {
+        RoomErrorCode::NotJoined => "caller is not a room member",
+        RoomErrorCode::InvalidState => "position report payload is malformed",
+        _ => "position report rejected",
     }
 }
 
@@ -1241,5 +1297,115 @@ mod tests {
         .await;
         assert!(out.to_caller.is_empty(), "new host must be allowed");
         assert_eq!(out.events.len(), 1);
+    }
+
+    // ----- P4-T03: POSITION_REPORT end-to-end through dispatch -----
+
+    /// P4-T03: an in-room sender's POSITION_REPORT is
+    /// accepted and lands in the broadcast `events` list
+    /// as a `RoomEvent::PositionReport` carrying the
+    /// verified room id + sender_id + original payload.
+    /// Nothing is sent back to the caller (the originator
+    /// filter on the WS forwarder suppresses the echo to
+    /// the sender so this is the expected behavior).
+    #[tokio::test]
+    async fn dispatch_viewer_position_report_is_broadcast() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, _host_uid, _host_pk, viewer_uid, _viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        let input = locast_protocol::room::PositionReportPayload {
+            user_id: viewer_uid,
+            media_position_ms: 5_500,
+            playing: true,
+            client_ts_ms: clock.now_ms(),
+        };
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::PositionReport,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 0,
+            payload: serde_json::to_value(&input).unwrap(),
+        };
+        let out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            viewer_uid,
+            [8u8; 32],
+        )
+        .await;
+        // Nothing back to the caller.
+        assert!(
+            out.to_caller.is_empty(),
+            "in-room POSITION_REPORT must not echo to_caller; got {:?}",
+            out.to_caller
+        );
+        // Exactly one broadcast event with the original payload.
+        assert_eq!(out.events.len(), 1);
+        match &out.events[0] {
+            RoomEvent::PositionReport {
+                room_id: rid,
+                sender_id,
+                payload,
+            } => {
+                assert_eq!(*rid, room_id);
+                assert_eq!(*sender_id, viewer_uid);
+                assert_eq!(payload.media_position_ms, 5_500);
+                assert!(payload.playing);
+                assert_eq!(payload.client_ts_ms, input.client_ts_ms);
+            }
+            other => panic!("expected PositionReport event, got {other:?}"),
+        }
+    }
+
+    /// P4-T03: a caller who is not currently a member of
+    /// the named room is denied with NotJoined. The report
+    /// is NOT broadcast. This is the cross-room injection
+    /// defense (mirrors `dispatch_manifest_request_cross_room_is_denied`).
+    #[tokio::test]
+    async fn dispatch_position_report_for_non_member_is_denied() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, _host_uid, _host_pk, _viewer_uid, _viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        // A user that is not in any room tries to send a
+        // POSITION_REPORT for the existing room.
+        let outsider_uid = uid(99);
+        let input = locast_protocol::room::PositionReportPayload {
+            user_id: outsider_uid,
+            media_position_ms: 0,
+            playing: false,
+            client_ts_ms: 0,
+        };
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::PositionReport,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 0,
+            payload: serde_json::to_value(&input).unwrap(),
+        };
+        let out = dispatch_room_message(
+            env,
+            &ctx(&reg, &s, &db, &clock, &relay),
+            outsider_uid,
+            [99u8; 32],
+        )
+        .await;
+        // Single-caller ROOM_ERROR(NotJoined). Not broadcast.
+        assert_eq!(out.to_caller.len(), 1);
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::NotJoined);
+        assert!(out.events.is_empty());
     }
 }

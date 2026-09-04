@@ -41,7 +41,13 @@
 // the `DownloadState` / `DownloadStateEvent` /
 // `DownloadProgressEvent` types. P3-T12 added the
 // `downloadOpen` command (and the `DownloadSessionIpc` return
-// type).
+// type). P4-T02 added the `playbackSend` command (and the
+// `PlaybackCommandInput` / `PlaybackSendResult` types) plus the
+// `playbackState` event listener (and the `PlaybackStateEvent`
+// type). P4-T03 added the `positionReport` command (and the
+// `PositionReportInput` / `PositionReportResult` types) plus
+// the `positionReport` event listener (and the
+// `PositionReportEvent` type).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -116,6 +122,19 @@ export const commands = {
   // forwards it through the signaling WebSocket.
   async playbackSend(cmd: PlaybackCommandInput): Promise<PlaybackSendResult> {
     return await __TAURI_INVOKE("playback_send", { cmd });
+  },
+  // P4-T03: 1 Hz POSITION_REPORT send. Wraps the
+  // POSITION_REPORT envelope in the host process and
+  // forwards it through the signaling WebSocket. The
+  // server is a pure relay and broadcasts the report to
+  // every other participant in the room. The cadence is
+  // owned by the React layer (see
+  // apps/client/src/components/Player.tsx); this
+  // command is a single-shot fire-and-forget call.
+  async positionReport(
+    report: PositionReportInput,
+  ): Promise<PositionReportResult> {
+    return await __TAURI_INVOKE("position_report", { report });
   },
 };
 
@@ -253,28 +272,56 @@ export type DownloadProgressEvent = {
 };
 
 // P3-T12: return type for the `downloadOpen` command.
-// P4-T02: the host playback command send + the
-// `playback://state` event payload.
-export type PlaybackCommandInput = {
-    action: "play" | "pause" | "seek";
-    monotonic_seq: number;
-    media_position_ms: number;
-};
+    // P4-T02: the host playback command send + the
+    // `playback://state` event payload.
+    export type PlaybackCommandInput = {
+        action: "play" | "pause" | "seek";
+        monotonic_seq: number;
+        media_position_ms: number;
+    };
 
-export type PlaybackSendResult = {
-    envelope_id: string;
-    monotonic_seq: number;
-};
+    export type PlaybackSendResult = {
+        envelope_id: string;
+        monotonic_seq: number;
+    };
 
-export type PlaybackStateEvent = {
-    room_id: string;
-    server_seq: number;
-    server_ts_ms: number;
-    sender_id: string;
-    monotonic_seq: number;
-    kind: "play" | "pause" | "seek";
-    media_position_ms: number;
-};
+    export type PlaybackStateEvent = {
+        room_id: string;
+        server_seq: number;
+        server_ts_ms: number;
+        sender_id: string;
+        monotonic_seq: number;
+        kind: "play" | "pause" | "seek";
+        media_position_ms: number;
+    };
+
+    // P4-T03: 1 Hz POSITION_REPORT input. The local
+    // <video> element's currentTime is converted to
+    // integer milliseconds by the React layer before
+    // calling `commands.positionReport`. The server is a
+    // pure relay (architecture section 12.8 + roadmap
+    // P4-T03 "server forwards without modification").
+    export type PositionReportInput = {
+        media_position_ms: number;
+        playing: boolean;
+    };
+
+    export type PositionReportResult = {
+        envelope_id: string;
+    };
+
+    // P4-T03: the `position://report` event payload. The
+    // server forwards the wire payload verbatim and stamps
+    // `sender_id` (= the originator's user_id) so the
+    // React layer can key positions by sender and keep
+    // multiple viewers distinguishable.
+    export type PositionReportEvent = {
+        room_id: string;
+        sender_id: string;
+        media_position_ms: number;
+        playing: boolean;
+        client_ts_ms: number;
+    };
 export type DownloadSessionIpc = {
   download_id: string;
   media_id: string;
@@ -321,6 +368,19 @@ export const events = {
   playbackState: <EventListener<PlaybackStateEvent>>((h) =>
     __listenAs__("playback://state", h)
   ),
+  // P4-T03: inbound POSITION_REPORT from a remote
+  // participant. Emitted ~1 Hz per remote viewer /
+  // host while the user is in a room. The local
+  // 1 Hz reporter (Player.tsx) does NOT consume this
+  // event; it only drives outbound reports. Receiving
+  // a report never produces another outbound report
+  // (no feedback loop). The receiving client is
+  // typically the host, who uses the per-sender
+  // position to render a "viewer's position"
+  // indicator.
+  positionReport: <EventListener<PositionReportEvent>>((h) =>
+    __listenAs__("position://report", h)
+  ),
 };
 
 export const signalingStateChanged = events.signalingState;
@@ -329,3 +389,4 @@ export const roomEventEnvelope = events.roomEvent;
 export const downloadStateChanged = events.downloadState;
 export const downloadProgressChanged = events.downloadProgress;
 export const playbackStateChanged = events.playbackState;
+export const positionReportChanged = events.positionReport;

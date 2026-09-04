@@ -14,7 +14,9 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
-pub use crate::net::room::{ManifestStateEvent, PlaybackStateEvent, RoomSummaryIpc};
+pub use crate::net::room::{
+    ManifestStateEvent, PlaybackStateEvent, PositionReportEvent, RoomSummaryIpc,
+};
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
 pub use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};
 
@@ -54,3 +56,15 @@ pub type RoomEventEnvelope = RoomSummaryIpc;
 /// of the canonical bytes and the per-room version (1 in
 /// v1).
 pub type ManifestStateChanged = ManifestStateEvent;
+
+/// P4-T03: the `position://report` event payload. Emitted
+/// by the `RoomClient` for every POSITION_REPORT inbound
+/// envelope (1 Hz per remote participant). The payload
+/// carries the viewer's reported local media state plus
+/// the originator's `user_id` so the React layer can key
+/// positions by sender and keep multiple viewers
+/// distinguishable. The server forwards the wire payload
+/// verbatim (architecture §12.8: "Relays POSITION_REPORT
+/// messages without modification"); the server stamps the
+/// `user_id` from the validated bearer.
+pub type PositionReportChanged = PositionReportEvent;

@@ -14,6 +14,7 @@ pub mod dispatch;
 pub mod error;
 pub mod manifest;
 pub mod playback;
+pub mod presence;
 pub mod registry;
 pub mod signal;
 pub mod state;
@@ -25,6 +26,7 @@ pub use dispatch::{dispatch_room_message, DispatchContext, RoomDispatchOutcome};
 pub use error::RoomError;
 pub use manifest::{handle_manifest_publish, manifest_published_envelope};
 pub use playback::{handle_playback_cmd, PlaybackError};
+pub use presence::{handle_position_report, PresenceError};
 pub use registry::{
     BroadcastItem, CachedManifest, RoomEvent, RoomHandle, RoomRegistry, RoomRegistryConfig,
 };
