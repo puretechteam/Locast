@@ -69,6 +69,34 @@ interface PlaybackStoreState {
      * via the <video> element. */
     suppressLocalEcho: boolean;
 
+    /** P4-T05: the host's next per-sender monotonic
+     * sequence. Shared across all host-authoritative
+     * `PLAYBACK_CMD` emit paths (the existing
+     * `PlaybackControls` Play/Pause/Seek buttons AND
+     * the new Sync button's host branch) so two
+     * per-component counters cannot race and produce a
+     * duplicate or out-of-order `monotonic_seq` that
+     * the server would reject (architecture §13.1,
+     * P4-T01). Initialized to 1 at store creation
+     * because the server expects the FIRST per-sender
+     * command to carry `monotonic_seq = 1`. The counter
+     * is reset to 1 on `setRoomId(null)` and on
+     * `clear()` because host migration restarts the
+     * per-sender sequence for the new host. Viewers
+     * (i.e. non-hosts) do not need this counter; the
+     * Sync button's viewer branch is a local-only DOM
+     * action and never reads or writes this field. */
+    hostNextSeq: number;
+    /** P4-T05: read the host's next monotonic sequence
+     * AND advance the counter by 1 in a single,
+     * race-free step. Returns the `seq` to use for the
+     * outgoing PLAYBACK_CMD. The counter advances
+     * unconditionally on `bumpHostSeq`; the caller is
+     * responsible for retrying on the SAME `seq` if
+     * the server rejects (the existing `PlaybackControls`
+     * pattern — see comments there). */
+    bumpHostSeq: () => number;
+
     setMediaReady: (ready: boolean) => void;
     setRoomId: (roomId: string | null) => void;
     setMediaSrc: (src: string | null) => void;
@@ -103,18 +131,25 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
     mediaReady: false,
     mediaSrc: null,
     suppressLocalEcho: false,
+    hostNextSeq: 1,
 
     setMediaReady: (ready) => set({ mediaReady: ready }),
     setRoomId: (roomId) => {
         // Switching rooms resets the ordering counter
         // and the pending slot. The new room's events
-        // will start at `server_seq = 1`.
+        // will start at `server_seq = 1`. P4-T05 also
+        // resets the host's monotonic sequence on room
+        // change so a re-host (e.g. host migration
+        // landing back on the same identity) does not
+        // see a stale seq counter collide with the new
+        // room's per-sender sequence.
         if (get().roomId !== roomId) {
             set({
                 roomId,
                 lastApplied: null,
                 pending: null,
                 lastAppliedServerSeq: 0,
+                hostNextSeq: 1,
             });
         }
     },
@@ -184,5 +219,22 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             mediaReady: false,
             mediaSrc: null,
             suppressLocalEcho: false,
+            hostNextSeq: 1,
         }),
+
+    /**
+     * P4-T05: atomically read the host's next monotonic
+     * sequence and advance the counter by 1. The counter
+     * lives in the playback store (not in
+     * `PlaybackControls` and not in the Sync button's
+     * closure) so multiple host-authoritative emit
+     * paths share one source of truth. See the
+     * `hostNextSeq` field comment for the reset rules
+     * on room change.
+     */
+    bumpHostSeq: () => {
+        const next = get().hostNextSeq;
+        set({ hostNextSeq: next + 1 });
+        return next;
+    },
 }));

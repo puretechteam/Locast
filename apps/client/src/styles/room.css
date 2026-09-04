@@ -546,3 +546,38 @@ code {
 .room-page__viewer-positions-median-drift[data-direction="behind"] {
     color: #f5c869;
 }
+
+/* P4-T05: standalone "Sync to Host" button. The
+ * button is a small, secondary action so the visual
+ * treatment is muted compared to the host's primary
+ * Play/Pause/Seek controls; the affordance should
+ * read as a maintenance / convergence action rather
+ * than the dominant interaction.
+ */
+.room-page__sync-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 0;
+}
+
+.sync-button {
+    background: #1a1f25;
+    color: #d4d8de;
+    border: 1px solid #2a3138;
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+    font: inherit;
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.sync-button:hover:not(:disabled) {
+    background: #232a32;
+    border-color: #3a2e10;
+}
+
+.sync-button:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}

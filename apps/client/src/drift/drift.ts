@@ -308,3 +308,74 @@ export function computeDriftVsMedian(
     if (medianMs === null) return null;
     return localMs - medianMs;
 }
+
+/* -----------------------------------------------------------------------
+ * P4-T05: manual sync ("Sync to Host") target calculation.
+ *
+ * The host target is the host's `lastApplied.media_position_ms`
+ * projected forward by `(nowMs - server_ts_ms)`. This is the
+ * same `expectedPositionMs` formula the drift smoother uses;
+ * colocated here so the sync target lives next to the drift
+ * math (single source of truth) and is unit-testable without
+ * React.
+ *
+ * The `isHost` flag determines which branch the UI takes
+ * (viewer -> local-only DOM seek; host -> local + PLAYBACK_CMD).
+ * The `canSync` gate disables the button until the user is in
+ * a room with a matching host command and ready media.
+ * --------------------------------------------------------------------- */
+
+export interface ManualSyncTarget {
+    /** The host's expected media position in integer ms.
+     *  Null when no host command has been received yet,
+     *  when the local user is not in a room, or when the
+     *  cached host command is from a different room. */
+    hostTargetMs: number | null;
+    /** True when the local user is the room's current
+     *  host. Controls which branch the Sync button's
+     *  onClick takes. */
+    isHost: boolean;
+    /** True when the Sync button should be enabled:
+     *  in room + media ready + matching host command
+     *  present + hostTargetMs computable. */
+    canSync: boolean;
+}
+
+/** Pure target computation. Extracted from `useManualSync`
+ *  so the same math is testable without React + a DOM. */
+export function computeSyncTarget(args: {
+    roomId: string | null;
+    isHost: boolean;
+    lastApplied:
+        | { room_id: string; media_position_ms: number; server_ts_ms: number }
+        | null;
+    mediaReady: boolean;
+    nowMs: number;
+    skewMs: number;
+}): ManualSyncTarget {
+    const inRoom = args.roomId !== null;
+    const sameRoom =
+        args.lastApplied !== null && args.lastApplied.room_id === args.roomId;
+    const hasHostCommand = inRoom && sameRoom;
+    // Pull the host command into a local const so the
+    // strict-mode null-narrowing carries into the
+    // `expectedPositionMs` call below.
+    const last = args.lastApplied;
+    const hostTargetMs =
+        hasHostCommand && last !== null
+            ? expectedPositionMs(
+                  {
+                      mediaPositionMs: last.media_position_ms,
+                      serverTsMs: last.server_ts_ms,
+                  },
+                  args.nowMs,
+                  args.skewMs,
+              )
+            : null;
+    return {
+        hostTargetMs,
+        isHost: args.isHost,
+        canSync:
+            inRoom && args.mediaReady && hasHostCommand && hostTargetMs !== null,
+    };
+}

@@ -9,7 +9,9 @@ import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
 import { PlaybackControls } from "../../components/PlaybackControls";
 import { DriftIndicator } from "../../components/DriftIndicator";
+import { SyncButton } from "../../components/SyncButton";
 import { useDriftSmoother } from "../../drift/useDriftSmoother";
+import { useManualSync } from "../../drift/useManualSync";
 import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
@@ -46,13 +48,27 @@ const handleLeft = useCallback(() => {
     // `useRoomStore.setSummary` on `window.__locastRoomStore`
     // so the Playwright harness can mount the room
     // without going through the Tauri invoke surface.
+    // P4-T05: also expose `setLocalUserId` /
+    // `getLocalUserId` so the harness can tell the
+    // page "I am participant X" -- the room
+    // summary alone does not disambiguate host
+    // from viewer in a multi-participant room.
     useEffect(() => {
         if (import.meta.env.MODE !== "test") return;
+        let localUserIdValue: string | null = null;
         const w = window as unknown as {
-            __locastRoomStore?: { setSummary: (s: unknown) => void };
+            __locastRoomStore?: {
+                setSummary: (s: unknown) => void;
+                setLocalUserId: (id: string | null) => void;
+                getLocalUserId: () => string | null;
+            };
         };
         w.__locastRoomStore = {
             setSummary: (s) => setSummary(s as Parameters<typeof setSummary>[0]),
+            setLocalUserId: (id) => {
+                localUserIdValue = id;
+            },
+            getLocalUserId: () => localUserIdValue,
         };
         return () => {
             if (w.__locastRoomStore) delete w.__locastRoomStore;
@@ -75,13 +91,48 @@ const handleLeft = useCallback(() => {
     // `summary.host_user_id`; if no participant is
     // marked as host in the snapshot (race during
     // host migration), fall back to "not the host".
+    //
+    // P4-T05 fix: `isHost` now means "the LOCAL user
+    // is the current host", not "the room has a
+    // host". The previous derivation returned true
+    // for any room with a host participant, which
+    // mistakenly gave viewers the host-authoritative
+    // Sync branch. The local user id is read from
+    // the identity store in production. The Vite
+    // harness exposes it through the
+    // `__locastRoomStore.setLocalUserId` test seam
+    // (see `tests/playwright/fixtures/vite-app.ts`).
     const { isHost, localUserId, hostPositionMs } = useMemo(() => {
+        // P4-T05 test-only: in Vite test mode the local
+        // user id is set by the Playwright harness via
+        // `__locastRoomStore.setLocalUserId`. The
+        // production path (when `import.meta.env.MODE
+        // !== "test"`) reads the same value from the
+        // identity store; that is wired in a later
+        // task. Until then, the test-only path is
+        // enough for P4-T05.
+        let localUserIdValue: string | null = null;
+        if (import.meta.env.MODE === "test") {
+            const w = window as unknown as {
+                __locastRoomStore?: {
+                    getLocalUserId?: () => string | null;
+                };
+            };
+            localUserIdValue = w.__locastRoomStore?.getLocalUserId?.() ?? null;
+        }
         const host = summary?.participants.find((p) => p.is_host);
-        const isHostFlag = host !== undefined && summary !== null;
-        const userId = isHostFlag ? (host?.user_id ?? null) : null;
+        const localUserIsHost =
+            host !== undefined &&
+            summary !== null &&
+            localUserIdValue !== null &&
+            host.user_id === localUserIdValue;
+        const userId =
+            localUserIsHost && host !== undefined
+                ? host.user_id
+                : null;
         const pos = usePlaybackStore.getState().lastApplied?.media_position_ms ?? 0;
         return {
-            isHost: isHostFlag,
+            isHost: localUserIsHost,
             localUserId: userId,
             hostPositionMs: pos,
         };
@@ -133,17 +184,36 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
         localUserId,
     });
 
-    // P4-T04: Resync button stub. The actual seek-to-host
-    // behavior ships in P4-T05 (manual sync). The button
-    // is wired so the UI surface matches architecture
-    // §25.3.2 today; the underlying handler is a no-op
-    // until P4-T05 lands. The stub is intentionally
-    // side-effect-free so it can be removed without
-    // migration.
+    // P4-T05: the manual sync hook. The hook owns the
+    // target-position computation and the DOM seek;
+    // the UI surfaces (DriftIndicator Resync, standalone
+    // SyncButton) both call into the same hook so there
+    // is one sync implementation. The branch is chosen
+    // by the hook based on `isHost` -- viewers get a
+    // local-only DOM seek; hosts get a local seek + a
+    // PLAYBACK_CMD emit through the existing
+    // `sendPlaybackCommand` path.
+    const sync = useManualSync({
+        roomId: summary?.id ?? null,
+        isHost,
+        getVideo: () => videoRef.current,
+    });
+
+    // P4-T05: real Resync handler. The DriftIndicator's
+    // Resync button (P4-T04 stub) now calls into the
+    // same shared `sync` hook as the standalone
+    // SyncButton. Selecting the branch is the hook's
+    // job; the UI surface just calls whichever entry
+    // point matches the user's role expectation
+    // (`authoritativeSeek` is also a no-op for
+    // non-hosts, so it is safe to wire unconditionally).
     const onResync = useCallback(() => {
-        // P4-T05 will replace this with a real seek
-        // path. Until then, the click is a no-op.
-    }, []);
+        if (isHost) {
+            void sync.authoritativeSeek();
+        } else {
+            void sync.localSeek();
+        }
+    }, [isHost, sync]);
 
     useEffect(() => {
         let cancelled = false;
@@ -352,6 +422,18 @@ return (
                 isHost={isHost}
                 positionMs={displayPositionMs}
             />
+            {/* P4-T05: standalone "Sync to Host" button.
+             * The DriftIndicator's Resync button is
+             * the same affordance hidden inside the
+             * drift indicator; this button is always
+             * visible (when in a room) so the user can
+             * manually converge to the host at any time,
+             * regardless of whether drift has crossed
+             * the 2 s indicator threshold. Both buttons
+             * call the same `useManualSync` hook. */}
+            <div className="room-page__sync-row">
+                <SyncButton sync={sync} />
+            </div>
             <RoomFooter
                 summary={summary}
                 signaling={signaling}

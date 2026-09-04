@@ -1,4 +1,5 @@
-import { useCallback, useRef } from "react";
+import { useCallback } from "react";
+import { usePlaybackStore } from "../stores/usePlaybackStore";
 import { sendPlaybackCommand } from "../services/playback";
 
 /**
@@ -40,7 +41,18 @@ export function PlaybackControls({
     isHost,
     positionMs,
 }: PlaybackControlsProps): React.ReactNode {
-    const nextSeq = useRef<number>(1);
+    // P4-T05: the host's monotonic sequence is now
+    // shared across all host-authoritative emit paths
+    // (the existing Play/Pause/Seek buttons here AND
+    // the Sync button's host branch) via
+    // `usePlaybackStore.bumpHostSeq`. We read+advance
+    // atomically in `send` and on server rejection the
+    // counter is NOT rolled back, so a retry must NOT
+    // call `bumpHostSeq` again -- it must reuse the
+    // same `seq`. The local `useRef` counter that lived
+    // here previously is removed; the store is the
+    // single source of truth.
+    const bumpHostSeq = usePlaybackStore((s) => s.bumpHostSeq);
 
     const send = useCallback(
         async (
@@ -48,31 +60,32 @@ export function PlaybackControls({
             media_position_ms: number,
         ): Promise<void> => {
             if (!isHost) return;
-            const seq = nextSeq.current;
+            const seq = bumpHostSeq();
             try {
                 await sendPlaybackCommand({
                     action,
                     monotonic_seq: seq,
                     media_position_ms,
                 });
-                // Only advance the sequence on
-                // server-accepted commands. The Tauri
-                // command throws on cap-gate rejection
-                // or monotonic_seq validation failure,
-                // so reaching this line means the
-                // command was accepted.
-                nextSeq.current = seq + 1;
+                // Reaching this line means the server
+                // accepted the command. The counter has
+                // already been advanced by `bumpHostSeq`
+                // above; on rejection it is left
+                // advanced so the next emit does NOT
+                // reuse this seq (the server already
+                // rejected it as out-of-order or
+                // invalid). The caller can recover by
+                // resetting the store on room change.
             } catch (err) {
                 // Surface to the host's console. The
-                // host can retry; the server's
-                // last_acked_seq is unchanged so a
-                // retry with the same `seq` is valid
-                // and not a duplicate.
+                // host can recover by leaving/rejoining
+                // the room which resets `hostNextSeq` via
+                // `setRoomId` -> `clear()`.
                 // eslint-disable-next-line no-console
                 console.warn("playback_send failed", err);
             }
         },
-        [isHost],
+        [isHost, bumpHostSeq],
     );
 
     const onPlay = useCallback(() => {

@@ -19,6 +19,7 @@ import {
     computeDriftVsMedian,
     computeRawDrift,
     computeRoomMedian,
+    computeSyncTarget,
     deriveDriftSample,
     expectedPositionMs,
     initialDriftState,
@@ -241,6 +242,88 @@ check("null median => null", computeDriftVsMedian(5000, null) === null);
 check("local > median => positive (ahead)", computeDriftVsMedian(7000, 5000) === 2000);
 check("local < median => negative (behind)", computeDriftVsMedian(3000, 5000) === -2000);
 check("local == median => 0", computeDriftVsMedian(5000, 5000) === 0);
+
+// ----- computeSyncTarget (P4-T05) -----
+process.stdout.write("computeSyncTarget (P4-T05)\n");
+{
+    // Not in a room: hostTargetMs null, canSync false.
+    const t1 = computeSyncTarget({
+        roomId: null,
+        isHost: false,
+        lastApplied: null,
+        mediaReady: true,
+        nowMs: 1000,
+        skewMs: 0,
+    });
+    check("not in room => hostTargetMs null", t1.hostTargetMs === null);
+    check("not in room => canSync false", t1.canSync === false);
+    check("not in room => isHost preserved", t1.isHost === false);
+
+    // In a room but no host command yet: canSync false.
+    const t2 = computeSyncTarget({
+        roomId: "r-1",
+        isHost: false,
+        lastApplied: null,
+        mediaReady: true,
+        nowMs: 1000,
+        skewMs: 0,
+    });
+    check("no host command => canSync false", t2.canSync === false);
+    check("no host command => hostTargetMs null", t2.hostTargetMs === null);
+
+    // In a room with a host command for a DIFFERENT room:
+    // canSync false (defense in depth).
+    const t3 = computeSyncTarget({
+        roomId: "r-1",
+        isHost: false,
+        lastApplied: { room_id: "r-2", media_position_ms: 1000, server_ts_ms: 1000 },
+        mediaReady: true,
+        nowMs: 1000,
+        skewMs: 0,
+    });
+    check("cross-room host command => canSync false", t3.canSync === false);
+
+    // In a room with a matching host command but media
+    // not ready: canSync false.
+    const t4 = computeSyncTarget({
+        roomId: "r-1",
+        isHost: false,
+        lastApplied: { room_id: "r-1", media_position_ms: 1000, server_ts_ms: 1000 },
+        mediaReady: false,
+        nowMs: 1000,
+        skewMs: 0,
+    });
+    check("media not ready => canSync false", t4.canSync === false);
+
+    // Happy path: in a room, matching host command,
+    // media ready. hostTargetMs projects forward by
+    // (nowMs - serverTsMs).
+    const t5 = computeSyncTarget({
+        roomId: "r-1",
+        isHost: false,
+        lastApplied: { room_id: "r-1", media_position_ms: 10_000, server_ts_ms: 1_000 },
+        mediaReady: true,
+        nowMs: 6_000,
+        skewMs: 0,
+    });
+    check("happy path => canSync true", t5.canSync === true);
+    check(
+        "happy path => hostTargetMs = 10000 + (6000-1000) = 15000",
+        t5.hostTargetMs === 15_000,
+    );
+
+    // isHost is preserved (the hook exposes it; the UI
+    // uses it to choose the branch).
+    const t6 = computeSyncTarget({
+        roomId: "r-1",
+        isHost: true,
+        lastApplied: { room_id: "r-1", media_position_ms: 10_000, server_ts_ms: 1_000 },
+        mediaReady: true,
+        nowMs: 1_000,
+        skewMs: 0,
+    });
+    check("isHost preserved (host branch)", t6.isHost === true);
+}
 
 if (failures > 0) {
     process.stdout.write(`\n${failures} failure(s)\n`);

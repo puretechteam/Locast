@@ -42,11 +42,13 @@ import {
     computeRawDrift,
     computeRoomMedian,
     deriveDriftSample,
+    expectedPositionMs,
     initialDriftState,
     type DriftSample,
     type DriftState,
     type MedianParticipant,
 } from "./drift";
+import { getForcedHostCommand, readLocalSeekTick, resetLocalSeekTick, setForcedHostCommand } from "./testSeams";
 
 /** What the hook needs to read from the local media element
  *  on every tick. The consumer provides this; the hook
@@ -108,6 +110,14 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
     const stateRef = useRef<DriftState>(initialDriftState());
     const [tick, setTick] = useState(0);
 
+    // P4-T05 (test-mode only): the host target + the
+    // local-seek counter are module-level helpers in
+    // `./testSeams.ts` so the smoother's seam AND the
+    // `useManualSync` hook share the same values. The
+    // tick body's 1 Hz sample still reads the playback
+    // store directly (the override is honored only by
+    // the seam's `hostTargetMs` and by `useManualSync`).
+
     // Reset on room change so samples from a previous room
     // cannot leak into the new room's drift EMA.
     const lastRoomIdRef = useRef<string | null>(roomId);
@@ -115,6 +125,9 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
         if (lastRoomIdRef.current !== roomId) {
             stateRef.current = initialDriftState();
             lastRoomIdRef.current = roomId;
+            // Clear any test override so it does not
+            // bleed into the new room.
+            setForcedHostCommand(null);
             setTick((t) => t + 1);
         }
     }, [roomId]);
@@ -197,19 +210,40 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
 
     const sample = deriveDriftSample(stateRef.current);
 
-    // P4-T04 test seam: in Vite's test mode, expose the
-    // current smoother state on `window.__locastDrift` so
-    // Playwright can drive deterministic scenarios
-    // (e.g. "set the smoother to +3000 ms" without
-    // waiting for the 1 Hz timer + a real `<video>`
-    // element). The seam is gated on `MODE === "test"`
-    // so it is tree-shaken from production builds.
+    // P4-T04 test seam (extended in P4-T05): in Vite's
+    // test mode, expose the current smoother state on
+    // `window.__locastDrift` so Playwright can drive
+    // deterministic scenarios (e.g. "set the smoother
+    // to +3000 ms" without waiting for the 1 Hz timer +
+    // a real `<video>` element). P4-T05 adds:
+    //   - `hostTargetMs`: the host's expected position
+    //     at the moment of capture, so tests can assert
+    //     "after click, the local <video>.currentTime is
+    //     hostTargetMs / 1000".
+    //   - `forceHostCommandForTest`: replaces the
+    //     internal `hostCommand` derivation for the
+    //     duration of one test (does not persist across
+    //     re-renders) so the Sync button's `canSync`
+    //     gate is testable without emitting a real
+    //     `playback://state` event.
+    //
+    // The seam is gated on `MODE === "test"` so it is
+    // tree-shaken from production builds.
     useEffect(() => {
         if (import.meta.env.MODE !== "test") return;
         const w = window as unknown as {
             __locastDrift?: {
                 getSample: () => DriftSmootherResult;
                 setSmoothed: (v: number | null) => void;
+                hostTargetMs: () => number | null;
+                forceHostCommandForTest: (p: {
+                    room_id: string;
+                    media_position_ms: number;
+                    server_ts_ms: number;
+                } | null) => void;
+                readLocalSeekTick: () => number;
+                resetLocalSeekTick: () => void;
+                resetForcedHostCommand: () => void;
             };
         };
         const live: DriftSmootherResult = {
@@ -218,6 +252,31 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
             driftVsMedianMs,
             active: roomId !== null,
             sampleCount: stateRef.current.sampleCount,
+        };
+        // P4-T05: the host target as of "now" is
+        // `expectedPositionMs(hostCommand, Date.now(), 0)`.
+        // The host command is read from the playback
+        // store (same source the smoother's tick body
+        // uses). In test mode we honor the seam's
+        // module-level override first so tests can
+        // inject a synthetic command without going
+        // through the playback event bridge.
+        const computeHostTarget = (): number | null => {
+            const override = getForcedHostCommand();
+            const hc =
+                override !== null
+                    ? override
+                    : (() => {
+                          const ev = usePlaybackStore.getState().lastApplied;
+                          if (ev === null) return null;
+                          if (roomId !== null && ev.room_id !== roomId) return null;
+                          return {
+                              mediaPositionMs: ev.media_position_ms,
+                              serverTsMs: ev.server_ts_ms,
+                          };
+                      })();
+            if (hc === null) return null;
+            return expectedPositionMs(hc, Date.now(), skewMs);
         };
         w.__locastDrift = {
             getSample: () => live,
@@ -230,11 +289,36 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                 };
                 setTick((t) => (t + 1) % 1_000_000);
             },
+            hostTargetMs: () => computeHostTarget(),
+            forceHostCommandForTest: (payload) => {
+                setForcedHostCommand(
+                    payload === null
+                        ? null
+                        : {
+                              mediaPositionMs: payload.media_position_ms,
+                              serverTsMs: payload.server_ts_ms,
+                          },
+                );
+                setTick((t) => (t + 1) % 1_000_000);
+            },
+            // P4-T05: the `useManualSync` hook bumps a
+            // module-level counter every time the local
+            // DOM seek completes (test mode only). The
+            // Chromium Vite harness cannot observe the
+            // actual `<video>.currentTime` write, so the
+            // counter is the test's only signal that the
+            // local seek ran.
+            readLocalSeekTick: () => readLocalSeekTick(),
+            resetLocalSeekTick: () => resetLocalSeekTick(),
+            // P4-T05: clear the forced host command
+            // override (e.g. when a test changes rooms
+            // between scenarios).
+            resetForcedHostCommand: () => setForcedHostCommand(null),
         };
         return () => {
             if (w.__locastDrift) delete w.__locastDrift;
         };
-    }, [sample, roomMedianMs, driftVsMedianMs, roomId]);
+    }, [sample, roomMedianMs, driftVsMedianMs, roomId, skewMs]);
 
     return {
         ...sample,

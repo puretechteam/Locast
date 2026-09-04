@@ -78,6 +78,17 @@ type LocastApi = {
     emitPlaybackState: (p: PlaybackStateEvent) => Promise<void>;
     emitPositionReport: (p: PositionReportEvent) => Promise<void>;
     waitForBridge: () => Promise<void>;
+    /** P4-T05: read all Tauri invoke() calls recorded
+     *  by the shim since the last reset. Tests assert
+     *  on this to verify that the local-only sync
+     *  branch does NOT emit a `playback_send` and the
+     *  host-authoritative branch DOES. */
+    readInvokeLog: () => Promise<
+        Array<{ name: string; args: unknown }>
+    >;
+    /** P4-T05: clear the invoke log. Tests call this at
+     *  the start of each scenario. */
+    resetInvokeLog: () => Promise<void>;
 };
 
 declare global {
@@ -109,7 +120,47 @@ const SHIM_SOURCE = `
                 last_error: null,
                 last_error_at_ms: null,
             });
+            // P4-T05: record every playback_send invocation
+            // so the manual-sync e2e tests can assert that a
+            // viewer click did NOT emit a command while a
+            // host click DID. The recorded list is a
+            // per-test throwaway; each Playwright test
+            // resets it via resetInvokeLog() before the
+            // scenario under test. The default return is
+            // shaped to match the Rust command success
+            // type (an envelope id + the monotonic seq the
+            // server would have assigned) so the host
+            // branch can call sendPlaybackCommand without
+            // a TypeError.
+            if (name === "playback_send") {
+                w.__locast_invoke_log.push({ name: name, args: args });
+                return Promise.resolve({
+                    envelope_id: "envelope-" + (w.__locast_invoke_log.length),
+                    monotonic_seq:
+                        args !== null &&
+                        args !== undefined &&
+                        typeof args.cmd === "object" &&
+                        args.cmd !== null &&
+                        typeof args.cmd.monotonic_seq === "number"
+                            ? args.cmd.monotonic_seq
+                            : 0,
+                });
+            }
             return Promise.resolve(null);
+        };
+        // P4-T05: the @tauri-apps/api/core.js package calls
+        // window.__TAURI_INTERNALS__.invoke (not
+        // window.__TAURI_INVOKE -- that property name is
+        // the older Tauri 1 convention). Wire BOTH
+        // shims so the bindings reach the harness
+        // recording surface.
+        w.__TAURI_INTERNALS__ = w.__TAURI_INTERNALS__ || {};
+        w.__TAURI_INTERNALS__.invoke = w.__TAURI_INVOKE;
+        // P4-T05: per-test invoke log (FIFO). resetInvokeLog
+        // empties it between scenarios.
+        w.__locast_invoke_log = [];
+        w.__locast_resetInvokeLog = function() {
+            w.__locast_invoke_log = [];
         };
         var api = {
             emitDownloadState: function(payload) {
@@ -216,6 +267,27 @@ export const test = base.extend<{ locast: LocastApi }>({
                     undefined,
                     { timeout: 5000 },
                 );
+            },
+            readInvokeLog: async () => {
+                return await page.evaluate(() => {
+                    const w = window as unknown as {
+                        __locast_invoke_log?: Array<{
+                            name: string;
+                            args: unknown;
+                        }>;
+                    };
+                    return w.__locast_invoke_log ?? [];
+                });
+            },
+            resetInvokeLog: async () => {
+                await page.evaluate(() => {
+                    const w = window as unknown as {
+                        __locast_resetInvokeLog?: () => void;
+                    };
+                    if (w.__locast_resetInvokeLog) {
+                        w.__locast_resetInvokeLog();
+                    }
+                });
             },
         };
         await use(api);
