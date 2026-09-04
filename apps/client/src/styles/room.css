@@ -430,3 +430,119 @@ code {
     font-size: 0.85rem;
     flex-basis: 100%;
 }
+
+/* P4-T04: drift indicator. The indicator is hidden by
+ * default (component returns null when |smoothed| <=
+ * 2 s); the rules below only apply when the element is
+ * mounted. The visual treatment mirrors the
+ * architecture's §12.4 / §25.3.2 "icon + numeric
+ * magnitude" guidance: a yellow "!" badge plus a signed
+ * magnitude. Color is paired with a number so the
+ * indicator is usable without color vision (§25.6).
+ */
+.drift-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0.5rem 0;
+    padding: 0.4rem 0.6rem;
+    border: 1px solid #3a2e10;
+    border-radius: 4px;
+    background: #2a2310;
+    color: #f5c869;
+    font-size: 0.9rem;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.drift-indicator--behind {
+    /* The user is behind the host (drift < 0). Yellow
+     * ("subtle", architecture §12.4 row 2 s - 5 s). */
+    border-color: #3a2e10;
+    background: #2a2310;
+    color: #f5c869;
+}
+
+.drift-indicator--ahead {
+    /* The user is ahead of the host. Same yellow band
+     * as "behind" (the architecture bands the
+     * indicator by absolute magnitude, not by
+     * direction). We keep distinct text so the user
+     * knows which way to seek if they choose to. */
+    border-color: #3a2e10;
+    background: #2a2310;
+    color: #f5c869;
+}
+
+.drift-indicator__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.4rem;
+    height: 1.4rem;
+    border-radius: 50%;
+    background: #f5c869;
+    color: #1f1500;
+    font-weight: 700;
+    font-size: 0.9rem;
+}
+
+.drift-indicator__text {
+    flex: 1;
+}
+
+.drift-indicator__resync {
+    background: #1a1f25;
+    color: #f5c869;
+    border: 1px solid #3a2e10;
+    border-radius: 4px;
+    padding: 0.25rem 0.6rem;
+    font: inherit;
+    cursor: pointer;
+    transition: background 120ms ease;
+}
+
+.drift-indicator__resync:hover:not(:disabled) {
+    background: #2a2310;
+}
+
+/* P4-T04: room median line inside the host's viewer
+ * positions panel. The label sits inline with the
+ * numeric magnitude and a signed-direction hint. Colors
+ * are muted (the median is informational, not a warning)
+ * but reuse the warning palette tokens so the visual
+ * language is consistent with the drift indicator.
+ */
+.room-page__viewer-positions-median {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin: 0 0 0.5rem 0;
+    padding: 0.35rem 0.5rem;
+    border: 1px dashed #2a3138;
+    border-radius: 4px;
+    background: #101317;
+    color: #c0c6cd;
+    font-size: 0.85rem;
+}
+
+.room-page__viewer-positions-median-label {
+    color: #9aa3ad;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+}
+
+.room-page__viewer-positions-median-value {
+    color: #e6e6e6;
+    font-variant-numeric: tabular-nums;
+}
+
+.room-page__viewer-positions-median-drift {
+    color: #9aa3ad;
+    font-variant-numeric: tabular-nums;
+}
+
+.room-page__viewer-positions-median-drift[data-direction="ahead"],
+.room-page__viewer-positions-median-drift[data-direction="behind"] {
+    color: #f5c869;
+}

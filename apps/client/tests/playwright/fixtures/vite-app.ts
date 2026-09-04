@@ -63,11 +63,20 @@ export type PlaybackStateEvent = {
     media_position_ms: number;
 };
 
+export type PositionReportEvent = {
+    room_id: string;
+    sender_id: string;
+    media_position_ms: number;
+    playing: boolean;
+    client_ts_ms: number;
+};
+
 type LocastApi = {
     emitDownloadState: (p: DownloadStateEvent) => Promise<void>;
     emitDownloadProgress: (p: DownloadProgressEvent) => Promise<void>;
     emitRoomState: (p: RoomSummaryIpc | null) => Promise<void>;
     emitPlaybackState: (p: PlaybackStateEvent) => Promise<void>;
+    emitPositionReport: (p: PositionReportEvent) => Promise<void>;
     waitForBridge: () => Promise<void>;
 };
 
@@ -139,6 +148,11 @@ const SHIM_SOURCE = `
                     mod.__emit("playback://state", payload);
                 });
             },
+            emitPositionReport: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("position://report", payload);
+                });
+            },
         };
         w.__locast = api;
     })();
@@ -185,6 +199,15 @@ export const test = base.extend<{ locast: LocastApi }>({
                         throw new Error("__locast not present on window");
                     }
                     return w.__locast.emitPlaybackState(payload);
+                }, p);
+            },
+            emitPositionReport: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitPositionReport: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitPositionReport(payload);
                 }, p);
             },
             waitForBridge: async () => {

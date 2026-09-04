@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { events } from "../../services/ipc";
 import { getRoomState } from "../../services/room";
@@ -8,6 +8,8 @@ import { useRoomStore } from "../../stores/useRoomStore";
 import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
 import { PlaybackControls } from "../../components/PlaybackControls";
+import { DriftIndicator } from "../../components/DriftIndicator";
+import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
@@ -96,6 +98,52 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     // position is shown via the server-authoritative
     // `displayPositionMs` above.
     const viewerPositions = useViewerPositionStore((s) => s.byUserId);
+
+    // P4-T04: the drift sampler. The smoother reads
+    // the local media position from a shared ref
+    // (`videoRef`) that the same `<video>` element
+    // Player renders. The ref is owned here so the
+    // smoother can read DOM state without coupling to
+    // Player's internal hooks. The room id is the
+    // gate: when it changes, the smoother resets its
+    // EMA state so old samples cannot leak across
+    // rooms.
+    const videoRef = useRef<HTMLVideoElement | null>(null);
+    const drift = useDriftSmoother({
+        roomId: summary?.id ?? null,
+        getLocalMs: () => {
+            const v = videoRef.current;
+            if (v === null) return null;
+            // `currentTime` is a non-negative double;
+            // we round to integer ms for the wire unit
+            // and to keep the EMA inputs integer-valued.
+            return Math.max(0, Math.round(v.currentTime * 1000));
+        },
+        getLocalPlaying: () => {
+            const v = videoRef.current;
+            if (v === null) return false;
+            return !v.paused;
+        },
+        remoteParticipants: Object.values(viewerPositions).map((p) => ({
+            userId: p.userId,
+            mediaPositionMs: p.mediaPositionMs,
+            playing: p.playing,
+            receivedAtMs: p.receivedAtMs,
+        })),
+        localUserId,
+    });
+
+    // P4-T04: Resync button stub. The actual seek-to-host
+    // behavior ships in P4-T05 (manual sync). The button
+    // is wired so the UI surface matches architecture
+    // §25.3.2 today; the underlying handler is a no-op
+    // until P4-T05 lands. The stub is intentionally
+    // side-effect-free so it can be removed without
+    // migration.
+    const onResync = useCallback(() => {
+        // P4-T05 will replace this with a real seek
+        // path. Until then, the click is a no-op.
+    }, []);
 
     useEffect(() => {
         let cancelled = false;
@@ -193,10 +241,16 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const idMismatch =
         expectedId !== undefined && expectedId.length > 0 && expectedId !== summary.id;
 
-    return (
-<div className="room-page">
-            <Player localUserId={localUserId} isHost={isHost} />
+return (
+        <div className="room-page">
+            <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
             <ParticipantStrip summary={summary} />
+            {/* P4-T04: drift indicator. Hidden by
+             * default; only renders when the smoothed
+             * offset exceeds 2.0 s. Non-blocking; the
+             * user is notified but playback is NOT
+             * auto-corrected. */}
+            <DriftIndicator sample={drift} onResync={onResync} />
             {isHost && (
                 <section
                     className="room-page__viewer-positions"
@@ -206,6 +260,46 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                     <h3 className="room-page__viewer-positions-title">
                         Viewer positions
                     </h3>
+                    {/* P4-T04: room median surface
+                     * (architecture §25.3.4 "thin marker
+                     * for the median participant
+                     * position"). Until the full
+                     * project-owned seek bar lands in a
+                     * later task, the median is rendered
+                     * here as a labeled line so the host
+                     * can see the room's central
+                     * position alongside each viewer's
+                     * row. The label is hidden when no
+                     * valid (playing + fresh) report is
+                     * available. */}
+                    {drift.roomMedianMs !== null && (
+                        <div
+                            className="room-page__viewer-positions-median"
+                            data-testid="room-median"
+                        >
+                            <span className="room-page__viewer-positions-median-label">
+                                Room median
+                            </span>
+                            <span className="room-page__viewer-positions-median-value">
+                                {(drift.roomMedianMs / 1000).toFixed(1)}s
+                            </span>
+                            {drift.driftVsMedianMs !== null && (
+                                <span
+                                    className="room-page__viewer-positions-median-drift"
+                                    data-testid="room-median-drift"
+                                    data-direction={drift.direction}
+                                >
+                                    {drift.direction === "ahead"
+                                        ? "ahead"
+                                        : drift.direction === "behind"
+                                          ? "behind"
+                                          : "aligned"}
+                                    {" "}
+                                    {Math.abs(drift.driftVsMedianMs / 1000).toFixed(1)}s
+                                </span>
+                            )}
+                        </div>
+                    )}
                     <ul className="room-page__viewer-positions-list">
                         {Object.values(viewerPositions)
                             .filter((v) => v.userId !== localUserId)

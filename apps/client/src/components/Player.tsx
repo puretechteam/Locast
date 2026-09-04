@@ -62,13 +62,20 @@ export interface PlayerProps {
     /** Whether the local user is the current host. If
      * `false`, host-echo suppression is disabled. */
     isHost?: boolean;
+    /** Optional shared ref that the parent (RoomPage) can
+     *  read for drift-sampler telemetry. The parent
+     *  supplies its own ref; Player's internal ref is
+     *  used only if this is omitted. P4-T04. */
+    videoRef?: React.MutableRefObject<HTMLVideoElement | null>;
 }
 
 export function Player({
     localUserId = null,
     isHost = false,
+    videoRef,
 }: PlayerProps): React.ReactNode {
-    const ref = useRef<HTMLVideoElement | null>(null);
+    const localRef = useRef<HTMLVideoElement | null>(null);
+    const ref = videoRef ?? localRef;
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
     const lastApplied = usePlaybackStore((s) => s.lastApplied);
