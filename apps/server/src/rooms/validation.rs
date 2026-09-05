@@ -39,7 +39,7 @@ pub fn validate_unit_range(n: f32) -> bool {
     if !n.is_finite() {
         return false;
     }
-    n >= 0.0 && n <= 1.0
+    (0.0..=1.0).contains(&n)
 }
 
 /// Trim leading/trailing ASCII whitespace and return the
