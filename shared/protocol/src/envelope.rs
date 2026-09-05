@@ -158,6 +158,32 @@ pub enum MessageKind {
     // not see its own position echoed back.
     #[serde(rename = "POSITION_REPORT")]
     PositionReport,
+    // ----- P5-T02: per-stroke drawing protocol -----
+    // DRAW_BEGIN is the per-stroke signed start. The envelope
+    // carries `sender: Some(Sender{ user_id, pubkey, sig })`
+    // and the server verifies the Ed25519 signature over
+    // `locast_crypto::drawing_signed_bytes(&payload)`
+    // (domain tag `"DRAW_START"`) before binding the
+    // stroke to the sender.
+    #[serde(rename = "DRAW_BEGIN")]
+    StrokeBegin,
+    // DRAW_POINT is an unsigned per-pointer sample. The
+    // sender is recovered from the bearer (matches the
+    // BEGIN binding) and the stroke_id -> sender_id link
+    // was established at BEGIN time. The server
+    // rebroadcasts verbatim; the receiver appends to its
+    // local in-memory stroke.
+    #[serde(rename = "DRAW_POINT")]
+    StrokePoint,
+    // DRAW_END is the unsigned stroke close. The server
+    // finalizes the stroke (removes from the pending map)
+    // and rebroadcasts. The receiver removes the
+    // pending stroke from its active list; existing
+    // points remain in the history (§15.6 stroke_undo
+    // and §15.7 late-point semantics are out of scope
+    // here; future tasks handle them).
+    #[serde(rename = "DRAW_END")]
+    StrokeEnd,
     // ----- P4-T06: NTP-style clock skew measurement -----
     // SKEW_PROBE / SKEW_REPLY is the per-connection clock
     // measurement exchange (architecture §13.3). The probe
@@ -209,6 +235,9 @@ impl MessageKind {
             MessageKind::Signal => "SIGNAL",
             MessageKind::PlaybackCmd => "PLAYBACK_CMD",
             MessageKind::PositionReport => "POSITION_REPORT",
+            MessageKind::StrokeBegin => "DRAW_BEGIN",
+            MessageKind::StrokePoint => "DRAW_POINT",
+            MessageKind::StrokeEnd => "DRAW_END",
             MessageKind::SkewProbe => "SKEW_PROBE",
             MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::Other(s) => s,
@@ -282,6 +311,20 @@ impl MessageKind {
     /// (no broadcast).
     pub fn is_skew_probe(&self) -> bool {
         matches!(self, MessageKind::SkewProbe)
+    }
+
+    /// `true` for any of the P5-T02 drawing envelope kinds
+    /// (DRAW_BEGIN / DRAW_POINT / DRAW_END). Routed through
+    /// the same WS-layer bearer check + per-room dispatch
+    /// path as POSITION_REPORT; the per-type handler then
+    /// performs the per-stroke signature / binding checks.
+    pub fn is_drawing(&self) -> bool {
+        matches!(
+            self,
+            MessageKind::StrokeBegin
+                | MessageKind::StrokePoint
+                | MessageKind::StrokeEnd
+        )
     }
 }
 

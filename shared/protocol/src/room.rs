@@ -506,6 +506,121 @@ pub enum PlaybackAction {
     Seek,
 }
 
+// ===== P5-T02: DRAW_BEGIN / DRAW_POINT / DRAW_END wire types =====
+//
+// docs/ARCHITECTURE.md §15.4 defines the drawing protocol. Three
+// payloads (signed-once-per-stroke + coalesced points + signed
+// close), each carried in a distinct `MessageKind` envelope.
+//
+// Signing model:
+// - DRAW_BEGIN is signed by the originating user via
+//   `locast_crypto::drawing_signed_bytes` (domain tag `"DRAW_START"`)
+//   and the envelope's `sender: Some(Sender{ user_id, pubkey, sig })`
+//   is verified server-side before the stroke is admitted.
+// - DRAW_POINT and DRAW_END are NOT individually signed. The
+//   server binds `stroke_id -> sender_id` at the BEGIN step and
+//   rejects any subsequent POINT/END whose bearer identity does
+//   not match. This matches §15.7 ("A stroke_end arriving without
+//   preceding points renders the stroke as a single-point dot") and
+//   keeps the per-point rate at the wire level low.
+//
+// Coalescing model (client-side):
+// - DRAW_POINT is rate-limited to <=120 messages per second per
+//   user by the client. The architecture allows per-point
+//   signatures as a future option but the current contract is
+//   that the BEGIN signature bounds the entire stroke.
+
+/// v1 drawing tools. The renderer paints only `Pen`; the
+/// other variants are present on the wire so a future task
+/// can extend the canvas without a protocol bump. Mirrors
+/// §15.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+#[serde(rename_all = "lowercase")]
+pub enum StrokeTool {
+    Pen,
+    Arrow,
+    Rect,
+    Circle,
+    Text,
+    Eraser,
+}
+
+/// DRAW_BEGIN (C -> S, S -> all).
+///
+/// Emitted by the client on `pointerdown`. The envelope is
+/// signed by the originating user; the server verifies the
+/// Ed25519 signature over `domain_tag("DRAW_START") ||
+/// rmp_serde::to_vec_named(payload)` and binds the stroke
+/// to the sender. The room rebroadcasts the accepted event
+/// to every other participant (originator suppression
+/// skips the sender).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeBeginPayload {
+    /// Unique stroke id (UUID v7). All subsequent
+    /// DRAW_POINT / DRAW_END envelopes for this stroke use
+    /// the same id; receivers group points by id.
+    pub stroke_id: Uuid,
+    /// v1 tool (`pen`). Other tools are accepted on the
+    /// wire but the renderer paints only `pen` today.
+    pub tool: StrokeTool,
+    /// CSS color string for the stroke. The renderer
+    /// does not interpret it; the canvas applies it as
+    /// `ctx.strokeStyle`.
+    pub color: String,
+    /// CSS-pixel stroke width at capture time.
+    pub width: f32,
+    /// Normalized [0..1] initial x. Matches the
+    /// `StrokePoint` coordinate convention.
+    pub x: f32,
+    /// Normalized [0..1] initial y.
+    pub y: f32,
+    /// Initial pressure [0..1]; `0.0` means "no pressure
+    /// reported" (mouse, touch without force).
+    pub pressure: f32,
+    /// Sender's local wall clock at pointerdown, ms.
+    pub ts_ms: i64,
+}
+
+/// DRAW_POINT (C -> S, S -> all).
+///
+/// Emitted on `pointermove`, coalesced to <=120 Hz by the
+/// client. The server rebroadcasts the accepted event
+/// without re-stamping coordinates or re-serializing
+/// fields; the receiver appends the point to the
+/// in-memory stroke.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokePointPayload {
+    /// Stroke id from the corresponding DRAW_BEGIN.
+    pub stroke_id: Uuid,
+    /// Normalized [0..1] x.
+    pub x: f32,
+    /// Normalized [0..1] y.
+    pub y: f32,
+    /// Pressure [0..1]; `0.0` for non-pressure devices.
+    pub pressure: f32,
+    /// Sender's local wall clock at the pointer event, ms.
+    pub ts_ms: i64,
+}
+
+/// DRAW_END (C -> S, S -> all).
+///
+/// Emitted on `pointerup` / `pointercancel`. The server
+/// finalizes the stroke (removes it from the pending
+/// map) and rebroadcasts to the room. A DRAW_END without
+/// preceding DRAW_POINT events renders the stroke as a
+/// single-point dot per §15.7.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeEndPayload {
+    /// Stroke id from the corresponding DRAW_BEGIN.
+    pub stroke_id: Uuid,
+    /// Sender's local wall clock at pointerup, ms.
+    pub ts_ms: i64,
+}
+
 // ===== P4-T03: POSITION_REPORT wire type =====
 //
 // docs/ARCHITECTURE.md §13.1: POSITION_REPORT is a passive,

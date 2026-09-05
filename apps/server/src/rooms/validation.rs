@@ -27,6 +27,21 @@ use super::error::RoomError;
 /// Maximum display-name length, in Unicode scalar values.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
 
+/// Validate that a `f32` lies in the unit range `[0, 1]`.
+///
+/// Used by P5-T02's drawing dispatcher to reject
+/// `StrokeBeginPayload` / `StrokePointPayload` coordinates
+/// outside the `[0, 1]` window the protocol mandates
+/// (§15.4). NaN / +/-Infinity collapse to `false` so a
+/// malformed payload cannot bypass the check via a
+/// non-finite value.
+pub fn validate_unit_range(n: f32) -> bool {
+    if !n.is_finite() {
+        return false;
+    }
+    n >= 0.0 && n <= 1.0
+}
+
 /// Trim leading/trailing ASCII whitespace and return the
 /// remaining slice. Returns `None` if the result is empty.
 fn trim_ascii(s: &str) -> Option<&str> {

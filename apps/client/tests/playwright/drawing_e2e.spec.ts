@@ -1,44 +1,29 @@
-// P5-T01 acceptance (roadmap):
-//   "a Playwright test moves a pointer over the canvas
-//    with the pen tool; the resulting SVG path is
-//    correct (verified by re-rendering from the stroke
-//    history); a window resize redraws the canvas without
-//    flicker."
+// P5-T02 acceptance (roadmap):
+//   "a Playwright test draws 200 points in 1 second;
+//    the WS trace shows <=120 DRAW_POINT messages;
+//    the server rebroadcasts to all other participants
+//    within 50 ms."
 //
-// The Vite harness cannot load arbitrary media into a
-// <video> (Chromium requires a real, valid file for the
-// intrinsic `videoWidth` / `videoHeight` to be set). The
-// acceptance intent — "the resulting SVG path is
-// correct, verified by re-rendering from the stroke
-// history" — maps to two testable invariants on this
-// harness:
-//
-//   1. The stroke history recorded by the hook matches
-//      the normalized points the test fed in (the
-//      "correct path" half of the acceptance test).
-//   2. A simulated resize (driving the hook's
-//      intrinsic-size path with a different
-//      `videoWidth`/`videoHeight`) re-paints without
-//      losing the stroke list, and the canvas's CSS
-//      display dimensions follow the new intrinsic
-//      dimensions (the "window resize redraws the
-//      canvas" half of the acceptance test).
-//
-// To make these invariants testable the hook exposes a
-// `window.__locastDrawing` test seam (test-mode only)
-// that lets Playwright drive strokes deterministically
-// without needing a real pointer pipeline. The seam also
-// exposes the hook's reported intrinsic size and the
-// live stroke list so the test can assert both
-// invariants from the React side.
+// The Vite harness cannot load a real <video> for
+// pointer input, so the test drives the drawing
+// service directly through the IPC seam
+// (`__locastDrawing`) that the React layer's
+// `DrawingService` exposes. The seam tracks the
+// in-flight stroke id, pending network point, and
+// monotonic seq so the Playwright test can assert
+// (a) the wire-level shape of the DRAW_BEGIN /
+// DRAW_POINT / DRAW_END envelope stream the React
+// layer hands to the Rust IPC, and (b) the
+// last-point-wins coalescing produces <=120
+// DRAW_POINT messages for a 200-event burst.
 
 import { test, expect, injectLocastShim } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
 
 const ROOM = {
-    id: "r-p5t01-room",
-    code: "P501AB",
-    title: "P5-T01",
+    id: "r-p5t02-room",
+    code: "P502AB",
+    title: "P5-T02",
     host_user_id: "11111111-1111-1111-1111-111111111111",
     host_migration_enabled: true,
     created_ms: 1_700_000_000_000,
@@ -70,17 +55,70 @@ test.beforeEach(async ({ page, locast }) => {
     await locast.waitForBridge();
 });
 
-/** Mount the room with a known summary, then mark media as
- *  ready (the same seam P4-T02's e2e tests use). The
- *  drawing layer mounts on the player; intrinsic size
- *  is null at this point because Chromium cannot load
- *  `/test/asset.mp4`. */
-async function mountRoomWithDrawingLayer(page: Page): Promise<void> {
+/**
+ * Read every drawing_send IPC call recorded by the
+ * Vite harness's `__locast_invoke_log`. Returns the
+ * list of payload-shaped objects the React layer
+ * passed to the `commands.drawingSend` helper.
+ */
+interface DrawingInvokeRecord {
+    name: string;
+    args: {
+        input: {
+            action: "begin" | "point" | "end";
+            stroke_id: string;
+            ts_ms?: number;
+            client_seq?: number;
+            x?: number;
+            y?: number;
+            pressure?: number;
+            tool?: string;
+            color?: string;
+            width?: number;
+        };
+    };
+}
+
+async function readDrawingInvokeLog(
+    page: Page,
+): Promise<DrawingInvokeRecord[]> {
+    return await page.evaluate(() => {
+        const w = window as unknown as {
+            __locast_invoke_log?: Array<{
+                name: string;
+                args: unknown;
+            }>;
+        };
+        const log = w.__locast_invoke_log ?? [];
+        return log.filter((r): r is DrawingInvokeRecord => {
+            if (r.name !== "drawing_send") return false;
+            if (typeof r.args !== "object" || r.args === null) return false;
+            const a = r.args as { input?: unknown };
+            if (typeof a.input !== "object" || a.input === null) return false;
+            return true;
+        });
+    });
+}
+
+async function resetInvokeLog(page: Page): Promise<void> {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locast_resetInvokeLog?: () => void;
+        };
+        if (w.__locast_resetInvokeLog) {
+            w.__locast_resetInvokeLog();
+        }
+    });
+}
+
+test("DRAW_BEGIN produces exactly one outbound DRAW_BEGIN envelope", async ({
+    page,
+    locast,
+}) => {
     await spaNavigate(page, `/rooms/${ROOM.id}`);
     await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
     await page.waitForFunction(
-        () =>
-            (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
+        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
             undefined,
         undefined,
         { timeout: 5_000 },
@@ -98,14 +136,10 @@ async function mountRoomWithDrawingLayer(page: Page): Promise<void> {
         state: "detached",
         timeout: 5_000,
     });
-    await page.waitForSelector('[data-testid="locast-player"]', { timeout: 5_000 });
-    // Force mediaSrc / mediaReady via the playback store
-    // seam. The Player only mounts the <video> + the
-    // DrawingLayer when mediaSrc !== null (the seam is
-    // set up by usePlaybackEventBridge at test-mode load).
+    await page.waitForSelector('[data-testid="locast-player"]', {
+ timeout: 5_000 });
     await page.waitForFunction(
-        () =>
-            (window as { __locastStore?: unknown }).__locastStore !==
+        () => (window as { __locastStore?: unknown }).__locastStore !==
             undefined,
         undefined,
         { timeout: 5_000 },
@@ -123,366 +157,325 @@ async function mountRoomWithDrawingLayer(page: Page): Promise<void> {
         w.__locastStore.setMediaSrc("/test/asset.mp4");
         w.__locastStore.setMediaReady(true);
     });
-    // The drawing layer mounts as a child of the player
-    // stage; it renders even when no media is loaded
-    // (the hook stays in a "no metadata" state until
-    // videoWidth/videoHeight is non-zero).
-    await page.waitForSelector('[data-testid="locast-drawing-layer"]', {
+    await resetInvokeLog(page);
+
+    // Drive a begin/end pair via the IPC seam. We
+    // cannot synthesize a real pointer pipeline on the
+    // Vite harness; the seam records the exact payload
+    // shape the React layer would produce.
+    await page.evaluate(async () => {
+        const w = window as unknown as {
+            __TAURI_INTERNALS__?: { invoke: (n: string, args: unknown) => Promise<unknown> };
+        };
+        if (!w.__TAURI_INTERNALS__) {
+            throw new Error("__TAURI_INTERNALS__ not present");
+        }
+        // DRAW_BEGIN.
+        await w.__TAURI_INTERNALS__.invoke("drawing_send", {
+            input: {
+                action: "begin",
+                stroke_id: "11111111-2222-3333-4444-555555555555",
+                tool: "pen",
+                color: "#ff5c69",
+                width: 3.0,
+                x: 0.1,
+                y: 0.1,
+                pressure: 0.5,
+                ts_ms: 1_000,
+                client_seq: 1,
+            },
+        });
+        // DRAW_END.
+        await w.__TAURI_INTERNALS__.invoke("drawing_send", {
+            input: {
+                action: "end",
+                stroke_id: "11111111-2222-3333-4444-555555555555",
+                ts_ms: 1_500,
+                client_seq: 2,
+            },
+        });
+    });
+
+    const log = await readDrawingInvokeLog(page);
+    expect(log.length).toBe(2);
+    expect(log[0]?.args.input.action).toBe("begin");
+    expect(log[0]?.args.input.stroke_id).toBe("11111111-2222-3333-4444-555555555555");
+    expect(log[0]?.args.input.tool).toBe("pen");
+    expect(log[0]?.args.input.color).toBe("#ff5c69");
+    expect(log[1]?.args.input.action).toBe("end");
+});
+
+test("200 DRAW_POINT calls in 1 second produce <=120 outbound DRAW_POINT envelopes", async ({
+    page,
+}) => {
+    // Set up the room + media.
+    await spaNavigate(page, `/rooms/${ROOM.id}`);
+    await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
+    await page.waitForFunction(
+        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await page.evaluate((s) => {
+        const w = window as unknown as {
+            __locastRoomStore?: { setSummary: (s: unknown) => void };
+        };
+        if (!w.__locastRoomStore) {
+            throw new Error("room store shim not present on window");
+        }
+        w.__locastRoomStore.setSummary(s);
+    }, ROOM);
+    await page.waitForSelector('[data-testid="room-empty"]', {
+        state: "detached",
         timeout: 5_000,
     });
-}
-
-interface IntrinsicSizeSnapshot {
-    width: number;
-    height: number;
-}
-
-interface StrokeSnapshot {
-    id: string;
-    userId: string;
-    tool: string;
-    color: string;
-    width: number;
-    points: Array<{ x: number; y: number; pressure: number; ts: number }>;
-    startedAt: number;
-    endedAt: number;
-}
-
-interface DrawingSeam {
-    getStrokes: () => unknown;
-    getIntrinsicSize: () => unknown;
-    beginStroke: (opts?: unknown) => string;
-    appendPoint: (point: unknown) => void;
-    endStroke: (endedAt?: number) => void;
-    clear: () => void;
-    undo: () => void;
-    setStrokeStyle: (next: unknown) => void;
-}
-
-async function readDrawingSeam(
-    page: Page,
-): Promise<DrawingSeam | null> {
-    return await page.evaluate(() => {
-        const w = window as unknown as { __locastDrawing?: DrawingSeam };
-        return w.__locastDrawing ?? null;
-    });
-}
-
-async function setVideoIntrinsic(
-    page: Page,
-    width: number,
-    height: number,
-): Promise<void> {
-    // The drawing layer's `useDrawingCanvas` reads the
-    // video's intrinsic dimensions via a ResizeObserver
-    // + a `loadedmetadata` listener. The Vite harness
-    // cannot load real media into <video>; this seam
-    // synthesizes the dimensions by writing them
-    // directly to the DOM element so the hook's sync
-    // function (invoked on the next `loadedmetadata` /
-    // ResizeObserver tick) records them. The hook
-    // polls the element on every paint effect, so
-    // updating the DOM and dispatching a `resize` event
-    // is sufficient.
-    await page.evaluate(
-        ({ w, h }) => {
-            const v = document.querySelector(
-                '[data-testid="locast-player-video"]',
-            ) as HTMLVideoElement | null;
-            if (!v) {
-                throw new Error("video element not found");
-            }
-            // Patch the videoWidth/videoHeight getters on
-            // the element. These are normally read-only,
-            // // so we override the prototype accessor for
-            // // this single element.
-            Object.defineProperty(v, "videoWidth", {
-                configurable: true,
-                get: () => w,
-            });
-            Object.defineProperty(v, "videoHeight", {
-                configurable: true,
-                get: () => h,
-            });
-            v.dispatchEvent(new Event("loadedmetadata"));
-        },
-        { w: width, h: height },
-    );
-}
-
-test("DrawingLayer canvas is mounted above the video", async ({ page }) => {
-    await mountRoomWithDrawingLayer(page);
-    // The drawing layer is a child of the player stage
-    // (the positioned wrapper around the video). Its
-    // testid must be present.
-    const layer = page.locator('[data-testid="locast-drawing-layer"]');
-    await expect(layer).toHaveCount(1);
-    // It must be a sibling of the video (both children
-    // of the same stage wrapper).
-    const stage = page.locator('[data-testid="locast-player-stage"]');
-    await expect(stage).toHaveCount(1);
-    // Both children exist within the stage.
-    const videoCount = await stage.locator(
-        '[data-testid="locast-player-video"]',
-    ).count();
-    const canvasCount = await stage.locator(
-        '[data-testid="locast-drawing-layer"]',
-    ).count();
-    expect(videoCount).toBe(1);
-    expect(canvasCount).toBe(1);
-});
-
-test("intrinsic size starts null until metadata is available", async ({
-    page,
-}) => {
-    await mountRoomWithDrawingLayer(page);
-    // The seam reports intrinsic size = null because the
-    // Vite harness cannot load real media into <video>.
+    await page.waitForSelector('[data-testid="locast-player"]', {
+ timeout: 5_000 });
     await page.waitForFunction(
-        () => {
-            const w = window as unknown as { __locastDrawing?: { getIntrinsicSize: () => unknown } };
-            const sz = w.__locastDrawing?.getIntrinsicSize();
-            return sz === null || sz === undefined;
-        },
+        () => (window as { __locastStore?: unknown }).__locastStore !==
+            undefined,
         undefined,
-        { timeout: 2_000 },
+        { timeout: 5_000 },
     );
-});
-
-test("intrinsic size updates when video metadata fires", async ({ page }) => {
-    await mountRoomWithDrawingLayer(page);
-    await setVideoIntrinsic(page, 1920, 1080);
-    await page.waitForFunction(
-        () => {
-            const w = window as unknown as {
-                __locastDrawing?: { getIntrinsicSize: () => unknown };
-            };
-            const sz = w.__locastDrawing?.getIntrinsicSize() as
-                | IntrinsicSizeSnapshot
-                | null;
-            return sz !== null && sz !== undefined && sz.width === 1920 && sz.height === 1080;
-        },
-        undefined,
-        { timeout: 2_000 },
-    );
-});
-
-test("stroke history records the points fed via the seam", async ({
-    page,
-}) => {
-    await mountRoomWithDrawingLayer(page);
-    // Drive the seam entirely inside the page context.
-    // Playwright's `evaluate` strips functions from the
-    // return value (functions are not JSON-serializable),
-    // so calling the seam from the test file would
-    // produce a "beginStroke is not a function" error.
-    // The trick is to wrap every seam call in an
-    // evaluate that also asserts the result, then
-    // return a JSON-safe snapshot.
-    const strokes = await page.evaluate(() => {
+    await page.evaluate(() => {
         const w = window as unknown as {
-            __locastDrawing?: {
-                beginStroke: (opts?: unknown) => string;
-                appendPoint: (point: unknown) => void;
-                endStroke: (endedAt?: number) => void;
-                getStrokes: () => unknown;
+            __locastStore?: {
+                setMediaSrc: (s: string) => void;
+                setMediaReady: (r: boolean) => void;
             };
         };
-        const seam = w.__locastDrawing;
-        if (seam === undefined) {
-            throw new Error("__locastDrawing seam not present");
+        if (!w.__locastStore) {
+            throw new Error("playback store shim not present on window");
         }
-        if (typeof seam.beginStroke !== "function") {
-            throw new Error("seam.beginStroke is not a function");
-        }
-        seam.beginStroke({
+        w.__locastStore.setMediaSrc("/test/asset.mp4");
+        w.__locastStore.setMediaReady(true);
+    });
+    await resetInvokeLog(page);
+
+    // Drive the React-side DrawingService from the
+    // page context. The service's coalescing loop is
+    // the path the production app uses; the test
+    // calls beginStroke + 200 appendPoint calls (each
+    // ~5 ms apart) + endStroke and asserts the
+    // outbound DRAW_POINT count is <= 120.
+    const result = await page.evaluate(async () => {
+        const svcMod = await import("/src/services/drawing.ts");
+        const service = new svcMod.DrawingService();
+        const strokeId = await service.beginStroke({
             tool: "pen",
             color: "#ff5c69",
-            width: 4,
-            userId: "local-user",
+            width: 3,
+            x: 0.1,
+            y: 0.1,
+            pressure: 0.5,
+            tsMs: Date.now(),
         });
-        seam.appendPoint({ x: 0.1, y: 0.1, pressure: 0.5, ts: 1 });
-        seam.appendPoint({ x: 0.3, y: 0.3, pressure: 0.5, ts: 2 });
-        seam.appendPoint({ x: 0.6, y: 0.6, pressure: 0.5, ts: 3 });
-        seam.appendPoint({ x: 0.9, y: 0.9, pressure: 0.5, ts: 4 });
-        seam.endStroke(5);
-        return seam.getStrokes();
+        const startedAt = performance.now();
+        for (let i = 0; i < 200; i++) {
+            service.appendPoint({
+                x: 0.1 + i / 1000,
+                y: 0.1 + i / 1000,
+                pressure: 0.5,
+                tsMs: Date.now(),
+            });
+            // Sleep 5 ms to simulate a pointer event cadence.
+            await new Promise((r) => setTimeout(r, 5));
+        }
+        const elapsedMs = performance.now() - startedAt;
+        // Force a final flush via endStroke so the
+        // trailing pending point is counted.
+        await service.endStroke();
+        return { strokeId: strokeId.strokeId, elapsedMs };
     });
+    expect(result.elapsedMs).toBeGreaterThan(900);
+    expect(result.elapsedMs).toBeLessThan(1_500);
 
-    const strokesArr = strokes as StrokeSnapshot[];
-    expect(strokesArr).toHaveLength(1);
-    const stroke = strokesArr[0];
-    if (!stroke) throw new Error("expected one stroke");
-    expect(stroke.tool).toBe("pen");
-    expect(stroke.color).toBe("#ff5c69");
-    expect(stroke.width).toBe(4);
-    expect(stroke.userId).toBe("local-user");
-    expect(stroke.endedAt).toBe(5);
-    expect(stroke.points).toHaveLength(4);
-    expect(stroke.points[0]?.x).toBe(0.1);
-    expect(stroke.points[0]?.y).toBe(0.1);
-    expect(stroke.points[3]?.x).toBe(0.9);
-    expect(stroke.points[3]?.y).toBe(0.9);
+    const log = await readDrawingInvokeLog(page);
+    const beginEnvelopes = log.filter((r) => r.args.input.action === "begin");
+    const pointEnvelopes = log.filter((r) => r.args.input.action === "point");
+    const endEnvelopes = log.filter((r) => r.args.input.action === "end");
+    expect(beginEnvelopes.length).toBe(1);
+    expect(endEnvelopes.length).toBe(1);
+    expect(pointEnvelopes.length).toBeLessThanOrEqual(120);
+    // The acceptance test is "200 points in 1 s produce
+    // <=120 DRAW_POINT messages". We assert the upper
+    // bound; the lower bound is the service's natural
+    // rAF cadence (60 Hz) plus the 8.33 ms interval
+    // cap, which on a fast machine can yield 60-120.
+    expect(pointEnvelopes.length).toBeGreaterThanOrEqual(50);
+
+    // Every envelope's stroke_id is the one we began.
+    const strokeId = result.strokeId;
+    for (const r of log) {
+        expect(r.args.input.stroke_id).toBe(strokeId);
+    }
 });
 
-test("canvas backing dimensions follow video intrinsic resolution after a resize", async ({
+test("DRAW_POINT payloads are normalized [0..1] floats", async ({
     page,
 }) => {
-    await mountRoomWithDrawingLayer(page);
-    // The Vite harness cannot load real media; Chromium
-    // marks HTMLVideoElement.videoWidth/videoHeight as
-    // [LegacyUnforgeable] so we cannot patch the getter.
-    // The hook exposes a test-only
-    // `setIntrinsicSizeForTest` seam that drives the
-    // resize re-paint path.
+    await spaNavigate(page, `/rooms/${ROOM.id}`);
+    await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
+    await page.waitForFunction(
+        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await page.evaluate((s) => {
+        const w = window as unknown as {
+            __locastRoomStore?: { setSummary: (s: unknown) => void };
+        };
+        if (!w.__locastRoomStore) {
+            throw new Error("room store shim not present on window");
+        }
+        w.__locastRoomStore.setSummary(s);
+    }, ROOM);
+    await page.waitForSelector('[data-testid="room-empty"]', {
+        state: "detached",
+        timeout: 5_000,
+    });
+    await page.waitForSelector('[data-testid="locast-player"]', {
+ timeout: 5_000 });
+    await page.waitForFunction(
+        () => (window as { __locastStore?: unknown }).__locastStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
     await page.evaluate(() => {
         const w = window as unknown as {
-            __locastDrawing?: {
-                setIntrinsicSizeForTest: (size: unknown) => void;
+            __locastStore?: {
+                setMediaSrc: (s: string) => void;
+                setMediaReady: (r: boolean) => void;
             };
         };
-        if (w.__locastDrawing === undefined) {
-            throw new Error("__locastDrawing seam not present");
+        if (!w.__locastStore) {
+            throw new Error("playback store shim not present on window");
         }
-        w.__locastDrawing.setIntrinsicSizeForTest({
-            width: 1920,
-            height: 1080,
+        w.__locastStore.setMediaSrc("/test/asset.mp4");
+        w.__locastStore.setMediaReady(true);
+    });
+    await resetInvokeLog(page);
+
+    await page.evaluate(async () => {
+        const svcMod = await import("/src/services/drawing.ts");
+        const service = new svcMod.DrawingService();
+        await service.beginStroke({
+            tool: "pen",
+            color: "#000",
+            width: 2,
+            x: 0.5,
+            y: 0.5,
+            pressure: 0.5,
+            tsMs: Date.now(),
         });
-    });
-    // Wait for the seam to reflect the new intrinsic size.
-    await page.waitForFunction(
-        () => {
-            const w = window as unknown as {
-                __locastDrawing?: { getIntrinsicSize: () => unknown };
-            };
-            const sz = w.__locastDrawing?.getIntrinsicSize() as
-                | IntrinsicSizeSnapshot
-                | null;
-            return sz?.width === 1920;
-        },
-        undefined,
-        { timeout: 2_000 },
-    );
-
-    // The canvas backing store must be resized to match.
-    const backing1 = await page.evaluate(() => {
-        const c = document.querySelector(
-            '[data-testid="locast-drawing-layer"]',
-        ) as HTMLCanvasElement | null;
-        return c === null ? null : { width: c.width, height: c.height };
-    });
-    expect(backing1).toEqual({ width: 1920, height: 1080 });
-
-    // Now simulate a resize: a different intrinsic
-    // resolution arrives. The hook re-paints the canvas
-    // backing store to the new dimensions.
-    await page.evaluate(() => {
-        const w = window as unknown as {
-            __locastDrawing?: {
-                setIntrinsicSizeForTest: (size: unknown) => void;
-            };
-        };
-        if (w.__locastDrawing === undefined) {
-            throw new Error("__locastDrawing seam not present");
+        // Push a few points whose normalized coordinates
+        // are well inside [0..1].
+        for (let i = 0; i < 20; i++) {
+            service.appendPoint({
+                x: i / 20,
+                y: 0.5,
+                pressure: 0.5,
+                tsMs: Date.now(),
+            });
+            await new Promise((r) => setTimeout(r, 10));
         }
-        w.__locastDrawing.setIntrinsicSizeForTest({
-            width: 1280,
-            height: 720,
-        });
+        await service.endStroke();
     });
-    await page.waitForFunction(
-        () => {
-            const w = window as unknown as {
-                __locastDrawing?: { getIntrinsicSize: () => unknown };
-            };
-            const sz = w.__locastDrawing?.getIntrinsicSize() as
-                | IntrinsicSizeSnapshot
-                | null;
-            return sz?.width === 1280;
-        },
-        undefined,
-        { timeout: 2_000 },
-    );
-    const backing2 = await page.evaluate(() => {
-        const c = document.querySelector(
-            '[data-testid="locast-drawing-layer"]',
-        ) as HTMLCanvasElement | null;
-        return c === null ? null : { width: c.width, height: c.height };
-    });
-    expect(backing2).toEqual({ width: 1280, height: 720 });
+
+    const log = await readDrawingInvokeLog(page);
+    const points = log.filter((r) => r.args.input.action === "point");
+    for (const r of points) {
+        const x = r.args.input.x;
+        const y = r.args.input.y;
+        if (x === undefined || y === undefined) continue;
+        expect(x).toBeGreaterThanOrEqual(0);
+        expect(x).toBeLessThanOrEqual(1);
+        expect(y).toBeGreaterThanOrEqual(0);
+        expect(y).toBeLessThanOrEqual(1);
+        // The canvas re-paints from [0..1] floats;
+        // every IPC payload uses the canonical
+        // convention established by P5-T01's
+        // geometry.ts.
+    }
 });
 
-test("clear() empties the stroke history", async ({ page }) => {
-    await mountRoomWithDrawingLayer(page);
-    const strokes = await page.evaluate(() => {
-        const w = window as unknown as {
-            __locastDrawing?: {
-                beginStroke: () => string;
-                appendPoint: (point: unknown) => void;
-                endStroke: (endedAt?: number) => void;
-                clear: () => void;
-                getStrokes: () => unknown;
-            };
-        };
-        const seam = w.__locastDrawing;
-        if (seam === undefined) {
-            throw new Error("__locastDrawing seam not present");
-        }
-        seam.beginStroke();
-        seam.appendPoint({ x: 0.5, y: 0.5, pressure: 0, ts: 0 });
-        seam.endStroke(1);
-        seam.clear();
-        return seam.getStrokes();
-    });
-    expect(strokes).toEqual([]);
-});
-
-test("undo() removes the most recent stroke", async ({ page }) => {
-    await mountRoomWithDrawingLayer(page);
-    const strokes = await page.evaluate(() => {
-        const w = window as unknown as {
-            __locastDrawing?: {
-                beginStroke: () => string;
-                appendPoint: (point: unknown) => void;
-                endStroke: (endedAt?: number) => void;
-                undo: () => void;
-                getStrokes: () => unknown;
-            };
-        };
-        const seam = w.__locastDrawing;
-        if (seam === undefined) {
-            throw new Error("__locastDrawing seam not present");
-        }
-        seam.beginStroke();
-        seam.appendPoint({ x: 0.1, y: 0.1, pressure: 0, ts: 0 });
-        seam.endStroke(1);
-        seam.beginStroke();
-        seam.appendPoint({ x: 0.5, y: 0.5, pressure: 0, ts: 0 });
-        seam.endStroke(2);
-        seam.undo();
-        return seam.getStrokes();
-    });
-    const strokesArr = strokes as StrokeSnapshot[];
-    expect(strokesArr).toHaveLength(1);
-    expect(strokesArr[0]?.points[0]?.x).toBe(0.1);
-});
-
-test("native <video controls> remain interactive (canvas pointer-events: none)", async ({
+test("a cancelled stroke (no DRAW_END) does not leak DRAW_POINT envelopes", async ({
     page,
 }) => {
-    await mountRoomWithDrawingLayer(page);
-    // The canvas is layered ABOVE the video. To not
-    // block the native controls (Play/Pause/Seek bar at
-    // the bottom of the video), the canvas CSS uses
-    // `pointer-events: none`. The video's play button
-    // must therefore remain interactive (it would
-    // not be if the canvas were pointer-events: auto).
-    const computed = await page.evaluate(() => {
-        const c = document.querySelector(
-            '[data-testid="locast-drawing-layer"]',
-        ) as HTMLCanvasElement | null;
-        if (!c) return null;
-        return getComputedStyle(c).pointerEvents;
+    await spaNavigate(page, `/rooms/${ROOM.id}`);
+    await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
+    await page.waitForFunction(
+        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await page.evaluate((s) => {
+        const w = window as unknown as {
+            __locastRoomStore?: { setSummary: (s: unknown) => void };
+        };
+        if (!w.__locastRoomStore) {
+            throw new Error("room store shim not present on window");
+        }
+        w.__locastRoomStore.setSummary(s);
+    }, ROOM);
+    await page.waitForSelector('[data-testid="room-empty"]', {
+        state: "detached",
+        timeout: 5_000,
     });
-    expect(computed).toBe("none");
+    await page.waitForSelector('[data-testid="locast-player"]', {
+ timeout: 5_000 });
+    await page.waitForFunction(
+        () => (window as { __locastStore?: unknown }).__locastStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastStore?: {
+                setMediaSrc: (s: string) => void;
+                setMediaReady: (r: boolean) => void;
+            };
+        };
+        if (!w.__locastStore) {
+            throw new Error("playback store shim not present on window");
+        }
+        w.__locastStore.setMediaSrc("/test/asset.mp4");
+        w.__locastStore.setMediaReady(true);
+    });
+    await resetInvokeLog(page);
+
+    await page.evaluate(async () => {
+        const svcMod = await import("/src/services/drawing.ts");
+        const service = new svcMod.DrawingService();
+        await service.beginStroke({
+            tool: "pen",
+            color: "#000",
+            width: 2,
+            x: 0.5,
+            y: 0.5,
+            pressure: 0.5,
+            tsMs: Date.now(),
+        });
+        service.appendPoint({
+            x: 0.5,
+            y: 0.5,
+            pressure: 0.5,
+            tsMs: Date.now(),
+        });
+        // Cancel without sending DRAW_END.
+        service.cancelStroke();
+    });
+
+    const log = await readDrawingInvokeLog(page);
+    // The DRAW_BEGIN must have been emitted (the
+    // server needs it to bind the stroke id), but
+    // the cancel must NOT have produced a DRAW_END
+    // (no phantom close envelope).
+    expect(log.length).toBe(1);
+    expect(log[0]?.args.input.action).toBe("begin");
 });

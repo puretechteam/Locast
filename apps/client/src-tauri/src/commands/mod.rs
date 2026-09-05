@@ -14,6 +14,7 @@
 //! existing caller keeps compiling unchanged.
 
 pub mod download;
+pub mod drawing;
 pub mod error;
 pub mod identity;
 pub mod import;
@@ -25,6 +26,7 @@ pub mod scan;
 pub mod signaling;
 
 pub use download::{download_open, DownloadSessionIpc};
+pub use drawing::{drawing_send, DrawingSendInput, DrawingSendResult};
 pub use error::AppError;
 pub use identity::{identity_get, identity_rotate, identity_set_display_name};
 pub use import::{media_import, AppError as _AppErrorCompat, ImportedMedia};

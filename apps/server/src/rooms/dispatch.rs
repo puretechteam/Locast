@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use super::caps::{self, Command};
 use super::codes;
+use super::drawing;
 use super::error::RoomError;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::playback::handle_playback_cmd;
@@ -85,14 +86,18 @@ pub async fn dispatch_room_message(
         MessageKind::Signal => Some(Command::Signal),
         MessageKind::PlaybackCmd => Some(Command::PlaybackControl),
         MessageKind::PositionReport => Some(Command::PositionReport),
+        MessageKind::StrokeBegin => Some(Command::Draw),
+        MessageKind::StrokePoint => Some(Command::Draw),
+        MessageKind::StrokeEnd => Some(Command::Draw),
         _ => None,
     };
     if let Some(cmd) = command {
         if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
             // For PublishManifest + FetchManifest + Signal +
             // PlaybackControl (P4-T01), surface the error to
-            // the caller as a ROOM_ERROR. Other commands fall
-            // through to the existing v1 behavior (log + no-op).
+            // the caller as a ROOM_ERROR. P5-T02's drawing
+            // commands also surface as ROOM_ERROR so a
+            // forged envelope gets an explicit denial.
             if matches!(
                 cmd,
                 Command::PublishManifest
@@ -100,6 +105,7 @@ pub async fn dispatch_room_message(
                     | Command::Signal
                     | Command::PlaybackControl
                     | Command::PositionReport
+                    | Command::Draw
             ) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
@@ -146,6 +152,15 @@ pub async fn dispatch_room_message(
         }
         MessageKind::PositionReport => {
             handle_position_report_dispatch(envelope, registry, user_id).await
+        }
+        MessageKind::StrokeBegin => {
+            handle_stroke_begin_dispatch(envelope, registry, clock, user_id, pubkey).await
+        }
+        MessageKind::StrokePoint => {
+            handle_stroke_point_dispatch(envelope, registry, clock, user_id).await
+        }
+        MessageKind::StrokeEnd => {
+            handle_stroke_end_dispatch(envelope, registry, clock, user_id).await
         }
         _ => RoomDispatchOutcome::default(),
     }
@@ -444,6 +459,107 @@ async fn handle_position_report_dispatch(
             ));
         }
     }
+    out
+}
+
+/// P5-T02: dispatch DRAW_BEGIN.
+///
+/// Acquires the room handle's write lock, validates the
+/// per-stroke signature + coordinate ranges, binds the
+/// stroke to the bearer, and emits a rebroadcastable
+/// `RoomEvent::StrokeBegin`. The originating connection is
+/// NOT in the events' originator-suppression set because
+/// the WS forwarder drops echoes via the
+/// `BroadcastItem::originator` field — we set it to
+/// `Some(user_id)` for every accepted stroke event.
+async fn handle_stroke_begin_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    clock: &dyn Clock,
+    user_id: Uuid,
+    pubkey: [u8; 32],
+) -> RoomDispatchOutcome {
+    let now_ms = clock.now_ms();
+    let room_id = match envelope.room_id {
+        Some(r) => r,
+        None => return default_reject("DRAW_BEGIN requires envelope.room_id"),
+    };
+    // Cross-room guard: the envelope's room_id must match
+    // the bearer's current room. Mirrors the SIGNAL
+    // check in `dispatch.rs::handle_signal_dispatch`.
+    match registry.get_user_room(user_id).await {
+        Some(rid) if rid == room_id => {}
+        Some(_) => return default_reject("cross-room drawing message rejected"),
+        None => return default_reject("drawing sender is not in any room"),
+    };
+    let handle = match registry.get_by_id(room_id).await {
+        Some(h) => h,
+        None => return default_reject("drawing target room not found"),
+    };
+    let mut state = handle.write().await;
+    drawing::handle_stroke_begin(envelope, &mut state, user_id, pubkey, now_ms).await
+}
+
+/// P5-T02: dispatch DRAW_POINT.
+async fn handle_stroke_point_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    _clock: &dyn Clock,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let room_id = match envelope.room_id {
+        Some(r) => r,
+        None => return default_reject("DRAW_POINT requires envelope.room_id"),
+    };
+    match registry.get_user_room(user_id).await {
+        Some(rid) if rid == room_id => {}
+        Some(_) => return default_reject("cross-room drawing message rejected"),
+        None => return default_reject("drawing sender is not in any room"),
+    };
+    let handle = match registry.get_by_id(room_id).await {
+        Some(h) => h,
+        None => return default_reject("drawing target room not found"),
+    };
+    let mut state = handle.write().await;
+    drawing::handle_stroke_point(envelope, &mut state, user_id).await
+}
+
+/// P5-T02: dispatch DRAW_END.
+async fn handle_stroke_end_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    _clock: &dyn Clock,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let room_id = match envelope.room_id {
+        Some(r) => r,
+        None => return default_reject("DRAW_END requires envelope.room_id"),
+    };
+    match registry.get_user_room(user_id).await {
+        Some(rid) if rid == room_id => {}
+        Some(_) => return default_reject("cross-room drawing message rejected"),
+        None => return default_reject("drawing sender is not in any room"),
+    };
+    let handle = match registry.get_by_id(room_id).await {
+        Some(h) => h,
+        None => return default_reject("drawing target room not found"),
+    };
+    let mut state = handle.write().await;
+    drawing::handle_stroke_end(envelope, &mut state, user_id).await
+}
+
+fn default_reject(message: &str) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    out.to_caller.push(err_envelope(
+        MessageKind::RoomError,
+        RoomErrorCode::InvalidState,
+        message.to_string(),
+        now_ms,
+    ));
     out
 }
 

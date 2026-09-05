@@ -146,6 +146,35 @@ const SHIM_SOURCE = `
                             : 0,
                 });
             }
+// P5-T02: capture the drawing send IPC so the
+                // acceptance test (200 points / 1s / <=120
+                // DRAW_POINT messages) can count the outbound
+                // envelope volume. The Rust side returns a
+                // synthetic envelope_id + the original stroke_id.
+                if (name === "drawing_send") {
+                    w.__locast_invoke_log.push({ name: name, args: args });
+                    // The Tauri-specta-generated wrapper calls
+                    // __TAURI_INVOKE("drawing_send", { input: {...} });
+                    // The shim records the WHOLE args bag
+                    // (including the "input" envelope) so the
+                    // Playwright suite can assert the React
+                    // layer's payload shape exactly. For the
+                    // synthetic return value we pull the
+                    // stroke_id out of "input" (or from a
+                    // top-level "stroke_id" for any caller
+                    // that bypasses the typed wrapper).
+                    var a = args;
+                    var aInput = (a !== null && a !== undefined && typeof a.input === "object" && a.input !== null)
+                        ? a.input
+                        : a;
+                    var stroke_id = (aInput !== null && aInput !== undefined && typeof aInput.stroke_id === "string")
+                        ? aInput.stroke_id
+                        : "";
+                    return Promise.resolve({
+                        envelope_id: "envelope-" + (w.__locast_invoke_log.length),
+                        stroke_id: stroke_id,
+                    });
+                }
             return Promise.resolve(null);
         };
         // P4-T05: the @tauri-apps/api/core.js package calls

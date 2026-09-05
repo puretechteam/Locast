@@ -11,6 +11,7 @@
 pub mod caps;
 pub mod codes;
 pub mod dispatch;
+pub mod drawing;
 pub mod error;
 pub mod manifest;
 pub mod playback;

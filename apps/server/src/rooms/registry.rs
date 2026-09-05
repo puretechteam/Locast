@@ -124,6 +124,40 @@ pub enum RoomEvent {
         /// The original payload, verbatim (cloned).
         payload: locast_protocol::room::PositionReportPayload,
     },
+    /// P5-T02: signed DRAW_BEGIN. The envelope's
+    /// `StrokeBeginPayload` carries the per-stroke id
+    /// (UUID v7); the server binds that id to the
+    /// sender's `user_id` and uses it to validate
+    /// subsequent DRAW_POINT / DRAW_END envelopes.
+    /// Broadcast to every other participant in the room
+    /// (the originator is suppressed by the WS forwarder).
+    StrokeBegin {
+        /// The room id.
+        room_id: Uuid,
+        /// The sender's user_id (authoritative; bound to
+        /// `stroke_id` for the lifetime of the stroke).
+        sender_id: Uuid,
+        /// The verified begin payload, cloned.
+        payload: locast_protocol::room::StrokeBeginPayload,
+    },
+    /// P5-T02: unsigned DRAW_POINT for an existing
+    /// stroke. The server verifies the sender matches the
+    /// stroke's bound sender (rejects otherwise) and
+    /// rebroadcasts verbatim. The receiver appends to the
+    /// in-memory stroke.
+    StrokePoint {
+        room_id: Uuid,
+        sender_id: Uuid,
+        payload: locast_protocol::room::StrokePointPayload,
+    },
+    /// P5-T02: unsigned DRAW_END. The server finalizes
+    /// the stroke (removes it from the pending map) and
+    /// rebroadcasts to the room.
+    StrokeEnd {
+        room_id: Uuid,
+        sender_id: Uuid,
+        payload: locast_protocol::room::StrokeEndPayload,
+    },
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -311,6 +345,9 @@ impl RoomRegistry {
                 // does not see its own 1 Hz report echoed
                 // back at itself.
                 RoomEvent::PositionReport { sender_id, .. } => Some(*sender_id),
+                RoomEvent::StrokeBegin { sender_id, .. } => Some(*sender_id),
+                RoomEvent::StrokePoint { sender_id, .. } => Some(*sender_id),
+                RoomEvent::StrokeEnd { sender_id, .. } => Some(*sender_id),
             };
             let room_id = match event {
                 RoomEvent::ManifestPublished { room_id, .. } => *room_id,
@@ -319,6 +356,9 @@ impl RoomRegistry {
                 // the WS layer does not need to look it up
                 // via the dispatch closure.
                 RoomEvent::PositionReport { room_id, .. } => *room_id,
+                RoomEvent::StrokeBegin { room_id, .. } => *room_id,
+                RoomEvent::StrokePoint { room_id, .. } => *room_id,
+                RoomEvent::StrokeEnd { room_id, .. } => *room_id,
                 _ => room_id_for_event(event),
             };
             let item = event_to_broadcast_item(event, room_id, originator);
@@ -1525,6 +1565,7 @@ impl RoomRegistry {
             host_disconnect_deadline_ms: deadline,
             participants: rebuilt,
             playback: super::state::PlaybackBookkeeping::default(),
+            drawing: super::state::StrokeBookkeeping::default(),
         };
         let handle = Arc::new(RwLock::new(state));
         {
@@ -1624,6 +1665,24 @@ fn event_to_broadcast_item(
         // directly.
         RoomEvent::PositionReport { payload, .. } => (
             locast_protocol::envelope::MessageKind::PositionReport,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
+        ),
+        // P5-T02: rebroadcast the verified stroke events as
+        // DRAW_BEGIN / DRAW_POINT / DRAW_END envelopes
+        // carrying the original payload verbatim. The
+        // originator field of the BroadcastItem is set
+        // to `Some(*sender_id)` by `publish_events` so the
+        // WS forwarder suppresses the echo to the sender.
+        RoomEvent::StrokeBegin { payload, .. } => (
+            locast_protocol::envelope::MessageKind::StrokeBegin,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
+        ),
+        RoomEvent::StrokePoint { payload, .. } => (
+            locast_protocol::envelope::MessageKind::StrokePoint,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
+        ),
+        RoomEvent::StrokeEnd { payload, .. } => (
+            locast_protocol::envelope::MessageKind::StrokeEnd,
             serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
         ),
     };

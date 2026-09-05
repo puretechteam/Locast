@@ -150,7 +150,56 @@ export const commands = {
   async clockSkewProbe(): Promise<SkewSample> {
     return await __TAURI_INVOKE<SkewSample>("clock_skew_probe");
   },
+  // P5-T02: per-stroke drawing envelope send. Wraps the
+  // DRAW_BEGIN / DRAW_POINT / DRAW_END envelope in the
+  // host process (the DRAW_BEGIN payload is signed
+  // server-side because the Ed25519 private key never
+  // leaves the Rust keyring) and forwards the envelope
+  // through the signaling WebSocket. The `input` shape
+  // is the discriminated union declared in
+  // `DrawingSendInput` (Tauri command); see
+  // apps/client/src-tauri/src/commands/drawing.rs.
+  async drawingSend(input: DrawingSendInput): Promise<DrawingSendResult> {
+    return await __TAURI_INVOKE<DrawingSendResult>("drawing_send", { input });
+  },
 };
+
+// P5-T02: typed shape for `drawing_send`. Mirrors the
+// Rust `DrawingSendInput` enum (Begin / Point / End
+// variants discriminated by `action`).
+export type DrawingSendInput =
+  | {
+      action: "begin";
+      stroke_id: string;
+      tool: string;
+      color: string;
+      width: number;
+      x: number;
+      y: number;
+      pressure: number;
+      ts_ms: number;
+      client_seq: number;
+    }
+  | {
+      action: "point";
+      stroke_id: string;
+      x: number;
+      y: number;
+      pressure: number;
+      ts_ms: number;
+      client_seq: number;
+    }
+  | {
+      action: "end";
+      stroke_id: string;
+      ts_ms: number;
+      client_seq: number;
+    };
+
+export interface DrawingSendResult {
+  envelope_id: string;
+  stroke_id: string;
+}
 
 /* Types */
 export type Identity = {

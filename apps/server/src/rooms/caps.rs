@@ -101,6 +101,17 @@ pub enum Command {
     /// every participant (host or viewer) reports its own
     /// local state at 1 Hz.
     PositionReport,
+    /// P5-T02: the per-stroke DRAWING protocol (DRAW_BEGIN
+    /// / DRAW_POINT / DRAW_END). The capability check is
+    /// "caller is a member of the room named in
+    /// `envelope.room_id`" (mirrors `Signal` /
+    /// `PositionReport`). The per-type handler
+    /// additionally verifies the DRAW_BEGIN signature
+    /// and binds the stroke id to the bearer so cross-
+    /// sender injections are denied at the per-stroke
+    /// level (any stroke begin a non-member could not
+    /// have started is rejected).
+    Draw,
 }
 
 /// Authoritative capability check for the v1 initial
@@ -210,6 +221,16 @@ pub async fn check_capability(
         // the caller's current room so cross-room injection
         // is denied. No host check.
         Command::PositionReport => {
+            if registry.get_user_room(user_id).await.is_some() {
+                Ok(())
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        // P5-T02: Draw. Same shape as PositionReport
+        // (member of some room; the per-type handler
+        // additionally checks the envelope's room_id).
+        Command::Draw => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
             } else {

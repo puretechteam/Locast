@@ -49,3 +49,24 @@ pub fn signal_signed_bytes(
     buf.extend_from_slice(&msg);
     Ok(buf)
 }
+
+/// Produce the canonical signed bytes for a DRAW_BEGIN
+/// envelope (P5-T02).
+///
+/// Same shape as [`signal_signed_bytes`]: a 16-byte domain
+/// tag (`"DRAW_START"`) followed by canonical msgpack of the
+/// `StrokeBeginPayload`. The server's drawing dispatcher
+/// (`apps/server/src/rooms/drawing.rs`) verifies the
+/// signature against this canonical form before admitting
+/// the stroke. DRAW_POINT and DRAW_END are NOT individually
+/// signed; the BEGIN signature binds the entire stroke to
+/// the originating user.
+pub fn drawing_signed_bytes(
+    payload: &impl serde::Serialize,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut buf = Vec::with_capacity(16 + 256);
+    buf.extend_from_slice(&domain_tag::build("DRAW_START"));
+    let msg = rmp_serde::to_vec_named(payload)?;
+    buf.extend_from_slice(&msg);
+    Ok(buf)
+}

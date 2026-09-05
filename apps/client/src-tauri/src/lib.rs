@@ -362,6 +362,7 @@ pub fn run() {
             commands::room::manifest_fetch,
             commands::download::download_open,
             commands::playback::playback_send,
+            commands::drawing::drawing_send,
             room::report::position_report,
             room::report::clock_skew_probe,
         ])

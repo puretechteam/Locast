@@ -9,6 +9,33 @@ use locast_protocol::room::{Participant, ParticipantSelf, ParticipantStatus, Roo
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// P5-T02: per-stroke binding for the drawing protocol.
+///
+/// The server records `stroke_id -> (sender_id, sender_pubkey)`
+/// when DRAW_BEGIN is accepted. Subsequent DRAW_POINT and
+/// DRAW_END envelopes for the same stroke must come from
+/// the same bearer identity. The binding is session-only;
+/// `RoomState` is in-memory and the map is cleared on
+/// `Ended` (the room's normal teardown path).
+#[derive(Debug, Clone, Copy)]
+pub struct PendingStroke {
+    pub sender_id: Uuid,
+    pub sender_pubkey: [u8; 32],
+    pub started_ms: i64,
+}
+
+#[derive(Debug, Default)]
+pub struct StrokeBookkeeping {
+    /// Live strokes keyed by `stroke_id`. The map is
+    /// populated by DRAW_BEGIN and removed by DRAW_END.
+    /// Stale entries are pruned by the room ticker (a
+    /// stroke that has not received any point for
+    /// `stroke_timeout_ms` after begin is GC'd; that
+    /// timeout is a future task — P5-T02 only
+    /// accumulates the bookkeeping).
+    pub pending: HashMap<Uuid, PendingStroke>,
+}
+
 /// The mutable per-room state. Lives behind a
 /// `tokio::sync::RwLock<RoomState>` so readers (snapshot
 /// builds) don't block other readers and don't block writers
@@ -59,6 +86,18 @@ pub struct RoomState {
     /// post-migration PLAYs cannot poison the new host's
     /// authoritative sequence).
     pub playback: PlaybackBookkeeping,
+    /// P5-T02: per-room drawing bookkeeping. The
+    /// `pending` map is populated by DRAW_BEGIN and
+    /// removed by DRAW_END (or by the room ticker when
+    /// a stroke times out; that path is added by a
+    /// later task). The state itself does not grow
+    /// meaningfully: a stroke is closed within seconds
+    /// in normal use and the upper bound on concurrent
+    /// strokes is bounded the by `max_participants` *
+    /// reasonable per-user limit (which the renderer
+    /// enforces client-side at a much smaller
+    /// threshold).
+    pub drawing: StrokeBookkeeping,
 }
 
 /// P4-T01: the per-room playback bookkeeping fields.
@@ -133,6 +172,7 @@ impl RoomState {
             host_disconnect_deadline_ms: None,
             participants: vec![host],
             playback: PlaybackBookkeeping::default(),
+            drawing: StrokeBookkeeping::default(),
         }
     }
 
