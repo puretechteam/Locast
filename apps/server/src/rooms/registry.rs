@@ -2023,7 +2023,7 @@ mod tests {
         s.participants
             .iter()
             .find(|p| p.user_id == user)
-            .map(|p| p.status.clone())
+            .map(|p| p.status)
             .expect("participant exists")
     }
 
