@@ -43,9 +43,9 @@
 
 #![forbid(unsafe_code)]
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 #[cfg(test)]
 use ed25519_dalek::Signer;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
 
 use locast_protocol::envelope::{Envelope, MessageKind, Sender};
