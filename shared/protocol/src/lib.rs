@@ -367,6 +367,17 @@ mod tests {
                 .expect("render SubtitleEntry bindings"),
         );
         rendered.push('\n');
+        // P4-T06: the SKEW_REPLY-side NTP sample. The Rust
+        // side emits this from
+        // `RoomClient::clock_skew_probe`; the React layer
+        // reduces a burst of 4 samples into (skewMs,
+        // jitterMs) and stores them in the
+        // `useClockSkewStore`. The 60 s cadence is owned by
+        // the React `useClockSkew` hook.
+        rendered.push_str(
+            &crate::room::SkewSample::export_to_string(&cfg).expect("render SkewSample bindings"),
+        );
+        rendered.push('\n');
         rendered.push_str(
             &locast_manifest::HostSignature::export_to_string(&cfg)
                 .expect("render HostSignature bindings"),
