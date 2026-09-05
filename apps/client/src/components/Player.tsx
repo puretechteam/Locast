@@ -231,7 +231,7 @@ return (
                        remains clickable). A future drawing-tool
                        task will switch this to pointer-events:
                        auto when the user enters pen mode. */}
-                    <DrawingLayer videoRef={ref} userId={localUserId} />
+                    <DrawingLayer videoRef={ref} userId={localUserId} roomId={summaryId} />
                 </div>
             )}
             {errorMessage !== null && (

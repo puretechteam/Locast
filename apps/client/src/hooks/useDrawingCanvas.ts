@@ -36,6 +36,7 @@ import type { RefObject } from "react";
 import type { Stroke, StrokePoint, StrokeTool } from "../drawing/types";
 import { makeStrokeId, newStroke } from "../drawing/types";
 import { renderStrokes } from "../drawing/strokeRenderer";
+import type { RemoteStroke } from "../stores/useDrawingStore";
 
 /** Configuration for the default pen style. The
  *  drawing toolbar (future task) will override these. */
@@ -97,6 +98,7 @@ export function useDrawingCanvas(
     canvasRef: RefObject<HTMLCanvasElement | null>,
     videoRef: RefObject<HTMLVideoElement | null>,
     userId?: string | null,
+    remoteStrokes?: readonly RemoteStroke[],
 ): DrawingCanvasHandle {
     // The canvas backing-store is the video's intrinsic
     // resolution. The intrinsic-size state is mirrored
@@ -239,10 +241,11 @@ export function useDrawingCanvas(
         renderStrokes(
             ctx,
             strokes,
+            remoteStrokes,
             intrinsicSize,
             cssWidth,
         );
-    }, [strokes, intrinsicSize]);
+    }, [strokes, remoteStrokes, intrinsicSize]);
 
     /**
      * Public imperative API. The future drawing toolbar

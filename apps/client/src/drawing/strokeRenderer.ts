@@ -115,6 +115,7 @@ function isRenderable(s: Stroke): boolean {
 export function renderStrokes(
     ctx: Canvas2DStateful,
     strokes: readonly Stroke[],
+    remoteStrokes: readonly { id: string; userId: string; tool: string; color: string; width: number; points: { x: number; y: number; pressure: number; ts: number }[] }[] | undefined,
     intrinsicSize: { width: number; height: number },
     canvasCssWidth: number,
 ): number {
@@ -141,7 +142,20 @@ export function renderStrokes(
     const widthScale = intrinsicSize.width / cssW;
 
     let lineToCount = 0;
-    for (const stroke of strokes) {
+    const allStrokes: Stroke[] = [
+        ...strokes,
+        ...(remoteStrokes ?? []).map((rs) => ({
+            id: rs.id,
+            userId: rs.userId,
+            tool: rs.tool as Stroke["tool"],
+            color: rs.color,
+            width: rs.width,
+            points: rs.points as StrokePoint[],
+            startedAt: rs.points[0]?.ts ?? 0,
+            endedAt: rs.points[rs.points.length - 1]?.ts ?? 0,
+        })),
+    ];
+    for (const stroke of allStrokes) {
         if (!isRenderable(stroke)) continue;
         ctx.strokeStyle = stroke.color;
         ctx.lineWidth = stroke.width * widthScale;

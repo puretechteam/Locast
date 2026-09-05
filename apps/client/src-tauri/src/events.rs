@@ -16,6 +16,7 @@
 
 pub use crate::net::room::{
     ManifestStateEvent, PlaybackStateEvent, PositionReportEvent, RoomSummaryIpc,
+    StrokeBeginEvent, StrokeEndEvent, StrokePointEvent,
 };
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
 pub use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};

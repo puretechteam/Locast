@@ -15,10 +15,15 @@
 // - Reads `data-testid` selectors that the Playwright
 //   suite uses to verify presence, intrinsic-size, and
 //   resize behavior end.
+// P5-T03: also subscribes to remote drawing events
+// (DRAW_BEGIN/POINT/END rebroadcast) and renders them
+// on the same canvas.
 
 import { useRef } from "react";
 import type { RefObject } from "react";
 import { useDrawingCanvas } from "../hooks/useDrawingCanvas";
+import { useDrawingEventBridge, useDrawingRoomSync } from "../hooks/useDrawingEventBridge";
+import { useDrawingStore } from "../stores/useDrawingStore";
 
 /**
  * Props
@@ -35,19 +40,22 @@ import { useDrawingCanvas } from "../hooks/useDrawingCanvas";
 export interface DrawingLayerProps {
     videoRef: RefObject<HTMLVideoElement | null>;
     userId?: string | null;
+    roomId?: string | null;
 }
 
 export function DrawingLayer({
     videoRef,
     userId,
+    roomId,
 }: DrawingLayerProps): React.ReactNode {
-    // The canvas DOM node lives in this component's JSX;
-    // the hook attaches a ResizeObserver + re-paint
-    // effect to it via the ref. The hook returns the
-    // imperative handles a future drawing toolbar will
-    // use; P5-T01 mounts the canvas only.
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
-    useDrawingCanvas(canvasRef, videoRef, userId);
+
+    useDrawingRoomSync(roomId ?? null);
+    useDrawingEventBridge({});
+
+    const remoteStrokes = useDrawingStore((s) => s.getAllStrokes());
+
+    useDrawingCanvas(canvasRef, videoRef, userId, remoteStrokes);
 
     return (
         <canvas

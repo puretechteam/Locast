@@ -385,6 +385,46 @@ export type DownloadProgressEvent = {
         playing: boolean;
         client_ts_ms: number;
     };
+
+// P5-T03: the `drawing://begin` event payload. Emitted
+// when a remote DRAW_BEGIN is accepted and rebroadcast by
+// the server. The sender_id is the server-authoritative
+// originator (from the validated bearer).
+export type StrokeBeginEvent = {
+    room_id: string;
+    sender_id: string;
+    stroke_id: string;
+    tool: string;
+    color: string;
+    width: number;
+    x: number;
+    y: number;
+    pressure: number;
+    ts_ms: number;
+};
+
+// P5-T03: the `drawing://point` event payload. Emitted
+// when a remote DRAW_POINT is accepted and rebroadcast by
+// the server.
+export type StrokePointEvent = {
+    room_id: string;
+    sender_id: string;
+    stroke_id: string;
+    x: number;
+    y: number;
+    pressure: number;
+    ts_ms: number;
+};
+
+// P5-T03: the `drawing://end` event payload. Emitted
+// when a remote DRAW_END is accepted and rebroadcast by
+// the server.
+export type StrokeEndEvent = {
+    room_id: string;
+    sender_id: string;
+    stroke_id: string;
+    ts_ms: number;
+};
 export type DownloadSessionIpc = {
   download_id: string;
   media_id: string;
@@ -457,6 +497,23 @@ export const events = {
   positionReport: <EventListener<PositionReportEvent>>((h) =>
     __listenAs__("position://report", h)
   ),
+  // P5-T03: remote DRAW_BEGIN rebroadcast. The server
+  // accepts a signed DRAW_BEGIN, binds stroke_id to the
+  // sender, and rebroadcasts to other room participants.
+  // The local client uses this to create a remote stroke.
+  strokeBegin: <EventListener<StrokeBeginEvent>>((h) =>
+    __listenAs__("drawing://begin", h)
+  ),
+  // P5-T03: remote DRAW_POINT rebroadcast. Appends to
+  // the remote stroke identified by stroke_id.
+  strokePoint: <EventListener<StrokePointEvent>>((h) =>
+    __listenAs__("drawing://point", h)
+  ),
+  // P5-T03: remote DRAW_END rebroadcast. Finalizes
+  // the remote stroke.
+  strokeEnd: <EventListener<StrokeEndEvent>>((h) =>
+    __listenAs__("drawing://end", h)
+  ),
 };
 
 export const signalingStateChanged = events.signalingState;
@@ -466,3 +523,6 @@ export const downloadStateChanged = events.downloadState;
 export const downloadProgressChanged = events.downloadProgress;
 export const playbackStateChanged = events.playbackState;
 export const positionReportChanged = events.positionReport;
+export const strokeBeginChanged = events.strokeBegin;
+export const strokePointChanged = events.strokePoint;
+export const strokeEndChanged = events.strokeEnd;

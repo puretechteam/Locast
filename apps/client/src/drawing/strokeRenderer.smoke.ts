@@ -84,7 +84,7 @@ process.stdout.write("stroke renderer smoke\n");
 process.stdout.write("empty history\n");
 {
     const { ctx, log } = makeMockCtx();
-    const count = renderStrokes(ctx, [], INTRINSIC, CSS_W);
+    const count = renderStrokes(ctx, [], undefined, INTRINSIC, CSS_W);
     check("0 lineTo calls on empty strokes", count === 0);
     check(
         "calls clearRect on empty history",
@@ -102,7 +102,7 @@ process.stdout.write("single pen stroke\n");
             points: [makePoint(0.1, 0.1), makePoint(0.5, 0.5), makePoint(0.9, 0.9)],
         }),
     ];
-    const count = renderStrokes(ctx, strokes, INTRINSIC, CSS_W);
+    const count = renderStrokes(ctx, strokes, undefined, INTRINSIC, CSS_W);
     check("3-point stroke -> 2 lineTo calls", count === 2);
     // The renderer should call: clearRect, beginPath,
     // moveTo(p0), lineTo(p1), lineTo(p2), stroke.
@@ -135,7 +135,7 @@ process.stdout.write("single-point stroke\n");
     const strokes: Stroke[] = [
         makeStroke({ id: "s1", points: [makePoint(0.5, 0.5)] }),
     ];
-    const count = renderStrokes(ctx, strokes, INTRINSIC, CSS_W);
+    const count = renderStrokes(ctx, strokes, undefined, INTRINSIC, CSS_W);
     check("1-point stroke -> 0 lineTo calls", count === 0);
     const lineTos = log.filter((c) => c.method === "lineTo");
     check(
@@ -160,7 +160,7 @@ process.stdout.write("two strokes\n");
             points: [makePoint(0, 0.5), makePoint(0.5, 0.5), makePoint(1, 0.5)],
         }),
     ];
-    const count = renderStrokes(ctx, strokes, INTRINSIC, CSS_W);
+    const count = renderStrokes(ctx, strokes, undefined, INTRINSIC, CSS_W);
     check("two strokes -> 3 lineTo calls", count === 3);
     const strokes$ = log.filter((c) => c.method === "stroke");
     check("two ctx.stroke() calls (one per stroke)", strokes$.length === 2);
@@ -176,7 +176,7 @@ process.stdout.write("degenerate intrinsic size\n");
             points: [makePoint(0.5, 0.5), makePoint(0.6, 0.6)],
         }),
     ];
-    const count = renderStrokes(ctx, strokes, { width: 0, height: 0 }, CSS_W);
+    const count = renderStrokes(ctx, strokes, undefined, { width: 0, height: 0 }, CSS_W);
     check("0 lineTo when intrinsic size is 0", count === 0);
     const lineTos = log.filter((c) => c.method === "lineTo");
     check("no lineTo calls", lineTos.length === 0);
@@ -195,7 +195,7 @@ process.stdout.write("stroke width scaling\n");
     ];
     // Intrinsic 1920 wide, CSS 960 wide -> scale = 2.
     // The renderer should set lineWidth = 4 * 2 = 8.
-    renderStrokes(ctx, strokes, { width: 1920, height: 1080 }, 960);
+    renderStrokes(ctx, strokes, undefined, { width: 1920, height: 1080 }, 960);
     // We assert the assignment at the time of stroke();
     // the mock records property reads but not writes.
     // The captured `lineWidth` at the moment of stroke()
@@ -216,7 +216,7 @@ process.stdout.write("backing-store coords\n");
             points: [makePoint(0.5, 0.5), makePoint(1, 1)],
         }),
     ];
-    renderStrokes(ctx, strokes, { width: 100, height: 100 }, 100);
+    renderStrokes(ctx, strokes, undefined, { width: 100, height: 100 }, 100);
     // moveTo(49.5, 49.5) (0.5 * 99 = 49.5) and
     // lineTo(99, 99) (1 * 99 = 99).
     const moveTo = log.find((c) => c.method === "moveTo");
@@ -250,7 +250,7 @@ process.stdout.write("non-pen strokes skipped\n");
         tool: "eraser",
     };
     const strokes: Stroke[] = [rectStroke, eraserStroke];
-    const count = renderStrokes(ctx, strokes, INTRINSIC, CSS_W);
+    const count = renderStrokes(ctx, strokes, undefined, INTRINSIC, CSS_W);
     check("non-pen strokes produce 0 lineTo", count === 0);
     const lineTos = log.filter((c) => c.method === "lineTo");
     check("no lineTo calls (no pen strokes)", lineTos.length === 0);

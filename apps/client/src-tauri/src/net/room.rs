@@ -79,6 +79,15 @@ pub trait RoomEventSink: Send + Sync {
     /// uses this to render the per-viewer position
     /// indicator.
     fn emit_position_report(&self, _ev: &PositionReportEvent) {}
+    /// P5-T03: emit `drawing://begin` when a remote
+    /// DRAW_BEGIN is accepted and rebroadcast by the server.
+    fn emit_stroke_begin(&self, _ev: &StrokeBeginEvent) {}
+    /// P5-T03: emit `drawing://point` when a remote
+    /// DRAW_POINT is accepted and rebroadcast by the server.
+    fn emit_stroke_point(&self, _ev: &StrokePointEvent) {}
+    /// P5-T03: emit `drawing://end` when a remote
+    /// DRAW_END is accepted and rebroadcast by the server.
+    fn emit_stroke_end(&self, _ev: &StrokeEndEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -91,6 +100,9 @@ impl RoomEventSink for NoopEventSink {
     fn emit_state(&self, _summary: &RoomSummaryIpc) {}
     fn emit_event(&self, _summary: &RoomSummaryIpc) {}
     fn emit_state_cleared(&self) {}
+    fn emit_stroke_begin(&self, _ev: &StrokeBeginEvent) {}
+    fn emit_stroke_point(&self, _ev: &StrokePointEvent) {}
+    fn emit_stroke_end(&self, _ev: &StrokeEndEvent) {}
 }
 
 /// A Tauri-backed sink. Wraps a `tauri::AppHandle` and
@@ -133,6 +145,15 @@ mod tauri_sink {
         }
         fn emit_position_report(&self, ev: &PositionReportEvent) {
             let _ = self.handle.emit(POSITION_REPORT_EVENT, ev.clone());
+        }
+        fn emit_stroke_begin(&self, ev: &StrokeBeginEvent) {
+            let _ = self.handle.emit(STROKE_BEGIN_EVENT, ev.clone());
+        }
+        fn emit_stroke_point(&self, ev: &StrokePointEvent) {
+            let _ = self.handle.emit(STROKE_POINT_EVENT, ev.clone());
+        }
+        fn emit_stroke_end(&self, ev: &StrokeEndEvent) {
+            let _ = self.handle.emit(STROKE_END_EVENT, ev.clone());
         }
     }
 }
@@ -369,6 +390,21 @@ pub const PLAYBACK_STATE_EVENT: &str = "playback://state";
 /// sender (multi-viewer distinction).
 pub const POSITION_REPORT_EVENT: &str = "position://report";
 
+/// P5-T03: Tauri event name emitted when a remote
+/// DRAW_BEGIN is accepted and rebroadcast by the server.
+/// The payload carries the sender_id, room_id, and the
+/// verified begin payload so the React layer can create
+/// a remote stroke.
+pub const STROKE_BEGIN_EVENT: &str = "drawing://begin";
+
+/// P5-T03: Tauri event name emitted when a remote
+/// DRAW_POINT is accepted and rebroadcast by the server.
+pub const STROKE_POINT_EVENT: &str = "drawing://point";
+
+/// P5-T03: Tauri event name emitted when a remote
+/// DRAW_END is accepted and rebroadcast by the server.
+pub const STROKE_END_EVENT: &str = "drawing://end";
+
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
 /// the same field names; the wire field `action`
@@ -511,6 +547,94 @@ impl From<(Uuid, Uuid, &locast_protocol::room::PositionReportPayload)> for Posit
             media_position_ms: payload.media_position_ms,
             playing: payload.playing,
             client_ts_ms: payload.client_ts_ms,
+        }
+    }
+}
+
+/// P5-T03: IPC-safe stroke begin event payload.
+/// Emitted as `drawing://begin` when a remote DRAW_BEGIN
+/// is accepted and rebroadcast by the server. The sender_id
+/// is the server-authoritative originator (from the bearer).
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeBeginEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub stroke_id: String,
+    pub tool: String,
+    pub color: String,
+    pub width: f32,
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    pub ts_ms: i64,
+}
+
+impl From<(Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)> for StrokeBeginEvent {
+    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            stroke_id: payload.stroke_id.to_string(),
+            tool: serde_json::to_value(&payload.tool)
+                .ok()
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "pen".to_string()),
+            color: payload.color.clone(),
+            width: payload.width,
+            x: payload.x,
+            y: payload.y,
+            pressure: payload.pressure,
+            ts_ms: payload.ts_ms,
+        }
+    }
+}
+
+/// P5-T03: IPC-safe stroke point event payload.
+/// Emitted as `drawing://point` when a remote DRAW_POINT
+/// is accepted and rebroadcast by the server.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokePointEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub stroke_id: String,
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    pub ts_ms: i64,
+}
+
+impl From<(Uuid, Uuid, &locast_protocol::room::StrokePointPayload)> for StrokePointEvent {
+    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokePointPayload)) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            stroke_id: payload.stroke_id.to_string(),
+            x: payload.x,
+            y: payload.y,
+            pressure: payload.pressure,
+            ts_ms: payload.ts_ms,
+        }
+    }
+}
+
+/// P5-T03: IPC-safe stroke end event payload.
+/// Emitted as `drawing://end` when a remote DRAW_END
+/// is accepted and rebroadcast by the server.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeEndEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub stroke_id: String,
+    pub ts_ms: i64,
+}
+
+impl From<(Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)> for StrokeEndEvent {
+    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            stroke_id: payload.stroke_id.to_string(),
+            ts_ms: payload.ts_ms,
         }
     }
 }
@@ -1232,6 +1356,81 @@ impl RoomClient {
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
                                 s.emit_position_report(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
+            // P5-T03: a remote DRAW_BEGIN was accepted and
+            // rebroadcast by the server. The sender_id is
+            // the server-authoritative originator (from the
+            // validated bearer). Emit `drawing://begin` so
+            // the React layer can create a remote stroke.
+            MessageKind::StrokeBegin => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    let room_id_str = room_id.to_string();
+                    if current_room.as_deref() == Some(room_id_str.as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::StrokeBeginPayload>(&env)
+                        {
+                            let sender_id = env.sender.as_ref()
+                                .map(|s| s.user_id)
+                                .unwrap_or_default();
+                            let ipc = StrokeBeginEvent::from((room_id, sender_id, &payload));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_stroke_begin(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
+            // P5-T03: a remote DRAW_POINT was accepted and
+            // rebroadcast by the server. The sender_id comes
+            // from the validated envelope sender (not the
+            // payload). Emit `drawing://point` so the React
+            // layer can append to the remote stroke.
+            MessageKind::StrokePoint => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    let room_id_str = room_id.to_string();
+                    if current_room.as_deref() == Some(room_id_str.as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::StrokePointPayload>(&env)
+                        {
+                            let sender_id = env.sender.as_ref()
+                                .map(|s| s.user_id)
+                                .unwrap_or_default();
+                            let ipc = StrokePointEvent::from((room_id, sender_id, &payload));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_stroke_point(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
+            // P5-T03: a remote DRAW_END was accepted and
+            // rebroadcast by the server. The sender_id comes
+            // from the validated envelope sender (not the
+            // payload). Emit `drawing://end` so the React
+            // layer can finalize the remote stroke.
+            MessageKind::StrokeEnd => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    let room_id_str = room_id.to_string();
+                    if current_room.as_deref() == Some(room_id_str.as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::StrokeEndPayload>(&env)
+                        {
+                            let sender_id = env.sender.as_ref()
+                                .map(|s| s.user_id)
+                                .unwrap_or_default();
+                            let ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_stroke_end(&ipc);
                             }
                         }
                     }

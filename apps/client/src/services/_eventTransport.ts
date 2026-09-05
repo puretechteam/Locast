@@ -11,9 +11,18 @@ let shim: ListenFn | undefined;
 async function getListener(): Promise<ListenFn> {
     if (!isTest) return listen as unknown as ListenFn;
     if (shim) return shim;
-    // IMPORTANT: Vite must resolve this dynamic import to the same module URL as the test-side /src/tests/.../tauriShim.ts import. Both URLs serve the same file. Do not add cache-busting query strings to either.
-    const mod = await import("../../tests/playwright/shim/tauriShim");
+    // In test mode, the test harness (vite-app.ts) imports the tauriShim
+    // module and uses it to emit events. The same module instance must be
+    // shared here so that events emitted by the harness are received by
+    // the listeners registered by this transport.
+    // The module is cached on window.__tauriShim by the test harness.
+    const mod = await import("/tests/playwright/shim/tauriShim" as string);
     shim = mod.listen as unknown as ListenFn;
+    // Also expose on window for sharing with the harness if not already there
+    const w = typeof window !== "undefined" ? window as unknown as { __tauriShim?: typeof mod } : null;
+    if (w && !w.__tauriShim) {
+        w.__tauriShim = mod;
+    }
     return shim;
 }
 
