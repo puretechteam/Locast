@@ -321,9 +321,7 @@ impl MessageKind {
     pub fn is_drawing(&self) -> bool {
         matches!(
             self,
-            MessageKind::StrokeBegin
-                | MessageKind::StrokePoint
-                | MessageKind::StrokeEnd
+            MessageKind::StrokeBegin | MessageKind::StrokePoint | MessageKind::StrokeEnd
         )
     }
 }

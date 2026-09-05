@@ -47,9 +47,7 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use uuid::Uuid;
 
 use locast_protocol::envelope::{Envelope, MessageKind, Sender};
-use locast_protocol::room::{
-    StrokeBeginPayload, StrokeEndPayload, StrokePointPayload,
-};
+use locast_protocol::room::{StrokeBeginPayload, StrokeEndPayload, StrokePointPayload};
 
 use super::dispatch::RoomDispatchOutcome;
 use super::state::RoomState;
@@ -108,8 +106,8 @@ fn verify_stroke_begin_signature(
         .as_slice()
         .try_into()
         .map_err(|_| DrawingError::BadSignature)?;
-    let verifying_key = VerifyingKey::from_bytes(&expected_pubkey)
-        .map_err(|_| DrawingError::BadSignature)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&expected_pubkey).map_err(|_| DrawingError::BadSignature)?;
     let signature = Signature::from_bytes(&sig_bytes);
     let signed_bytes =
         locast_crypto::drawing_signed_bytes(payload).map_err(|_| DrawingError::BadSignature)?;
@@ -153,7 +151,10 @@ pub async fn handle_stroke_begin(
     // Reject a second BEGIN for the same stroke id (a
     // replay or a collision).
     if state.drawing.pending.contains_key(&payload.stroke_id) {
-        return err_outcome(&envelope, reason(DrawingError::StrokeIdMismatch).to_string());
+        return err_outcome(
+            &envelope,
+            reason(DrawingError::StrokeIdMismatch).to_string(),
+        );
     }
     // Bind the stroke to this sender.
     state.drawing.pending.insert(
@@ -203,7 +204,10 @@ pub async fn handle_stroke_point(
         }
     };
     if binding.sender_id != user_id {
-        return err_outcome(&envelope, reason(DrawingError::StrokeIdMismatch).to_string());
+        return err_outcome(
+            &envelope,
+            reason(DrawingError::StrokeIdMismatch).to_string(),
+        );
     }
     let evt = super::registry::RoomEvent::StrokePoint {
         room_id: envelope.room_id.unwrap_or(state.id),
@@ -238,7 +242,10 @@ pub async fn handle_stroke_end(
         }
     };
     if binding.sender_id != user_id {
-        return err_outcome(&envelope, reason(DrawingError::StrokeIdMismatch).to_string());
+        return err_outcome(
+            &envelope,
+            reason(DrawingError::StrokeIdMismatch).to_string(),
+        );
     }
     let evt = super::registry::RoomEvent::StrokeEnd {
         room_id: envelope.room_id.unwrap_or(state.id),
@@ -404,10 +411,7 @@ mod tests {
         let out = handle_stroke_begin(env, &mut state, host_uid, pk, 1000).await;
         assert_eq!(out.events.len(), 0);
         assert_eq!(out.to_caller.len(), 1);
-        assert_eq!(
-            out.to_caller[0].r#type,
-            MessageKind::RoomError
-        );
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
     }
 
     #[tokio::test]

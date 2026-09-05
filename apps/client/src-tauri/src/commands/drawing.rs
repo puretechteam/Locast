@@ -110,35 +110,46 @@ pub async fn drawing_send(
     signaling: TauriState<'_, std::sync::Arc<SignalingClient>>,
     identity: TauriState<'_, std::sync::Arc<IdentityService>>,
 ) -> Result<DrawingSendResult, AppError> {
-    let summary = room
-        .state()
-        .await
-        .ok_or_else(|| err("not in a room"))?;
-    let room_id = uuid::Uuid::parse_str(&summary.id)
-        .map_err(|e| err(format!("bad cached room id: {e}")))?;
+    let summary = room.state().await.ok_or_else(|| err("not in a room"))?;
+    let room_id =
+        uuid::Uuid::parse_str(&summary.id).map_err(|e| err(format!("bad cached room id: {e}")))?;
 
     let (kind, stroke_id_str, ts_ms, client_seq) = match &input {
-        DrawingSendInput::Begin { stroke_id, ts_ms, client_seq, .. } => (
+        DrawingSendInput::Begin {
+            stroke_id,
+            ts_ms,
+            client_seq,
+            ..
+        } => (
             locast_protocol::envelope::MessageKind::StrokeBegin,
             stroke_id.clone(),
             *ts_ms,
             *client_seq,
         ),
-        DrawingSendInput::Point { stroke_id, ts_ms, client_seq, .. } => (
+        DrawingSendInput::Point {
+            stroke_id,
+            ts_ms,
+            client_seq,
+            ..
+        } => (
             locast_protocol::envelope::MessageKind::StrokePoint,
             stroke_id.clone(),
             *ts_ms,
             *client_seq,
         ),
-        DrawingSendInput::End { stroke_id, ts_ms, client_seq } => (
+        DrawingSendInput::End {
+            stroke_id,
+            ts_ms,
+            client_seq,
+        } => (
             locast_protocol::envelope::MessageKind::StrokeEnd,
             stroke_id.clone(),
             *ts_ms,
             *client_seq,
         ),
     };
-    let stroke_id = uuid::Uuid::parse_str(&stroke_id_str)
-        .map_err(|e| err(format!("bad stroke id: {e}")))?;
+    let stroke_id =
+        uuid::Uuid::parse_str(&stroke_id_str).map_err(|e| err(format!("bad stroke id: {e}")))?;
 
     // Resolve the identity (signing key + pubkey + user_id).
     // The identity service is the single TauriState that
@@ -157,8 +168,8 @@ pub async fn drawing_send(
         .map_err(|e| err(format!("load_keypair: {e}")))?;
     let pubkey: [u8; 32] = kp.signing.verifying_key().to_bytes();
     let user_id_str = crate::identity::derive_user_id(pubkey);
-    let user_id = uuid::Uuid::parse_str(&user_id_str)
-        .map_err(|e| err(format!("derive user_id: {e}")))?;
+    let user_id =
+        uuid::Uuid::parse_str(&user_id_str).map_err(|e| err(format!("derive user_id: {e}")))?;
 
     // Build the typed payload + (for Begin) the signed
     // sender.
@@ -202,12 +213,7 @@ pub async fn drawing_send(
                 Some(sender),
             )
         }
-        DrawingSendInput::Point {
-            x,
-            y,
-            pressure,
-            ..
-        } => {
+        DrawingSendInput::Point { x, y, pressure, .. } => {
             let point_payload = locast_protocol::room::StrokePointPayload {
                 stroke_id,
                 x: *x,
