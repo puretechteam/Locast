@@ -69,12 +69,33 @@ export function usePlaybackEventBridge(): null {
                 setMediaSrc: (s: string) => void;
                 setMediaReady: (r: boolean) => void;
                 getLastApplied: () => unknown;
+                /** P4-T07: read the current per-sender
+                 *  dedup state for the test seam. */
+                getDedupSnapshot: () => unknown;
+                /** P4-T07: drive the dedup buffer
+                 *  timeout tick so the test seam can
+                 *  assert the 5 s grace window without
+                 *  real time advances. Returns the
+                 *  number of events force-applied. */
+                tickDedup: (nowMs: number) => number;
             };
         };
         w.__locastStore = {
             setMediaSrc: (s) => usePlaybackStore.getState().setMediaSrc(s),
             setMediaReady: (r) => usePlaybackStore.getState().setMediaReady(r),
             getLastApplied: () => usePlaybackStore.getState().lastApplied,
+            getDedupSnapshot: () => {
+                const s = usePlaybackStore.getState().getDedupState();
+                return {
+                    bySender: Array.from(s.bySender.entries()).map(([k, v]) => ({
+                        senderId: k,
+                        lastAppliedSeq: v.lastAppliedSeq,
+                        pendingSeq: v.pending === null ? null : v.pending.seq,
+                        pendingParkedAtMs: v.pending === null ? null : v.pending.parkedAtMs,
+                    })),
+                };
+            },
+            tickDedup: (nowMs) => usePlaybackStore.getState().tickDedup(nowMs),
         };
         return () => {
             if (w.__locastStore) delete w.__locastStore;

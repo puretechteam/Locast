@@ -1,5 +1,12 @@
 import { create } from "zustand";
 import type { PlaybackStateEvent } from "../services/playback";
+import {
+    clearDedupState,
+    evaluateDedup,
+    initialDedupState,
+    tickDedup,
+    type DedupState,
+} from "../drift/dedup";
 
 export type { PlaybackStateEvent };
 
@@ -97,6 +104,21 @@ interface PlaybackStoreState {
      * pattern — see comments there). */
     bumpHostSeq: () => number;
 
+    /** P4-T07: per-sender `monotonic_seq` dedup state.
+     *  Lives inside the playback store so it is
+     *  automatically reset on room change (`setRoomId`)
+     *  and on `clear()`. The store's `acceptEvent` is
+     *  the single chokepoint that consults this state;
+     *  callers in the React layer (the bridge hook) just
+     *  hand the inbound `playback://state` event to
+     *  `acceptEvent`. The dedup state is independent of
+     *  the existing `server_seq` counter, which remains
+     *  authoritative for room-level ordering; the per-
+     *  sender dedup is the P4-T07 safety net for
+     *  per-sender gaps, duplicates, and out-of-order
+     *  late arrivals (architecture §13.2). */
+    dedupState: DedupState<PlaybackStateEvent>;
+
     setMediaReady: (ready: boolean) => void;
     setRoomId: (roomId: string | null) => void;
     setMediaSrc: (src: string | null) => void;
@@ -105,6 +127,21 @@ interface PlaybackStoreState {
      * applied or parked), `false` if the event was
      * dropped as stale, duplicate, or out of scope. */
     acceptEvent: (event: PlaybackStateEvent) => boolean;
+    /** P4-T07: read the current per-sender dedup state
+     * for the test seam. Production code should NOT call
+     * this -- it is a debug-only surface used by the
+     * Vite harness to assert the dedup behavior end to
+     * end. */
+    getDedupState: () => Readonly<DedupState<PlaybackStateEvent>>;
+    /** P4-T07: force-evaluate any buffered events whose
+     * 5 s grace window has elapsed. The playback store
+     * does not own a setInterval for this; the test
+     * harness drives it explicitly so the dedup math is
+     * exercised deterministically without real time
+     * advances. Returns the number of events that were
+     * force-applied as a result of the tick (0 when no
+     * parked event has expired). */
+    tickDedup: (nowMs: number) => number;
     setSuppressLocalEcho: (suppress: boolean) => void;
     /** Called by the Player after the <video> element
      * has finished applying the event so the store
@@ -132,6 +169,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
     mediaSrc: null,
     suppressLocalEcho: false,
     hostNextSeq: 1,
+    dedupState: initialDedupState(),
 
     setMediaReady: (ready) => set({ mediaReady: ready }),
     setRoomId: (roomId) => {
@@ -150,6 +188,12 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
                 pending: null,
                 lastAppliedServerSeq: 0,
                 hostNextSeq: 1,
+                // P4-T07: a new room has a fresh per-sender
+                // monotonic sequence namespace. Reusing the
+                // old dedup map would let a duplicate seq
+                // from a previous room drop a legitimate
+                // event from the new room (or vice versa).
+                dedupState: clearDedupState(),
             });
         }
     },
@@ -168,19 +212,65 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         }
         // Drop duplicate / stale events (server_seq <=
         // last applied). Strictly monotonic per the
-        // server's contract (P4-T01).
+        // server's contract (P4-T01). The per-sender
+        // `monotonic_seq` check is performed below; this
+        // server_seq check is the room-level ordering
+        // invariant and is kept because the server
+        // already enforces it.
         if (event.server_seq <= state.lastAppliedServerSeq) {
             return false;
         }
+
+        // P4-T07: per-sender `monotonic_seq` dedup.
+        // The pure math lives in `drift/dedup.ts`; here
+        // we apply the decision.
+        const dedup = evaluateDedup(state.dedupState, event, Date.now());
+        // Persist the post-dedup state immediately so a
+        // re-entrant call (a future event arriving in the
+        // same tick) sees the advanced `last_applied_seq`.
+        set({ dedupState: dedup.next });
+
+        if (dedup.decision.kind === "drop") {
+            return false;
+        }
+        if (dedup.decision.kind === "buffer") {
+            // Parked in the dedup module's own pending
+            // slot; the store's authoritative playback
+            // state is unchanged. A future successor will
+            // drain (or `tickDedup` will force-apply after
+            // 5 s).
+            return true;
+        }
+        if (dedup.decision.kind === "applyHeld") {
+            // The dedup math decided the buffered event
+            // has expired (the test seam drove a clock
+            // advance past `BUFFER_TIMEOUT_MS`). Treat it
+            // as an ordinary apply.
+        }
+
+        // apply / applyHeld: write the event into the
+        // store. The Player component will read it from
+        // `lastApplied` and apply it to the DOM.
+        //
+        // If the apply decision has a `drain` payload,
+        // the parked event has a HIGHER seq than the
+        // current event (it was buffered because its
+        // predecessor -- the current event -- was
+        // missing). The dedup state has already advanced
+        // to the drained event's seq. We apply the
+        // drained event to the store (the current event
+        // is logically superseded); the current event is
+        // recorded nowhere in the playback store because
+        // the drain semantics are "the gap is filled, we
+        // catch up to the parked event".
+        const drained =
+            dedup.decision.kind === "apply" &&
+            "drain" in dedup.decision &&
+            dedup.decision.drain !== undefined
+                ? dedup.decision.drain.event
+                : event;
         if (state.mediaReady) {
-            // The <video> element is ready; record this
-            // as the new authoritative state. The Player
-            // component will read `lastApplied` and
-            // apply it to the DOM. We do NOT mutate
-            // `lastAppliedServerSeq` here — that
-            // happens in `markApplied` once the Player
-            // has finished applying.
-            set({ lastApplied: event });
+            set({ lastApplied: drained });
             return true;
         }
         // Media is not ready yet. Park the event. A
@@ -191,7 +281,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         // accept whichever event is parked at drain
         // time, which is by construction the newest
         // accepted event.
-        set({ pending: { event, parkedAtMs: Date.now() } });
+        set({ pending: { event: drained, parkedAtMs: Date.now() } });
         return true;
     },
 
@@ -220,6 +310,14 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             mediaSrc: null,
             suppressLocalEcho: false,
             hostNextSeq: 1,
+            // P4-T07: a fresh client should not carry
+            // per-sender dedup state across room
+            // lifetimes; clearing the map is the only
+            // safe way to ensure a new room's first
+            // `monotonic_seq = 1` event is not mistaken
+            // for a duplicate of a previous room's
+            // last event.
+            dedupState: clearDedupState(),
         }),
 
     /**
@@ -237,4 +335,54 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         set({ hostNextSeq: next + 1 });
         return next;
     },
+
+    /** P4-T07: read-only view of the per-sender dedup
+     * state. Exposed for the Vite test seam so the
+     * Playwright suite can assert the dedup math end
+     * to end without rebuilding the React tree. */
+    getDedupState: () => get().dedupState,
+
+    /** P4-T07: force a 5 s tick on the dedup state.
+     * The production React layer does not own a
+     * `setInterval` for this; the store's `acceptEvent`
+     * is the only entry that exercises `evaluateDedup`,
+     * and `tickDedup` is the drain path the test seam
+     * drives explicitly so the dedup math is exercised
+     * deterministically without real time advances.
+     *
+     * Returns the number of held events that were
+     * force-applied because their parked timer
+     * exceeded `BUFFER_TIMEOUT_MS`. */
+    tickDedup: (nowMs) => {
+        const state = get();
+        const { expired, next } = tickDedup(state.dedupState, nowMs);
+        if (expired.length === 0) {
+            // Still persist any clock bookkeeping the
+            // tick may have done (none today, but the
+            // future may add per-sender timestamps).
+            set({ dedupState: next });
+            return 0;
+        }
+        // The first expired event is the one to apply
+        // (the buffer is a single slot per sender). If
+        // multiple senders had parked events expire in
+        // the same tick, apply each in deterministic
+        // sender-id order so the test assertions can
+        // predict the result.
+        expired.sort((a, b) => a.senderId.localeCompare(b.senderId));
+        const applied = expired[0];
+        if (applied === undefined) {
+            set({ dedupState: next });
+            return 0;
+        }
+        set({
+            dedupState: next,
+            lastApplied: state.mediaReady ? applied.event : state.lastApplied,
+            pending: state.mediaReady
+                ? state.pending
+                : { event: applied.event, parkedAtMs: nowMs },
+        });
+        return expired.length;
+    },
 }));
+    

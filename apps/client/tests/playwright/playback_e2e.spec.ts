@@ -237,23 +237,35 @@ test("stale server_seq is dropped: an older event does not overwrite newer state
     locast,
 }) => {
     await mountRoomWithPlayer(page, ROOM);
-    // Newer event first.
+    // Newer event first. P4-T07 note: `monotonic_seq = 1`
+    // is the bootstrap value for a brand-new sender
+    // (architecture §13.2: the server starts every
+    // per-sender seq at 1). The earlier test draft used
+    // monotonic_seq = 5 here, which under P4-T07's
+    // per-sender dedup is correctly buffered as a gap
+    // (the test is about server_seq ordering, not
+    // monotonic_seq, and a gap would obscure the
+    // invariant being asserted).
     await locast.emitPlaybackState({
         room_id: ROOM.id,
         server_seq: 5,
         server_ts_ms: Date.now(),
         sender_id: "11111111-1111-1111-1111-111111111111",
-        monotonic_seq: 5,
+        monotonic_seq: 1,
         kind: "seek",
         media_position_ms: 30_000,
     });
-    // Stale (older) event second.
+    // Stale (older) event second. monotonic_seq = 0 is a
+    // duplicate per P4-T07; it is also dropped by the
+    // server_seq check below. Either gate is sufficient;
+    // the point is that the store does NOT overwrite the
+    // newer state.
     await locast.emitPlaybackState({
         room_id: ROOM.id,
         server_seq: 4,
         server_ts_ms: Date.now() - 100,
         sender_id: "11111111-1111-1111-1111-111111111111",
-        monotonic_seq: 4,
+        monotonic_seq: 0,
         kind: "seek",
         media_position_ms: 5_000,
     });
