@@ -28,7 +28,7 @@
 //!   samples remain after rejection (jitter cannot be computed
 //!   from a single sample; architecture §13.3 says "If jitter_ms
 //!   > 200 ms, the client increases its drift-detection
-//!   threshold").
+//!   threshold is exceeded).
 //!
 //! The Rust side's job is to own the `Clock` (no real
 //! clock; the system clock is captured at the network
@@ -37,6 +37,7 @@
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
+#![allow(clippy::doc_lazy_continuation)]
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -110,7 +111,7 @@ pub fn compute_skew_jitter(samples: &[SkewSample]) -> SkewMeasurement {
     let mut rejected: u32 = 0;
     for s in samples {
         let rtt = s.t3_local_ms - s.t0_local_ms;
-        if rtt < 0 || rtt > MAX_RTT_MS {
+        if !(0..=MAX_RTT_MS).contains(&rtt) {
             rejected += 1;
             continue;
         }
@@ -198,7 +199,7 @@ fn isqrt(n: u128) -> u128 {
         return 0;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + n / x) / 2;
