@@ -117,8 +117,7 @@ mod tests {
         // hard-code 15_000 here to keep this test
         // hermetic and decoupled from the server crate.
         const SERVER_DISCONNECT_AFTER_MS: i64 = 15_000;
-        let three_intervals_ms: i64 =
-            (PRESENCE_INTERVAL.as_millis() as i64).saturating_mul(3);
+        let three_intervals_ms: i64 = (PRESENCE_INTERVAL.as_millis() as i64).saturating_mul(3);
         assert!(
             three_intervals_ms >= SERVER_DISCONNECT_AFTER_MS,
             "3 * PRESENCE_INTERVAL ({three_intervals_ms} ms) must be >= server \

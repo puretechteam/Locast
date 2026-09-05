@@ -174,8 +174,9 @@ impl Config {
             .unwrap_or(DEFAULT_ROOM_CREATE_MAX_COLLISIONS);
         let participant_stale_after_ms = parse_env_i64("LOCAST_PARTICIPANT_STALE_AFTER_MS")?
             .unwrap_or(DEFAULT_PARTICIPANT_STALE_AFTER_MS);
-        let participant_disconnect_after_ms = parse_env_i64("LOCAST_PARTICIPANT_DISCONNECT_AFTER_MS")?
-            .unwrap_or(DEFAULT_PARTICIPANT_DISCONNECT_AFTER_MS);
+        let participant_disconnect_after_ms =
+            parse_env_i64("LOCAST_PARTICIPANT_DISCONNECT_AFTER_MS")?
+                .unwrap_or(DEFAULT_PARTICIPANT_DISCONNECT_AFTER_MS);
 
         Ok(Self {
             bind_addr,
