@@ -197,6 +197,15 @@ pub struct RoomRegistryConfig {
     pub max_participants: u8,
     pub host_disconnect_grace_ms: i64,
     pub participant_stale_after_ms: i64,
+    /// P4-T08: the 15-second (default) presence-driven
+    /// `DISCONNECTED` threshold. After this many ms without
+    /// an inbound `PRESENCE`, a non-host `Connected`
+    /// participant is flipped to `Disconnected` and a
+    /// `ParticipantLeft { reason: "timeout" }` is
+    /// broadcast. The record remains in memory until
+    /// `participant_stale_after_ms` (5 min default) elapses
+    /// so a quick reconnect can revive it.
+    pub participant_disconnect_after_ms: i64,
 }
 
 impl RoomRegistryConfig {
@@ -207,6 +216,7 @@ impl RoomRegistryConfig {
             max_participants: c.room_max_participants,
             host_disconnect_grace_ms: c.host_disconnect_grace_ms,
             participant_stale_after_ms: c.participant_stale_after_ms,
+            participant_disconnect_after_ms: c.participant_disconnect_after_ms,
         }
     }
 }
@@ -428,11 +438,96 @@ impl RoomRegistry {
         out
     }
 
-    /// Stale-participant cleanup. Any participant whose
-    /// `last_seen_ms` is older than `participant_stale_after_ms`
-    /// is removed from their room and a
-    /// `ParticipantLeft { reason: "timeout" }` is emitted.
-    pub async fn tick_stale_participants(
+/// P4-T08: presence-driven `DISCONNECTED` transition.
+///
+/// For every non-host participant whose status is still
+/// `Connected` and whose `last_seen_ms` is older than
+/// `participant_disconnect_after_ms`, flip the in-memory
+/// status to `Disconnected` AND broadcast a
+/// `ParticipantLeft { reason: "timeout" }` to the room so
+/// other clients' UI immediately removes them. The record
+/// is NOT removed from `state.participants` and the DB
+/// row is NOT touched, so a quick reconnect can revive
+/// the participant via `touch` (which flips the status
+/// back to `Connected`). After
+/// `participant_stale_after_ms` (5 min default) of
+/// silence the existing [`tick_stale_participants`] sweep
+/// removes the record and persists `"left"` to the DB.
+///
+/// Hosts are exempt: their transport-loss path is owned by
+/// `host_disconnect_grace_ms` + `elect_new_host`.
+///
+/// Returns the list of `(room_id, RoomEvent)` for the
+/// broadcasts so the WS layer can publish them through the
+/// same path as `tick_stale_participants`.
+pub async fn tick_presence_timeout(
+    &self,
+    now_ms: i64,
+) -> Vec<(Uuid, RoomEvent)> {
+    let mut out: Vec<(Uuid, RoomEvent)> = Vec::new();
+    let mut to_publish: Vec<(Uuid, BroadcastItem)> = Vec::new();
+    {
+        let by_id = self.by_id.read().await;
+        for (rid, h) in by_id.iter() {
+            let mut state = h.write().await;
+            if state.state == RoomLifecycle::Ended {
+                continue;
+            }
+            // Walk the participants in reverse so we can
+            // borrow `state.participants` immutably while
+            // collecting the indices to flip. (The existing
+            // `tick_stale_participants` uses the same
+            // pattern at lines 456-471.)
+            let threshold = self.config.participant_disconnect_after_ms;
+            let mut to_disconnect: Vec<usize> = Vec::new();
+            for (i, p) in state.participants.iter().enumerate() {
+                if p.is_host {
+                    continue;
+                }
+                if p.status != ParticipantStatus::Connected {
+                    continue;
+                }
+                let age = now_ms.saturating_sub(p.last_seen_ms);
+                if age >= threshold {
+                    to_disconnect.push(i);
+                }
+            }
+            for &i in to_disconnect.iter() {
+                if let Some(p) = state.participants.get_mut(i) {
+                    p.status = ParticipantStatus::Disconnected;
+                }
+                let user_id = state
+                    .participants
+                    .get(i)
+                    .map(|p| p.user_id)
+                    .unwrap_or(Uuid::nil());
+                let payload = ParticipantLeftPayload {
+                    user_id,
+                    reason: "timeout".into(),
+                };
+                to_publish.push((
+                    *rid,
+                    event_to_broadcast_item(
+                        &RoomEvent::ParticipantLeft(payload.clone()),
+                        *rid,
+                        None,
+                    ),
+                ));
+                out.push((*rid, RoomEvent::ParticipantLeft(payload)));
+            }
+        }
+    }
+    for (rid, item) in &to_publish {
+        self.publish(*rid, item.clone());
+    }
+    out
+}
+
+/// Stale-participant cleanup. Any participant whose
+/// `last_seen_ms` is older than `participant_stale_after_ms`
+/// is removed from their room and a
+/// `ParticipantLeft { reason: "timeout" }` is emitted.
+pub async fn tick_stale_participants(
         &self,
         store: &dyn RoomStore,
         now_ms: i64,
@@ -1146,14 +1241,36 @@ impl RoomRegistry {
     }
 
     /// Update `last_seen_ms` for a participant on every
-    /// authed inbound message. No-op if the user is not in
-    /// any room.
+    /// authed inbound message. Also revives a participant
+    /// whose status is `Disconnected` back to `Connected`,
+    /// because the act of sending a fresh authed envelope
+    /// proves the transport is alive again. No-op if the
+    /// user is not in any room.
+    ///
+    /// The host is intentionally NOT auto-revived here:
+    /// host liveness is owned by the dedicated
+    /// `host_disconnect_grace_ms` / `elect_new_host` path
+    /// (see [`Self::leave`] and [`Self::tick_grace`]). A
+    /// re-connecting host must go through the
+    /// `rejoin` / `host_reconnected` flow so the cap_set
+    /// transfer is auditable.
+    ///
+    /// `Left` is terminal and is not revived.
     pub async fn touch(&self, user_id: Uuid, now_ms: i64) {
         let by_id = self.by_id.read().await;
         for h in by_id.values() {
             let mut state = h.write().await;
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.last_seen_ms = now_ms;
+                // P4-T08 revival: a non-host participant
+                // whose status was flipped to
+                // `Disconnected` by the
+                // presence-timeout tick is brought back to
+                // `Connected` when it sends a fresh
+                // authed message.
+                if !p.is_host && p.status == ParticipantStatus::Disconnected {
+                    p.status = ParticipantStatus::Connected;
+                }
                 return;
             }
         }
@@ -1587,6 +1704,7 @@ mod tests {
             max_participants: 8,
             host_disconnect_grace_ms: 200,
             participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
         }
     }
 
@@ -1839,6 +1957,7 @@ mod tests {
             max_participants: 8,
             host_disconnect_grace_ms: 200,
             participant_stale_after_ms: 100,
+            participant_disconnect_after_ms: 15_000,
         });
         let (summary, _) = r
             .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
@@ -1868,6 +1987,236 @@ mod tests {
             .await
             .expect_err("err");
         assert_eq!(RoomErrorCode::from(err), RoomErrorCode::NotJoined);
+    }
+
+    // ----- P4-T08: presence-driven DISCONNECTED transition -----
+    //
+    // Acceptance (roadmap P4-T08): "after 15 s the server
+    // marks it DISCONNECTED and broadcasts PEER_LEAVE;
+    // a 5-min wait removes it from the in-memory state."
+    //
+    // The tests below exercise the pure registry math
+    // with deterministic clock advancement (no real sleep).
+    // `tick_presence_timeout` is the 15-second tier;
+    // `tick_stale_participants` is the 5-minute tier.
+    // The two are independent and both run from the same
+    // `run_tick` body.
+
+    async fn room_with_host_and_viewer() -> (RoomRegistry, Uuid, Uuid) {
+        let r = RoomRegistry::new(RoomRegistryConfig {
+            max_participants: 8,
+            host_disconnect_grace_ms: 200,
+            participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
+        });
+        let (summary, _) = r
+            .create(&store(), "P4-T08".into(), uid(1), keypair(1), true, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        r.join(&store(), &code, uid(2), keypair(2), "viewer".into(), 1_100)
+            .await
+            .expect("join");
+        (r, summary.id, uid(2))
+    }
+
+    async fn participant_status(r: &RoomRegistry, rid: Uuid, user: Uuid) -> ParticipantStatus {
+        let h = r.get_by_id(rid).await.expect("handle");
+        let s = h.read().await;
+        s.participants
+            .iter()
+            .find(|p| p.user_id == user)
+            .map(|p| p.status.clone())
+            .expect("participant exists")
+    }
+
+    #[tokio::test]
+    async fn p4t08_no_disconnect_before_15s_threshold() {
+        // Roadmap: "3 missed = DISCONNECTED" -> first
+        // 14.999 s of silence must NOT flip status.
+        let (r, rid, viewer) = room_with_host_and_viewer().await;
+        // Last touch at join (1_100).
+        let events = r.tick_presence_timeout(1_100 + 14_999).await;
+        assert!(events.is_empty(), "got {events:?}");
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Connected,
+        );
+    }
+
+    #[tokio::test]
+    async fn p4t08_disconnect_at_15s_broadcasts_participant_left() {
+        // Roadmap: "after 15 s the server marks it DISCONNECTED
+        // and broadcasts PEER_LEAVE". PEER_LEAVE on this server
+        // is the existing `ParticipantLeftPayload` event (the
+        // v1 protocol uses `ParticipantLeft`; the client
+        // already maps it to a UI removal at
+        // `apps/client/src-tauri/src/net/room.rs:1114`).
+        let (r, rid, viewer) = room_with_host_and_viewer().await;
+        let events = r.tick_presence_timeout(1_100 + 15_000).await;
+        assert_eq!(events.len(), 1);
+        match &events[0].1 {
+            RoomEvent::ParticipantLeft(p) => {
+                assert_eq!(p.user_id, viewer);
+                assert_eq!(p.reason, "timeout");
+            }
+            other => panic!("expected ParticipantLeft, got {other:?}"),
+        }
+        assert_eq!(events[0].0, rid);
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Disconnected,
+        );
+    }
+
+    #[tokio::test]
+    async fn p4t08_disconnect_record_retained_for_5min_window() {
+        // Roadmap: "a 5-min wait removes it from the
+        // in-memory state". The 15 s timeout MUST NOT
+        // remove the record; the 5 min sweep is the only
+        // path that does.
+        let (r, rid, viewer) = room_with_host_and_viewer().await;
+        // 15 s tier: flip to Disconnected.
+        let _ = r.tick_presence_timeout(1_100 + 15_000).await;
+        // 5 min tier: REMOVE. Use a 300_000 ms window
+        // and advance the clock past it.
+        let removed = r.tick_stale_participants(&store(), 1_100 + 300_001).await;
+        assert_eq!(removed.len(), 1, "expected viewer removed by 5 min sweep");
+        // Confirm the record is gone from in-memory state.
+        let h = r.get_by_id(rid).await.expect("handle");
+        let s = h.read().await;
+        assert!(
+            !s.participants.iter().any(|p| p.user_id == viewer),
+            "viewer record must be removed after 5 min"
+        );
+    }
+
+    #[tokio::test]
+    async fn p4t08_touch_revives_disconnected_participant() {
+        // Roadmap implies: "stops sending PRESENCE" and
+        // then "starts sending PRESENCE again before the
+        // 5-minute removal" must bring the participant
+        // back. The existing `touch` updates `last_seen_ms`;
+        // the P4-T08 extension flips status back to
+        // `Connected`.
+        let (r, rid, viewer) = room_with_host_and_viewer().await;
+        // Disconnect after 15 s.
+        let _ = r.tick_presence_timeout(1_100 + 15_000).await;
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Disconnected,
+        );
+        // Fresh PRESENCE before the 5 min sweep.
+        r.touch(viewer, 1_100 + 20_000).await;
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Connected,
+        );
+        // A second timeout tick within the 15 s grace window is a no-op.
+        let events = r
+            .tick_presence_timeout(1_100 + 20_000 + 14_999)
+            .await;
+        assert!(events.is_empty(), "revived viewer should not be re-disconnected inside the 15 s window; got {events:?}");
+    }
+
+    #[tokio::test]
+    async fn p4t08_host_is_exempt_from_presence_timeout() {
+        // Host liveness is owned by
+        // `host_disconnect_grace_ms` + `elect_new_host`,
+        // NOT by the presence timeout. A silent host
+        // MUST NOT be flipped to Disconnected by
+        // `tick_presence_timeout` even if their
+        // `last_seen_ms` is ancient (the host may be the
+        // server itself in some test fixtures).
+        let (r, rid, host) = {
+            let r = RoomRegistry::new(RoomRegistryConfig {
+                max_participants: 8,
+                host_disconnect_grace_ms: 200,
+                participant_stale_after_ms: 300_000,
+                participant_disconnect_after_ms: 15_000,
+            });
+            let (summary, _) = r
+                .create(&store(), "host-exempt".into(), uid(1), keypair(1), true, 1_000)
+                .await
+                .expect("create");
+            // Don't touch last_seen_ms; let it sit at the
+            // create time (1_000).
+            (r, summary.id, uid(1))
+        };
+        let events = r.tick_presence_timeout(1_000 + 1_000_000).await;
+        assert!(events.is_empty(), "host must not be disconnected by presence timeout; got {events:?}");
+        assert_eq!(
+            participant_status(&r, rid, host).await,
+            ParticipantStatus::Connected,
+        );
+    }
+
+    #[tokio::test]
+    async fn p4t08_cross_room_presence_does_not_affect_other_room() {
+        // Two rooms; only room one has a stale viewer.
+        // The presence sweep must only affect room one.
+        let r = RoomRegistry::new(RoomRegistryConfig {
+            max_participants: 8,
+            host_disconnect_grace_ms: 200,
+            participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
+        });
+        let (s1, _) = r
+            .create(&store(), "r1".into(), uid(1), keypair(1), true, 1_000)
+            .await
+            .expect("create");
+        let (s2, _) = r
+            .create(&store(), "r2".into(), uid(3), keypair(3), true, 1_000)
+            .await
+            .expect("create");
+        // r1: stale viewer (joined at 1_100, never touched).
+        let _ = r
+            .join(&store(), &s1.code, uid(2), keypair(2), "v1".into(), 1_100)
+            .await
+            .expect("join r1");
+        // r2: fresh viewer (joined + touched at 1_200).
+        let _ = r
+            .join(&store(), &s2.code, uid(4), keypair(4), "v2".into(), 1_200)
+            .await
+            .expect("join r2");
+        r.touch(uid(4), 1_300).await;
+        // Sweep at 1_100 + 15_001.
+        let events = r.tick_presence_timeout(1_100 + 15_001).await;
+        assert_eq!(events.len(), 1, "only r1's viewer must fire");
+        assert_eq!(events[0].0, s1.id);
+        // r2's viewer must still be Connected.
+        assert_eq!(
+            participant_status(&r, s2.id, uid(4)).await,
+            ParticipantStatus::Connected,
+        );
+    }
+
+    #[tokio::test]
+    async fn p4t08_two_and_three_missed_intervals_advance_correctly() {
+        // Roadmap: "3 missed = DISCONNECTED". A
+        // participant who has missed 1 or 2 intervals
+        // (< 15 s) is still Connected; at 3 intervals
+        // (>= 15 s) the sweep flips them.
+        let (r, rid, viewer) = room_with_host_and_viewer().await;
+        // 1 interval (5 s): no event.
+        assert!(r.tick_presence_timeout(1_100 + 5_000).await.is_empty());
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Connected,
+        );
+        // 2 intervals (10 s): no event.
+        assert!(r.tick_presence_timeout(1_100 + 10_000).await.is_empty());
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Connected,
+        );
+        // 3 intervals (15 s): DISCONNECTED + broadcast.
+        let events = r.tick_presence_timeout(1_100 + 15_000).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            participant_status(&r, rid, viewer).await,
+            ParticipantStatus::Disconnected,
+        );
     }
 
     fn room_row(id: Uuid, host: Uuid, deadline: Option<i64>) -> RoomRow {

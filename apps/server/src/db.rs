@@ -1031,6 +1031,7 @@ mod tests {
             host_disconnect_grace_ms: 30_000,
             room_create_max_collisions: 5,
             participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
         };
         let db = Db::open(&cfg).await.expect("open from config");
         // A trivial query proves the schema is applied.

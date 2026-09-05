@@ -82,6 +82,21 @@ async fn run_tick(
     if !migrations.is_empty() {
         tracing::debug!(count = migrations.len(), "room grace tick fired");
     }
+    // P4-T08: presence-driven DISCONNECTED transition.
+    // Runs BEFORE the5-minute stale-cleanup sweep so a
+    // participant who times out is broadcast as
+    // `Disconnected` immediately and is then removed
+    // from in-memory state only after the longer stale
+    // window elapses. The two timers share the same tick
+    // cadence (500 ms in production) so there is exactly
+    // one background task, not two.
+    let disconnects = rooms.tick_presence_timeout(now).await;
+    if !disconnects.is_empty() {
+        tracing::debug!(
+            count = disconnects.len(),
+            "presence timeout -> DISCONNECTED + broadcast"
+        );
+    }
     // Stale-participant cleanup.
     let stale = rooms.tick_stale_participants(store, now).await;
     if !stale.is_empty() {

@@ -14,6 +14,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod chunk_plan;
+pub mod heartbeat;
 pub mod host;
 pub mod invite;
 pub mod peer_id;

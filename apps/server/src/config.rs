@@ -69,6 +69,21 @@ pub const DEFAULT_ROOM_CREATE_MAX_COLLISIONS: u8 = 5;
 /// broadcast.
 pub const DEFAULT_PARTICIPANT_STALE_AFTER_MS: i64 = 300_000;
 
+/// P4-T08: presence-driven `DISCONNECTED` transition
+/// threshold. After this many ms without an inbound
+/// `PRESENCE`, a non-host participant whose status is
+/// still `Connected` is flipped to `Disconnected` and a
+/// `PARTICIPANT_LEFT { reason: "timeout" }` is broadcast
+/// to the room. The participant record remains in
+/// in-memory state for `DEFAULT_PARTICIPANT_STALE_AFTER_MS`
+/// (5 minutes) so a quick reconnect can revive them
+/// without re-creating the participant row. This matches
+/// the roadmap's "3 missed = DISCONNECTED; PEER_LEAVE
+/// broadcast" intent: 3 * `client PRESENCE_INTERVAL` (5 s)
+/// = 15 s. Hosts are exempt; host liveness is owned by
+/// the existing `host_disconnect_grace_ms` migration path.
+pub const DEFAULT_PARTICIPANT_DISCONNECT_AFTER_MS: i64 = 15_000;
+
 /// Runtime configuration resolved from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -105,6 +120,15 @@ pub struct Config {
     /// A viewer that has not sent a `PRESENCE` in this
     /// many ms is removed from the room.
     pub participant_stale_after_ms: i64,
+    /// P4-T08: a viewer that has not sent a `PRESENCE` in
+    /// this many ms is flipped to `Disconnected` and a
+    /// `ParticipantLeft { reason: "timeout" }` broadcast
+    /// is emitted. The record remains in memory for the
+    /// `participant_stale_after_ms` window so a quick
+    /// reconnect can revive it. Hosts are exempt; the
+    /// host-disconnect path uses `host_disconnect_grace_ms`
+    /// instead.
+    pub participant_disconnect_after_ms: i64,
 }
 
 impl Config {
@@ -150,6 +174,8 @@ impl Config {
             .unwrap_or(DEFAULT_ROOM_CREATE_MAX_COLLISIONS);
         let participant_stale_after_ms = parse_env_i64("LOCAST_PARTICIPANT_STALE_AFTER_MS")?
             .unwrap_or(DEFAULT_PARTICIPANT_STALE_AFTER_MS);
+        let participant_disconnect_after_ms = parse_env_i64("LOCAST_PARTICIPANT_DISCONNECT_AFTER_MS")?
+            .unwrap_or(DEFAULT_PARTICIPANT_DISCONNECT_AFTER_MS);
 
         Ok(Self {
             bind_addr,
@@ -169,6 +195,7 @@ impl Config {
             host_disconnect_grace_ms,
             room_create_max_collisions,
             participant_stale_after_ms,
+            participant_disconnect_after_ms,
         })
     }
 }

@@ -304,6 +304,7 @@ mod tests {
             max_participants: 8,
             host_disconnect_grace_ms: 200,
             participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
         };
         crate::rooms::RoomRegistry::new(cfg)
     }
