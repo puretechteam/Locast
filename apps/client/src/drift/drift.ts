@@ -54,6 +54,42 @@
 /** Roadmap / §25.3.2 default indicator threshold. */
 export const INDICATOR_THRESHOLD_MS = 2000;
 
+/** Architecture §13.3: the severe band threshold.
+ *  When the smoothed drift exceeds this value the user
+ *  is in a "severe drift" state. The UI does not currently
+ *  show a separate "severe" surface (P4-T04's DriftIndicator
+ *  is the only drift UI), but the threshold is exposed
+ *  for the future YouAreBehindModal (P4-T05 follow-on)
+ *  and for telemetry. */
+export const SEVERE_THRESHOLD_MS = 5000;
+
+/** P4-T06 / architecture §13.3: when the stddev of the
+ *  four-sample NTP offsets (jitter) exceeds 200 ms, the
+ *  client is on an unstable connection; the indicator
+ *  and severe thresholds are widened to avoid flicker
+ *  (2 s -> 3 s; 5 s -> 7 s). */
+export const JITTER_HIGH_MS = 200;
+export const INDICATOR_THRESHOLD_HIGH_MS = 3000;
+export const SEVERE_THRESHOLD_HIGH_MS = 7000;
+
+/** Select the indicator + severe threshold based on
+ *  the current jitter. Pure function; called by
+ *  `deriveDriftSample`. */
+export function activeThresholds(
+    jitterMs: number | null,
+): { indicator: number; severe: number } {
+    if (jitterMs !== null && jitterMs > JITTER_HIGH_MS) {
+        return {
+            indicator: INDICATOR_THRESHOLD_HIGH_MS,
+            severe: SEVERE_THRESHOLD_HIGH_MS,
+        };
+    }
+    return {
+        indicator: INDICATOR_THRESHOLD_MS,
+        severe: SEVERE_THRESHOLD_MS,
+    };
+}
+
 /** Risk 9 smoothing time constant (seconds). */
 export const SMOOTHING_TAU_SECONDS = 5;
 
@@ -102,8 +138,14 @@ export interface DriftSample {
     /** Expected room position at `nowMs`, ms. */
     expectedMs: number | null;
     /** True iff the indicator should be visible
-     *  (`|smoothedDriftMs| > INDICATOR_THRESHOLD_MS`). */
+     *  (`|smoothedDriftMs| > active.indicator`). */
     indicatorVisible: boolean;
+    /** True iff the smoothed drift has crossed the
+     *  severe band (`|smoothedDriftMs| >= active.severe`).
+     *  Used by the future YouAreBehindModal (P4-T05
+     *  follow-on). The current DriftIndicator does not
+     *  surface this directly. */
+    severeVisible: boolean;
     /** Direction of the smoothed drift: "ahead", "behind",
      *  or "none" when no smoothed value is available. */
     direction: "ahead" | "behind" | "none";
@@ -202,7 +244,10 @@ export function applyDriftSample(
 }
 
 /** Derive a UI-ready DriftSample from the current state. */
-export function deriveDriftSample(state: DriftState): DriftSample {
+export function deriveDriftSample(
+    state: DriftState,
+    jitterMs: number | null = null,
+): DriftSample {
     const expected: number | null = null; // expected is recomputed by callers per-tick
     if (state.smoothedDriftMs === null) {
         return {
@@ -210,10 +255,16 @@ export function deriveDriftSample(state: DriftState): DriftSample {
             smoothedDriftMs: null,
             expectedMs: expected,
             indicatorVisible: false,
+            severeVisible: false,
             direction: "none",
         };
     }
     const abs = Math.abs(state.smoothedDriftMs);
+    // P4-T06: pick the threshold based on jitter. High
+    // jitter (>= 200 ms) widens the visibility threshold
+    // (2 s -> 3 s) and the severe band (5 s -> 7 s) per
+    // architecture §13.3.
+    const t = activeThresholds(jitterMs);
     const direction: DriftSample["direction"] =
         state.smoothedDriftMs > 0
             ? "ahead"
@@ -224,7 +275,8 @@ export function deriveDriftSample(state: DriftState): DriftSample {
         rawDriftMs: state.rawDriftMs,
         smoothedDriftMs: state.smoothedDriftMs,
         expectedMs: expected,
-        indicatorVisible: abs > INDICATOR_THRESHOLD_MS,
+        indicatorVisible: abs > t.indicator,
+        severeVisible: abs >= t.severe,
         direction,
     };
 }

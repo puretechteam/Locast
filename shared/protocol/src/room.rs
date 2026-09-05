@@ -609,6 +609,70 @@ pub struct PlaybackAcceptedEvent {
     pub server_ts_ms: i64,
 }
 
+/// SKEW_PROBE (C -> S). P4-T06 NTP-style clock skew
+/// measurement (docs/ARCHITECTURE.md §13.3). The client
+/// records its local wall clock at send time, then awaits
+/// SKEW_REPLY. The reply carries the server's `now_ms()` and
+/// echoes `client_send_ms` so the client can compute RTT,
+/// offset, skew, and jitter from a single round trip.
+///
+/// The probe is fully authenticated (the per-connection
+/// bearer is enforced by the WS layer before the room
+/// dispatcher sees the envelope). There is no payload-level
+/// `user_id` because the server attributes the probe to the
+/// bearer; the client does not need a server-issued
+/// identity to measure clock skew.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct SkewProbePayload {
+    /// Client's local wall clock at send time (unix ms).
+    /// The client captures this IMMEDIATELY before writing
+    /// the envelope to the socket so the measurement
+    /// tracks the actual wire-write moment rather than the
+    /// envelope-construction moment. The server echoes this
+    /// value back in `SkewReplyPayload.client_send_ms` so
+    /// the client can compute RTT = `t3 - t0` and offset =
+    /// `server_ts - (t0 + t_recv_client) / 2` after `t_recv_client`
+    /// arrives.
+    pub client_send_ms: i64,
+}
+
+/// SKEW_REPLY (S -> caller). P4-T06 server's response to a
+/// SKEW_PROBE. Carries the server's wall clock at the moment
+/// the request was accepted (the same `now_ms()` the
+/// dispatcher captures for `Envelope.ts_ms` on every
+/// `to_caller` reply) plus the echoed `client_send_ms` so the
+/// client can pair the round trip deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct SkewReplyPayload {
+    /// Server's wall clock at the moment the probe was
+    /// accepted, unix ms. Read from the dispatcher's
+    /// injected `AppState::clock` (the same clock the rest
+    /// of the room protocol uses for `Envelope.ts_ms`).
+    pub server_ts_ms: i64,
+    /// Echo of the request's `client_send_ms`. The server
+    /// does not touch this value; the client uses it to
+    /// pair the round trip with the original probe.
+    pub client_send_ms: i64,
+}
+
+/// SKEW_REPLY-side NTP sample (architecture §13.3). The
+/// client reconstructs the four-timestamp exchange from
+/// its own local clock at send (`t0_local_ms`) and at
+/// receive (`t3_local_ms`) plus the server's
+/// `server_ts_ms` from the reply payload. The
+/// `client_send_ms_echo` is included so the client can
+/// assert the round trip was not reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct SkewSample {
+    pub t0_local_ms: i64,
+    pub t3_local_ms: i64,
+    pub server_ts_ms: i64,
+    pub client_send_ms_echo: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

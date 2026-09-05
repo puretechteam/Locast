@@ -158,6 +158,17 @@ pub enum MessageKind {
     // not see its own position echoed back.
     #[serde(rename = "POSITION_REPORT")]
     PositionReport,
+    // ----- P4-T06: NTP-style clock skew measurement -----
+    // SKEW_PROBE / SKEW_REPLY is the per-connection clock
+    // measurement exchange (architecture §13.3). The probe
+    // is a per-connection request (not a room envelope), so
+    // the dispatcher does not require the caller to be a
+    // room member. The reply is sent only to the caller
+    // (no broadcast).
+    #[serde(rename = "SKEW_PROBE")]
+    SkewProbe,
+    #[serde(rename = "SKEW_REPLY")]
+    SkewReply,
     /// Forward-compat: an unknown type string. The v1 server
     /// rejects anything in this variant; future versions may
     /// learn to handle some of them.
@@ -198,6 +209,8 @@ impl MessageKind {
             MessageKind::Signal => "SIGNAL",
             MessageKind::PlaybackCmd => "PLAYBACK_CMD",
             MessageKind::PositionReport => "POSITION_REPORT",
+            MessageKind::SkewProbe => "SKEW_PROBE",
+            MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::Other(s) => s,
         }
     }
@@ -257,6 +270,18 @@ impl MessageKind {
     /// the payload verbatim without mutation.
     pub fn is_position_report(&self) -> bool {
         matches!(self, MessageKind::PositionReport)
+    }
+
+    /// `true` for the SKEW_PROBE envelope (P4-T06 NTP-style
+    /// clock skew measurement). Routed through the same
+    /// WS-layer entry point as the lifecycle predicates so
+    /// the per-connection bearer check applies, but the
+    /// probe does NOT require room membership (the client
+    /// measures skew across the whole connection, not per
+    /// room). The per-type handler is a one-shot reply
+    /// (no broadcast).
+    pub fn is_skew_probe(&self) -> bool {
+        matches!(self, MessageKind::SkewProbe)
     }
 }
 

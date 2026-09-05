@@ -197,3 +197,28 @@ mod tests {
         assert_eq!(v["playing"], false);
     }
 }
+
+/// P4-T06: NTP-style clock skew measurement (architecture
+/// section 13.3). The Tauri command is the thinnest
+/// possible transport: it calls
+/// `RoomClient::clock_skew_probe()` which performs one
+/// SKEW_PROBE/SKEW_REPLY round trip and returns the
+/// four-timestamp sample. The React layer owns the
+/// 60 s cadence and the 4-sample burst, the median /
+/// stddev math, and the Jitter / Skew store updates. The
+/// Rust side deliberately does not start its own timer
+/// (a Rust-side timer would outlive the React page's
+/// mount / unmount and the room-change reset).
+///
+/// The command is callable from the test harness
+/// (Playwright / Vitest) so the production IPC path
+/// can be exercised end-to-end without real media.
+#[tauri::command]
+#[specta::specta]
+pub async fn clock_skew_probe(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+) -> Result<locast_protocol::room::SkewSample, AppError> {
+    room.clock_skew_probe()
+        .await
+        .map_err(|e| AppError::other(format!("clock_skew_probe: {e}")))
+}

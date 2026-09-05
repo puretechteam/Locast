@@ -35,6 +35,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useClockSkewStore } from "../stores/useClockSkewStore";
 import { usePlaybackStore, type PlaybackStateEvent } from "../stores/usePlaybackStore";
 import {
     applyDriftSample,
@@ -152,6 +153,19 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                           serverTsMs: hostEvent.server_ts_ms,
                       }
                     : null;
+            // P4-T06: the drift projection's
+            // `skewMs` comes from the measured
+            // server-local clock offset (architecture
+            // section 13.3). The store is the single
+            // source of truth; until the first NTP
+            // measurement is available, `skewMs` is
+            // null and the projection is equivalent
+            // to the v1 (skew = 0) behavior so existing
+            // tests / the P4-T04 default continue to
+            // pass.
+            const storedSkewMs =
+                useClockSkewStore.getState().skewMs;
+            const effectiveSkewMs = storedSkewMs ?? skewMs;
             // §12.4: drift is computed only when the local
             // player is PLAYING. A paused local player
             // produces no raw drift, so the EMA is not
@@ -164,7 +178,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                           localMs,
                           hostCommand,
                           nowMs: Date.now(),
-                          skewMs,
+                          skewMs: effectiveSkewMs,
                       });
             stateRef.current = applyDriftSample(
                 stateRef.current,
@@ -208,7 +222,14 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
             ? null
             : computeDriftVsMedian(localMsNow, roomMedianMs);
 
-    const sample = deriveDriftSample(stateRef.current);
+    // P4-T06: read the current jitter from the clock
+    // skew store. `deriveDriftSample` widens the
+    // indicator + severe thresholds when jitter is high
+    // (architecture section 13.3). Until the first NTP
+    // measurement is available, jitter is null and the
+    // defaults apply.
+    const jitterMs = useClockSkewStore.getState().jitterMs;
+    const sample = deriveDriftSample(stateRef.current, jitterMs);
 
     // P4-T04 test seam (extended in P4-T05): in Vite's
     // test mode, expose the current smoother state on

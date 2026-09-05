@@ -12,9 +12,11 @@ import { DriftIndicator } from "../../components/DriftIndicator";
 import { SyncButton } from "../../components/SyncButton";
 import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { useManualSync } from "../../drift/useManualSync";
+import { useClockSkew } from "../../drift/useClockSkew";
 import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
+import { useClockSkewStore } from "../../stores/useClockSkewStore";
 import { ParticipantStrip } from "./ParticipantStrip";
 import { RoomFooter } from "./RoomFooter";
 
@@ -193,10 +195,28 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     // local-only DOM seek; hosts get a local seek + a
     // PLAYBACK_CMD emit through the existing
     // `sendPlaybackCommand` path.
+    // P4-T06: thread the measured skew into the manual-sync
+    // hook. Until the first NTP measurement is available,
+    // `skewMs` is null; the hook falls back to 0 in that
+    // case so P4-T05's existing behavior is preserved.
+    const measuredSkewMs = useClockSkewStore((s) => s.skewMs);
     const sync = useManualSync({
         roomId: summary?.id ?? null,
         isHost,
         getVideo: () => videoRef.current,
+        skewMs: measuredSkewMs ?? 0,
+    });
+
+    // P4-T06: mount the 60s NTP measurement driver. The
+    // probe is wired to a no-op stub in v1; a future
+    // P-task will thread the Tauri `clockSkewProbe`
+    // command through. The hook still runs the test
+    // seam (`__locastClockSkew.setSkewJitter`) so the
+    // drift threshold widening can be exercised in
+    // Playwright.
+    useClockSkew({
+        roomId: summary?.id ?? null,
+        probeOnce: async () => null,
     });
 
     // P4-T05: real Resync handler. The DriftIndicator's

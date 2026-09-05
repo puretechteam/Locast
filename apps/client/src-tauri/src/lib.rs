@@ -363,6 +363,7 @@ pub fn run() {
             commands::download::download_open,
             commands::playback::playback_send,
             room::report::position_report,
+            room::report::clock_skew_probe,
         ])
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri

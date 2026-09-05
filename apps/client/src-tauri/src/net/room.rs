@@ -963,6 +963,44 @@ impl RoomClient {
             .map_err(|e| RoomClientError::Signaling(e.to_string()))
     }
 
+    /// P4-T06: NTP-style clock skew measurement. Captures
+    /// the local wall clock at send time, sends a
+    /// `SKEW_PROBE` envelope, awaits the `SKEW_REPLY`,
+    /// and returns the four-timestamp sample for the
+    /// `room::skew::compute_skew_jitter` reducer. The
+    /// actual NTP math (median / stddev / RTT filter)
+    /// lives in `apps/client/src-tauri/src/room/skew.rs`
+    /// and is exercised in isolation there; this method
+    /// is a thin transport.
+    pub async fn clock_skew_probe(
+        &self,
+    ) -> Result<locast_protocol::room::SkewSample, RoomClientError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t0_local_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let env = envelope(
+            MessageKind::SkewProbe,
+            None,
+            locast_protocol::room::SkewProbePayload {
+                client_send_ms: t0_local_ms,
+            },
+        );
+        let reply = self.request(env, MessageKind::SkewReply).await?;
+        let payload: locast_protocol::room::SkewReplyPayload = decode_payload(&reply)?;
+        let t3_local_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        Ok(locast_protocol::room::SkewSample {
+            t0_local_ms,
+            t3_local_ms,
+            server_ts_ms: payload.server_ts_ms,
+            client_send_ms_echo: payload.client_send_ms,
+        })
+    }
+
     /// Drive the inbound subscriber: pop envelopes off the
     /// channel, update the cached state, dispatch any
     /// pending request-reply correlations, and emit

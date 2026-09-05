@@ -13,8 +13,13 @@
 
 import {
     INDICATOR_THRESHOLD_MS,
+    INDICATOR_THRESHOLD_HIGH_MS,
+    JITTER_HIGH_MS,
+    SEVERE_THRESHOLD_MS,
+    SEVERE_THRESHOLD_HIGH_MS,
     SMOOTHING_ALPHA_1HZ,
     STALE_REPORT_MS,
+    activeThresholds,
     applyDriftSample,
     computeDriftVsMedian,
     computeRawDrift,
@@ -323,6 +328,87 @@ process.stdout.write("computeSyncTarget (P4-T05)\n");
         skewMs: 0,
     });
     check("isHost preserved (host branch)", t6.isHost === true);
+}
+
+// ----- P4-T06: jitter threshold widening -----
+process.stdout.write("activeThresholds (P4-T06)\n");
+{
+    const low = activeThresholds(0);
+    check(`jitter=0 => indicator ${INDICATOR_THRESHOLD_MS}`, low.indicator === INDICATOR_THRESHOLD_MS);
+    check(`jitter=0 => severe ${SEVERE_THRESHOLD_MS}`, low.severe === SEVERE_THRESHOLD_MS);
+
+    const mid = activeThresholds(150);
+    check(
+        `jitter=150 (< ${JITTER_HIGH_MS}) => indicator stays ${INDICATOR_THRESHOLD_MS}`,
+        mid.indicator === INDICATOR_THRESHOLD_MS,
+    );
+    check(
+        `jitter=150 => severe stays ${SEVERE_THRESHOLD_MS}`,
+        mid.severe === SEVERE_THRESHOLD_MS,
+    );
+
+    const high = activeThresholds(250);
+    check(
+        `jitter=250 (> ${JITTER_HIGH_MS}) => indicator widens to ${INDICATOR_THRESHOLD_HIGH_MS}`,
+        high.indicator === INDICATOR_THRESHOLD_HIGH_MS,
+    );
+    check(
+        `jitter=250 => severe widens to ${SEVERE_THRESHOLD_HIGH_MS}`,
+        high.severe === SEVERE_THRESHOLD_HIGH_MS,
+    );
+
+    const noJitter = activeThresholds(null);
+    check(
+        "null jitter => normal indicator",
+        noJitter.indicator === INDICATOR_THRESHOLD_MS,
+    );
+
+    const boundary = activeThresholds(JITTER_HIGH_MS);
+    check(
+        `jitter=${JITTER_HIGH_MS} (boundary, strict >) => normal indicator`,
+        boundary.indicator === INDICATOR_THRESHOLD_MS,
+    );
+}
+
+process.stdout.write("deriveDriftSample + jitter (P4-T06)\n");
+{
+    function stateWithSmoothed(v: number | null) {
+        return {
+            ...initialDriftState(),
+            smoothedDriftMs: v,
+            rawDriftMs: v,
+            lastSampleAtMs: 1000,
+            sampleCount: 1,
+        };
+    }
+    check(
+        "1500ms smoothed, low jitter => hidden",
+        deriveDriftSample(stateWithSmoothed(1500), 50).indicatorVisible === false,
+    );
+    check(
+        "2500ms smoothed, low jitter => visible",
+        deriveDriftSample(stateWithSmoothed(2500), 50).indicatorVisible === true,
+    );
+    check(
+        "2500ms smoothed, high jitter (250) => hidden (widened to 3s)",
+        deriveDriftSample(stateWithSmoothed(2500), 250).indicatorVisible === false,
+    );
+    check(
+        "3500ms smoothed, high jitter (250) => visible (widened threshold)",
+        deriveDriftSample(stateWithSmoothed(3500), 250).indicatorVisible === true,
+    );
+    check(
+        "5000ms smoothed, low jitter => severe (>= 5s threshold)",
+        deriveDriftSample(stateWithSmoothed(5000), 50).severeVisible === true,
+    );
+    check(
+        "5000ms smoothed, high jitter (250) => not severe (widened to 7s)",
+        deriveDriftSample(stateWithSmoothed(5000), 250).severeVisible === false,
+    );
+    check(
+        "7500ms smoothed, high jitter (250) => severe (widened 7s)",
+        deriveDriftSample(stateWithSmoothed(7500), 250).severeVisible === true,
+    );
 }
 
 if (failures > 0) {

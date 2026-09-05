@@ -789,6 +789,19 @@ async fn dispatch_authed(
         warn!(request_id = %request_id, "bearer pubkey mismatch");
         return DispatchOutcome::close("bearer_mismatch");
     }
+    // P4-T06: SKEW_PROBE is a per-connection clock-skew
+    // measurement (architecture §13.3). It is a one-shot
+    // request/reply round trip; the reply is sent only to
+    // the caller (no broadcast, no room context). The probe
+    // is a single `MessageKind::SkewProbe` envelope whose
+    // payload is `SkewProbePayload { client_send_ms: i64 }`;
+    // the server stamps its own `clock.now_ms()` into a
+    // `SkewReplyPayload` and echoes `client_send_ms` back
+    // so the client can compute RTT, offset, and jitter
+    // from the four-timestamp exchange.
+    if envelope.r#type.is_skew_probe() {
+        return handle_skew_probe(envelope, state.clock.as_ref(), request_id).await;
+    }
     // The message passed bearer validation. Route ROOM_*
     // envelopes to the room dispatcher. Other envelope
     // types (future PLAY/PAUSE/SEEK/DRAW/LASER/CHAT/MANIFEST_*)
@@ -1139,6 +1152,77 @@ async fn handle_auth(
         }
     }
     out
+}
+
+/// P4-T06: SKEW_PROBE reply handler. The probe is a
+/// per-connection, one-shot, request/response exchange
+/// (architecture §13.3). The caller has already been
+/// authenticated (the WS layer's bearer check ran before
+/// this function is reached). The handler:
+///
+///  1. Decodes the probe payload as `SkewProbePayload`.
+///     A malformed payload closes the connection (the
+///     probe is bearer-bearing, so the only way to send
+///     one is to be an authenticated connection; a
+///     malformed payload is a real bug).
+///  2. Reads `state.clock.now_ms()` (the same
+///     `AppState::clock` the rest of the server uses for
+///     `Envelope.ts_ms` and room dispatch time) and
+///     stamps it into `SkewReplyPayload.server_ts_ms`.
+///  3. Echoes the request's `client_send_ms` back so
+///     the client can pair the round trip deterministically.
+///  4. Returns a single `Action::Send` carrying the
+///     `SKEW_REPLY` envelope. There is no broadcast, no
+///     room context, and no room state mutation.
+///
+/// The handler does not consult `usePlaybackStore` / room
+/// membership / cap gates; SKEW_PROBE is the only bearer-
+/// bearing envelope that is intentionally NOT room-scoped
+/// because the client measures skew across the whole
+/// connection, not per room.
+async fn handle_skew_probe(
+    envelope: Envelope,
+    clock: &dyn crate::time::Clock,
+    request_id: Uuid,
+) -> DispatchOutcome {
+    use locast_protocol::room::{SkewProbePayload, SkewReplyPayload};
+    let probe: SkewProbePayload = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "invalid SKEW_PROBE payload");
+            return DispatchOutcome::close("bad_msg");
+        }
+    };
+    let reply = SkewReplyPayload {
+        server_ts_ms: clock.now_ms(),
+        client_send_ms: probe.client_send_ms,
+    };
+    let env = Envelope {
+        v: 1,
+        r#type: MessageKind::SkewReply,
+        id: Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: reply.server_ts_ms,
+        seq: 0,
+        payload: serde_json::to_value(&reply).unwrap_or(json!({})),
+    };
+    let msg = match encode_envelope_message(&env) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "encode SKEW_REPLY failed");
+            return DispatchOutcome::close("internal");
+        }
+    };
+    debug!(
+        request_id = %request_id,
+        server_ts_ms = reply.server_ts_ms,
+        echoed_client_send_ms = reply.client_send_ms,
+        "sent SKEW_REPLY"
+    );
+    DispatchOutcome {
+        actions: vec![Action::Send(msg)],
+    }
 }
 
 async fn send_auth_fail_bytes(

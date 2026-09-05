@@ -47,7 +47,11 @@
 // type). P4-T03 added the `positionReport` command (and the
 // `PositionReportInput` / `PositionReportResult` types) plus
 // the `positionReport` event listener (and the
-// `PositionReportEvent` type).
+// `PositionReportEvent` type). P4-T06 added the
+// `clockSkewProbe` command (returning `SkewSample`); the
+// 60 s cadence and the 4-sample burst live in the React
+// `useClockSkew` hook and the pure-math reducer lives in
+// `apps/client/src-tauri/src/room/skew.rs`.
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -135,6 +139,16 @@ export const commands = {
     report: PositionReportInput,
   ): Promise<PositionReportResult> {
     return await __TAURI_INVOKE("position_report", { report });
+  },
+  // P4-T06: NTP-style clock skew probe. Returns a single
+  // `SkewSample` (t0 / t3 / server_ts_ms / echoed
+  // client_send_ms). The React layer owns the 60 s
+  // cadence and the 4-sample burst, and the
+  // `useClockSkew` hook reduces the samples into
+  // (skewMs, jitterMs) via the same math as
+  // `apps/client/src-tauri/src/room/skew.rs::compute_skew_jitter`.
+  async clockSkewProbe(): Promise<SkewSample> {
+    return await __TAURI_INVOKE<SkewSample>("clock_skew_probe");
   },
 };
 
@@ -330,6 +344,19 @@ export type DownloadSessionIpc = {
   total_bytes: number;
   transferred_bytes: number;
   on_disk_path: string | null;
+};
+
+// P4-T06: the SKEW_PROBE round-trip's 4-timestamp sample
+// (architecture section 13.3). The Rust side emits this from
+// `RoomClient::clock_skew_probe`; the React layer reduces a
+// burst of 4 samples into (skewMs, jitterMs) and stores them
+// in the `useClockSkewStore`. The 60 s cadence is owned by
+// the React `useClockSkew` hook.
+export type SkewSample = {
+    t0_local_ms: number;
+    t3_local_ms: number;
+    server_ts_ms: number;
+    client_send_ms_echo: number;
 };
 
 /* Events */
