@@ -431,6 +431,41 @@ code {
     flex-basis: 100%;
 }
 
+/* P5-T01: drawing canvas overlay. The .room-page__player-stage
+ * container establishes a positioning context so the canvas
+ * can sit exactly over the <video>. The canvas itself
+ * inherits the video's pixel area via 100% / 100% and is
+ * `pointer-events: none` so the native <video controls>
+ * overlay (Play/Pause/Seek bar) remains interactive. A
+ * future drawing-mode task toggles this to `auto` when the
+ * user enters pen mode.
+ */
+.room-page__player-stage {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+}
+
+.drawing-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    /* The canvas is fully transparent; this `z-index`
+     * guarantees it sits above the <video> pixel area
+     * but BELOW the browser-rendered native controls
+     * overlay (which is rendered by the user-agent
+     * shadow tree outside the normal stacking context).
+     * `pointer-events: none` makes the stacking context
+     * moot for input but the explicit z-index documents
+     * the intent. */
+    z-index: 1;
+}
+
 /* P4-T04: drift indicator. The indicator is hidden by
  * default (component returns null when |smoothed| <=
  * 2 s); the rules below only apply when the element is

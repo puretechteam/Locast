@@ -13,6 +13,8 @@
     "test": "echo \"locast-client: no test runner yet (Vitest lands in P0-T04)\" && exit 0",
     "smoke:drift": "node --experimental-strip-types --no-warnings src/drift/drift.smoke.ts",
     "smoke:dedup": "node --experimental-strip-types --no-warnings src/drift/dedup.smoke.ts",
+    "smoke:geometry": "node --experimental-strip-types --no-warnings src/drawing/geometry.smoke.ts",
+    "smoke:stroke-renderer": "node --experimental-strip-types --no-warnings src/drawing/strokeRenderer.smoke.ts",
     "test:e2e": "playwright test --config=tests/playwright/playwright.config.ts",
     "lint": "echo \"locast-client: no linter yet (eslint lands in P0-T04)\" && exit 0",
     "tauri": "tauri"

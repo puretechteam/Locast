@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import { sendPositionReport } from "../services/playback";
+import { DrawingLayer } from "./DrawingLayer";
 
 /**
  * P4-T02: the room media player.
@@ -206,22 +207,32 @@ export function Player({
         };
     }, [mediaReady, summaryId]);
 
-    return (
+return (
         <div className="room-page__player" data-testid="locast-player">
             {mediaSrc === null ? (
                 <p className="room-page__player-empty">No media loaded yet.</p>
             ) : (
-                <video
-                    ref={ref}
-                    data-testid="locast-player-video"
-                    src={mediaSrc}
-                    controls
-                    playsInline
-                    onCanPlay={onCanPlay}
-                    onLoadedMetadata={onLoadedMetadata}
-                    onError={onError}
-                    style={{ maxWidth: "100%", maxHeight: "100%" }}
-                />
+                <div className="room-page__player-stage" data-testid="locast-player-stage">
+                    <video
+                        ref={ref}
+                        data-testid="locast-player-video"
+                        src={mediaSrc}
+                        controls
+                        playsInline
+                        onCanPlay={onCanPlay}
+                        onLoadedMetadata={onLoadedMetadata}
+                        onError={onError}
+                        style={{ maxWidth: "100%", maxHeight: "100%" }}
+                    />
+                    {/* P5-T01: transparent drawing canvas overlaid
+                       on the video. The canvas sits above the
+                       video's pixel area (pointer-events: none
+                       so the native <video controls> overlay
+                       remains clickable). A future drawing-tool
+                       task will switch this to pointer-events:
+                       auto when the user enters pen mode. */}
+                    <DrawingLayer videoRef={ref} userId={localUserId} />
+                </div>
             )}
             {errorMessage !== null && (
                 <p
