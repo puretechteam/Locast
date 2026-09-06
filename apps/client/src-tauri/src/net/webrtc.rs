@@ -1393,6 +1393,7 @@ mod tests {
                 status: crate::net::room::ParticipantStatusIpc::Connected,
                 last_seen_ms: 1,
                 is_host: true,
+                cap_set: 0,
             }],
             host_disconnected: false,
             host_disconnect_deadline_ms: None,
@@ -1406,6 +1407,7 @@ mod tests {
             status: crate::net::room::ParticipantStatusIpc::Connected,
             last_seen_ms: 2,
             is_host: false,
+            cap_set: 0,
         });
         assert_ne!(room_summary_signature(&s1), room_summary_signature(&s2));
     }

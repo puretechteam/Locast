@@ -17,6 +17,7 @@ import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
 import { useClockSkewStore } from "../../stores/useClockSkewStore";
+import { useCapabilityStore } from "../../stores/useCapabilityStore";
 import { ParticipantStrip } from "./ParticipantStrip";
 import { RoomFooter } from "./RoomFooter";
 
@@ -301,6 +302,14 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
             }
         };
     }, [setSummary, setSignaling]);
+
+    // P6-T02: sync you_cap_set from the room summary to the
+    // capability store so DrawingLayer can gate toolbar visibility.
+    useEffect(() => {
+        if (summary?.you_cap_set !== undefined) {
+            useCapabilityStore.getState().setYouCapSet(summary.you_cap_set);
+        }
+    }, [summary]);
 
     if (!hydrated) {
         return (

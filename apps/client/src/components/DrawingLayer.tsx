@@ -16,13 +16,14 @@
 // P5-T04: laser pointer overlay integrated here.
 // P5-T06: drawing toolbar and keyboard shortcuts.
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useDrawingCanvas } from "../hooks/useDrawingCanvas";
 import { useDrawingEventBridge, useDrawingRoomSync } from "../hooks/useDrawingEventBridge";
 import { useDrawingStore } from "../stores/useDrawingStore";
+import { useCapabilityStore, CAP } from "../stores/useCapabilityStore";
 import { useKeyboardScope } from "../hooks/useKeyboardScope";
-import type { DrawingTool } from "../hooks/useKeyboardScope";
+import type { DrawingTool, DrawingMode } from "../hooks/useKeyboardScope";
 import type { StrokeTool } from "../drawing/types";
 import { LaserPointer } from "./LaserPointer";
 import { DrawingToolbar } from "./DrawingToolbar";
@@ -69,9 +70,42 @@ export function DrawingLayer({
     const [strokeColor, setStrokeColor] = useState("#e6e6e6");
     const [strokeWidth, setStrokeWidth] = useState(3);
 
+    const youCapSet = useCapabilityStore((s) => s.youCapSet);
+    const canDraw = youCapSet !== null && (youCapSet & CAP.DRAW) !== 0;
+
     const keyboard = useKeyboardScope({
         onUndo: undo,
+        canDraw,
     });
+
+    // P6-T02 test seam: expose keyboard scope state so
+    // the Playwright harness can verify toolbar visibility
+    // gating without keyboard simulation.
+    useEffect(() => {
+        if (import.meta.env.MODE !== "test") return;
+        const w = window as unknown as {
+            __locastKeyboardScope?: {
+                toolbarVisible: boolean;
+                laserActive: boolean;
+                drawingMode: DrawingMode;
+                canvasMode: string;
+                canDraw: boolean;
+                toggleToolbar: () => void;
+                setDrawingMode: (mode: DrawingMode) => void;
+                setLaserActive: (active: boolean) => void;
+            };
+        };
+        w.__locastKeyboardScope = {
+            toolbarVisible: keyboard.toolbarVisible,
+            laserActive: keyboard.laserActive,
+            drawingMode: keyboard.drawingMode,
+            canvasMode: keyboard.canvasMode,
+            canDraw,
+            toggleToolbar: keyboard.toggleToolbar,
+            setDrawingMode: keyboard.setDrawingMode,
+            setLaserActive: keyboard.setLaserActive,
+        };
+    }, [keyboard, canDraw]);
 
     const handleToolSelect = useCallback(
         (tool: DrawingTool) => {

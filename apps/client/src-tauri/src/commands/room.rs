@@ -210,3 +210,28 @@ pub async fn manifest_publish(
     .await
     .map_err(|e| AppError::other(e.to_string()))
 }
+
+/// P6-T02: grant or revoke capabilities for a participant.
+/// The caller must be the room host; the server enforces
+/// this. Sends a `PERMISSION_SET` envelope and waits for
+/// a `CAPABILITY_UPDATE` broadcast confirmation.
+#[tauri::command]
+#[specta::specta]
+pub async fn room_permission_set(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    target_user_id: String,
+    add_cap_set: u32,
+    remove_cap_set: u32,
+) -> Result<(), AppError> {
+    let summary = room
+        .state()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    let room_id = Uuid::parse_str(&summary.id)
+        .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    let target_uuid = Uuid::parse_str(&target_user_id)
+        .map_err(|e| AppError::other(format!("bad target user_id: {e}")))?;
+    room.permission_set(room_id, target_uuid, add_cap_set, remove_cap_set)
+        .await
+        .map_err(|e| AppError::other(e.to_string()))
+}

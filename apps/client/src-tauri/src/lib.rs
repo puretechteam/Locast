@@ -360,6 +360,7 @@ pub fn run() {
             commands::room::recent_room_upsert,
             commands::room::manifest_publish,
             commands::room::manifest_fetch,
+            commands::room::room_permission_set,
             commands::download::download_open,
             commands::playback::playback_send,
             commands::drawing::drawing_send,

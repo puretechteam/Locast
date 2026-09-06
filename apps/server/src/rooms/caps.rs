@@ -201,6 +201,20 @@ pub enum Command {
     /// level (any stroke begin a non-member could not
     /// have started is rejected).
     Draw,
+    /// P6-T02: host-only PERMISSION_SET envelope. The
+    /// capability check is two-fold:
+    ///
+    /// 1. The caller must be a participant of the room
+    ///    named in `envelope.room_id`.
+    /// 2. The caller must be the room's CURRENT host
+    ///    (`ParticipantRecord::is_host` is true).
+    ///
+    /// Unlike `PublishManifest` / `PlaybackControl` which
+    /// also check `is_room_host`, the PERMISSION_SET
+    /// handler does NOT call `can()` — it performs the
+    /// `is_host` check directly and then applies the
+    /// mutation. The `can()` function is read-only.
+    PermissionSet,
 }
 
 impl Command {
@@ -209,6 +223,9 @@ impl Command {
             Command::PlaybackControl => Some((Scope::Playback, Action::IssuePlaybackCommand)),
             Command::Draw => Some((Scope::Drawing, Action::DrawBegin)),
             Command::PublishManifest => Some((Scope::Manifest, Action::PublishManifest)),
+            // PermissionSet is checked via is_room_host directly in check_capability;
+            // it does not use can() since can() is read-only.
+            Command::PermissionSet => None,
             _ => None,
         }
     }
@@ -293,6 +310,17 @@ pub async fn check_capability(
         Command::Draw => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        Command::PermissionSet => {
+            if let Some(rid) = registry.get_user_room(user_id).await {
+                if registry.is_room_host(rid, user_id).await {
+                    Ok(())
+                } else {
+                    Err(CapsError::NotHost)
+                }
             } else {
                 Err(CapsError::NotMember)
             }

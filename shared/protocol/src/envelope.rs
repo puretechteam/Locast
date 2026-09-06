@@ -158,6 +158,19 @@ pub enum MessageKind {
     // not see its own position echoed back.
     #[serde(rename = "POSITION_REPORT")]
     PositionReport,
+    // ----- P6-T02: capability grant / revoke -----
+    // PERMISSION_SET is host -> server; the server validates
+    // the caller is the current host, mutates the target's
+    // `cap_set`, persists it, and broadcasts
+    // CAPABILITY_UPDATE to every room participant.
+    #[serde(rename = "PERMISSION_SET")]
+    PermissionSet,
+    // CAPABILITY_UPDATE is server -> all participants. It
+    // carries the authoritative new `cap_set` for the
+    // affected participant so every client can update its
+    // mirror.
+    #[serde(rename = "CAPABILITY_UPDATE")]
+    CapabilityUpdate,
     // ----- P5-T02: per-stroke drawing protocol -----
     // DRAW_BEGIN is the per-stroke signed start. The envelope
     // carries `sender: Some(Sender{ user_id, pubkey, sig })`
@@ -240,6 +253,8 @@ impl MessageKind {
             MessageKind::StrokeEnd => "DRAW_END",
             MessageKind::SkewProbe => "SKEW_PROBE",
             MessageKind::SkewReply => "SKEW_REPLY",
+            MessageKind::PermissionSet => "PERMISSION_SET",
+            MessageKind::CapabilityUpdate => "CAPABILITY_UPDATE",
             MessageKind::Other(s) => s,
         }
     }
@@ -323,6 +338,18 @@ impl MessageKind {
             self,
             MessageKind::StrokeBegin | MessageKind::StrokePoint | MessageKind::StrokeEnd
         )
+    }
+
+    /// `true` for the P6-T02 host-only PERMISSION_SET envelope.
+    pub fn is_permission_set(&self) -> bool {
+        matches!(self, MessageKind::PermissionSet)
+    }
+
+    /// `true` for the server-originated CAPABILITY_UPDATE
+    /// broadcast. This is always server-originated so it
+    /// bypasses the normal room dispatch.
+    pub fn is_capability_update(&self) -> bool {
+        matches!(self, MessageKind::CapabilityUpdate)
     }
 }
 

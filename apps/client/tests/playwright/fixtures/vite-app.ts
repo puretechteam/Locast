@@ -51,6 +51,7 @@ export type RoomSummaryIpc = {
     }>;
     host_disconnected: boolean;
     host_disconnect_deadline_ms: number | null;
+    you_cap_set?: number;
 };
 
 export type PlaybackStateEvent = {
@@ -105,6 +106,7 @@ type LocastApi = {
     emitDownloadState: (p: DownloadStateEvent) => Promise<void>;
     emitDownloadProgress: (p: DownloadProgressEvent) => Promise<void>;
     emitRoomState: (p: RoomSummaryIpc | null) => Promise<void>;
+    emitCapabilityUpdate: (p: RoomSummaryIpc) => Promise<void>;
     emitPlaybackState: (p: PlaybackStateEvent) => Promise<void>;
     emitPositionReport: (p: PositionReportEvent) => Promise<void>;
     emitStrokeBegin: (p: StrokeBeginEvent) => Promise<void>;
@@ -313,6 +315,11 @@ const SHIM_SOURCE = `
                     mod.__emit("room://state", payload);
                 });
             },
+            emitCapabilityUpdate: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("room://event", payload);
+                });
+            },
             emitPlaybackState: function(payload) {
                 return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
                     mod.__emit("playback://state", payload);
@@ -375,6 +382,15 @@ export const test = base.extend<{ locast: LocastApi }>({
                         throw new Error("__locast not present on window");
                     }
                     return w.__locast.emitRoomState(payload);
+                }, p);
+            },
+            emitCapabilityUpdate: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitCapabilityUpdate: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitCapabilityUpdate(payload);
                 }, p);
             },
             emitPlaybackState: async (p) => {

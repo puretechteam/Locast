@@ -118,6 +118,19 @@ export const commands = {
   async recentRoomUpsert(entry: RecentRoomEntry): Promise<void> {
     await __TAURI_INVOKE("recent_room_upsert", { entry });
   },
+  // P6-T02: grant or revoke capabilities for a participant.
+  // The caller must be the room host; the server enforces this.
+  async roomPermissionSet(
+    targetUserId: string,
+    addCapSet: number,
+    removeCapSet: number,
+  ): Promise<void> {
+    await __TAURI_INVOKE("room_permission_set", {
+      targetUserId,
+      addCapSet,
+      removeCapSet,
+    });
+  },
   async downloadOpen(mediaId: string): Promise<DownloadSessionIpc> {
     return await __TAURI_INVOKE("download_open", { mediaId });
   },
@@ -268,6 +281,7 @@ export type RoomSummaryIpc = {
   participants: ParticipantIpc[];
   host_disconnected: boolean;
   host_disconnect_deadline_ms: number | null;
+  you_cap_set?: number;
 };
 
 export type ParticipantIpc = {

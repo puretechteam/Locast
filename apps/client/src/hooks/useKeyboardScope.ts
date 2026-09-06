@@ -39,7 +39,9 @@ const LASER_TOGGLE_KEY = "l";
 
 export function useKeyboardScope(handlers: {
     onUndo?: () => void;
+    canDraw?: boolean;
 }): KeyboardScopeHandle {
+    const canDraw = handlers.canDraw ?? false;
     const [toolbarVisible, setToolbarVisible] = useState(false);
     const [laserActive, setLaserActive] = useState(false);
     const [drawingMode, setDrawingModeState] = useState<DrawingMode>("none");
@@ -58,8 +60,10 @@ export function useKeyboardScope(handlers: {
           : "idle";
 
     const toggleToolbar = useCallback(() => {
-        setToolbarVisible((v) => !v);
-    }, []);
+        if (canDraw) {
+            setToolbarVisible((v) => !v);
+        }
+    }, [canDraw]);
 
     const setDrawingMode = useCallback((mode: DrawingMode) => {
         setDrawingModeState(mode);
@@ -132,7 +136,7 @@ export function useKeyboardScope(handlers: {
 
         window.addEventListener("keydown", onKeyDown);
         return () => window.removeEventListener("keydown", onKeyDown);
-    }, [laserActive, drawingMode, isDrawing, toggleToolbar, setLaserActiveHandler, exitAll, handleUndo]);
+    }, [laserActive, drawingMode, isDrawing, canDraw, toggleToolbar, setLaserActiveHandler, exitAll, handleUndo]);
 
     return {
         toolbarVisible,

@@ -36,8 +36,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
-    HostMigratedPayload, Participant, ParticipantStatus, PresencePayload, RoomCreatePayload,
-    RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload, RoomSummary,
+    HostMigratedPayload, Participant, ParticipantStatus,
+    PresencePayload, RoomCreatePayload, RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload,
+    RoomStatePayload, RoomSummary,
 };
 use serde::Serialize;
 use specta::Type;
@@ -210,6 +211,7 @@ pub struct ParticipantIpc {
     pub status: ParticipantStatusIpc,
     pub last_seen_ms: i64,
     pub is_host: bool,
+    pub cap_set: u32,
 }
 
 impl From<Participant> for ParticipantIpc {
@@ -221,6 +223,7 @@ impl From<Participant> for ParticipantIpc {
             status: p.status.into(),
             last_seen_ms: p.last_seen_ms,
             is_host: p.is_host,
+            cap_set: 0,
         }
     }
 }
@@ -727,6 +730,12 @@ pub struct RoomClient {
     /// cached/persisted manifest cannot be downgraded by
     /// a previously-buffered older one.
     current_versions: StdMutex<HashMap<Uuid, i64>>,
+    /// P6-T02: the local user's server-assigned `user_id`
+    /// (Uuid v7). Set on successful `room_create` /
+    /// `room_join` and cleared on `room_leave`. Used
+    /// to identify whether an inbound `CAPABILITY_UPDATE`
+    /// is for the local user.
+    local_user_id: Mutex<Option<Uuid>>,
 }
 
 impl RoomClient {
@@ -744,6 +753,7 @@ impl RoomClient {
             expected_host_pubkey: StdMutex::new(None),
             pool: StdMutex::new(None),
             current_versions: StdMutex::new(HashMap::new()),
+            local_user_id: Mutex::new(None),
         }
     }
 
@@ -894,7 +904,36 @@ impl RoomClient {
         // ROOM_CLOSED and the inbound loop will clear
         // it.
         *self.state.lock().await = None;
+        *self.local_user_id.lock().await = None;
         self.abort_presence_loop().await;
+        Ok(())
+    }
+
+    /// P6-T02: send a `PERMISSION_SET` envelope to grant or
+    /// revoke capabilities for a participant. This is a
+    /// fire-and-forget from the client's perspective: the
+    /// server validates the caller is the host, applies the
+    /// mutation, and broadcasts a `CAPABILITY_UPDATE` to
+    /// all participants. The client that sent `PERMISSION_SET`
+    /// receives the broadcast via `handle_inbound` and updates
+    /// its local state.
+    pub async fn permission_set(
+        &self,
+        room_id: Uuid,
+        target_user_id: Uuid,
+        add_cap_set: u32,
+        remove_cap_set: u32,
+    ) -> Result<(), RoomClientError> {
+        let payload = locast_protocol::room::PermissionSetPayload {
+            target_user_id,
+            add_cap_set,
+            remove_cap_set,
+        };
+        let env = envelope(MessageKind::PermissionSet, Some(room_id), payload);
+        self.signaling
+            .send_envelope(env)
+            .await
+            .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
         Ok(())
     }
 
@@ -1180,8 +1219,10 @@ impl RoomClient {
             }
             MessageKind::RoomJoined => {
                 if let Ok(p) = decode_payload::<locast_protocol::room::RoomJoinedPayload>(&env) {
-                    let summary = RoomSummaryIpc::from(p.room);
+                    let mut summary = RoomSummaryIpc::from(p.room);
+                    summary.you_cap_set = Some(p.you.cap_set);
                     *self.state.lock().await = Some(summary.clone());
+                    *self.local_user_id.lock().await = Some(p.you.user_id);
                     self.emit_state(&summary).await;
                     // The viewer joined: the participant
                     // list now includes them. The
@@ -1203,6 +1244,7 @@ impl RoomClient {
                     let mut summary = RoomSummaryIpc::from(p.room);
                     summary.you_cap_set = Some(p.you.cap_set);
                     *self.state.lock().await = Some(summary.clone());
+                    *self.local_user_id.lock().await = Some(p.you.user_id);
                     self.emit_state(&summary).await;
                     self.emit_event(&summary).await;
                 }
@@ -1290,6 +1332,7 @@ impl RoomClient {
             }
             MessageKind::RoomClosed | MessageKind::RoomError => {
                 *self.state.lock().await = None;
+                *self.local_user_id.lock().await = None;
                 self.emit_state_cleared().await;
                 self.abort_presence_loop().await;
             }
@@ -1444,6 +1487,33 @@ impl RoomClient {
                                 s.emit_stroke_end(&ipc);
                             }
                         }
+                    }
+                }
+            }
+            // P6-T02: a participant's cap_set was updated
+            // by the host. If the target is the local user,
+            // update `you_cap_set`. Otherwise update the
+            // participant's entry in the participants list.
+            MessageKind::CapabilityUpdate => {
+                if let Ok(payload) =
+                    decode_payload::<locast_protocol::room::CapabilityUpdatePayload>(&env)
+                {
+                    let mut g = self.state.lock().await;
+                    let local_user_id = self.local_user_id.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        if Some(payload.target_user_id) == *local_user_id {
+                            s.you_cap_set = Some(payload.cap_set);
+                        } else if let Some(participant) = s
+                            .participants
+                            .iter_mut()
+                            .find(|p| p.user_id == payload.target_user_id.to_string())
+                        {
+                            participant.cap_set = payload.cap_set;
+                        }
+                    }
+                    if let Some(s) = g.as_ref() {
+                        self.emit_state(s).await;
+                        self.emit_event(s).await;
                     }
                 }
             }

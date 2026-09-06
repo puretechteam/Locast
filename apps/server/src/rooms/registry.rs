@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use locast_protocol::room::cap;
 use locast_protocol::room::{
-    HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
-    ParticipantLeftPayload, ParticipantStatus, RoomClosedPayload, RoomErrorCode, RoomErrorPayload,
-    RoomJoinedPayload, RoomStatePayload, RoomSummary,
+    CapabilityUpdatePayload, HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload,
+    ParticipantJoinedPayload, ParticipantLeftPayload, ParticipantStatus, RoomClosedPayload, RoomErrorCode,
+    RoomErrorPayload, RoomJoinedPayload, RoomStatePayload, RoomSummary,
 };
 use rand::rngs::OsRng;
 use tokio::sync::broadcast;
@@ -158,6 +158,16 @@ pub enum RoomEvent {
         sender_id: Uuid,
         payload: locast_protocol::room::StrokeEndPayload,
     },
+    /// P6-T02: the host has granted or revoked capabilities
+    /// for a participant. Broadcast to all room participants.
+    CapabilityUpdated(CapabilityUpdated),
+}
+
+/// P6-T02: the payload for a capability update event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityUpdated {
+    pub target_user_id: Uuid,
+    pub cap_set: u32,
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -348,6 +358,10 @@ impl RoomRegistry {
                 RoomEvent::StrokeBegin { sender_id, .. } => Some(*sender_id),
                 RoomEvent::StrokePoint { sender_id, .. } => Some(*sender_id),
                 RoomEvent::StrokeEnd { sender_id, .. } => Some(*sender_id),
+                // P6-T02: capability update is server-broadcast
+                // from the host's PERMISSION_SET. The host SHOULD
+                // receive the update so it can confirm the change.
+                RoomEvent::CapabilityUpdated(_) => None,
             };
             let room_id = match event {
                 RoomEvent::ManifestPublished { room_id, .. } => *room_id,
@@ -1313,6 +1327,31 @@ impl RoomRegistry {
         }
     }
 
+    /// P6-T02: update a participant's cap_set. Called by the
+    /// PERMISSION_SET handler after persisting the new cap_set.
+    pub async fn update_participant_cap_set(
+        &self,
+        room_id: Uuid,
+        target_user_id: Uuid,
+        new_cap_set: u32,
+        _now_ms: i64,
+    ) -> Result<(), RoomError> {
+        let handle = self
+            .get_by_id(room_id)
+            .await
+            .ok_or(RoomError::RoomNotFound)?;
+        let mut state = handle.write().await;
+        let participant = state
+            .participants
+            .iter_mut()
+            .find(|p| p.user_id == target_user_id)
+            .ok_or_else(|| {
+                RoomError::Internal("cap_set update: target not found".into())
+            })?;
+        participant.cap_set = new_cap_set;
+        Ok(())
+    }
+
     /// Look up a room by code; useful for tests and for the
     /// "pre-validate code before join" UX.
     pub async fn get_by_code(&self, code: &str) -> Option<Uuid> {
@@ -1685,6 +1724,18 @@ fn event_to_broadcast_item(
             locast_protocol::envelope::MessageKind::StrokeEnd,
             serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
         ),
+        // P6-T02: rebroadcast the capability update as a
+        // CAPABILITY_UPDATE envelope carrying the new cap_set.
+        RoomEvent::CapabilityUpdated(evt) => {
+            let payload = CapabilityUpdatePayload {
+                target_user_id: evt.target_user_id,
+                cap_set: evt.cap_set,
+            };
+            (
+                locast_protocol::envelope::MessageKind::CapabilityUpdate,
+                serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
+            )
+        }
     };
     BroadcastItem {
         kind,

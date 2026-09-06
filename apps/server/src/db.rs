@@ -384,6 +384,27 @@ impl Db {
         Ok(())
     }
 
+    /// Update a participant's `cap_set`. Used by P6-T02's
+    /// PERMISSION_SET handler to persist a grant/revoke.
+    pub async fn update_participant_cap_set(
+        &self,
+        room_id: Uuid,
+        user_id: Uuid,
+        cap_set: u32,
+    ) -> Result<(), sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        sqlx::query(
+            "UPDATE room_participants SET cap_set = ?3 \
+             WHERE room_id = ?1 AND user_id = ?2",
+        )
+        .bind(room_id.to_string())
+        .bind(user_id.to_string())
+        .bind(cap_set as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// List the participants in a room. The order is by
     /// `joined_ms ASC, user_id ASC` to match the host-election
     /// rule.

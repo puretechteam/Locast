@@ -506,6 +506,41 @@ pub enum PlaybackAction {
     Seek,
 }
 
+// ===== P6-T02: PERMISSION_SET / CAPABILITY_UPDATE wire types =====
+//
+// PERMISSION_SET is host -> server. The server validates:
+//   1. Caller is the current room host.
+//   2. Target is a current room participant.
+//   3. Caller is not targeting themselves.
+// The server then updates the target's cap_set and broadcasts
+// CAPABILITY_UPDATE to all room participants.
+
+/// PERMISSION_SET (host -> S). The host grants or revokes
+/// capabilities for a specific participant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct PermissionSetPayload {
+    /// The target participant's user_id.
+    pub target_user_id: Uuid,
+    /// Bits to add to the target's cap_set (OR-in).
+    pub add_cap_set: u32,
+    /// Bits to remove from the target's cap_set (AND-out).
+    pub remove_cap_set: u32,
+}
+
+/// CAPABILITY_UPDATE (S -> all room participants). Broadcast by
+/// the server after a successful PERMISSION_SET. Every
+/// participant updates their local mirror of the affected
+/// participant's cap_set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct CapabilityUpdatePayload {
+    /// The affected participant's user_id.
+    pub target_user_id: Uuid,
+    /// The new authoritative cap_set for this participant.
+    pub cap_set: u32,
+}
+
 // ===== P5-T02: DRAW_BEGIN / DRAW_POINT / DRAW_END wire types =====
 //
 // docs/ARCHITECTURE.md §15.4 defines the drawing protocol. Three

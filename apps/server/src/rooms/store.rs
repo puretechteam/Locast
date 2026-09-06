@@ -70,6 +70,15 @@ pub trait RoomStore: Send + Sync {
         last_seen_ms: i64,
     ) -> Result<(), String>;
 
+    /// Update a participant's `cap_set`. Used by P6-T02's
+    /// PERMISSION_SET handler to persist a grant/revoke.
+    async fn update_participant_cap_set(
+        &self,
+        room_id: Uuid,
+        user_id: Uuid,
+        cap_set: u32,
+    ) -> Result<(), String>;
+
     /// Mark a room ended.
     async fn end_room(&self, room_id: Uuid, ended_ms: i64) -> Result<(), String>;
 
@@ -174,6 +183,21 @@ impl RoomStore for DbRoomStore {
             })
     }
 
+    async fn update_participant_cap_set(
+        &self,
+        room_id: Uuid,
+        user_id: Uuid,
+        cap_set: u32,
+    ) -> Result<(), String> {
+        self.db
+            .update_participant_cap_set(room_id, user_id, cap_set)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "locast-server room store update_participant_cap_set failed");
+                e.to_string()
+            })
+    }
+
     async fn end_room(&self, room_id: Uuid, ended_ms: i64) -> Result<(), String> {
         self.db.end_room(room_id, ended_ms).await.map_err(|e| {
             warn!(error = %e, "locast-server room store end_room failed");
@@ -246,6 +270,15 @@ impl RoomStore for NoopRoomStore {
         _user_id: Uuid,
         _status: &str,
         _last_seen_ms: i64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn update_participant_cap_set(
+        &self,
+        _room_id: Uuid,
+        _user_id: Uuid,
+        _cap_set: u32,
     ) -> Result<(), String> {
         Ok(())
     }
