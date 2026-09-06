@@ -541,6 +541,71 @@ pub struct CapabilityUpdatePayload {
     pub cap_set: u32,
 }
 
+// ===== P6-T03: CHAT_MESSAGE wire types =====
+
+/// Maximum chat message text length in bytes (2 KiB).
+const CHAT_MAX_TEXT_LEN: usize = 2048;
+
+/// CHAT_MESSAGE (C -> S, S -> all participants).
+///
+/// A text message sent by a room participant. The server
+/// acts as a relay: it validates the 2 KiB text limit,
+/// checks the sender's CHAT capability, and broadcasts
+/// the message to all other participants in the room.
+/// The `reply_to` field optionally references a previous
+/// message's sender_id for threading.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct ChatPayload {
+    /// The user_id of the message sender. Set by the
+    /// server from the validated bearer so receivers
+    /// can trust the attribution.
+    pub sender_id: Uuid,
+    /// The message text. Maximum 2048 bytes (2 KiB).
+    /// Messages exceeding this limit are rejected at
+    /// deserialization.
+    pub text: String,
+    /// Optional user_id of the message being replied to.
+    /// Used for threading / quote-reply UI patterns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<Uuid>,
+    /// Server-stamped send time, unix ms. Set by the
+    /// server at acceptance time, not the client's
+    /// wall clock.
+    pub sent_ms: i64,
+}
+
+impl<'de> Deserialize<'de> for ChatPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ChatPayloadInner {
+            sender_id: Uuid,
+            text: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            reply_to: Option<Uuid>,
+            sent_ms: i64,
+        }
+
+        let inner = ChatPayloadInner::deserialize(deserializer)?;
+        if inner.text.len() > CHAT_MAX_TEXT_LEN {
+            return Err(serde::de::Error::custom(format!(
+                "chat message text exceeds {} byte limit (got {})",
+                CHAT_MAX_TEXT_LEN,
+                inner.text.len()
+            )));
+        }
+        Ok(ChatPayload {
+            sender_id: inner.sender_id,
+            text: inner.text,
+            reply_to: inner.reply_to,
+            sent_ms: inner.sent_ms,
+        })
+    }
+}
+
 // ===== P5-T02: DRAW_BEGIN / DRAW_POINT / DRAW_END wire types =====
 //
 // docs/ARCHITECTURE.md §15.4 defines the drawing protocol. Three
@@ -853,5 +918,46 @@ mod tests {
     fn participant_status_serializes() {
         let s = serde_json::to_string(&ParticipantStatus::Connected).unwrap();
         assert_eq!(s, "\"Connected\"");
+    }
+
+    #[test]
+    fn chat_payload_accepts_2kib_text() {
+        let text = "x".repeat(2048);
+        let p = ChatPayload {
+            sender_id: Uuid::nil(),
+            text,
+            reply_to: None,
+            sent_ms: 0,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ChatPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.text.len(), 2048);
+    }
+
+    #[test]
+    fn chat_payload_rejects_over_2kib_text() {
+        let text = "x".repeat(2049);
+        let p = ChatPayload {
+            sender_id: Uuid::nil(),
+            text,
+            reply_to: None,
+            sent_ms: 0,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let result: Result<ChatPayload, _> = serde_json::from_str(&s);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn chat_payload_roundtrip() {
+        let p = ChatPayload {
+            sender_id: Uuid::now_v7(),
+            text: "Hello, world!".to_string(),
+            reply_to: Some(Uuid::now_v7()),
+            sent_ms: 1_700_000_000_000,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: ChatPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, p);
     }
 }

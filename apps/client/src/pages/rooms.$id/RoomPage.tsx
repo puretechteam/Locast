@@ -4,12 +4,14 @@ import { events } from "../../services/ipc";
 import { getRoomState } from "../../services/room";
 import { getSignalingState } from "../../services/signaling";
 import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
+import type { ChatMessage } from "../../services/chat";
 import { useRoomStore } from "../../stores/useRoomStore";
 import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
 import { PlaybackControls } from "../../components/PlaybackControls";
 import { DriftIndicator } from "../../components/DriftIndicator";
 import { SyncButton } from "../../components/SyncButton";
+import { ChatPanel } from "../../components/ChatPanel";
 import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { useManualSync } from "../../drift/useManualSync";
 import { useClockSkew } from "../../drift/useClockSkew";
@@ -29,6 +31,7 @@ export function RoomPage(): JSX.Element {
     const setSignaling = useRoomStore((s) => s.setSignaling);
     const clear = useRoomStore((s) => s.clear);
     const [hydrated, setHydrated] = useState(false);
+    const [messages, setMessages] = useState<ChatMessage[]>([]);
 
     // P4-T02: on leave, reset BOTH the room store's
     // `summary` AND the playback store's mediaSrc /
@@ -281,6 +284,17 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                     return;
                 }
                 unlistens.push(u3);
+
+                // P6-T03: listen for chat://message events relayed from the server.
+                const u4 = await events.chatMessage((next: ChatMessage) => {
+                    if (cancelled) return;
+                    setMessages((prev) => [...prev, next]);
+                });
+                if (cancelled) {
+                    u4();
+                    return;
+                }
+                unlistens.push(u4);
             } finally {
                 if (!cancelled) {
                     setHydrated(true);
@@ -468,6 +482,7 @@ return (
                 signaling={signaling}
                 onLeft={handleLeft}
             />
+            <ChatPanel messages={messages} />
             {idMismatch && (
                 <p className="room-page__hint">
                     Note: URL id <code>{expectedId}</code> differs from the

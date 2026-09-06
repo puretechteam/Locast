@@ -936,6 +936,30 @@ impl RoomClient {
         Ok(())
     }
 
+    /// P6-T03: send a chat message. The server validates the
+    /// caller's CHAT capability, broadcasts a `CHAT_MESSAGE`
+    /// envelope to all participants, and sets `sent_ms` from
+    /// the server clock.
+    pub async fn chat_message(
+        &self,
+        room_id: Uuid,
+        text: String,
+        reply_to: Option<Uuid>,
+    ) -> Result<(), RoomClientError> {
+        let payload = locast_protocol::room::ChatPayload {
+            sender_id: Uuid::nil(),
+            text,
+            reply_to,
+            sent_ms: 0,
+        };
+        let env = envelope(MessageKind::ChatMessage, Some(room_id), payload);
+        self.signaling
+            .send_envelope(env)
+            .await
+            .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
+        Ok(())
+    }
+
     /// P3-T04 prerequisite 3: ask the server for the
     /// room's currently-authoritative manifest. Used by
     /// late-joiners to catch up on a manifest that was

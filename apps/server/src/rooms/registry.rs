@@ -161,6 +161,12 @@ pub enum RoomEvent {
     /// P6-T02: the host has granted or revoked capabilities
     /// for a participant. Broadcast to all room participants.
     CapabilityUpdated(CapabilityUpdated),
+    /// P6-T03: a chat message from a room participant. Broadcast
+    /// to all other participants in the room. The originator
+    /// field of the BroadcastItem is set to `Some(sender_id)`
+    /// by `publish_events` so the WS forwarder suppresses
+    /// the echo to the sender.
+    ChatMessage(ChatMessage),
 }
 
 /// P6-T02: the payload for a capability update event.
@@ -168,6 +174,16 @@ pub enum RoomEvent {
 pub struct CapabilityUpdated {
     pub target_user_id: Uuid,
     pub cap_set: u32,
+}
+
+/// P6-T03: the payload for a chat message event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub room_id: Uuid,
+    pub sender_id: Uuid,
+    pub text: String,
+    pub reply_to: Option<Uuid>,
+    pub sent_ms: i64,
 }
 
 /// A single room. The inner state lives behind a `RwLock`
@@ -362,6 +378,10 @@ impl RoomRegistry {
                 // from the host's PERMISSION_SET. The host SHOULD
                 // receive the update so it can confirm the change.
                 RoomEvent::CapabilityUpdated(_) => None,
+                // P6-T03: chat message is broadcast to all
+                // participants. The originator field suppresses
+                // the echo to the sender.
+                RoomEvent::ChatMessage(evt) => Some(evt.sender_id),
             };
             let room_id = match event {
                 RoomEvent::ManifestPublished { room_id, .. } => *room_id,
@@ -373,6 +393,7 @@ impl RoomRegistry {
                 RoomEvent::StrokeBegin { room_id, .. } => *room_id,
                 RoomEvent::StrokePoint { room_id, .. } => *room_id,
                 RoomEvent::StrokeEnd { room_id, .. } => *room_id,
+                RoomEvent::ChatMessage(ChatMessage { room_id, .. }) => *room_id,
                 _ => room_id_for_event(event),
             };
             let item = event_to_broadcast_item(event, room_id, originator);
@@ -1731,6 +1752,20 @@ fn event_to_broadcast_item(
             };
             (
                 locast_protocol::envelope::MessageKind::CapabilityUpdate,
+                serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
+            )
+        }
+        // P6-T03: rebroadcast the chat message as a
+        // CHAT_MESSAGE envelope.
+        RoomEvent::ChatMessage(evt) => {
+            let payload = locast_protocol::room::ChatPayload {
+                sender_id: evt.sender_id,
+                text: evt.text.clone(),
+                reply_to: evt.reply_to,
+                sent_ms: evt.sent_ms,
+            };
+            (
+                locast_protocol::envelope::MessageKind::ChatMessage,
                 serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
             )
         }

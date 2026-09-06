@@ -171,6 +171,13 @@ pub enum MessageKind {
     // mirror.
     #[serde(rename = "CAPABILITY_UPDATE")]
     CapabilityUpdate,
+    // ----- P6-T03: server-relayed chat -----
+    // CHAT_MESSAGE is a bidirectional text message between
+    // room participants. The server acts as a relay:
+    // it validates the 2 KiB text limit and the sender's
+    // CHAT capability, then broadcasts to all participants.
+    #[serde(rename = "CHAT_MESSAGE")]
+    ChatMessage,
     // ----- P5-T02: per-stroke drawing protocol -----
     // DRAW_BEGIN is the per-stroke signed start. The envelope
     // carries `sender: Some(Sender{ user_id, pubkey, sig })`
@@ -255,6 +262,7 @@ impl MessageKind {
             MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::PermissionSet => "PERMISSION_SET",
             MessageKind::CapabilityUpdate => "CAPABILITY_UPDATE",
+            MessageKind::ChatMessage => "CHAT_MESSAGE",
             MessageKind::Other(s) => s,
         }
     }
@@ -351,6 +359,11 @@ impl MessageKind {
     pub fn is_capability_update(&self) -> bool {
         matches!(self, MessageKind::CapabilityUpdate)
     }
+
+    /// `true` for the P6-T03 CHAT_MESSAGE envelope.
+    pub fn is_chat_message(&self) -> bool {
+        matches!(self, MessageKind::ChatMessage)
+    }
 }
 
 /// The per-envelope sender identity. The signature is over the
@@ -396,5 +409,13 @@ mod tests {
         let s = r#"{"v":1,"type":"FOOBAR","id":"00000000-0000-0000-0000-000000000000","room_id":null,"sender":null,"ts_ms":1,"seq":1,"payload":{}}"#;
         let env: Envelope = serde_json::from_str(s).expect("decode unknown");
         assert!(matches!(env.r#type, MessageKind::Other(ref t) if t == "FOOBAR"));
+    }
+
+    #[test]
+    fn is_chat_message_predicate() {
+        assert!(MessageKind::ChatMessage.is_chat_message());
+        assert!(!MessageKind::RoomCreate.is_chat_message());
+        assert!(!MessageKind::PermissionSet.is_chat_message());
+        assert!(!MessageKind::CapabilityUpdate.is_chat_message());
     }
 }

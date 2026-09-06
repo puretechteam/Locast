@@ -102,6 +102,15 @@ export type StrokeEndEvent = {
     ts_ms: number;
 };
 
+export type ChatMessage = {
+    room_id: string;
+    sender_id: string;
+    sender_name: string;
+    text: string;
+    reply_to: string | null;
+    ts_ms: number;
+};
+
 type LocastApi = {
     emitDownloadState: (p: DownloadStateEvent) => Promise<void>;
     emitDownloadProgress: (p: DownloadProgressEvent) => Promise<void>;
@@ -112,10 +121,13 @@ type LocastApi = {
     emitStrokeBegin: (p: StrokeBeginEvent) => Promise<void>;
     emitStrokePoint: (p: StrokePointEvent) => Promise<void>;
     emitStrokeEnd: (p: StrokeEndEvent) => Promise<void>;
+    emitChatMessage: (p: ChatMessage) => Promise<void>;
     /** P4-T05: wait for download/playback event bridge to subscribe. */
     waitForBridge: () => Promise<void>;
     /** P5-T03: wait for the drawing event bridge to subscribe. */
     waitForDrawingBridge: () => Promise<void>;
+    /** P6-T03: wait for the chat event bridge to subscribe. */
+    waitForChatBridge: () => Promise<void>;
     /** P4-T05: read all Tauri invoke() calls recorded
      *  by the shim since the last reset. Tests assert
      *  on this to verify that the local-only sync
@@ -345,6 +357,11 @@ const SHIM_SOURCE = `
                     mod.__emit("drawing://end", payload);
                 });
             },
+            emitChatMessage: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("chat://message", payload);
+                });
+            },
         };
         w.__locast = api;
     })();
@@ -438,6 +455,15 @@ export const test = base.extend<{ locast: LocastApi }>({
                     return w.__locast.emitStrokeEnd(payload);
                 }, p);
             },
+            emitChatMessage: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitChatMessage: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitChatMessage(payload);
+                }, p);
+            },
             waitForBridge: async () => {
                 await page.waitForFunction(
                     () => (window as { __locast_subscribed?: boolean }).__locast_subscribed === true,
@@ -448,6 +474,13 @@ export const test = base.extend<{ locast: LocastApi }>({
             waitForDrawingBridge: async () => {
                 await page.waitForFunction(
                     () => (window as { __locast_drawing_subscribed?: boolean }).__locast_drawing_subscribed === true,
+                    undefined,
+                    { timeout: 5000 },
+                );
+            },
+            waitForChatBridge: async () => {
+                await page.waitForFunction(
+                    () => (window as { __locast_chat_subscribed?: boolean }).__locast_chat_subscribed === true,
                     undefined,
                     { timeout: 5000 },
                 );

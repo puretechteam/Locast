@@ -235,3 +235,27 @@ pub async fn room_permission_set(
         .await
         .map_err(|e| AppError::other(e.to_string()))
 }
+
+/// P6-T03: send a chat message. The server validates the
+/// caller's CHAT capability and broadcasts to all participants.
+#[tauri::command]
+#[specta::specta]
+pub async fn room_chat_message(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    text: String,
+    reply_to: Option<String>,
+) -> Result<(), AppError> {
+    let summary = room
+        .state()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    let room_id = Uuid::parse_str(&summary.id)
+        .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    let reply_to_uuid = reply_to
+        .map(|s| Uuid::parse_str(&s))
+        .transpose()
+        .map_err(|e| AppError::other(format!("bad reply_to user_id: {e}")))?;
+    room.chat_message(room_id, text, reply_to_uuid)
+        .await
+        .map_err(|e| AppError::other(e.to_string()))
+}

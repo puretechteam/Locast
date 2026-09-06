@@ -16,6 +16,7 @@ use locast_protocol::room::{
 use uuid::Uuid;
 
 use super::caps::{self, Command};
+use super::chat::handle_chat_message;
 use super::codes;
 use super::drawing;
 use super::error::RoomError;
@@ -91,6 +92,7 @@ pub async fn dispatch_room_message(
         MessageKind::StrokePoint => Some(Command::Draw),
         MessageKind::StrokeEnd => Some(Command::Draw),
         MessageKind::PermissionSet => Some(Command::PermissionSet),
+        MessageKind::ChatMessage => Some(Command::ChatMessage),
         _ => None,
     };
     if let Some(cmd) = command {
@@ -109,6 +111,7 @@ pub async fn dispatch_room_message(
                     | Command::PositionReport
                     | Command::Draw
                     | Command::PermissionSet
+                    | Command::ChatMessage
             ) {
                 let code = match e {
                     caps::CapsError::NotHost => RoomErrorCode::NotHost,
@@ -177,6 +180,30 @@ pub async fn dispatch_room_message(
                     out.to_caller.push(err_envelope(
                         MessageKind::RoomError,
                         RoomErrorCode::Internal,
+                        e.to_string(),
+                        now_ms,
+                    ));
+                    out
+                }
+            }
+        }
+        MessageKind::ChatMessage => {
+            match handle_chat_message(envelope, registry, store, user_id, now_ms).await {
+                Ok(events) => RoomDispatchOutcome {
+                    to_caller: Vec::new(),
+                    events,
+                    close_caller: false,
+                },
+                Err(e) => {
+                    let mut out = RoomDispatchOutcome::default();
+                    let code: RoomErrorCode = match e {
+                        RoomError::NotHost => RoomErrorCode::NotHost,
+                        RoomError::NotJoined => RoomErrorCode::NotJoined,
+                        _ => RoomErrorCode::Internal,
+                    };
+                    out.to_caller.push(err_envelope(
+                        MessageKind::RoomError,
+                        code,
                         e.to_string(),
                         now_ms,
                     ));

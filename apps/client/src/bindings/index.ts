@@ -175,6 +175,13 @@ export const commands = {
   async drawingSend(input: DrawingSendInput): Promise<DrawingSendResult> {
     return await __TAURI_INVOKE<DrawingSendResult>("drawing_send", { input });
   },
+  // P6-T03: send a chat message. The caller passes
+  // the text (max 2 KiB) and an optional reply_to
+  // message id. The server validates the CHAT cap
+  // and rebroadcasts the message to all participants.
+  async roomChatMessage(text: string, replyTo: string | null): Promise<void> {
+    return await __TAURI_INVOKE("room_chat_message", { text, replyTo });
+  },
 };
 
 // P5-T02: typed shape for `drawing_send`. Mirrors the
@@ -462,6 +469,19 @@ export type SkewSample = {
     client_send_ms_echo: number;
 };
 
+// P6-T03: the `chat://message` event payload. Emitted
+// when a remote CHAT_MESSAGE is accepted and rebroadcast
+// by the server. The sender_id is the server-authoritative
+// originator (from the validated bearer).
+export type ChatMessage = {
+    room_id: string;
+    sender_id: string;
+    sender_name: string;
+    text: string;
+    reply_to: string | null;
+    ts_ms: number;
+};
+
 /* Events */
 // bindings-regen: keep in sync with the hand-maintained
 // `events.rs` registrations. These helpers are not in the
@@ -528,6 +548,13 @@ export const events = {
   strokeEnd: <EventListener<StrokeEndEvent>>((h) =>
     __listenAs__("drawing://end", h)
   ),
+  // P6-T03: inbound CHAT_MESSAGE from a remote participant.
+  // Emitted when a chat message is accepted and rebroadcast
+  // by the server. The sender_id is the server-authoritative
+  // originator.
+  chatMessage: <EventListener<ChatMessage>>((h) =>
+    __listenAs__("chat://message", h)
+  ),
 };
 
 export const signalingStateChanged = events.signalingState;
@@ -540,3 +567,4 @@ export const positionReportChanged = events.positionReport;
 export const strokeBeginChanged = events.strokeBegin;
 export const strokePointChanged = events.strokePoint;
 export const strokeEndChanged = events.strokeEnd;
+export const chatMessageChanged = events.chatMessage;

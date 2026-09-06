@@ -9,6 +9,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod caps;
+pub mod chat;
 pub mod codes;
 pub mod dispatch;
 pub mod drawing;

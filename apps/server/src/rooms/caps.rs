@@ -215,6 +215,11 @@ pub enum Command {
     /// `is_host` check directly and then applies the
     /// mutation. The `can()` function is read-only.
     PermissionSet,
+    /// P6-T03: CHAT_MESSAGE envelope. Any room member with
+    /// the CHAT capability can send. The capability check
+    /// is "caller is a member of the room named in
+    /// `envelope.room_id` AND has the CHAT bit set".
+    ChatMessage,
 }
 
 impl Command {
@@ -223,6 +228,7 @@ impl Command {
             Command::PlaybackControl => Some((Scope::Playback, Action::IssuePlaybackCommand)),
             Command::Draw => Some((Scope::Drawing, Action::DrawBegin)),
             Command::PublishManifest => Some((Scope::Manifest, Action::PublishManifest)),
+            Command::ChatMessage => Some((Scope::Chat, Action::SendChat)),
             // PermissionSet is checked via is_room_host directly in check_capability;
             // it does not use can() since can() is read-only.
             Command::PermissionSet => None,
@@ -321,6 +327,13 @@ pub async fn check_capability(
                 } else {
                     Err(CapsError::NotHost)
                 }
+            } else {
+                Err(CapsError::NotMember)
+            }
+        }
+        Command::ChatMessage => {
+            if registry.get_user_room(user_id).await.is_some() {
+                Ok(())
             } else {
                 Err(CapsError::NotMember)
             }
