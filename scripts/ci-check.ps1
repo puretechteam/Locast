@@ -47,13 +47,13 @@ cargo fmt --all -- --check
 if ($LASTEXITCODE -ne 0) { Fail "cargo fmt --check found unformatted code" }
 Ok
 
-Step "cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
+Step "cargo clippy --workspace --all-targets -j 1 -- -D warnings"
+cargo clippy --workspace --all-targets -j 1 -- -D warnings
 if ($LASTEXITCODE -ne 0) { Fail "cargo clippy reported warnings or errors" }
 Ok
 
-Step "cargo test --workspace"
-cargo test --workspace
+Step "cargo test --workspace -j 1"
+cargo test --workspace -j 1
 if ($LASTEXITCODE -ne 0) { Fail "cargo test --workspace had failing tests" }
 Ok
 
@@ -77,8 +77,20 @@ pnpm -r test
 if ($LASTEXITCODE -ne 0) { Fail "pnpm test failed" }
 Ok
 
-Step "cargo build --workspace"
-cargo build --workspace
+Step "playwright test (apps/client)"
+$playwrightDir = Join-Path $repoRoot "apps/client"
+Push-Location $playwrightDir
+try {
+    pnpm test:e2e
+    if ($LASTEXITCODE -ne 0) { Fail "playwright e2e tests failed" }
+}
+finally {
+    Pop-Location
+}
+Ok
+
+Step "cargo build --workspace -j 1"
+cargo build --workspace -j 1
 if ($LASTEXITCODE -ne 0) { Fail "cargo build --workspace failed" }
 Ok
 

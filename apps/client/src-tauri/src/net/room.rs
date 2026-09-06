@@ -570,12 +570,14 @@ pub struct StrokeBeginEvent {
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)> for StrokeBeginEvent {
-    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)) -> Self {
+    fn from(
+        (room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload),
+    ) -> Self {
         Self {
             room_id: room_id.to_string(),
             sender_id: sender_id.to_string(),
             stroke_id: payload.stroke_id.to_string(),
-            tool: serde_json::to_value(&payload.tool)
+            tool: serde_json::to_value(payload.tool)
                 .ok()
                 .and_then(|v| v.as_str().map(|s| s.to_string()))
                 .unwrap_or_else(|| "pen".to_string()),
@@ -604,7 +606,9 @@ pub struct StrokePointEvent {
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokePointPayload)> for StrokePointEvent {
-    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokePointPayload)) -> Self {
+    fn from(
+        (room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokePointPayload),
+    ) -> Self {
         Self {
             room_id: room_id.to_string(),
             sender_id: sender_id.to_string(),
@@ -629,7 +633,9 @@ pub struct StrokeEndEvent {
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)> for StrokeEndEvent {
-    fn from((room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)) -> Self {
+    fn from(
+        (room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeEndPayload),
+    ) -> Self {
         Self {
             room_id: room_id.to_string(),
             sender_id: sender_id.to_string(),
@@ -1374,9 +1380,8 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokeBeginPayload>(&env)
                         {
-                            let sender_id = env.sender.as_ref()
-                                .map(|s| s.user_id)
-                                .unwrap_or_default();
+                            let sender_id =
+                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
                             let ipc = StrokeBeginEvent::from((room_id, sender_id, &payload));
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
@@ -1399,9 +1404,8 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokePointPayload>(&env)
                         {
-                            let sender_id = env.sender.as_ref()
-                                .map(|s| s.user_id)
-                                .unwrap_or_default();
+                            let sender_id =
+                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
                             let ipc = StrokePointEvent::from((room_id, sender_id, &payload));
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
@@ -1424,9 +1428,8 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokeEndPayload>(&env)
                         {
-                            let sender_id = env.sender.as_ref()
-                                .map(|s| s.user_id)
-                                .unwrap_or_default();
+                            let sender_id =
+                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
                             let ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
