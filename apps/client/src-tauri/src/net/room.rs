@@ -179,6 +179,10 @@ pub struct RoomSummaryIpc {
     pub participants: Vec<ParticipantIpc>,
     pub host_disconnected: bool,
     pub host_disconnect_deadline_ms: Option<i64>,
+    /// The local user's capability bitfield from `you.cap_set`
+    /// in `ROOM_CREATED` / `ROOM_JOINED`. `None` until the
+    /// room summary is loaded from a create/join response.
+    pub you_cap_set: Option<u32>,
 }
 
 impl From<RoomSummary> for RoomSummaryIpc {
@@ -193,6 +197,7 @@ impl From<RoomSummary> for RoomSummaryIpc {
             participants: s.participants.into_iter().map(Into::into).collect(),
             host_disconnected: s.host_disconnected,
             host_disconnect_deadline_ms: s.host_disconnect_deadline_ms,
+            you_cap_set: None,
         }
     }
 }
@@ -839,7 +844,8 @@ impl RoomClient {
         let env = envelope(MessageKind::RoomCreate, None, payload);
         let reply = self.request(env, MessageKind::RoomCreated).await?;
         let created: locast_protocol::room::RoomCreatedPayload = decode_payload(&reply)?;
-        let summary = RoomSummaryIpc::from(created.room);
+        let mut summary = RoomSummaryIpc::from(created.room);
+        summary.you_cap_set = Some(created.you.cap_set);
         *self.state.lock().await = Some(summary.clone());
         // The room create is a "to caller" event; we
         // emit a `room://state` so the React side
@@ -866,7 +872,8 @@ impl RoomClient {
         let env = envelope(MessageKind::RoomJoinRequest, None, payload);
         let reply = self.request(env, MessageKind::RoomJoined).await?;
         let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
-        let summary = RoomSummaryIpc::from(joined.room);
+        let mut summary = RoomSummaryIpc::from(joined.room);
+        summary.you_cap_set = Some(joined.you.cap_set);
         *self.state.lock().await = Some(summary.clone());
         self.emit_state(&summary).await;
         self.spawn_presence_loop();
@@ -1193,7 +1200,8 @@ impl RoomClient {
             }
             MessageKind::RoomCreated => {
                 if let Ok(p) = decode_payload::<locast_protocol::room::RoomCreatedPayload>(&env) {
-                    let summary = RoomSummaryIpc::from(p.room);
+                    let mut summary = RoomSummaryIpc::from(p.room);
+                    summary.you_cap_set = Some(p.you.cap_set);
                     *self.state.lock().await = Some(summary.clone());
                     self.emit_state(&summary).await;
                     self.emit_event(&summary).await;

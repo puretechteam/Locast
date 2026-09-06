@@ -9,12 +9,20 @@
 //! carry both v1's permissive rules and P3+'s
 //! per-capability rules without re-plumbing the dispatch
 //! layer.
+//!
+//! P6-T01 introduces the [`Scope`] / [`Action`] / [`can()`]
+//! API as the canonical capability check. The legacy
+//! [`Command`] enum and [`check_capability()`] are retained
+//! for the dispatch layer mapping from `MessageKind`;
+//! `check_capability()` delegates to `can()` internally.
 
 #![forbid(unsafe_code)]
 
 use uuid::Uuid;
 
 use super::registry::RoomRegistry;
+
+pub use locast_protocol::room::cap as cap_bits;
 
 /// The closed set of reasons a capability gate may
 /// refuse a command. v1 only emits `NotMember` (for
@@ -30,6 +38,87 @@ pub enum CapsError {
     /// `RoomErrorCode::NotHost`.
     #[error("not the room host")]
     NotHost,
+}
+
+/// The set of capability scopes. Each scope groups related
+/// actions that share a common capability bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Playback,
+    Drawing,
+    Chat,
+    Room,
+    Manifest,
+}
+
+/// Actions within a capability scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    IssuePlaybackCommand,
+    DrawBegin,
+    DrawPoint,
+    DrawEnd,
+    UndoStroke,
+    ClearAll,
+    SendChat,
+    ManageRoom,
+    Kick,
+    PublishManifest,
+    Invite,
+}
+
+impl Scope {
+    pub fn action_bit(self, action: Action) -> u32 {
+        match (self, action) {
+            (Scope::Playback, Action::IssuePlaybackCommand) => cap_bits::PLAYBACK_CONTROL,
+            (Scope::Drawing, Action::DrawBegin) => cap_bits::DRAW,
+            (Scope::Drawing, Action::DrawPoint) => cap_bits::DRAW,
+            (Scope::Drawing, Action::DrawEnd) => cap_bits::DRAW,
+            (Scope::Drawing, Action::UndoStroke) => cap_bits::DRAW,
+            (Scope::Drawing, Action::ClearAll) => cap_bits::DRAW,
+            (Scope::Chat, Action::SendChat) => cap_bits::CHAT,
+            (Scope::Room, Action::ManageRoom) => cap_bits::MANAGE_ROOM,
+            (Scope::Room, Action::Kick) => cap_bits::KICK,
+            (Scope::Manifest, Action::PublishManifest) => cap_bits::PUBLISH_MANIFEST,
+            (Scope::Manifest, Action::Invite) => cap_bits::INVITE,
+            _ => 0,
+        }
+    }
+}
+
+/// Authoritative capability check using the (scope, action) API.
+/// Returns `true` if the given `user_id` is permitted to perform
+/// `action` in `scope` within the room identified by `room_id`.
+///
+/// The host always returns `true` for every action. Non-host
+/// members are checked against their `cap_set` bitfield.
+///
+/// # Arguments
+/// * `registry` - The room registry
+/// * `user_id` - The user attempting the action
+/// * `room_id` - The room in which the action is attempted
+/// * `scope` - The capability scope
+/// * `action` - The specific action within the scope
+pub async fn can(
+    registry: &RoomRegistry,
+    user_id: Uuid,
+    room_id: Uuid,
+    scope: Scope,
+    action: Action,
+) -> bool {
+    let Some(handle) = registry.get_by_id(room_id).await else {
+        return false;
+    };
+    let state = handle.read().await;
+    if let Some(participant) = state.participants.iter().find(|p| p.user_id == user_id) {
+        if participant.is_host {
+            return true;
+        }
+        let bit = scope.action_bit(action);
+        participant.cap_set & bit != 0
+    } else {
+        false
+    }
 }
 
 /// The four initial room envelopes the capability gate
@@ -114,6 +203,17 @@ pub enum Command {
     Draw,
 }
 
+impl Command {
+    fn to_scope_action(self) -> Option<(Scope, Action)> {
+        match self {
+            Command::PlaybackControl => Some((Scope::Playback, Action::IssuePlaybackCommand)),
+            Command::Draw => Some((Scope::Drawing, Action::DrawBegin)),
+            Command::PublishManifest => Some((Scope::Manifest, Action::PublishManifest)),
+            _ => None,
+        }
+    }
+}
+
 /// Authoritative capability check for the v1 initial
 /// command set. v1 is permissive: every command passes
 /// for any joined participant; PRESENCE additionally
@@ -129,19 +229,17 @@ pub async fn check_capability(
     user_id: Uuid,
     command: Command,
 ) -> Result<(), CapsError> {
+    if let Some((scope, action)) = command.to_scope_action() {
+        if let Some(rid) = registry.get_user_room(user_id).await {
+            if !can(registry, user_id, rid, scope, action).await {
+                return Err(CapsError::NotHost);
+            }
+        }
+    }
     match command {
-        // Anyone authed may create a room; the registry
-        // will assign them as host with the full cap set.
         Command::RoomCreate => Ok(()),
-        // Anyone authed may request to join a room; the
-        // registry's `join` handles "already joined",
-        // "room full", etc.
         Command::RoomJoinRequest => Ok(()),
-        // ROOM_LEAVE requires being a member of a room.
-        // The registry's `leave` returns `NotJoined` for
-        // non-members, so we trust that path.
         Command::RoomLeave => Ok(()),
-        // PRESENCE requires being a member of a room.
         Command::Presence => {
             if registry.get_user_room(user_id).await.is_none() {
                 Err(CapsError::NotMember)
@@ -149,17 +247,6 @@ pub async fn check_capability(
                 Ok(())
             }
         }
-        // P3-T03: PublishManifest requires the caller to
-        // be the current host. The check is "is the user
-        // a participant AND marked as host in the CURRENT
-        // room state?" The `get_user_room` + per-room
-        // participant walk covers both branches; if the
-        // user is not in any room, `is_host` defaults to
-        // false. We do NOT trust `cap_set` for the
-        // host-only check because the bitfield is
-        // historical (it may include PUBLISH_MANIFEST
-        // from a previous host election that was later
-        // undone).
         Command::PublishManifest => {
             if let Some(rid) = registry.get_user_room(user_id).await {
                 if registry.is_room_host(rid, user_id).await {
@@ -171,12 +258,6 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
-        // P3-T04 prerequisite 3: FetchManifest. The caller
-        // must be a member of SOME room. The per-type
-        // handler also checks that the caller's room is
-        // the SAME as `envelope.room_id` (the caller's
-        // membership in room X does not grant them the
-        // right to fetch room Y's manifest).
         Command::FetchManifest => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
@@ -184,11 +265,6 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
-        // P3-T05: Signal. Caller must be a member of SOME
-        // room. The per-type handler additionally checks
-        // that envelope.room_id matches the caller's
-        // current room AND that to_user_id is a member
-        // of the same room.
         Command::Signal => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
@@ -196,14 +272,6 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
-        // P4-T01: PlaybackControl. Host-only. Mirrors
-        // the PublishManifest shape: caller must be a
-        // participant of the room named in
-        // envelope.room_id AND must be marked as host in
-        // the CURRENT room state. Per-sender monotonic_seq
-        // and room-lifecycle checks happen in the per-type
-        // handler (handle_playback_command in
-        // rooms/playback.rs).
         Command::PlaybackControl => {
             if let Some(rid) = registry.get_user_room(user_id).await {
                 if registry.is_room_host(rid, user_id).await {
@@ -215,11 +283,6 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
-        // P4-T03: PositionReport. The caller must be a
-        // member of some room. The per-type handler
-        // additionally verifies envelope.room_id matches
-        // the caller's current room so cross-room injection
-        // is denied. No host check.
         Command::PositionReport => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
@@ -227,9 +290,6 @@ pub async fn check_capability(
                 Err(CapsError::NotMember)
             }
         }
-        // P5-T02: Draw. Same shape as PositionReport
-        // (member of some room; the per-type handler
-        // additionally checks the envelope's room_id).
         Command::Draw => {
             if registry.get_user_room(user_id).await.is_some() {
                 Ok(())
@@ -264,6 +324,167 @@ mod tests {
         Uuid::from_bytes(b)
     }
 
+    async fn setup_room_with_host_and_viewer(
+        reg: &RoomRegistry,
+        clock: &MockClock,
+    ) -> (Uuid, Uuid) {
+        use super::super::store::NoopRoomStore;
+        let s = NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room");
+        reg.join(
+            &s,
+            &room.code,
+            uid(2),
+            [2u8; 32],
+            "viewer".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("viewer joins");
+        (room.id, uid(1))
+    }
+
+    // --- can() tests ---
+
+    #[tokio::test]
+    async fn can_returns_false_for_non_member() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        assert!(
+            !can(
+                &reg,
+                uid(99),
+                room_id,
+                Scope::Playback,
+                Action::IssuePlaybackCommand
+            )
+            .await
+        );
+        assert!(!can(&reg, uid(99), room_id, Scope::Drawing, Action::DrawBegin).await);
+        assert!(!can(&reg, uid(99), room_id, Scope::Chat, Action::SendChat).await);
+        assert!(!can(&reg, uid(99), room_id, Scope::Room, Action::ManageRoom).await);
+        assert!(
+            !can(
+                &reg,
+                uid(99),
+                room_id,
+                Scope::Manifest,
+                Action::PublishManifest
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn can_returns_false_for_wrong_room() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let (room1, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room1");
+        let (room2, _self_view) = reg
+            .create(&s, "T".into(), uid(3), [3u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room2");
+        reg.join(
+            &s,
+            &room2.code,
+            uid(2),
+            [2u8; 32],
+            "viewer".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("viewer joins room2");
+        assert!(
+            !can(
+                &reg,
+                uid(2),
+                room1.id,
+                Scope::Playback,
+                Action::IssuePlaybackCommand
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn can_host_has_all_capabilities() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, host_uid) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        assert!(
+            can(
+                &reg,
+                host_uid,
+                room_id,
+                Scope::Playback,
+                Action::IssuePlaybackCommand
+            )
+            .await
+        );
+        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawBegin).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawPoint).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawEnd).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::UndoStroke).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::ClearAll).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Chat, Action::SendChat).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Room, Action::ManageRoom).await);
+        assert!(can(&reg, host_uid, room_id, Scope::Room, Action::Kick).await);
+        assert!(
+            can(
+                &reg,
+                host_uid,
+                room_id,
+                Scope::Manifest,
+                Action::PublishManifest
+            )
+            .await
+        );
+        assert!(can(&reg, host_uid, room_id, Scope::Manifest, Action::Invite).await);
+    }
+
+    #[tokio::test]
+    async fn can_viewer_with_default_caps() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let viewer = uid(2);
+        assert!(
+            !can(
+                &reg,
+                viewer,
+                room_id,
+                Scope::Playback,
+                Action::IssuePlaybackCommand
+            )
+            .await
+        );
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawPoint).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawEnd).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::UndoStroke).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::ClearAll).await);
+        assert!(can(&reg, viewer, room_id, Scope::Chat, Action::SendChat).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Room, Action::ManageRoom).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Room, Action::Kick).await);
+        assert!(
+            !can(
+                &reg,
+                viewer,
+                room_id,
+                Scope::Manifest,
+                Action::PublishManifest
+            )
+            .await
+        );
+        assert!(!can(&reg, viewer, room_id, Scope::Manifest, Action::Invite).await);
+    }
+
+    // --- check_capability() legacy tests ---
+
     #[tokio::test]
     async fn room_create_is_allowed_for_anyone() {
         let (reg, _clock) = fresh_registry();
@@ -285,10 +506,6 @@ mod tests {
 
     #[tokio::test]
     async fn room_leave_is_allowed_in_v1() {
-        // v1 lets ROOM_LEAVE through unconditionally; the
-        // registry's `leave` returns NotJoined for
-        // non-members, which the per-type handler
-        // translates into ROOM_ERROR(NotJoined).
         let (reg, _clock) = fresh_registry();
         assert!(check_capability(&reg, uid(1), Command::RoomLeave)
             .await
@@ -298,17 +515,12 @@ mod tests {
     #[tokio::test]
     async fn presence_is_denied_when_user_is_not_in_a_room() {
         let (reg, _clock) = fresh_registry();
-        // No room membership -> PRESENCE is rejected.
         let err = check_capability(&reg, uid(1), Command::Presence)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
     }
 
-    /// P3-T05: SIGNAL requires the caller to be a member
-    /// of some room (the per-type handler additionally
-    /// checks the same-room + recipient-membership
-    /// invariants). A non-member is denied.
     #[tokio::test]
     async fn signal_is_denied_when_user_is_not_in_any_room() {
         let (reg, _clock) = fresh_registry();
@@ -329,74 +541,34 @@ mod tests {
 
     #[tokio::test]
     async fn publish_manifest_is_denied_when_user_is_not_host() {
-        // Set up: uid(1) creates a room, uid(2) joins it as
-        // a viewer. PublishManifest must succeed for the
-        // host and fail with NotHost for the viewer.
         let (reg, clock) = fresh_registry();
-        let s = super::super::store::NoopRoomStore;
-        let (room, _self_view) = reg
-            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
-            .await
-            .expect("create room");
-        // uid(2) joins as a viewer (not host).
-        let (_joined, _evt) = reg
-            .join(
-                &s,
-                &room.code,
-                uid(2),
-                [2u8; 32],
-                "viewer".into(),
-                clock.now_ms(),
-            )
-            .await
-            .expect("viewer joins");
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
         let host_ok = check_capability(&reg, uid(1), Command::PublishManifest).await;
         assert!(host_ok.is_ok(), "host should be allowed to publish");
         let viewer_err = check_capability(&reg, uid(2), Command::PublishManifest)
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
+        let _ = room_id;
     }
 
-    /// P3-T04 prerequisite 3: a viewer can fetch the
-    /// manifest (it is not host-only). A non-member
-    /// cannot.
     #[tokio::test]
     async fn fetch_manifest_is_allowed_for_any_member_but_denied_for_non_member() {
         let (reg, clock) = fresh_registry();
-        let s = super::super::store::NoopRoomStore;
-        let (room, _self_view) = reg
-            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
-            .await
-            .expect("create");
-        let (_joined, _evt) = reg
-            .join(
-                &s,
-                &room.code,
-                uid(2),
-                [2u8; 32],
-                "viewer".into(),
-                clock.now_ms(),
-            )
-            .await
-            .expect("join");
-        // Host and viewer can both fetch.
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
         assert!(check_capability(&reg, uid(1), Command::FetchManifest)
             .await
             .is_ok());
         assert!(check_capability(&reg, uid(2), Command::FetchManifest)
             .await
             .is_ok());
-        // Non-member is denied.
         let err = check_capability(&reg, uid(3), Command::FetchManifest)
             .await
             .expect_err("non-member must be denied");
         assert!(matches!(err, CapsError::NotMember));
+        let _ = room_id;
     }
 
-    /// P4-T01: PlaybackControl is host-only. A viewer cannot
-    /// issue PLAYBACK_CMD. A non-member is denied with
-    /// NotMember (mirrors the FetchManifest case).
     #[tokio::test]
     async fn playback_control_is_denied_when_user_is_not_in_any_room() {
         let (reg, _clock) = fresh_registry();
@@ -406,38 +578,19 @@ mod tests {
         assert!(matches!(err, CapsError::NotMember));
     }
 
-    /// P4-T01: PlaybackControl requires the caller to be the
-    /// current host. A viewer (non-host member) is denied
-    /// with NotHost even though they pass membership.
     #[tokio::test]
     async fn playback_control_is_denied_when_user_is_not_host() {
         let (reg, clock) = fresh_registry();
-        let s = super::super::store::NoopRoomStore;
-        let (room, _self_view) = reg
-            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
-            .await
-            .expect("create room");
-        let (_joined, _evt) = reg
-            .join(
-                &s,
-                &room.code,
-                uid(2),
-                [2u8; 32],
-                "viewer".into(),
-                clock.now_ms(),
-            )
-            .await
-            .expect("viewer joins");
-        // Host is allowed.
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
         let host_ok = check_capability(&reg, uid(1), Command::PlaybackControl).await;
         assert!(
             host_ok.is_ok(),
             "host should be allowed to playback-control"
         );
-        // Viewer is denied with NotHost (not NotMember) because they ARE a room member.
         let viewer_err = check_capability(&reg, uid(2), Command::PlaybackControl)
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
+        let _ = room_id;
     }
 }

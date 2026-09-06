@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
+pub mod caps;
 pub mod chunk_plan;
 pub mod heartbeat;
 pub mod host;

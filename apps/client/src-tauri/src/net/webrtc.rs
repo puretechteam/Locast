@@ -1396,6 +1396,7 @@ mod tests {
             }],
             host_disconnected: false,
             host_disconnect_deadline_ms: None,
+            you_cap_set: None,
         };
         let mut s2 = s1.clone();
         s2.participants.push(crate::net::room::ParticipantIpc {
