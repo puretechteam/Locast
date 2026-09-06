@@ -379,6 +379,20 @@ mod tests {
         );
         rendered.push('\n');
         rendered.push_str(
+            &crate::room::PermissionSetPayload::export_to_string(&cfg)
+                .expect("render PermissionSetPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::CapabilityUpdatePayload::export_to_string(&cfg)
+                .expect("render CapabilityUpdatePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::room::ChatPayload::export_to_string(&cfg).expect("render ChatPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
             &locast_manifest::HostSignature::export_to_string(&cfg)
                 .expect("render HostSignature bindings"),
         );
