@@ -36,9 +36,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
-    HostMigratedPayload, Participant, ParticipantStatus,
-    PresencePayload, RoomCreatePayload, RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload,
-    RoomStatePayload, RoomSummary,
+    HostMigratedPayload, Participant, ParticipantStatus, PresencePayload, RoomCreatePayload,
+    RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload, RoomSummary,
 };
 use serde::Serialize;
 use specta::Type;

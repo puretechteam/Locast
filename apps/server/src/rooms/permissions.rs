@@ -43,14 +43,13 @@ pub async fn handle_permission_set(
     caller_user_id: Uuid,
     now_ms: i64,
 ) -> Result<Vec<RoomEvent>, RoomError> {
-    let room_id = envelope.room_id.ok_or_else(|| {
-        RoomError::Internal("PERMISSION_SET missing room_id".into())
-    })?;
+    let room_id = envelope
+        .room_id
+        .ok_or_else(|| RoomError::Internal("PERMISSION_SET missing room_id".into()))?;
 
     let payload: PermissionSetPayload = decode_payload(&envelope.payload)?;
 
-    handle_permission_set_payload(room_id, payload, registry, store, caller_user_id, now_ms)
-        .await
+    handle_permission_set_payload(room_id, payload, registry, store, caller_user_id, now_ms).await
 }
 
 async fn handle_permission_set_payload(
@@ -103,12 +102,10 @@ async fn handle_permission_set_payload(
         "capability updated"
     );
 
-    Ok(vec![RoomEvent::CapabilityUpdated(
-        CapabilityUpdated {
-            target_user_id,
-            cap_set: new_cap_set,
-        },
-    )])
+    Ok(vec![RoomEvent::CapabilityUpdated(CapabilityUpdated {
+        target_user_id,
+        cap_set: new_cap_set,
+    })])
 }
 
 #[cfg(test)]
@@ -199,7 +196,8 @@ mod tests {
             .find(|p| p.user_id == viewer_id)
             .expect("viewer should be in participants");
         assert_eq!(
-            viewer.cap_set, cap::CHAT | cap::DRAW,
+            viewer.cap_set,
+            cap::CHAT | cap::DRAW,
             "viewer should have DRAW added"
         );
 
@@ -286,7 +284,9 @@ mod tests {
         let err = handle_permission_set(env, &reg, &s, host_id, clock.now_ms())
             .await
             .expect_err("should return error when targeting unknown user");
-        assert!(matches!(err, RoomError::Internal(ref msg) if msg.contains("not a room participant")));
+        assert!(
+            matches!(err, RoomError::Internal(ref msg) if msg.contains("not a room participant"))
+        );
     }
 
     #[tokio::test]
@@ -341,7 +341,8 @@ mod tests {
             .find(|p| p.user_id == viewer_id)
             .expect("viewer should be in participants");
         assert_eq!(
-            viewer.cap_set, cap::CHAT | cap::DRAW,
+            viewer.cap_set,
+            cap::CHAT | cap::DRAW,
             "viewer cap_set should be updated in registry"
         );
     }

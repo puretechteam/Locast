@@ -24,8 +24,8 @@ use std::sync::Arc;
 use locast_protocol::room::cap;
 use locast_protocol::room::{
     CapabilityUpdatePayload, HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload,
-    ParticipantJoinedPayload, ParticipantLeftPayload, ParticipantStatus, RoomClosedPayload, RoomErrorCode,
-    RoomErrorPayload, RoomJoinedPayload, RoomStatePayload, RoomSummary,
+    ParticipantJoinedPayload, ParticipantLeftPayload, ParticipantStatus, RoomClosedPayload,
+    RoomErrorCode, RoomErrorPayload, RoomJoinedPayload, RoomStatePayload, RoomSummary,
 };
 use rand::rngs::OsRng;
 use tokio::sync::broadcast;
@@ -1345,9 +1345,7 @@ impl RoomRegistry {
             .participants
             .iter_mut()
             .find(|p| p.user_id == target_user_id)
-            .ok_or_else(|| {
-                RoomError::Internal("cap_set update: target not found".into())
-            })?;
+            .ok_or_else(|| RoomError::Internal("cap_set update: target not found".into()))?;
         participant.cap_set = new_cap_set;
         Ok(())
     }

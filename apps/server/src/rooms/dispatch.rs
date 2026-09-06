@@ -20,8 +20,8 @@ use super::codes;
 use super::drawing;
 use super::error::RoomError;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
-use super::playback::handle_playback_cmd;
 use super::permissions::handle_permission_set;
+use super::playback::handle_playback_cmd;
 use super::presence::handle_position_report;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
@@ -167,7 +167,11 @@ pub async fn dispatch_room_message(
         }
         MessageKind::PermissionSet => {
             match handle_permission_set(envelope, registry, store, user_id, now_ms).await {
-                Ok(events) => RoomDispatchOutcome { to_caller: Vec::new(), events, close_caller: false },
+                Ok(events) => RoomDispatchOutcome {
+                    to_caller: Vec::new(),
+                    events,
+                    close_caller: false,
+                },
                 Err(e) => {
                     let mut out = RoomDispatchOutcome::default();
                     out.to_caller.push(err_envelope(
