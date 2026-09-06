@@ -414,3 +414,156 @@ test("addPosition resets fading trail to full opacity", async ({ page }) => {
     expect(after?.fadingOut).toBe(false);
     expect(after?.opacity).toBe(1);
 });
+
+test("remote users get deterministic non-red colors", async ({ page }) => {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                addPosition: (userId: string, x: number, y: number) => void;
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+        w.__locastLaser?.addPosition("remote-user-a", 0.1, 0.1);
+        w.__locastLaser?.addPosition("remote-user-b", 0.2, 0.2);
+    });
+
+    await page.waitForTimeout(50);
+
+    const state = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const userA = state?.trails.find((t) => t.userId === "remote-user-a");
+    const userB = state?.trails.find((t) => t.userId === "remote-user-b");
+
+    expect(userA?.color).not.toBe("#ff0000");
+    expect(userB?.color).not.toBe("#ff0000");
+    expect(userA?.color).not.toBe(userB?.color);
+});
+
+test("same userId always gets the same color", async ({ page }) => {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                addPosition: (userId: string, x: number, y: number) => void;
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+        w.__locastLaser?.addPosition("user-consistent", 0.1, 0.1);
+    });
+
+    await page.waitForTimeout(50);
+
+    const state1 = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                addPosition: (userId: string, x: number, y: number) => void;
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+        w.__locastLaser?.addPosition("user-consistent", 0.5, 0.5);
+    });
+
+    await page.waitForTimeout(50);
+
+    const state2 = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const color1 = state1?.trails.find((t) => t.userId === "user-consistent")?.color;
+    const color2 = state2?.trails.find((t) => t.userId === "user-consistent")?.color;
+    expect(color1).toBe(color2);
+});
+
+test("local user can be assigned red laser color", async ({ page }) => {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                addPosition: (userId: string, x: number, y: number, color?: string) => void;
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+        w.__locastLaser?.addPosition("local-user", 0.1, 0.1, "#ff0000");
+    });
+
+    await page.waitForTimeout(50);
+
+    const state = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const localTrail = state?.trails.find((t) => t.userId === "local-user");
+    expect(localTrail?.color).toBe("#ff0000");
+});
+
+test("16 simultaneous lasers get palette colors", async ({ page }) => {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                addPosition: (userId: string, x: number, y: number, color?: string) => void;
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+        for (let i = 0; i < 16; i++) {
+            w.__locastLaser?.addPosition(`user-${i}`, i / 15, i / 15);
+        }
+    });
+
+    await page.waitForTimeout(50);
+
+    const state = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const colors = state?.trails.map((t) => t.color) ?? [];
+    expect(colors.length).toBe(16);
+    const uniqueColors = [...new Set(colors)];
+    expect(uniqueColors.length).toBeGreaterThanOrEqual(10);
+    for (const c of colors) {
+        expect(c).toMatch(/^#[0-9a-f]{6}$/i);
+    }
+});

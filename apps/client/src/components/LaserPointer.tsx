@@ -22,6 +22,7 @@
 import { useEffect, useRef, useCallback } from "react";
 import type { RefObject } from "react";
 import { useLaserTrail, type LaserState } from "../hooks/useLaserTrail";
+import { hexToRgba } from "../utils/laserColor";
 
 /**
  * Props
@@ -35,10 +36,12 @@ export interface LaserPointerProps {
     videoRef: RefObject<HTMLVideoElement | null>;
 }
 
-/** Render a single user's laser trail. */
+/** Render a single user's laser trail.
+ *  The color is provided by the trail data. */
 function renderTrail(
     ctx: CanvasRenderingContext2D,
     points: { x: number; y: number }[],
+    color: string,
     opacity: number,
     intrinsicSize: { width: number; height: number },
     cssWidth: number,
@@ -68,7 +71,7 @@ function renderTrail(
         const y1 = p1.y * intrinsicSize.height;
 
         ctx.beginPath();
-        ctx.strokeStyle = `rgba(255, 50, 50, ${pointOpacity})`;
+        ctx.strokeStyle = hexToRgba(color, pointOpacity);
         ctx.lineWidth = (4 * t) * widthScale; // Thinner at tail
         ctx.lineCap = "round";
         ctx.lineJoin = "round";
@@ -77,7 +80,7 @@ function renderTrail(
         ctx.stroke();
     }
 
-    // Draw the red dot at the head.
+    // Draw the laser dot at the head.
     if (points.length > 0) {
         const head = points[points.length - 1]!;
         const hx = head.x * intrinsicSize.width;
@@ -85,7 +88,7 @@ function renderTrail(
         const radius = 6 * widthScale;
 
         ctx.beginPath();
-        ctx.fillStyle = `rgba(255, 0, 0, ${opacity})`;
+        ctx.fillStyle = hexToRgba(color, opacity);
         ctx.arc(hx, hy, radius, 0, Math.PI * 2);
         ctx.fill();
 
@@ -132,6 +135,7 @@ export function LaserPointer({
             renderTrail(
                 ctx,
                 trail.points,
+                trail.color,
                 trail.opacity,
                 size,
                 cssWidth,
@@ -183,7 +187,7 @@ export function LaserPointer({
         if (import.meta.env.MODE !== "test") return;
         const w = window as unknown as {
             __locastLaser?: {
-                addPosition: (userId: string, x: number, y: number) => void;
+                addPosition: (userId: string, x: number, y: number, color?: string) => void;
                 removeTrail: (userId: string) => void;
                 clearAll: () => void;
                 getState: () => ReturnType<typeof getState>;

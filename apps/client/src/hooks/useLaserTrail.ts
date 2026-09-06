@@ -19,6 +19,7 @@
 // data and hands it to `LaserPointer` which renders.
 
 import { useCallback, useRef, useEffect } from "react";
+import { laserColor } from "../utils/laserColor";
 
 /** Maximum number of trail positions kept per user. */
 const MAX_TRAIL_LENGTH = 20;
@@ -37,6 +38,7 @@ export interface TrailPoint {
 export interface UserTrail {
     userId: string;
     points: TrailPoint[];
+    color: string;
     opacity: number;
     fadingOut: boolean;
     fadeOutStartMs: number | null;
@@ -50,7 +52,7 @@ export interface LaserState {
 
 /** Hook return value. */
 export interface UseLaserTrailHandle {
-    addPosition: (userId: string, x: number, y: number) => void;
+    addPosition: (userId: string, x: number, y: number, color?: string) => void;
     removeTrail: (userId: string) => void;
     clearAll: () => void;
     getState: () => LaserState;
@@ -76,28 +78,38 @@ export function useLaserTrail(
     const cancelledRef = useRef<boolean>(false);
 
     /** Add a position to a user's trail. Creates the trail
-     *  if it doesn't exist. Trims to MAX_TRAIL_LENGTH. */
-    const addPosition = useCallback((userId: string, x: number, y: number) => {
-        const now = Date.now();
-        let trail = trailsRef.current.get(userId);
-        if (!trail) {
-            trail = {
-                userId,
-                points: [],
-                opacity: 1,
-                fadingOut: false,
-                fadeOutStartMs: null,
-            };
-            trailsRef.current.set(userId, trail);
-        }
-        trail.points.push({ x, y, tsMs: now });
-        if (trail.points.length > MAX_TRAIL_LENGTH) {
-            trail.points.shift();
-        }
-        trail.fadingOut = false;
-        trail.fadeOutStartMs = null;
-        trail.opacity = 1;
-    }, []);
+     *  if it doesn't exist. Trims to MAX_TRAIL_LENGTH.
+     *  The color is assigned on first position and used for
+     *  the lifetime of the trail. If no color is provided
+     *  for a new trail, defaults to the remote-user palette
+     *  color for that userId. */
+    const addPosition = useCallback(
+        (userId: string, x: number, y: number, color?: string) => {
+            const now = Date.now();
+            let trail = trailsRef.current.get(userId);
+            if (!trail) {
+                const trailColor =
+                    color ?? laserColor(userId, false);
+                trail = {
+                    userId,
+                    points: [],
+                    color: trailColor,
+                    opacity: 1,
+                    fadingOut: false,
+                    fadeOutStartMs: null,
+                };
+                trailsRef.current.set(userId, trail);
+            }
+            trail.points.push({ x, y, tsMs: now });
+            if (trail.points.length > MAX_TRAIL_LENGTH) {
+                trail.points.shift();
+            }
+            trail.fadingOut = false;
+            trail.fadeOutStartMs = null;
+            trail.opacity = 1;
+        },
+        [],
+    );
 
     /** Start fading a user's trail over FADE_OUT_MS. */
     const removeTrail = useCallback((userId: string) => {
