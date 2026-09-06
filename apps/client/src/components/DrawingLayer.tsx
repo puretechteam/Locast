@@ -24,6 +24,7 @@ import type { RefObject } from "react";
 import { useDrawingCanvas } from "../hooks/useDrawingCanvas";
 import { useDrawingEventBridge, useDrawingRoomSync } from "../hooks/useDrawingEventBridge";
 import { useDrawingStore } from "../stores/useDrawingStore";
+import { LaserPointer } from "./LaserPointer";
 
 /**
  * Props
@@ -58,11 +59,15 @@ export function DrawingLayer({
     useDrawingCanvas(canvasRef, videoRef, userId, remoteStrokes);
 
     return (
-        <canvas
-            ref={canvasRef}
-            className="drawing-layer"
-            data-testid="locast-drawing-layer"
-            aria-hidden="true"
-        />
+        <>
+            <canvas
+                ref={canvasRef}
+                className="drawing-layer"
+                data-testid="locast-drawing-layer"
+                aria-hidden="true"
+            />
+            {/* P5-T04: laser pointer overlay */}
+            <LaserPointer videoRef={videoRef} />
+        </>
     );
 }
