@@ -567,3 +567,123 @@ test("16 simultaneous lasers get palette colors", async ({ page }) => {
         expect(c).toMatch(/^#[0-9a-f]{6}$/i);
     }
 });
+
+test("d key shows the drawing toolbar", async ({ page }) => {
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+    });
+    const toolbar = page.locator('[data-testid="drawing-toolbar"]');
+    await expect(toolbar).toBeVisible();
+});
+
+test("l key activates local laser when not drawing", async ({ page }) => {
+    await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                clearAll: () => void;
+            };
+        };
+        w.__locastLaser?.clearAll();
+    });
+
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "l", bubbles: true }));
+    });
+
+    await page.mouse.move(400, 300);
+    await page.waitForTimeout(50);
+
+    const state = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const localTrail = state?.trails.find((t) =>
+        t.color === "#ff0000",
+    );
+    expect(localTrail).toBeDefined();
+    expect(localTrail!.color).toBe("#ff0000");
+});
+
+test("Escape exits drawing mode and deactivates laser", async ({ page }) => {
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+    });
+
+    const toolbar = page.locator('[data-testid="drawing-toolbar"]');
+    await expect(toolbar).toBeVisible();
+
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+
+    await expect(toolbar).not.toBeVisible();
+});
+
+test("canvas has pointer-events: auto when drawing tool is active", async ({ page }) => {
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+    });
+
+    const toolbar = page.locator('[data-testid="drawing-toolbar"]');
+    await expect(toolbar).toBeVisible();
+
+    await page.locator('[data-testid="drawing-toolbar-tool-pen"]').click();
+
+    const canvas = page.locator('[data-testid="locast-drawing-layer"]');
+    const pointerEvents = await canvas.evaluate((el) =>
+        window.getComputedStyle(el).pointerEvents,
+    );
+    expect(pointerEvents).toBe("auto");
+});
+
+test("l key does not activate laser while drawing", async ({ page }) => {
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "d", bubbles: true }));
+    });
+
+    const toolbar = page.locator('[data-testid="drawing-toolbar"]');
+    await expect(toolbar).toBeVisible();
+
+    await page.locator('[data-testid="drawing-toolbar-tool-pen"]').click();
+
+    const stateBefore = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    await page.evaluate(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "l", bubbles: true }));
+    });
+
+    await page.mouse.move(400, 300);
+    await page.waitForTimeout(50);
+
+    const stateAfter = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastLaser?: {
+                getState?: () => {
+                    trails: { userId: string; color: string }[];
+                };
+            };
+        };
+        return w.__locastLaser?.getState?.();
+    });
+
+    const redTrailsBefore = stateBefore?.trails.filter((t) => t.color === "#ff0000") ?? [];
+    const redTrailsAfter = stateAfter?.trails.filter((t) => t.color === "#ff0000") ?? [];
+
+    expect(redTrailsAfter.length).toBe(redTrailsBefore.length);
+});

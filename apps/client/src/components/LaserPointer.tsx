@@ -5,24 +5,23 @@
 //
 // - Is a separate `<canvas>` positioned above the
 //   drawing canvas (z-index stacking in room.css).
-// - Does NOT handle pointer events; it is purely
-//   visual.
+// - Is purely visual (`pointer-events: none`).
 // - Receives trail data from `useLaserTrail` via the
 //   `LaserState` passed to `onLaserUpdate`.
 // - Renders a fading polyline trail (last 20 positions)
-//   and a red dot at the head for each participant.
+//   and a colored dot at the head for each participant.
 // - The fade-out animation is computed in `useLaserTrail`
 //   and applied here as canvas globalAlpha.
 //
-// The component does NOT manage laser activation state;
-// that is owned by the caller (e.g. a keyboard handler
-// in a future toolbar task). This component simply renders
-// whatever trails are provided.
+// Laser activation is controlled by the `laserActive` prop
+// and the `localUserId`. When `laserActive` is true, the
+// component tracks window-level pointer moves and emits
+// positions for the local user in red.
 
 import { useEffect, useRef, useCallback } from "react";
 import type { RefObject } from "react";
 import { useLaserTrail, type LaserState } from "../hooks/useLaserTrail";
-import { hexToRgba } from "../utils/laserColor";
+import { hexToRgba, laserColor } from "../utils/laserColor";
 
 /**
  * Props
@@ -31,9 +30,17 @@ import { hexToRgba } from "../utils/laserColor";
  * passes to the `<video>` element. The hook attaches a
  * `ResizeObserver` to it so the canvas backing store
  * follows the video's intrinsic resolution.
+ *
+ * `localUserId` is the local user's id; used to stamp
+ * the local laser trail.
+ *
+ * `laserActive` controls whether the local user's laser
+ * is tracking the pointer.
  */
 export interface LaserPointerProps {
     videoRef: RefObject<HTMLVideoElement | null>;
+    localUserId: string;
+    laserActive: boolean;
 }
 
 /** Render a single user's laser trail.
@@ -104,6 +111,8 @@ function renderTrail(
 
 export function LaserPointer({
     videoRef,
+    localUserId,
+    laserActive,
 }: LaserPointerProps): React.ReactNode {
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -181,6 +190,35 @@ export function LaserPointer({
             video.removeEventListener("loadedmetadata", sync);
         };
     }, [videoRef]);
+
+    /** Track window-level pointer moves when laser is active. */
+    useEffect(() => {
+        if (!laserActive) return;
+
+        const localColor = laserColor(localUserId, true);
+
+        const onPointerMove = (e: PointerEvent): void => {
+            const canvas = canvasRef.current;
+            if (!canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) return;
+            const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+            addPosition(localUserId, x, y, localColor);
+        };
+
+        const onPointerUp = (): void => {
+            removeTrail(localUserId);
+        };
+
+        window.addEventListener("pointermove", onPointerMove);
+        window.addEventListener("pointerup", onPointerUp);
+        return () => {
+            window.removeEventListener("pointermove", onPointerMove);
+            window.removeEventListener("pointerup", onPointerUp);
+            removeTrail(localUserId);
+        };
+    }, [laserActive, localUserId, addPosition, removeTrail]);
 
     /** Expose the laser control functions on window in test mode. */
     useEffect(() => {
