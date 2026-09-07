@@ -657,10 +657,12 @@ impl RoomRegistry {
         for (rid, item) in &to_publish {
             self.publish(*rid, item.clone());
         }
-        for (rid, uid) in &removed_pairs {
-            let _ = store
-                .update_participant_status(*rid, *uid, "left", now_ms)
-                .await;
+        let mut stale_rooms: Vec<Uuid> = removed_pairs.iter().map(|(rid, _)| *rid).collect();
+        stale_rooms.sort_unstable();
+        stale_rooms.dedup();
+        for rid in stale_rooms {
+            let cutoff = now_ms.saturating_sub(self.config.participant_stale_after_ms);
+            let _ = store.purge_stale_participants(rid, cutoff).await;
         }
         for rid in to_remove {
             self.remove_room(rid).await;
@@ -1162,6 +1164,7 @@ impl RoomRegistry {
             }
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.status = ParticipantStatus::Disconnected;
+                p.last_seen_ms = now_ms;
             }
             return Ok(vec![]);
         }
@@ -1384,10 +1387,13 @@ impl RoomRegistry {
         let by_id = self.by_id.read().await;
         for (rid, h) in by_id.iter() {
             let s = h.read().await;
-            if s.participants
-                .iter()
-                .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
-            {
+            if s.participants.iter().any(|p| {
+                p.user_id == user_id
+                    && matches!(
+                        p.status,
+                        ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+                    )
+            }) {
                 return Some(*rid);
             }
         }
@@ -1395,17 +1401,20 @@ impl RoomRegistry {
     }
 
     /// `true` if the user is currently a participant in the
-    /// named room (status != Left). Used by the WS layer to
-    /// filter stale broadcast events for users who have
-    /// just left.
+    /// named room (status is Connected or Reconnecting).
+    /// Used by the WS layer to filter stale broadcast events
+    /// for users who have just left or are Disconnected.
     pub async fn is_user_in_room(&self, user_id: Uuid, room_id: Uuid) -> bool {
         let by_id = self.by_id.read().await;
         if let Some(h) = by_id.get(&room_id) {
             let s = h.read().await;
-            return s
-                .participants
-                .iter()
-                .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left);
+            return s.participants.iter().any(|p| {
+                p.user_id == user_id
+                    && matches!(
+                        p.status,
+                        ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+                    )
+            });
         }
         false
     }

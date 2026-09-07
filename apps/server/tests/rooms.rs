@@ -28,7 +28,7 @@ use locast_protocol::room::{
     RoomSummary,
 };
 use locast_server::time::MockClock;
-use locast_server::{AppState, Config, Db, Metrics, RoomRegistry, RoomRegistryConfig};
+use locast_server::{AppState, Clock, Config, Db, Metrics, RoomRegistry, RoomRegistryConfig};
 use rand::RngCore;
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -66,11 +66,15 @@ struct TestHarness {
     handle: tokio::task::JoinHandle<()>,
     #[allow(dead_code)]
     clock: Arc<MockClock>,
-    _db: Db,
+    db: Db,
+    rooms: Arc<RoomRegistry>,
 }
 
 async fn spawn_test_server() -> TestHarness {
-    let config = test_config();
+    spawn_test_server_with_config(test_config()).await
+}
+
+async fn spawn_test_server_with_config(config: Config) -> TestHarness {
     let db = Db::open(&config).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&config)));
     let clock = Arc::new(MockClock::new(1_000_000));
@@ -91,12 +95,6 @@ async fn spawn_test_server() -> TestHarness {
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Start the room ticker that drives the host-disconnect
-    // grace and the stale-participant cleanup. The test
-    // harness uses a 50ms interval so the 200ms grace
-    // resolves within ~4 ticks. The handle is dropped
-    // (the test process exiting is fine; the spawn keeps
-    // the ticker running until the runtime shuts down).
     let _ticker_handle = {
         let rooms = rooms.clone();
         let clock = clock.clone();
@@ -117,7 +115,8 @@ async fn spawn_test_server() -> TestHarness {
         addr,
         handle,
         clock,
-        _db: db,
+        db,
+        rooms,
     }
 }
 
@@ -866,6 +865,71 @@ async fn multiple_rooms_in_parallel() {
     let _ = expect_envelope(&mut ws_b, MessageKind::RoomJoined).await;
     let _ = expect_envelope(&mut ws_a, MessageKind::ParticipantJoined).await;
     let _ = r1_id;
+}
+
+// ---------------------------------------------------------------------------
+// 21. Stale participant cleanup after DISCONNECTED (P7-T02).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_participant_removed_after_disconnect_timeout() {
+    let mut config = test_config();
+    config.participant_disconnect_after_ms = 200;
+    config.participant_stale_after_ms = 500;
+    let harness = spawn_test_server_with_config(config).await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+
+    send_envelope(&mut ws_a, &room_create_envelope(a.token, "M", false)).await;
+    let env = expect_envelope(&mut ws_a, MessageKind::RoomCreated).await;
+    let created: RoomCreatedPayload = serde_json::from_value(env.payload).unwrap();
+    let room_id = created.room.id;
+
+    send_envelope(
+        &mut ws_b,
+        &room_join_envelope(b.token, &created.room.code, "B"),
+    )
+    .await;
+    let _ = expect_envelope(&mut ws_b, MessageKind::RoomJoined).await;
+    let _ = expect_envelope(&mut ws_a, MessageKind::ParticipantJoined).await;
+
+    drop(ws_b);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let store: Arc<dyn locast_server::rooms::RoomStore> =
+        Arc::new(locast_server::rooms::DbRoomStore::new(harness.db.clone()));
+    let now = harness.clock.now_ms();
+    harness.rooms.tick_presence_timeout(now).await;
+    harness.clock.advance(600);
+    let now = harness.clock.now_ms();
+    harness
+        .rooms
+        .tick_stale_participants(store.as_ref(), now)
+        .await;
+
+    let handle = harness.rooms.get_by_id(room_id).await.expect("room exists");
+    let state = handle.read().await;
+    assert!(
+        !state.participants.iter().any(|p| p.user_id == b.user_id),
+        "stale participant should be removed from in-memory state"
+    );
+
+    let rows = harness
+        .db
+        .list_room_participants(room_id)
+        .await
+        .expect("list participants");
+    assert!(
+        !rows.iter().any(|r| r.user_id == b.user_id),
+        "stale participant row should be deleted from DB"
+    );
+
+    drop(ws_a);
+    drop(harness);
 }
 
 // ---------------------------------------------------------------------------

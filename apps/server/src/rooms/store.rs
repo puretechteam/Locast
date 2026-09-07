@@ -89,6 +89,14 @@ pub trait RoomStore: Send + Sync {
         deadline_ms: Option<i64>,
     ) -> Result<(), String>;
 
+    /// Purge stale non-host participants from a room. The
+    /// implementation should delete rows whose
+    /// `last_seen_ms` is older than `cutoff_ms` and whose
+    /// status is not already `left`. Returns the
+    /// `(room_id, user_id)` pairs removed so the caller can
+    /// broadcast `ParticipantLeft` events.
+    async fn purge_stale_participants(&self, room_id: Uuid, cutoff_ms: i64) -> Result<(), String>;
+
     /// Check whether a room with the given code already
     /// exists in durable storage. Used by the create-time
     /// collision loop to close the race where a concurrent
@@ -229,6 +237,17 @@ impl RoomStore for DbRoomStore {
                 e.to_string()
             })
     }
+
+    async fn purge_stale_participants(&self, room_id: Uuid, cutoff_ms: i64) -> Result<(), String> {
+        self.db
+            .purge_stale_participants(room_id, cutoff_ms)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                warn!(error = %e, "locast-server room store purge_stale_participants failed");
+                e.to_string()
+            })
+    }
 }
 
 /// Test store. Every operation succeeds without touching
@@ -297,6 +316,14 @@ impl RoomStore for NoopRoomStore {
 
     async fn room_code_taken(&self, _code: &str) -> Result<bool, String> {
         Ok(false)
+    }
+
+    async fn purge_stale_participants(
+        &self,
+        _room_id: Uuid,
+        _cutoff_ms: i64,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 

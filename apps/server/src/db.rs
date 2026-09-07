@@ -549,7 +549,7 @@ impl Db {
             sqlx::query_as(
                 "SELECT user_id, pubkey, display_name, is_host, joined_ms, left_ms, \
                  status, cap_set FROM room_participants \
-                 WHERE room_id = ?1 \
+                 WHERE room_id = ?1 AND status != 'left' \
                  ORDER BY joined_ms ASC, user_id ASC",
             )
             .bind(room_id.to_string())
@@ -838,22 +838,24 @@ impl Db {
     /// `PARTICIPANT_LEFT` per pair.
     pub async fn purge_stale_participants(
         &self,
+        room_id: Uuid,
         cutoff_ms: i64,
     ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
         let _g = self.write_lock.lock().await;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT room_id, user_id FROM room_participants \
-             WHERE is_host = 0 AND status != 'left' AND last_seen_ms < ?1",
+              WHERE room_id = ?1 AND is_host = 0 AND status != 'left' AND last_seen_ms < ?2",
         )
+        .bind(room_id.to_string())
         .bind(cutoff_ms)
         .fetch_all(&self.pool)
         .await?;
         sqlx::query(
-            "UPDATE room_participants SET status = 'left', left_ms = ?2 \
-             WHERE is_host = 0 AND status != 'left' AND last_seen_ms < ?1",
+            "DELETE FROM room_participants \
+              WHERE room_id = ?1 AND is_host = 0 AND status != 'left' AND last_seen_ms < ?2",
         )
+        .bind(room_id.to_string())
         .bind(cutoff_ms)
-        .bind(now_ms())
         .execute(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
