@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod permissions;
 pub mod playback;
 pub mod presence;
+pub mod presets;
 pub mod registry;
 pub mod signal;
 pub mod state;

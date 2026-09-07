@@ -20,7 +20,7 @@ export const CAP = {
     CHAT: 0x80,
 } as const;
 
-export type Cap = (typeof CAP)[keyof typeof CAP];
+export type Cap = number;
 
 export async function grantCapability(targetUserId: string, cap: Cap): Promise<void> {
     await commands.roomPermissionSet(targetUserId, cap, 0);

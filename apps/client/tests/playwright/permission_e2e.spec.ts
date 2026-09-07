@@ -323,3 +323,79 @@ test("toolbar hidden after DRAW cap is revoked", async ({ page: viewerPage, loca
     const toolbarElement = await viewerPage.locator('[data-testid="drawing-toolbar"]');
     await expect(toolbarElement).toHaveCount(0);
 });
+
+const CAP_PLAYBACK_CONTROL = 0x01;
+
+test("co-host can playback after applying Co-host preset", async ({ page: viewerPage, locast }) => {
+    await setupViewerClient(viewerPage);
+
+    const initialSummary = makeRoomSummary(0);
+    await viewerPage.evaluate((s) => {
+        const w = window as unknown as {
+            __locastRoomStore?: { setSummary: (s: unknown) => void };
+        };
+        w.__locastRoomStore!.setSummary(s);
+    }, initialSummary);
+
+    await viewerPage.waitForSelector('[data-testid="room-empty"]', {
+        state: "detached",
+        timeout: 5_000,
+    });
+    await viewerPage.waitForSelector('[data-testid="locast-player"]', {
+        timeout: 5_000,
+    });
+    await viewerPage.waitForFunction(
+        () => (window as { __locastStore?: unknown }).__locastStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await viewerPage.evaluate(() => {
+        const w = window as unknown as {
+            __locastStore?: {
+                setMediaSrc: (s: string) => void;
+                setMediaReady: (r: boolean) => void;
+            };
+        };
+        w.__locastStore!.setMediaSrc("/test/asset.mp4");
+        w.__locastStore!.setMediaReady(true);
+    });
+
+    await viewerPage.waitForFunction(
+        () =>
+            (window as { __locastKeyboardScope?: { canPlayback: boolean } })
+                .__locastKeyboardScope !== undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+
+    const canPlaybackBefore = await viewerPage.evaluate(() => {
+        const w = window as unknown as {
+            __locastKeyboardScope?: { canPlayback: boolean };
+        };
+        return w.__locastKeyboardScope?.canPlayback ?? false;
+    });
+    expect(canPlaybackBefore).toBe(false);
+
+    const cohostSummary = makeRoomSummary(CAP_PLAYBACK_CONTROL);
+    await locast.emitCapabilityUpdate(cohostSummary);
+
+    await viewerPage.waitForFunction(
+        () => {
+            const w = window as unknown as {
+                __locastKeyboardScope?: { canPlayback: boolean };
+            };
+            return w.__locastKeyboardScope?.canPlayback === true;
+        },
+        undefined,
+        { timeout: 5_000 },
+    );
+
+    const canPlaybackAfter = await viewerPage.evaluate(() => {
+        const w = window as unknown as {
+            __locastKeyboardScope?: { canPlayback: boolean };
+        };
+        return w.__locastKeyboardScope?.canPlayback ?? false;
+    });
+    expect(canPlaybackAfter).toBe(true);
+});

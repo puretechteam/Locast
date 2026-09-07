@@ -297,7 +297,15 @@ pub async fn check_capability(
         }
         Command::PlaybackControl => {
             if let Some(rid) = registry.get_user_room(user_id).await {
-                if registry.is_room_host(rid, user_id).await {
+                if can(
+                    registry,
+                    user_id,
+                    rid,
+                    Scope::Playback,
+                    Action::IssuePlaybackCommand,
+                )
+                .await
+                {
                     Ok(())
                 } else {
                     Err(CapsError::NotHost)
@@ -632,6 +640,73 @@ mod tests {
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
+        let _ = room_id;
+    }
+
+    #[tokio::test]
+    async fn playback_control_allowed_for_cohost_with_playback_bit() {
+        let (reg, clock) = fresh_registry();
+        use super::super::store::NoopRoomStore;
+        let s = NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room");
+        reg.join(
+            &s,
+            &room.code,
+            uid(2),
+            [2u8; 32],
+            "cohost".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("cohost joins");
+        let cohost_id = uid(2);
+        let room_id = room.id;
+        reg.update_participant_cap_set(
+            room_id,
+            cohost_id,
+            cap_bits::PLAYBACK_CONTROL,
+            clock.now_ms(),
+        )
+        .await
+        .expect("grant playback control to cohost");
+        let result = check_capability(&reg, cohost_id, Command::PlaybackControl).await;
+        assert!(
+            result.is_ok(),
+            "co-host with PLAYBACK_CONTROL bit should be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn playback_control_denied_for_cohost_without_playback_bit() {
+        let (reg, clock) = fresh_registry();
+        use super::super::store::NoopRoomStore;
+        let s = NoopRoomStore;
+        let (room, _self_view) = reg
+            .create(&s, "T".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create room");
+        reg.join(
+            &s,
+            &room.code,
+            uid(2),
+            [2u8; 32],
+            "cohost".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("cohost joins");
+        let cohost_id = uid(2);
+        let room_id = room.id;
+        reg.update_participant_cap_set(room_id, cohost_id, cap_bits::DRAW, clock.now_ms())
+            .await
+            .expect("grant draw (not playback) to cohost");
+        let err = check_capability(&reg, cohost_id, Command::PlaybackControl)
+            .await
+            .expect_err("co-host without PLAYBACK_CONTROL bit must be denied");
+        assert!(matches!(err, CapsError::NotHost));
         let _ = room_id;
     }
 }

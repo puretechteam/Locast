@@ -83,7 +83,11 @@ async fn handle_permission_set_payload(
                 RoomError::Internal("PERMISSION_SET: target is not a room participant".into())
             })?;
 
-        (participant.cap_set & !payload.remove_cap_set) | payload.add_cap_set
+        if payload.remove_cap_set == u32::MAX {
+            payload.add_cap_set
+        } else {
+            (participant.cap_set & !payload.remove_cap_set) | payload.add_cap_set
+        }
     };
 
     store

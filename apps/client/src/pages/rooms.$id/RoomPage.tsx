@@ -12,6 +12,7 @@ import { PlaybackControls } from "../../components/PlaybackControls";
 import { DriftIndicator } from "../../components/DriftIndicator";
 import { SyncButton } from "../../components/SyncButton";
 import { ChatPanel } from "../../components/ChatPanel";
+import { PermissionsModal } from "../../components/PermissionsModal";
 import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { useManualSync } from "../../drift/useManualSync";
 import { useClockSkew } from "../../drift/useClockSkew";
@@ -32,6 +33,7 @@ export function RoomPage(): JSX.Element {
     const clear = useRoomStore((s) => s.clear);
     const [hydrated, setHydrated] = useState(false);
     const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [showPermissions, setShowPermissions] = useState(false);
 
     // P4-T02: on leave, reset BOTH the room store's
     // `summary` AND the playback store's mediaSrc /
@@ -358,6 +360,14 @@ return (
         <div className="room-page">
             <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
             <ParticipantStrip summary={summary} />
+            {isHost && (
+                <button
+                    className="room-page__permissions-btn"
+                    onClick={() => setShowPermissions(true)}
+                >
+                    Permissions
+                </button>
+            )}
             {/* P4-T04: drift indicator. Hidden by
              * default; only renders when the smoothed
              * offset exceeds 2.0 s. Non-blocking; the
@@ -482,6 +492,9 @@ return (
                 signaling={signaling}
                 onLeft={handleLeft}
             />
+            {showPermissions && (
+                <PermissionsModal onClose={() => setShowPermissions(false)} />
+            )}
             <ChatPanel messages={messages} />
             {idMismatch && (
                 <p className="room-page__hint">
