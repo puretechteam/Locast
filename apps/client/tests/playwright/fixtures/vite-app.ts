@@ -280,6 +280,47 @@ const SHIM_SOURCE = `
                         stroke_id: stroke_id,
                     });
                 }
+            // P6-T06: download_open marks a temp file as permanent
+            // (changes state to "complete").
+            if (name === "download_open") {
+                var mediaId = args && args.mediaId;
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("download://state", {
+                        v: 1,
+                        id: mediaId,
+                        media_id: mediaId,
+                        state: "complete",
+                        error_message: null,
+                    });
+                    return { download_id: mediaId, media_id: mediaId, state: "complete", dedup_hit: false, total_bytes: 0, transferred_bytes: 0, on_disk_path: null };
+                });
+            }
+            // P6-T06: download_delete moves a temp file to trash
+            // (changes state to "deleted").
+            if (name === "download_delete") {
+                var delMediaId = args && args.mediaId;
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("download://state", {
+                        v: 1,
+                        id: delMediaId,
+                        media_id: delMediaId,
+                        state: "deleted",
+                        error_message: null,
+                    });
+                    return null;
+                });
+            }
+            // P6-T06: temp file management IPC. get_temp_files
+            // returns a list of TempFileInfo objects for the room.
+            // mark_files_permanent flips status to permanent.
+            // delete_files_to_trash moves files to OS trash.
+            if (name === "get_temp_files") {
+                return Promise.resolve([]);
+            }
+            if (name === "mark_files_permanent" || name === "delete_files_to_trash") {
+                w.__locast_invoke_log.push({ name: name, args: args });
+                return Promise.resolve();
+            }
             return Promise.resolve(null);
         };
         // P4-T05: the @tauri-apps/api/core.js package calls

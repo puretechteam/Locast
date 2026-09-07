@@ -32,6 +32,7 @@ pub mod cap {
     pub const PUBLISH_MANIFEST: u32 = 0x20;
     pub const INVITE: u32 = 0x40;
     pub const CHAT: u32 = 0x80;
+    pub const MEDIA: u32 = 0x100;
 }
 
 /// ROOM_CREATE (C -> S). The creator chooses the migration

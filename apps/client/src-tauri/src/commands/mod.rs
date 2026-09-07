@@ -24,6 +24,7 @@ pub mod quota;
 pub mod room;
 pub mod scan;
 pub mod signaling;
+pub mod temp_files;
 
 pub use download::{download_open, DownloadSessionIpc};
 pub use drawing::{drawing_send, DrawingSendInput, DrawingSendResult};
@@ -39,6 +40,7 @@ pub use room::{
 };
 pub use scan::{library_scan, ScanResult};
 pub use signaling::{signaling_connect, signaling_disconnect, signaling_get_state};
+pub use temp_files::{delete_files_to_trash, get_temp_files, mark_files_permanent};
 
 /// The single Tauri command exposed to the webview in P0-T06.
 ///

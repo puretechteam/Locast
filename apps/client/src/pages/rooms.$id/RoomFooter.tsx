@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
 import { leaveRoom } from "../../services/room";
+import { LeaveRoomModal } from "../../components/LeaveRoomModal";
 
 interface RoomFooterProps {
     summary: RoomSummaryIpc;
@@ -13,6 +14,7 @@ export function RoomFooter({ summary, signaling, onLeft }: RoomFooterProps): JSX
     const navigate = useNavigate();
     const [leaving, setLeaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [showModal, setShowModal] = useState(false);
 
     async function onLeave(): Promise<void> {
         if (leaving) return;
@@ -31,21 +33,30 @@ export function RoomFooter({ summary, signaling, onLeft }: RoomFooterProps): JSX
     const phase = signaling?.phase ?? "Disconnected";
 
     return (
-        <footer className="room-footer">
-            <div className="room-footer__meta">
-                <span className="room-footer__code">{summary.code}</span>
-                <span className="room-footer__title">{summary.title}</span>
-                <span className="room-footer__phase">signaling: {phase}</span>
-            </div>
-            {error !== null && <p className="room-footer__error">{error}</p>}
-            <button
-                className="room-footer__leave"
-                type="button"
-                onClick={onLeave}
-                disabled={leaving}
-            >
-                {leaving ? "Leaving..." : "Leave"}
-            </button>
-        </footer>
+        <>
+            {showModal && (
+                <LeaveRoomModal
+                    roomId={summary.id}
+                    onClose={() => setShowModal(false)}
+                    onConfirm={onLeave}
+                />
+            )}
+            <footer className="room-footer">
+                <div className="room-footer__meta">
+                    <span className="room-footer__code">{summary.code}</span>
+                    <span className="room-footer__title">{summary.title}</span>
+                    <span className="room-footer__phase">signaling: {phase}</span>
+                </div>
+                {error !== null && <p className="room-footer__error">{error}</p>}
+                <button
+                    className="room-footer__leave"
+                    type="button"
+                    onClick={() => setShowModal(true)}
+                    disabled={leaving}
+                >
+                    {leaving ? "Leaving..." : "Leave"}
+                </button>
+            </footer>
+        </>
     );
 }

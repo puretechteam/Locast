@@ -6,6 +6,8 @@ settings:
 
 importers:
 
+  .: {}
+
   apps/client:
     dependencies:
       '@tauri-apps/api':

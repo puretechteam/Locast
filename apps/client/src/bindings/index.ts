@@ -182,6 +182,18 @@ export const commands = {
   async roomChatMessage(text: string, replyTo: string | null): Promise<void> {
     return await __TAURI_INVOKE("room_chat_message", { text, replyTo });
   },
+  // P6-T06: fetch the list of temp files for a room.
+  async getTempFiles(roomId: string): Promise<TempFileInfo[]> {
+    return await __TAURI_INVOKE("get_temp_files", { roomId });
+  },
+  // P6-T06: mark temp files as permanent.
+  async markFilesPermanent(fileIds: string[]): Promise<void> {
+    return await __TAURI_INVOKE("mark_files_permanent", { fileIds });
+  },
+  // P6-T06: move temp files to trash.
+  async deleteFilesToTrash(fileIds: string[]): Promise<void> {
+    return await __TAURI_INVOKE("delete_files_to_trash", { fileIds });
+  },
 };
 
 // P5-T02: typed shape for `drawing_send`. Mirrors the
@@ -480,6 +492,16 @@ export type ChatMessage = {
     text: string;
     reply_to: string | null;
     ts_ms: number;
+};
+
+// P6-T06: temp file info returned by getTempFiles.
+export type TempFileInfo = {
+    file_id: string;
+    room_id: string;
+    filename: string;
+    size_bytes: number;
+    created_ms: number;
+    owner_user_id: string;
 };
 
 /* Events */

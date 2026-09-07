@@ -24,7 +24,8 @@ pub const COHOST: Preset = Preset {
         | cap::CHAT
         | cap::MANAGE_ROOM
         | cap::KICK
-        | cap::INVITE,
+        | cap::INVITE
+        | cap::MEDIA,
 };
 
 pub const ALL_PRESETS: &[(&str, u32)] = &[

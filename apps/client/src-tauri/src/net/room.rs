@@ -960,6 +960,35 @@ impl RoomClient {
         Ok(())
     }
 
+    /// P6-T06: fetch the list of temp files for a room.
+    /// Protocol support (TempFilesRequest / TempFilesResponse) is pending.
+    pub async fn get_temp_files(
+        &self,
+        _room_id: Uuid,
+    ) -> Result<Vec<crate::commands::temp_files::TempFileInfo>, RoomClientError> {
+        Ok(vec![])
+    }
+
+    /// P6-T06: mark temp files as permanent.
+    /// Protocol support (MarkFilesPermanent) is pending.
+    pub async fn mark_files_permanent(
+        &self,
+        _room_id: Uuid,
+        _file_ids: Vec<Uuid>,
+    ) -> Result<(), RoomClientError> {
+        Ok(())
+    }
+
+    /// P6-T06: move temp files to trash.
+    /// Protocol support (DeleteFiles) is pending.
+    pub async fn delete_files_to_trash(
+        &self,
+        _room_id: Uuid,
+        _file_ids: Vec<Uuid>,
+    ) -> Result<(), RoomClientError> {
+        Ok(())
+    }
+
     /// P3-T04 prerequisite 3: ask the server for the
     /// room's currently-authoritative manifest. Used by
     /// late-joiners to catch up on a manifest that was

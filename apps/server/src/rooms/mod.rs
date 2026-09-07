@@ -23,6 +23,7 @@ pub mod registry;
 pub mod signal;
 pub mod state;
 pub mod store;
+pub mod temp_files;
 pub mod validation;
 
 pub use codes::{generate_code, is_valid_code, normalize, ALPHABET, CODE_LEN};
@@ -41,6 +42,10 @@ pub use state::{ParticipantRecord, PlaybackBookkeeping, RoomLifecycle, RoomState
 use std::sync::Arc;
 use std::time::Duration;
 pub use store::{DbRoomStore, NoopRoomStore, RoomStore};
+pub use temp_files::{
+    delete_to_trash, list_temp_files, mark_permanent, TempFile, TempFileAppState, TempFileError,
+    TempFileList, TempFileResult,
+};
 use tracing::warn;
 pub use validation::validate_display_name;
 

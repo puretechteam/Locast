@@ -16,6 +16,7 @@ pub enum Scope {
     Chat,
     Room,
     Manifest,
+    Media,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,8 @@ pub enum Action {
     Kick,
     PublishManifest,
     Invite,
+    KeepTempFile,
+    DeleteTempFile,
 }
 
 impl Scope {
@@ -47,6 +50,8 @@ impl Scope {
             (Scope::Room, Action::Kick) => cap_bits::KICK,
             (Scope::Manifest, Action::PublishManifest) => cap_bits::PUBLISH_MANIFEST,
             (Scope::Manifest, Action::Invite) => cap_bits::INVITE,
+            (Scope::Media, Action::KeepTempFile) => cap_bits::MEDIA,
+            (Scope::Media, Action::DeleteTempFile) => cap_bits::MEDIA,
             _ => 0,
         }
     }
