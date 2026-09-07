@@ -377,6 +377,26 @@ code {
     display: inline-block;
 }
 
+.participant-tile__quality {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 0.1rem;
+    height: 0.7rem;
+}
+
+.participant-tile__quality-bar {
+    display: inline-block;
+    width: 0.2rem;
+    border-radius: 1px;
+}
+
+.participant-tile__quality-bar:nth-child(1) { height: 0.25rem; }
+.participant-tile__quality-bar:nth-child(2) { height: 0.5rem; }
+.participant-tile__quality-bar:nth-child(3) { height: 0.75rem; }
+
+.participant-tile__quality--fair .participant-tile__quality-bar { background: #f5c869; }
+.participant-tile__quality--poor .participant-tile__quality-bar { background: #f5a3a3; }
+
 .room-footer {
     display: flex;
     align-items: center;

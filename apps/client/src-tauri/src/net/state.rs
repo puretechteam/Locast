@@ -72,6 +72,27 @@ pub enum DisconnectReason {
     LocalShutdown,
 }
 
+/// Quality level derived from RTT measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionQuality {
+    Good,
+    Fair,
+    Poor,
+}
+
+impl ConnectionQuality {
+    pub fn from_rtt_ms(rtt_ms: u32) -> Self {
+        if rtt_ms < 100 {
+            ConnectionQuality::Good
+        } else if rtt_ms <= 300 {
+            ConnectionQuality::Fair
+        } else {
+            ConnectionQuality::Poor
+        }
+    }
+}
+
 /// The connection state the webview is allowed to see.
 ///
 /// **Security contract:**
@@ -110,6 +131,10 @@ pub struct ConnectionState {
     pub last_error: Option<String>,
     /// Unix-ms timestamp of the most recent disconnect.
     pub last_error_at_ms: Option<i64>,
+    /// The current round-trip time in milliseconds, sourced
+    /// from the ClockSkew infrastructure. `None` until a
+    /// measurement cycle completes.
+    pub rtt_ms: Option<u32>,
 }
 
 impl ConnectionState {
@@ -126,6 +151,7 @@ impl ConnectionState {
             attempt: 0,
             last_error: None,
             last_error_at_ms: None,
+            rtt_ms: None,
         }
     }
 }

@@ -189,3 +189,109 @@ test("host and viewer exchange 10 messages", async ({ page: hostPage, page: view
     const viewerMessageTexts = await viewerMessages.allTextContents();
     expect(hostMessageTexts).toEqual(viewerMessageTexts);
 });
+
+const HOST_ID_P6 = "aaaa0000-0000-0000-0000-000000000001";
+const VIEWER_A_ID_P6 = "aaaa0000-0000-0000-0000-000000000002";
+const VIEWER_B_ID_P6 = "aaaa0000-0000-0000-0000-000000000003";
+const ROOM_ID_P6 = "r-p6t04-participants";
+
+function makeP6Summary(participantCount: number) {
+    const participants = [
+        {
+            user_id: HOST_ID_P6,
+            display_name: "host-alice",
+            joined_ms: 1_700_000_000_000,
+            status: "Connected" as const,
+            last_seen_ms: 1_700_000_000_000,
+            is_host: true,
+        },
+    ];
+    for (let i = 0; i < participantCount - 1; i++) {
+        participants.push({
+            user_id: [VIEWER_A_ID_P6, VIEWER_B_ID_P6][i] ?? `viewer-${i}`,
+            display_name: `viewer-${i}`,
+            joined_ms: 1_700_000_000_500 + i,
+            status: "Connected" as const,
+            last_seen_ms: 1_700_000_000_500 + i,
+            is_host: false,
+        });
+    }
+    return {
+        id: ROOM_ID_P6,
+        code: "P6T04",
+        title: "P6-T04",
+        host_user_id: HOST_ID_P6,
+        host_migration_enabled: true,
+        created_ms: 1_700_000_000_000,
+        participants,
+        host_disconnected: false,
+        host_disconnect_deadline_ms: null,
+    };
+}
+
+async function navigateAndHydrateP6(page: Page, summary: ReturnType<typeof makeP6Summary>) {
+    await injectLocastShim(page);
+    await page.goto("/");
+    await page.waitForLoadState("domcontentloaded");
+    await spaNavigate(page, `/rooms/${ROOM_ID_P6}`);
+    await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
+    await page.waitFunction(
+        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
+            undefined,
+        undefined,
+        { timeout: 5_000 },
+    );
+    await page.evaluate((s) => {
+        const w = window as unknown as {
+            __locastRoomStore?: { setSummary: (s: unknown) => void };
+        };
+        w.__locastRoomStore!.setSummary(s);
+    }, summary);
+    await page.waitForSelector('[data-testid="locast-player"]', {
+        timeout: 5_000,
+    });
+}
+
+test("P6-T04: strip shows N tiles for N participants", async ({ page }) => {
+    for (const count of [1, 2, 4]) {
+        const summary = makeP6Summary(count);
+        await navigateAndHydrateP6(page, summary);
+        const tiles = page.locator(".participant-tile");
+        await expect(tiles).toHaveCount(count);
+    }
+});
+
+test("P6-T04: host participant has Host badge", async ({ page }) => {
+    const summary = makeP6Summary(3);
+    await navigateAndHydrateP6(page, summary);
+    const hostBadge = page.locator(".participant-tile__badge").filter({ hasText: "Host" });
+    await expect(hostBadge).toHaveCount(1);
+    const tileWithBadge = hostBadge.locator("..");
+    await expect(tileWithBadge.locator(".participant-tile__name")).toContainText("host-alice");
+});
+
+test("P6-T04: quality bar is present on each tile", async ({ page }) => {
+    const summary = makeP6Summary(2);
+    await navigateAndHydrateP6(page, summary);
+    const tiles = page.locator(".participant-tile");
+    const count = await tiles.count();
+    for (let i = 0; i < count; i++) {
+        const qualityBar = tiles.nth(i).locator(".participant-tile__quality");
+        await expect(qualityBar).toBeAttached({ timeout: 2_000 });
+    }
+});
+
+test("P6-T04: quality bar shows poor class when probe responses are delayed", async ({ page }) => {
+    const summary = makeP6Summary(1);
+    await page.route("**/v1/call/clock_skew_probe", async (route) => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        await route.continue();
+    });
+    await navigateAndHydrateP6(page, summary);
+    const tile = page.locator(".participant-tile").first();
+    const qualityBar = tile.locator(".participant-tile__quality");
+    await expect(qualityBar).toBeAttached({ timeout: 2_000 });
+    await page.waitForTimeout(2_000);
+    const qualityClass = await qualityBar.getAttribute("class");
+    expect(qualityClass ?? "").toContain("poor");
+});

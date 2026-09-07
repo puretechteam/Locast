@@ -96,3 +96,5 @@ apps/client/tests/playwright/playwright-report/
 # Smoke harness artifacts. pnpm smoke writes result.json to a per-run temp directory and copies it to <repo>/smoke-last-result.json for stable inspection; both are local-only and must not be committed.
 **/locast-smoke-*/
 /smoke-last-result.json
+
+.agent-reports/
