@@ -84,6 +84,9 @@ async fn spawn_test_server() -> SocketAddr {
         rooms,
         clock,
         signal_relay: locast_server::SignalRelay::new(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

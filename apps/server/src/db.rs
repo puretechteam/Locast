@@ -65,11 +65,121 @@ pub enum DbOpenError {
     Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
-/// Information returned by [`Db::validate_bearer`].
+/// P3+ banlist helpers. The `banned_pubkeys` table was
+/// added in P7-T01; the public key is the canonical
+/// identifier (per §21.3) so a ban matches the pubkey the
+/// client used in AUTH, not the server-assigned user_id.
+impl Db {
+    /// `true` when the supplied 32-byte pubkey is in the
+    /// `banned_pubkeys` table. The check is a single
+    /// indexed SELECT; it runs before signature verification
+    /// so a banned client cannot consume the server's CPU
+    /// budget via repeated AUTH frames.
+    pub async fn is_pubkey_banned(&self, pubkey: &[u8; 32]) -> Result<bool, sqlx::Error> {
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM banned_pubkeys WHERE pubkey = ?1 LIMIT 1")
+                .bind(&pubkey[..])
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.is_some())
+    }
+
+    /// P7-T01: insert a fresh `session_resume_tokens` row.
+    /// `token_hash` is `sha256(plaintext)`; the plaintext is
+    /// never stored. `user_id`, `connection_epoch`, and
+    /// optional `room_id` are the binding the AUTH_OK mint
+    /// records so a stolen token cannot be replayed against
+    /// a different connection or room.
+    pub async fn insert_resume_token(
+        &self,
+        token_hash: &[u8; 32],
+        user_id: Uuid,
+        connection_epoch: u64,
+        room_id: Option<Uuid>,
+        expires_ms: i64,
+    ) -> Result<(), sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        let room_str = room_id.map(|r| r.to_string());
+        sqlx::query(
+            "INSERT OR REPLACE INTO session_resume_tokens
+                 (token_hash, user_id, connection_epoch, room_id, expires_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&token_hash[..])
+        .bind(user_id.to_string())
+        .bind(connection_epoch as i64)
+        .bind(room_str)
+        .bind(expires_ms)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// P7-T01: look up a resume token by SHA-256. Returns
+    /// `None` if the token is unknown or expired.
+    pub async fn validate_resume_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<ResumeInfo>, sqlx::Error> {
+        let now = now_ms();
+        let row: Option<(String, i64, Option<String>, i64)> = sqlx::query_as(
+            "SELECT user_id, connection_epoch, room_id, expires_ms
+             FROM session_resume_tokens WHERE token_hash = ?1",
+        )
+        .bind(&token_hash[..])
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((user_id, epoch, room_id, expires_ms)) if expires_ms > now => {
+                let uuid = Uuid::parse_str(&user_id).map_err(|e| sqlx::Error::ColumnDecode {
+                    index: "user_id".to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid user_id uuid: {e}"),
+                    )),
+                })?;
+                let room_uuid = match room_id {
+                    Some(s) => {
+                        Some(Uuid::parse_str(&s).map_err(|e| sqlx::Error::ColumnDecode {
+                            index: "room_id".to_string(),
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid room_id uuid: {e}"),
+                            )),
+                        })?)
+                    }
+                    None => None,
+                };
+                Ok(Some(ResumeInfo {
+                    user_id: uuid,
+                    connection_epoch: epoch as u64,
+                    room_id: room_uuid,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// P7-T01: information returned by [`Db::validate_resume_token`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeInfo {
+    pub user_id: Uuid,
+    pub connection_epoch: u64,
+    pub room_id: Option<Uuid>,
+}
+
+/// P7-T01: information returned by [`Db::validate_bearer`].
+/// Carries the (connection_epoch, room_id) binding so the
+/// WS layer can call [`crate::auth::BearerBinding::matches`]
+/// against the current ConnState.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerInfo {
     pub user_id: Uuid,
     pub pubkey: [u8; 32],
+    pub connection_epoch: u64,
+    pub room_id: Option<Uuid>,
 }
 
 impl Db {
@@ -178,12 +288,15 @@ impl Db {
 
     /// Insert a fresh bearer token row. `token_hash` is the
     /// SHA-256 of the 32-byte plaintext token; the plaintext is
-    /// never stored.
+    /// never stored. P7-T01: `connection_epoch` and `room_id`
+    /// stamp the bearer for [`crate::auth::BearerBinding::matches`].
     pub async fn insert_bearer(
         &self,
         user_id: Uuid,
         token_hash: [u8; 32],
         expires_ms: i64,
+        connection_epoch: u64,
+        room_id: Option<Uuid>,
     ) -> Result<(), sqlx::Error> {
         let _g = self.write_lock.lock().await;
         // We also need the pubkey to round-trip the bearer through
@@ -205,16 +318,20 @@ impl Db {
             });
         }
         pubkey_arr.copy_from_slice(&pubkey.0);
+        let room_str = room_id.map(|r| r.to_string());
 
         sqlx::query(
-            "INSERT INTO bearer_tokens (token_hash, user_id, pubkey, expires_ms, created_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO bearer_tokens \
+              (token_hash, user_id, pubkey, expires_ms, created_ms, connection_epoch, room_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&token_hash[..])
         .bind(user_id.to_string())
         .bind(&pubkey_arr[..])
         .bind(expires_ms)
         .bind(now_ms())
+        .bind(connection_epoch as i64)
+        .bind(room_str)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -222,20 +339,22 @@ impl Db {
 
     /// Validate a bearer token. Returns `Some(BearerInfo)` if the
     /// token is present and not yet expired, `None` otherwise.
+    /// P7-T01: also returns the (connection_epoch, room_id)
+    /// binding the row was stamped with.
     pub async fn validate_bearer(
         &self,
         token_hash: &[u8; 32],
     ) -> Result<Option<BearerInfo>, sqlx::Error> {
         let now = now_ms();
-        let row: Option<(String, Vec<u8>, i64)> = sqlx::query_as(
-            "SELECT user_id, pubkey, expires_ms FROM bearer_tokens \
-             WHERE token_hash = ?1",
+        let row: Option<(String, Vec<u8>, i64, i64, Option<String>)> = sqlx::query_as(
+            "SELECT user_id, pubkey, expires_ms, connection_epoch, room_id \
+             FROM bearer_tokens WHERE token_hash = ?1",
         )
         .bind(&token_hash[..])
         .fetch_optional(&self.pool)
         .await?;
         match row {
-            Some((user_id, pubkey, expires_ms)) if expires_ms > now => {
+            Some((user_id, pubkey, expires_ms, connection_epoch, room_id)) if expires_ms > now => {
                 let uuid = Uuid::parse_str(&user_id).map_err(|e| sqlx::Error::ColumnDecode {
                     index: "user_id".to_string(),
                     source: Box::new(std::io::Error::new(
@@ -254,9 +373,23 @@ impl Db {
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&pubkey);
+                let room_uuid = match room_id {
+                    Some(s) => {
+                        Some(Uuid::parse_str(&s).map_err(|e| sqlx::Error::ColumnDecode {
+                            index: "room_id".to_string(),
+                            source: Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("invalid room_id uuid: {e}"),
+                            )),
+                        })?)
+                    }
+                    None => None,
+                };
                 Ok(Some(BearerInfo {
                     user_id: uuid,
                     pubkey: arr,
+                    connection_epoch: connection_epoch as u64,
+                    room_id: room_uuid,
                 }))
             }
             _ => Ok(None),
@@ -982,7 +1115,7 @@ mod tests {
 
         let hash = [1u8; 32];
         let exp = now_ms() + 60_000;
-        db.insert_bearer(user_id, hash, exp)
+        db.insert_bearer(user_id, hash, exp, 0, None)
             .await
             .expect("insert bearer");
 
@@ -1005,7 +1138,7 @@ mod tests {
         let user_id = db.upsert_user(&pk).await.expect("upsert");
 
         let hash = [2u8; 32];
-        db.insert_bearer(user_id, hash, now_ms() - 1)
+        db.insert_bearer(user_id, hash, now_ms() - 1, 0, None)
             .await
             .expect("insert bearer");
         assert!(db.validate_bearer(&hash).await.expect("validate").is_none());
@@ -1019,10 +1152,10 @@ mod tests {
 
         let stale = [3u8; 32];
         let live = [4u8; 32];
-        db.insert_bearer(user_id, stale, now_ms() - 1)
+        db.insert_bearer(user_id, stale, now_ms() - 1, 0, None)
             .await
             .expect("insert stale");
-        db.insert_bearer(user_id, live, now_ms() + 60_000)
+        db.insert_bearer(user_id, live, now_ms() + 60_000, 0, None)
             .await
             .expect("insert live");
 

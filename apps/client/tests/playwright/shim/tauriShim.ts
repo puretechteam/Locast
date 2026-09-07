@@ -48,3 +48,8 @@ export function __reset(): void {
     queues.clear();
     counter = 1;
 }
+
+export function __has_listeners(event: string): boolean {
+    const set = listeners.get(event);
+    return !!set && set.size > 0;
+}

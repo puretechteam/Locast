@@ -104,6 +104,13 @@ impl ConnectionQuality {
 /// - `bearer` is intentionally absent. The token lives in
 ///   `SignalingInner` in `tauri::State` and never crosses
 ///   the IPC boundary.
+/// - `resume_token` is intentionally absent (P7-T01). The
+///   server-issued opaque session-resume token lives in
+///   `SignalingInner::resume_token` and never crosses the
+///   IPC boundary; a leaked resume_token lets an attacker
+///   re-bind to the same user/server epoch without the
+///   private key, so it must not be surfaced to the
+///   webview.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct ConnectionState {
     /// The coarse phase the connection is in.

@@ -27,8 +27,8 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::handshake::{
-    AuthBearer, AuthFailPayload, AuthFailReason, AuthOkPayload, AuthPayload, ChallengePayload,
-    HelloPayload, RateLimitPayload, WelcomeConfig, WelcomePayload, WelcomeRate,
+    AuthBearer, AuthFailPayload, AuthFailReason, AuthOkPayload, AuthPayload, AuthResumePayload,
+    ChallengePayload, HelloPayload, RateLimitPayload, WelcomeConfig, WelcomePayload, WelcomeRate,
 };
 use rand::RngCore;
 use serde_json::json;
@@ -38,8 +38,9 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::auth::bearer;
+use crate::auth::bearer::BearerBinding;
 use crate::auth::state::ConnState;
-use crate::auth::{verify, AuthError};
+use crate::auth::{verify, AuthError, AUTH_FAILURE_THRESHOLD, AUTH_FAILURE_WINDOW_MS};
 use crate::ratelimit::{PerConnLimiter, RateLimitHit};
 use crate::AppState;
 
@@ -235,6 +236,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     let throttle = Arc::new(Mutex::new(0i64));
     // Rolling window of recent bad-msg timestamps (§20.4.1).
     let bad_msgs: Arc<Mutex<VecDeque<i64>>> = Arc::new(Mutex::new(VecDeque::new()));
+    // P7-T01: rolling window of AUTH-failure timestamps. Once
+    // the window length crosses AUTH_FAILURE_THRESHOLD in
+    // AUTH_FAILURE_WINDOW_MS milliseconds we emit
+    // AUTH_FAIL(Rate) and start throttling this connection's
+    // handshake path. Mirrors the bad-msg tracking shape so
+    // the failure-handling code stays uniform.
+    let auth_failures: Arc<Mutex<VecDeque<i64>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut authed: Option<(Uuid, [u8; 32])> = None;
     // The user's current room, for the broadcast forwarder
     // task spawned below. `None` if the user is not in a
@@ -521,6 +529,7 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             envelope,
             &state,
             &conn_state,
+            auth_failures.clone(),
             authed,
             request_id,
             handshake_deadline,
@@ -712,6 +721,7 @@ async fn dispatch(
     envelope: Envelope,
     state: &AppState,
     conn_state: &Arc<Mutex<ConnState>>,
+    auth_failures: Arc<Mutex<VecDeque<i64>>>,
     authed: Option<(Uuid, [u8; 32])>,
     request_id: Uuid,
     handshake_deadline: i64,
@@ -726,16 +736,41 @@ async fn dispatch(
             handle_hello(envelope, state, conn_state, request_id, handshake_deadline).await
         }
         MessageKind::Auth => {
-            handle_auth(envelope, state, conn_state, request_id, handshake_deadline).await
+            handle_auth(
+                envelope,
+                state,
+                conn_state,
+                auth_failures,
+                request_id,
+                handshake_deadline,
+            )
+            .await
+        }
+        MessageKind::AuthResume => {
+            handle_auth_resume(
+                envelope,
+                state,
+                conn_state,
+                auth_failures,
+                request_id,
+                handshake_deadline,
+            )
+            .await
         }
         _ => {
-            // During the handshake, only HELLO and AUTH are valid.
+            // P7-T01: during the handshake, unknown
+            // envelope kinds are LOGGED and SKIPPED, not
+            // rejected. Per §18.11 a v1.1 client may speak
+            // a kind the v1 server does not yet understand;
+            // the server stays forward-compatible by
+            // accepting-and-ignoring rather than dropping
+            // the connection.
             warn!(
                 request_id = %request_id,
                 msg_type = %envelope.r#type.as_str(),
-                "rejected unexpected handshake message"
+                "ignored unknown handshake message"
             );
-            DispatchOutcome::close("unexpected_type")
+            DispatchOutcome::default()
         }
     }
 }
@@ -918,6 +953,48 @@ async fn handle_hello(
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let expires_ms = server_ts_ms + state.config.challenge_ttl_ms;
 
+    // P7-T01: peel off an optional `resume_token` field
+    // from the HELLO payload. A valid resume token lets
+    // the client follow up with AUTH_RESUME (instead of
+    // AUTH); a bogus / unknown token is treated as a
+    // plain HELLO so a corrupted envelope never blocks
+    // the handshake.
+    let mut resume_token_hash: Option<[u8; 32]> = None;
+    if let Some(rt_val) = envelope.payload.get("resume_token") {
+        if let Some(arr) = rt_val.as_array() {
+            let bytes: Vec<u8> = arr
+                .iter()
+                .filter_map(|n| n.as_u64().and_then(|x| u8::try_from(x).ok()))
+                .collect();
+            if bytes.len() == 32 {
+                let mut buf = [0u8; 32];
+                buf.copy_from_slice(&bytes);
+                let hash = bearer::hash_bearer(&buf);
+                match state.db.validate_resume_token(&hash).await {
+                    Ok(Some(_info)) => {
+                        resume_token_hash = Some(hash);
+                    }
+                    Ok(None) => {
+                        debug!(
+                            request_id = %request_id,
+                            "hello resume_token not found or expired; treating as fresh HELLO"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(request_id = %request_id, error = %e, "validate_resume_token failed");
+                    }
+                }
+            }
+        }
+    }
+    // Mint a fresh connection_epoch for every HELLO so a
+    // bearer stolen from connection N cannot be replayed
+    // on connection N+1.
+    let connection_epoch = {
+        let mut g = state.epoch_counter.lock().expect("epoch_counter lock");
+        g.next()
+    };
+
     // Move New -> HelloReceived -> ChallengeSent atomically.
     {
         let mut s = conn_state.lock().await;
@@ -932,7 +1009,12 @@ async fn handle_hello(
                 return DispatchOutcome::close("duplicate_hello");
             }
         };
-        let after_challenge = match after_hello.transition_challenge(nonce, expires_ms) {
+        let after_challenge = match after_hello.transition_challenge(
+            nonce,
+            expires_ms,
+            connection_epoch,
+            resume_token_hash,
+        ) {
             Ok(s) => s,
             Err(current) => {
                 warn!(
@@ -1006,6 +1088,7 @@ async fn handle_auth(
     envelope: Envelope,
     state: &AppState,
     conn_state: &Arc<Mutex<ConnState>>,
+    auth_failures: Arc<Mutex<VecDeque<i64>>>,
     request_id: Uuid,
     handshake_deadline: i64,
 ) -> DispatchOutcome {
@@ -1031,13 +1114,40 @@ async fn handle_auth(
         return DispatchOutcome::auth_fail(AuthFailReason::Expired);
     }
 
+    // P7-T01: AUTH-failure rate limit. If this connection
+    // has crossed AUTH_FAILURE_THRESHOLD bad AUTHs in the
+    // last AUTH_FAILURE_WINDOW_MS, short-circuit to
+    // AUTH_FAIL(Rate) before doing any verification work.
+    if is_auth_throttled(&auth_failures).await {
+        warn!(request_id = %request_id, "AUTH rate limited");
+        return DispatchOutcome::auth_fail(AuthFailReason::Rate);
+    }
+
+    // P7-T01: banlist check (§21.3). Runs BEFORE signature
+    // verification so a banned client cannot consume CPU
+    // on repeated AUTH frames.
+    match state.db.is_pubkey_banned(&pubkey).await {
+        Ok(true) => {
+            record_auth_failure(&auth_failures).await;
+            warn!(request_id = %request_id, "AUTH rejected: banned pubkey");
+            return DispatchOutcome::auth_fail(AuthFailReason::Banned);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "is_pubkey_banned lookup failed");
+        }
+    }
+
     // Pull the challenge from state.
-    let (nonce, expires_ms) = {
+    let (nonce, expires_ms, connection_epoch) = {
         let s = conn_state.lock().await;
         match &*s {
             ConnState::ChallengeSent {
-                nonce, expires_ms, ..
-            } => (*nonce, *expires_ms),
+                nonce,
+                expires_ms,
+                connection_epoch,
+                ..
+            } => (*nonce, *expires_ms, *connection_epoch),
             _ => return DispatchOutcome::close("unexpected_auth"),
         }
     };
@@ -1047,6 +1157,7 @@ async fn handle_auth(
     }
 
     if let Err(_e) = verify::verify_auth(&pubkey, &nonce, &sig) {
+        record_auth_failure(&auth_failures).await;
         debug!(request_id = %request_id, "AUTH verify failed");
         return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
     }
@@ -1065,7 +1176,13 @@ async fn handle_auth(
     let token_hash = bearer::hash_bearer(&token);
     if let Err(e) = state
         .db
-        .insert_bearer(user_id, token_hash, expires_ms_token)
+        .insert_bearer(
+            user_id,
+            token_hash,
+            expires_ms_token,
+            connection_epoch,
+            None,
+        )
         .await
     {
         warn!(request_id = %request_id, error = %e, "db insert_bearer failed");
@@ -1082,6 +1199,38 @@ async fn handle_auth(
         *guard = new_state;
     }
 
+    // P7-T01: issue an opaque session_resume_token the
+    // client can present on the next WS connection. The
+    // server stores sha256(token) along with the
+    // (user_id, connection_epoch, room_id) binding so a
+    // stolen token cannot be replayed against a new
+    // connection. The room_id is None at AUTH time (the
+    // bearer is transport-only); a per-room token would
+    // be minted after a successful ROOM_JOIN, out of
+    // scope for this task.
+    let mut resume_token = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut resume_token);
+    let resume_token_hash = bearer::hash_bearer(&resume_token);
+    let resume_expires_ms = now_ms() + state.config.bearer_ttl_seconds * 1000;
+    if let Err(e) = state
+        .db
+        .insert_resume_token(
+            &resume_token_hash,
+            user_id,
+            connection_epoch,
+            None,
+            resume_expires_ms,
+        )
+        .await
+    {
+        // Resume-token persistence is best-effort: a
+        // failure does not block AUTH_OK (the client has a
+        // working bearer for this session), it just means
+        // the next reconnect will require a fresh HELLO +
+        // CHALLENGE round trip.
+        warn!(request_id = %request_id, error = %e, "insert_resume_token failed");
+    }
+
     let ok = AuthOkPayload {
         user_id,
         bearer: AuthBearer {
@@ -1089,6 +1238,7 @@ async fn handle_auth(
             expires_ms: expires_ms_token,
         },
         pubkey: pubkey.to_vec(),
+        resume_token: Some(resume_token.to_vec()),
     };
     let env = Envelope {
         v: 1,
@@ -1152,6 +1302,292 @@ async fn handle_auth(
         }
     }
     out
+}
+
+/// P7-T01: AUTH_RESUME handler. The client presents a
+/// bearer it received in a prior AUTH_OK together with a
+/// fresh signature over the nonce from this connection's
+/// CHALLENGE. The server:
+///   1. Validates the bearer row exists and is not
+///      expired.
+///   2. Confirms the connection_epoch stamped onto the
+///      bearer matches this connection's
+///      `connection_epoch` (rejects replay against a
+///      newer connection).
+///   3. Verifies the Ed25519 signature against the
+///      bearer-bound pubkey (rejects an attacker who stole
+///      the bearer but does not have the matching private
+///      key).
+///   4. Re-issues a fresh bearer bound to the SAME
+///      (user_id, connection_epoch, room_id) triple so the
+///      resumed session keeps its capabilities.
+///   5. Mints a fresh resume_token for the next cycle.
+async fn handle_auth_resume(
+    envelope: Envelope,
+    state: &AppState,
+    conn_state: &Arc<Mutex<ConnState>>,
+    auth_failures: Arc<Mutex<VecDeque<i64>>>,
+    request_id: Uuid,
+    _handshake_deadline: i64,
+) -> DispatchOutcome {
+    let resume: AuthResumePayload = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "invalid AUTH_RESUME payload");
+            return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+        }
+    };
+    if envelope.sender.is_some() {
+        return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+    }
+    if resume.bearer.len() != 32 || resume.signed_nonce.len() != 64 || resume.user_id.is_nil() {
+        return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+    }
+    if is_auth_throttled(&auth_failures).await {
+        warn!(request_id = %request_id, "AUTH_RESUME rate limited");
+        return DispatchOutcome::auth_fail(AuthFailReason::Rate);
+    }
+    // Pull challenge + epoch from state.
+    let (nonce, expires_ms, connection_epoch, resume_token_hash) = {
+        let s = conn_state.lock().await;
+        match &*s {
+            ConnState::ChallengeSent {
+                nonce,
+                expires_ms,
+                connection_epoch,
+                resume_token_hash,
+                ..
+            } => (*nonce, *expires_ms, *connection_epoch, *resume_token_hash),
+            _ => return DispatchOutcome::close("unexpected_resume"),
+        }
+    };
+    if now_ms() > expires_ms {
+        return DispatchOutcome::auth_fail(AuthFailReason::Expired);
+    }
+    // No resume_token_hash means the HELLO did not
+    // advertise a valid one; AUTH_RESUME is invalid here.
+    let _stored_hash = match resume_token_hash {
+        Some(h) => h,
+        None => {
+            record_auth_failure(&auth_failures).await;
+            warn!(request_id = %request_id, "AUTH_RESUME without prior HELLO resume_token");
+            return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+        }
+    };
+    // Look up the bearer.
+    let mut bearer_bytes = [0u8; 32];
+    bearer_bytes.copy_from_slice(&resume.bearer);
+    let token_hash = bearer::hash_bearer(&bearer_bytes);
+    let info = match state.db.validate_bearer(&token_hash).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            record_auth_failure(&auth_failures).await;
+            warn!(request_id = %request_id, "AUTH_RESUME bearer not found or expired");
+            return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+        }
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "bearer lookup failed");
+            return DispatchOutcome::close("internal");
+        }
+    };
+    if info.user_id != resume.user_id {
+        record_auth_failure(&auth_failures).await;
+        warn!(request_id = %request_id, "AUTH_RESUME bearer user_id mismatch");
+        return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+    }
+    // P7-T01 review-fix: triple-bind assertion. The bearer
+    // row carries the (user_id, connection_epoch, room_id)
+    // it was minted for; reject any bearer presented against
+    // a different connection_epoch (stolen-bearer replay
+    // across a newer connection) or a different room_id.
+    let binding = BearerBinding {
+        user_id: info.user_id,
+        connection_epoch: info.connection_epoch,
+        room_id: info.room_id,
+    };
+    if !binding.matches(resume.user_id, connection_epoch, None) {
+        record_auth_failure(&auth_failures).await;
+        warn!(
+            request_id = %request_id,
+            bearer_epoch = info.connection_epoch,
+            conn_epoch = connection_epoch,
+            "AUTH_RESUME bearer epoch/room mismatch",
+        );
+        return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+    }
+    // Banlist check on the bearer-bound pubkey.
+    match state.db.is_pubkey_banned(&info.pubkey).await {
+        Ok(true) => {
+            record_auth_failure(&auth_failures).await;
+            warn!(request_id = %request_id, "AUTH_RESUME banned pubkey");
+            return DispatchOutcome::auth_fail(AuthFailReason::Banned);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "is_pubkey_banned lookup failed");
+        }
+    }
+    // Verify signature against the bearer-bound pubkey.
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&resume.signed_nonce);
+    if verify::verify_auth(&info.pubkey, &nonce, &sig).is_err() {
+        record_auth_failure(&auth_failures).await;
+        warn!(request_id = %request_id, "AUTH_RESUME signature failed");
+        return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
+    }
+    let user_id = info.user_id;
+    let pubkey = info.pubkey;
+
+    // Mint a fresh bearer bound to the SAME (user_id,
+    // connection_epoch, None) so the resumed session
+    // keeps its transport-layer binding. (A per-room
+    // resume is a future-task scope item; today every
+    // AUTH_OK is transport-only at the time it is
+    // minted.)
+    let expires_ms_token = now_ms() + state.config.bearer_ttl_seconds * 1000;
+    let mut new_token = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut new_token);
+    let new_token_hash = bearer::hash_bearer(&new_token);
+    if let Err(e) = state
+        .db
+        .insert_bearer(
+            user_id,
+            new_token_hash,
+            expires_ms_token,
+            connection_epoch,
+            None,
+        )
+        .await
+    {
+        warn!(request_id = %request_id, error = %e, "db insert_bearer failed (resume)");
+        return DispatchOutcome::close("internal");
+    }
+
+    {
+        let mut guard = conn_state.lock().await;
+        let new_state = match guard.clone().transition_authenticated(user_id, pubkey) {
+            Ok(s) => s,
+            Err(_) => return DispatchOutcome::close("illegal_state"),
+        };
+        *guard = new_state;
+    }
+
+    // Mint a new resume_token under the SAME epoch so the
+    // client can resume again after a future disconnect.
+    let mut resume_token = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut resume_token);
+    let resume_token_hash_new = bearer::hash_bearer(&resume_token);
+    let resume_expires_ms = now_ms() + state.config.bearer_ttl_seconds * 1000;
+    if let Err(e) = state
+        .db
+        .insert_resume_token(
+            &resume_token_hash_new,
+            user_id,
+            connection_epoch,
+            None,
+            resume_expires_ms,
+        )
+        .await
+    {
+        warn!(request_id = %request_id, error = %e, "insert_resume_token failed (resume)");
+    }
+
+    let ok = AuthOkPayload {
+        user_id,
+        bearer: AuthBearer {
+            token: new_token.to_vec(),
+            expires_ms: expires_ms_token,
+        },
+        pubkey: pubkey.to_vec(),
+        resume_token: Some(resume_token.to_vec()),
+    };
+    let env = Envelope {
+        v: 1,
+        r#type: MessageKind::AuthOk,
+        id: Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: now_ms(),
+        seq: 0,
+        payload: serde_json::to_value(&ok).unwrap_or(json!({})),
+    };
+    let msg = match encode_envelope_message(&env) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "encode AUTH_OK failed (resume)");
+            return DispatchOutcome::close("internal");
+        }
+    };
+    let mut out = DispatchOutcome::upgrade(user_id, pubkey);
+    out.actions.push(Action::Send(msg));
+
+    // Same host-rejoin path as the AUTH handler so a
+    // resumed host's HOST_RECONNECTED event is delivered.
+    {
+        let store: Arc<dyn crate::rooms::RoomStore> =
+            Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
+        if let Ok(Some(events)) = state
+            .rooms
+            .rejoin(store.as_ref(), user_id, pubkey, state.clock.now_ms())
+            .await
+        {
+            for event in events {
+                let (kind, payload) = match event {
+                    crate::rooms::RoomEvent::HostReconnected(p) => (
+                        MessageKind::HostReconnected,
+                        serde_json::to_value(&p).unwrap_or(serde_json::json!({})),
+                    ),
+                    _ => continue,
+                };
+                if let Some(rid) = state.rooms.get_user_room(user_id).await {
+                    let env = Envelope {
+                        v: 1,
+                        r#type: kind,
+                        id: Uuid::now_v7(),
+                        room_id: Some(rid),
+                        sender: None,
+                        ts_ms: now_ms(),
+                        seq: 0,
+                        payload,
+                    };
+                    if let Ok(msg) = encode_envelope_message(&env) {
+                        out.actions.push(Action::Send(msg));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// P7-T01: AUTH-failure tracking. Mirrors
+/// [`record_bad_msg`]: returns `true` once the rolling
+/// window crosses the configured threshold so the caller
+/// can emit AUTH_FAIL(Rate) and throttle.
+async fn is_auth_throttled(failures: &Arc<Mutex<VecDeque<i64>>>) -> bool {
+    let mut q = failures.lock().await;
+    let now = now_ms();
+    while let Some(&front) = q.front() {
+        if now - front > AUTH_FAILURE_WINDOW_MS {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    q.len() >= AUTH_FAILURE_THRESHOLD
+}
+
+async fn record_auth_failure(failures: &Arc<Mutex<VecDeque<i64>>>) {
+    let mut q = failures.lock().await;
+    let now = now_ms();
+    while let Some(&front) = q.front() {
+        if now - front > AUTH_FAILURE_WINDOW_MS {
+            q.pop_front();
+        } else {
+            break;
+        }
+    }
+    q.push_back(now);
 }
 
 /// P4-T06: SKEW_PROBE reply handler. The probe is a

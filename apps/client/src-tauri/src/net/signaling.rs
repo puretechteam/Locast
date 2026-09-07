@@ -69,7 +69,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::handshake::{
-    AuthFailReason, AuthOkPayload, AuthPayload, HelloPayload, WelcomePayload,
+    AuthFailReason, AuthOkPayload, AuthPayload, AuthResumePayload, WelcomePayload,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -87,6 +87,14 @@ use crate::identity::keystore::IdentityService;
 use super::config::SignalingConfig;
 use super::reconnect::Backoff;
 use super::state::{ConnPhase, ConnectionState, DisconnectReason};
+
+/// P7-T01: Tauri event name emitted whenever the
+/// observable `ConnPhase` changes. The payload is the
+/// redacted `ConnectionState` (no bearer, no signature,
+/// no nonce, no private key). Subscribers can use this
+/// event to render a "Connecting..." / "Reconnecting..."
+/// badge without polling `signaling_get_state`.
+pub const SIGNALING_STATE_EVENT: &str = "signaling://state";
 
 /// The opaque `ws://...` -> `tokio_tungstenite` stream type
 /// after a successful upgrade.
@@ -154,7 +162,10 @@ pub struct BearerRecord {
 /// The mutable runtime state of the signaling client. The
 /// `bearer` field is intentionally NOT serialized and NOT
 /// exposed through [`SignalingClient::snapshot`].
-#[derive(Debug)]
+///
+/// `Debug` is intentionally NOT derived: the `bearer` and
+/// `resume_token` fields hold raw 32-byte secrets that
+/// must never appear in a panic message.
 pub struct SignalingInner {
     /// The safe view of the connection state. Updated under
     /// `inner`'s mutex.
@@ -163,6 +174,23 @@ pub struct SignalingInner {
     /// authenticated. The field is private to the module; no
     /// IPC consumer ever sees it.
     pub bearer: Option<BearerRecord>,
+    /// P7-T01: the most recent opaque `resume_token`
+    /// issued by the server in an AUTH_OK envelope. `None`
+    /// until the first successful AUTH_OK; cleared on
+    /// `shutdown()`. Held in native memory only; never
+    /// serialized into `ConnectionState` (which is the
+    /// IPC-visible shape).
+    pub resume_token: Option<Vec<u8>>,
+    /// P7-T01: callbacks invoked from the connection
+    /// loop immediately after every successful AUTH_OK.
+    /// The RoomClient uses this to re-issue ROOM_JOIN
+    /// when the user was already in a room before the
+    /// WS reconnect. Stored as `Arc` so the same
+    /// callback can fire on every reconnect; each
+    /// callback is responsible for re-installing itself
+    /// if it wants to persist across cycles. Errors
+    /// (panics) inside a callback are NOT caught here.
+    pub on_authenticated: Vec<Arc<dyn Fn() + Send + Sync>>,
     /// Inbound subscribers. Every envelope the connection
     /// loop receives (post-handshake) is forwarded to each
     /// subscriber via an `mpsc::UnboundedSender`. The
@@ -181,6 +209,12 @@ pub struct SignalingInner {
     /// outbound send wakes the loop immediately rather
     /// than waiting for the next inbound frame.
     pub outbound_notify: Arc<tokio::sync::Notify>,
+    /// P7-T01: closure used to emit `signaling://state`
+    /// events on every phase change. `None` in unit tests
+    /// and integration tests so the test binary does not
+    /// link Tauri's WebView2 / GUI subsystem DLLs on
+    /// Windows (the closure type is `AppHandle`-free).
+    pub emit_state: Option<Arc<dyn Fn(ConnectionState) + Send + Sync>>,
 }
 
 impl SignalingInner {
@@ -188,9 +222,12 @@ impl SignalingInner {
         Self {
             state: ConnectionState::for_url(&config.url),
             bearer: None,
+            resume_token: None,
             subscribers: Vec::new(),
             outbound_tx: None,
             outbound_notify: Arc::new(tokio::sync::Notify::new()),
+            emit_state: None,
+            on_authenticated: Vec::new(),
         }
     }
 }
@@ -256,6 +293,7 @@ impl SignalingClient {
             g.state.last_error_at_ms = None;
             g.state.attempt = 0;
             g.bearer = None;
+            g.resume_token = None;
             g.state.session_id = None;
             g.state.user_id = None;
             g.subscribers.clear();
@@ -317,6 +355,15 @@ impl SignalingClient {
         self.inner.lock().await.bearer.clone()
     }
 
+    /// P7-T01 review-fix: alias for `bearer_for_test` that
+    /// returns a `bool`. Lets `RoomClient::send_or_buffer`
+    /// gate buffering without consuming the bearer record.
+    /// Lives next to `bearer_for_test` for visibility.
+    #[cfg(test)]
+    pub async fn has_bearer_for_test(&self) -> bool {
+        self.inner.lock().await.bearer.is_some()
+    }
+
     /// **Test-only.** Returns the current count of inbound
     /// subscribers registered on the signaling client. The
     /// P2-T05 spec asserts that `RoomClient::request` does
@@ -342,6 +389,64 @@ impl SignalingClient {
         let mut g = self.inner.lock().await;
         g.subscribers.push(tx);
         rx
+    }
+
+    /// P7-T01: install a closure that emits
+    /// `signaling://state` events. The lib wires this
+    /// from `run()` with a closure that calls
+    /// `tauri::Emitter::emit` on the Tauri `AppHandle`;
+    /// tests and any embedder that does not need
+    /// push events leave it `None`. The closure type
+    /// is intentionally `AppHandle`-free so the lib
+    /// never forces the linker to pull in
+    /// `WebView2Loader.dll` / the Windows GUI subsystem
+    /// when only the signaling surface is in use (e.g.
+    /// `cargo test -p locast-client`).
+    #[cfg(not(test))]
+    pub async fn install_emit_state<F>(&self, f: F)
+    where
+        F: Fn(ConnectionState) + Send + Sync + 'static,
+    {
+        let mut g = self.inner.lock().await;
+        g.emit_state = Some(Arc::new(f));
+    }
+
+    /// P7-T01: install the Tauri `AppHandle` so the
+    /// connection loop can emit `signaling://state` push
+    /// events. Optional; the client works without one
+    /// (the events just don't fire). Thin wrapper over
+    /// [`Self::install_emit_state`] that adapts
+    /// `tauri::Emitter::emit` into the closure shape.
+    #[cfg(not(test))]
+    pub async fn install_app_handle(&self, handle: tauri::AppHandle) {
+        use tauri::Emitter;
+        let event = SIGNALING_STATE_EVENT.to_string();
+        self.install_emit_state(move |snapshot| {
+            let _ = handle.emit(&event, snapshot);
+        })
+        .await;
+    }
+
+    /// P7-T01: install a closure that fires immediately
+    /// after every successful AUTH_OK. The RoomClient
+    /// uses this to re-issue ROOM_JOIN on a WS reconnect.
+    /// The closure is held as an `Arc` so it persists
+    /// across reconnect cycles. The closure runs on the
+    /// connection-loop task; long work should be spawned
+    /// onto a separate task rather than executed inline.
+    pub async fn on_authenticated<F>(&self, f: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let mut g = self.inner.lock().await;
+        g.on_authenticated.push(Arc::new(f));
+    }
+
+    /// P7-T01: read the held resume_token, if any. Held
+    /// in native memory only; never returned via IPC.
+    #[cfg(test)]
+    pub async fn resume_token_for_test(&self) -> Option<Vec<u8>> {
+        self.inner.lock().await.resume_token.clone()
     }
 
     /// Send a single envelope over the signaling WS. The
@@ -407,6 +512,17 @@ async fn connection_loop(
     // envelopes from any task. The notify is shared with
     // `inner` so the idle phase can wake on outbound
     // activity.
+    //
+    // P7-T01: replace the (possibly populated)
+    // pre-disconnect outbound queue with a fresh one so
+    // envelopes that referenced a stale bearer from the
+    // previous connection do NOT get replayed. The old
+    // receiver (if any) drops, and any senders see
+    // `None` after the channel closes.
+    {
+        let mut g = inner.lock().await;
+        g.outbound_tx = None;
+    }
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Envelope>();
     {
         let mut g = inner.lock().await;
@@ -478,14 +594,25 @@ async fn connection_loop(
         // Phase: Handshaking.
         set_phase(&inner, ConnPhase::Handshaking, None).await;
 
-        // Send HELLO.
+        // Send HELLO. P7-T01: if the client holds a
+        // resume_token from a prior AUTH_OK, advertise it
+        // in the HELLO payload so the server can fast-path
+        // the handshake (skipping CHALLENGE if it accepts
+        // the token).
         let hello_id = Uuid::now_v7();
-        let hello_payload = serde_json::to_value(HelloPayload {
-            client_version: crate::VERSION.to_string(),
-            platform: config.platform,
-            device_id: hello_id.to_string(),
-        })
-        .unwrap_or(serde_json::json!({}));
+        let resume_token = { inner.lock().await.resume_token.clone() };
+        let mut hello_value = serde_json::json!({
+            "client_version": crate::VERSION.to_string(),
+            "platform": config.platform,
+            "device_id": hello_id.to_string(),
+        });
+        if let Some(tok) = resume_token.as_ref() {
+            if let Some(obj) = hello_value.as_object_mut() {
+                let arr: Vec<serde_json::Value> =
+                    tok.iter().map(|b| serde_json::Value::from(*b)).collect();
+                obj.insert("resume_token".into(), serde_json::Value::Array(arr));
+            }
+        }
         let hello_env = Envelope {
             v: 1,
             r#type: MessageKind::Hello,
@@ -494,7 +621,7 @@ async fn connection_loop(
             sender: None,
             ts_ms: now_ms(),
             seq: 1,
-            payload: hello_payload,
+            payload: hello_value,
         };
         if let Err(e) = send_envelope(&mut socket, &hello_env).await {
             warn!(error = %e, "send HELLO failed");
@@ -648,6 +775,12 @@ async fn run_handshake(
     let mut welcome: Option<WelcomePayload> = None;
     let mut nonce: Option<Vec<u8>> = None;
     let mut auth_sent = false;
+    // P7-T01: did this handshake send AUTH_RESUME
+    // instead of a full AUTH? Tracked so we can short-
+    // circuit the nonce-signing path when the server
+    // skipped CHALLENGE in response to a valid
+    // resume_token (future work).
+    let mut resume_token_held: Option<Vec<u8>> = inner.lock().await.resume_token.clone();
 
     for _ in 0..FRAME_LIMIT {
         if cancel.is_cancelled() {
@@ -749,6 +882,12 @@ async fn run_handshake(
                         token,
                         expires_ms: ok.bearer.expires_ms,
                     });
+                    // P7-T01: hold the freshly-issued
+                    // resume_token so the next HELLO can
+                    // advertise it. The token is held in
+                    // native memory only; never returned
+                    // via `snapshot()`.
+                    g.resume_token = ok.resume_token.clone();
                     g.state.connected = true;
                     g.state.phase = ConnPhase::Authenticated;
                     g.state.last_error = None;
@@ -759,6 +898,22 @@ async fn run_handshake(
                     token_fpr = %redact_token(&token),
                     "AUTH_OK received"
                 );
+                // P7-T01: fire any registered
+                // post-auth callbacks. The RoomClient
+                // uses this to re-issue ROOM_JOIN on a
+                // WS reconnect when the user was already
+                // in a room. Callbacks are stored as
+                // `Arc` so they persist across
+                // reconnect cycles; the callback itself
+                // is responsible for re-installing if it
+                // wants to survive.
+                let callbacks: Vec<Arc<dyn Fn() + Send + Sync>> = {
+                    let g = inner.lock().await;
+                    g.on_authenticated.clone()
+                };
+                for cb in callbacks {
+                    cb();
+                }
                 return HandshakeResult::Authenticated;
             }
             MessageKind::AuthFail => {
@@ -783,9 +938,27 @@ async fn run_handshake(
         }
 
         // Once we have both WELCOME and CHALLENGE, sign the
-        // nonce and send AUTH.
+        // nonce and send AUTH (or AUTH_RESUME if we hold
+        // a resume_token + the bearer from the prior
+        // AUTH_OK).
         if let (Some(_w), Some(nonce_bytes)) = (&welcome, &nonce) {
             if !auth_sent {
+                // Snapshot the bearer + user_id under
+                // the lock once so the AUTH_RESUME
+                // branch below does not need to re-
+                // lock.
+                let (token_bytes, user_id) = {
+                    let g = inner.lock().await;
+                    let tok = g
+                        .bearer
+                        .as_ref()
+                        .map(|b| b.token.to_vec())
+                        .unwrap_or_default();
+                    let uid = g.bearer.as_ref().map(|b| b.user_id);
+                    (tok, uid)
+                };
+                let can_resume =
+                    !token_bytes.is_empty() && user_id.is_some() && resume_token_held.is_some();
                 let keypair = match identity.load_keypair().await {
                     Ok(k) => k,
                     Err(_) => {
@@ -797,20 +970,39 @@ async fn run_handshake(
                 let sig = keypair.sign_challenge(nonce_bytes);
                 let pubkey = keypair.public_key_bytes();
                 let auth_id = Uuid::now_v7();
-                let auth_payload = serde_json::to_value(AuthPayload {
-                    pubkey: pubkey.to_vec(),
-                    sig: sig.to_vec(),
-                })
-                .unwrap_or(serde_json::json!({}));
+                let (msg_kind, payload_value) = if can_resume {
+                    // Consume the resume_token so we do
+                    // not retry AUTH_RESUME on a stale
+                    // token if the server rejects it.
+                    resume_token_held = None;
+                    (
+                        MessageKind::AuthResume,
+                        serde_json::to_value(AuthResumePayload {
+                            user_id: user_id.expect("can_resume"),
+                            bearer: token_bytes,
+                            signed_nonce: sig.to_vec(),
+                        })
+                        .unwrap_or(serde_json::json!({})),
+                    )
+                } else {
+                    (
+                        MessageKind::Auth,
+                        serde_json::to_value(AuthPayload {
+                            pubkey: pubkey.to_vec(),
+                            sig: sig.to_vec(),
+                        })
+                        .unwrap_or(serde_json::json!({})),
+                    )
+                };
                 let auth_env = Envelope {
                     v: 1,
-                    r#type: MessageKind::Auth,
+                    r#type: msg_kind,
                     id: auth_id,
                     room_id: None,
                     sender: None,
                     ts_ms: now_ms(),
                     seq: 2,
-                    payload: auth_payload,
+                    payload: payload_value,
                 };
                 if let Err(e) = send_envelope(socket, &auth_env).await {
                     return HandshakeResult::ProtocolError(format!("send AUTH: {e}"));
@@ -1009,13 +1201,18 @@ async fn send_envelope(socket: &mut Ws, env: &Envelope) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 async fn set_phase(inner: &Arc<Mutex<SignalingInner>>, phase: ConnPhase, err: Option<String>) {
-    let mut g = inner.lock().await;
-    g.state.phase = phase;
-    g.state.connected = matches!(phase, ConnPhase::Authenticated);
-    if let Some(msg) = err {
-        g.state.last_error = Some(msg);
-        g.state.last_error_at_ms = Some(now_ms());
+    let snapshot: ConnectionState;
+    {
+        let mut g = inner.lock().await;
+        g.state.phase = phase;
+        g.state.connected = matches!(phase, ConnPhase::Authenticated);
+        if let Some(msg) = err {
+            g.state.last_error = Some(msg);
+            g.state.last_error_at_ms = Some(now_ms());
+        }
+        snapshot = g.state.clone();
     }
+    emit_signaling_state(inner, &snapshot).await;
 }
 
 async fn record_failure(
@@ -1030,15 +1227,37 @@ async fn record_failure(
     // otherwise the caller would double-advance past the cap.
     // The UI sees the upcoming attempt (current + 1) so a
     // single failure already surfaces attempt >= 1.
-    let mut g = inner.lock().await;
-    g.state.phase = ConnPhase::Reconnecting;
-    g.state.connected = false;
-    g.bearer = None;
-    g.state.session_id = None;
-    g.state.user_id = None;
-    g.state.attempt = backoff.attempt() + 1;
-    g.state.last_error = Some(format!("{reason:?}: {err}"));
-    g.state.last_error_at_ms = Some(now_ms());
+    let snapshot: ConnectionState;
+    {
+        let mut g = inner.lock().await;
+        g.state.phase = ConnPhase::Reconnecting;
+        g.state.connected = false;
+        g.bearer = None;
+        // P7-T01: a failed connection invalidates any
+        // resume_token it had issued; the next AUTH round
+        // trip will mint a fresh one. We deliberately do
+        // NOT clear `resume_token` here so the upcoming
+        // HELLO can still advertise it -- a transient
+        // network failure should not force the client
+        // through a fresh CHALLENGE/AUTH cycle.
+        g.state.session_id = None;
+        g.state.user_id = None;
+        g.state.attempt = backoff.attempt() + 1;
+        g.state.last_error = Some(format!("{reason:?}: {err}"));
+        g.state.last_error_at_ms = Some(now_ms());
+        snapshot = g.state.clone();
+    }
+    emit_signaling_state(inner, &snapshot).await;
+}
+
+async fn emit_signaling_state(inner: &Arc<Mutex<SignalingInner>>, snapshot: &ConnectionState) {
+    let cb = {
+        let g = inner.lock().await;
+        g.emit_state.clone()
+    };
+    if let Some(cb) = cb {
+        cb(snapshot.clone());
+    }
 }
 
 async fn sleep_with_cancel(

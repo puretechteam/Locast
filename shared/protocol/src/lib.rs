@@ -181,6 +181,21 @@ mod tests {
             &crate::handshake::Platform::export_to_string(&cfg).expect("render Platform bindings"),
         );
         rendered.push('\n');
+        // P7-T01: resume-token protocol shape. The HELLO
+        // payload already supports an optional resume_token
+        // (see `HelloPayload`), so we register the new
+        // envelope-only types so the regenerated
+        // `ts/index.ts` carries the resume helpers too.
+        rendered.push_str(
+            &crate::handshake::HelloResume::export_to_string(&cfg)
+                .expect("render HelloResume bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::handshake::AuthResumePayload::export_to_string(&cfg)
+                .expect("render AuthResumePayload bindings"),
+        );
+        rendered.push('\n');
         rendered.push_str(
             &crate::room::RoomCreatePayload::export_to_string(&cfg)
                 .expect("render RoomCreatePayload bindings"),

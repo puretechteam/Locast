@@ -162,6 +162,7 @@ mod tauri_sink {
 pub use tauri_sink::TauriEventSink;
 
 use super::signaling::SignalingClient;
+use super::state::ConnPhase;
 
 /// The redacted, IPC-safe summary of a single room as seen
 /// from the client. Mirrors `RoomSummary` with the
@@ -407,6 +408,14 @@ pub const STROKE_BEGIN_EVENT: &str = "drawing://begin";
 /// P5-T03: Tauri event name emitted when a remote
 /// DRAW_POINT is accepted and rebroadcast by the server.
 pub const STROKE_POINT_EVENT: &str = "drawing://point";
+
+/// P7-T01 review-fix: maximum number of envelopes the
+/// room client will buffer in `pending_outbound` while the
+/// signaling connection is offline. Beyond this cap, the
+/// oldest envelope is dropped (with a WARN) so an extended
+/// outage combined with a UI emit-storm cannot grow the
+/// buffer without bound and OOM the native side.
+pub const PENDING_OUTBOUND_CAP: usize = 256;
 
 /// P5-T03: Tauri event name emitted when a remote
 /// DRAW_END is accepted and rebroadcast by the server.
@@ -735,6 +744,21 @@ pub struct RoomClient {
     /// to identify whether an inbound `CAPABILITY_UPDATE`
     /// is for the local user.
     local_user_id: Mutex<Option<Uuid>>,
+    /// P7-T01: outbound envelopes produced while the
+    /// signaling WS was in Reconnecting / Handshaking /
+    /// Connecting. The signaling client cannot accept
+    /// sends during those phases (its `outbound_tx` is
+    /// `None` until AUTH_OK), so the RoomClient buffers
+    /// them here. After AUTH_OK the connection-loop
+    /// callback drains the buffer by re-issuing each
+    /// envelope through the live `signaling.send_envelope`
+    /// path.
+    pending_outbound: StdMutex<Vec<Envelope>>,
+    /// P7-T01: the (code, display_name) of the most
+    /// recent room the user was in. Used by
+    /// `rejoin_active_room` to re-issue ROOM_JOIN_REQUEST
+    /// after a WS reconnect.
+    active_room_code: StdMutex<Option<(String, String)>>,
 }
 
 impl RoomClient {
@@ -753,6 +777,8 @@ impl RoomClient {
             pool: StdMutex::new(None),
             current_versions: StdMutex::new(HashMap::new()),
             local_user_id: Mutex::new(None),
+            pending_outbound: StdMutex::new(Vec::new()),
+            active_room_code: StdMutex::new(None),
         }
     }
 
@@ -877,7 +903,10 @@ impl RoomClient {
         code: String,
         display_name: String,
     ) -> Result<RoomSummaryIpc, RoomClientError> {
-        let payload = RoomJoinRequestPayload { code, display_name };
+        let payload = RoomJoinRequestPayload {
+            code: code.clone(),
+            display_name: display_name.clone(),
+        };
         let env = envelope(MessageKind::RoomJoinRequest, None, payload);
         let reply = self.request(env, MessageKind::RoomJoined).await?;
         let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
@@ -886,7 +915,55 @@ impl RoomClient {
         *self.state.lock().await = Some(summary.clone());
         self.emit_state(&summary).await;
         self.spawn_presence_loop();
+        // P7-T01: remember the join credentials so a
+        // post-AUTH_OK rejoin can re-issue ROOM_JOIN_REQUEST
+        // if the WS reconnects.
+        if let Ok(mut g) = self.active_room_code.lock() {
+            *g = Some((code, display_name));
+        } else {
+            // Lock poisoned; fall through silently.
+        }
         Ok(summary)
+    }
+
+    /// P7-T01: re-issue ROOM_JOIN_REQUEST for the room
+    /// the user was in before the WS reconnect. Called
+    /// from the signaling client's post-AUTH_OK hook.
+    /// Returns `Ok(())` if the user is not in a room
+    /// (no-op). Any error is propagated so the caller
+    /// can log it.
+    pub async fn rejoin_active_room(&self) -> Result<(), RoomClientError> {
+        let creds = {
+            let g = self.active_room_code.lock().expect("active_room_code lock");
+            g.clone()
+        };
+        let (code, display_name) = match creds {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let env = envelope(
+            MessageKind::RoomJoinRequest,
+            None,
+            RoomJoinRequestPayload { code, display_name },
+        );
+        let reply = self.request(env, MessageKind::RoomJoined).await?;
+        let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
+        let mut summary = RoomSummaryIpc::from(joined.room);
+        summary.you_cap_set = Some(joined.you.cap_set);
+        *self.state.lock().await = Some(summary.clone());
+        self.emit_state(&summary).await;
+        // Drain any pending outbound envelopes that
+        // accumulated during the WS outage.
+        let pending: Vec<Envelope> = {
+            let mut g = self.pending_outbound.lock().expect("pending_outbound lock");
+            std::mem::take(&mut *g)
+        };
+        for env in pending {
+            if let Err(e) = self.signaling.send_envelope(env).await {
+                warn!(error = %e, "drain pending_outbound send failed");
+            }
+        }
+        Ok(())
     }
 
     /// Send a `ROOM_LEAVE` envelope. The server does not
@@ -895,17 +972,95 @@ impl RoomClient {
     /// events to update the UI.
     pub async fn room_leave(&self) -> Result<(), RoomClientError> {
         let env = envelope(MessageKind::RoomLeave, None, RoomLeavePayload {});
-        self.signaling
-            .send_envelope(env)
-            .await
-            .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
+        self.send_or_buffer(env).await?;
         // Drop the cached state; the server will send
         // ROOM_CLOSED and the inbound loop will clear
         // it.
         *self.state.lock().await = None;
         *self.local_user_id.lock().await = None;
+        if let Ok(mut g) = self.active_room_code.lock() {
+            *g = None;
+        }
         self.abort_presence_loop().await;
         Ok(())
+    }
+
+    /// P7-T01: send an envelope, buffering it if the
+    /// signaling WS is not currently in the
+    /// `Authenticated` phase (Connecting / Handshaking /
+    /// Reconnecting / ShuttingDown). The buffer is
+    /// drained after a successful reconnect by
+    /// `rejoin_active_room`.
+    pub async fn send_or_buffer(&self, env: Envelope) -> Result<(), RoomClientError> {
+        // If the signaling snapshot says
+        // `connected == true`, the bearer is live and
+        // we send through the live path. Otherwise the
+        // WS is mid-reconnect; buffer the envelope so
+        // it can be flushed after the next AUTH_OK.
+        //
+        // P7-T01 review-fix: only buffer when we
+        // actually had a connection that just dropped.
+        // A fresh client that has never authenticated
+        // (e.g. unit tests, or a user that joined a
+        // room before `start`) must still error out
+        // fast via `send_envelope`, the same as the
+        // pre-P7-T01 behavior. Buffering without a
+        // prior connection would silently hold
+        // envelopes indefinitely and turn a 0-cost
+        // error into a 10s+ per-call timeout storm.
+        let snapshot = self.signaling.snapshot().await;
+        let has_bearer = self.signaling.bearer_for_test().await.is_some();
+        if snapshot.connected && matches!(snapshot.phase, ConnPhase::Authenticated) && has_bearer {
+            self.signaling
+                .send_envelope(env)
+                .await
+                .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
+        } else if !has_bearer {
+            self.signaling
+                .send_envelope(env)
+                .await
+                .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
+        } else {
+            let mut g = self.pending_outbound.lock().expect("pending_outbound lock");
+            // P7-T01 review-fix: cap the buffer at
+            // `PENDING_OUTBOUND_CAP` envelopes. The pending
+            // queue is only ever populated while the
+            // signaling WS is mid-reconnect; under normal
+            // operation the queue stays near-empty and the
+            // cap is never hit. An extended outage combined
+            // with a UI emit-storm (chat, drawing, playback)
+            // could otherwise grow the buffer without bound
+            // and OOM the native side.
+            while g.len() >= PENDING_OUTBOUND_CAP {
+                let dropped = g.remove(0);
+                warn!(
+                    kind = ?dropped.r#type,
+                    pending = g.len(),
+                    cap = PENDING_OUTBOUND_CAP,
+                    "pending_outbound cap exceeded; dropped oldest envelope",
+                );
+            }
+            g.push(env);
+        }
+        Ok(())
+    }
+
+    /// P7-T01: drain any buffered outbound envelopes
+    /// produced while the signaling WS was offline.
+    /// Called by `rejoin_active_room` after the
+    /// post-AUTH_OK ROOM_JOIN succeeds. Each buffered
+    /// envelope is re-sent; failures are logged but do
+    /// not abort the drain.
+    pub async fn drain_pending_outbound(&self) {
+        let pending: Vec<Envelope> = {
+            let mut g = self.pending_outbound.lock().expect("pending_outbound lock");
+            std::mem::take(&mut *g)
+        };
+        for env in pending {
+            if let Err(e) = self.signaling.send_envelope(env).await {
+                warn!(error = %e, "drain pending_outbound send failed");
+            }
+        }
     }
 
     /// P6-T02: send a `PERMISSION_SET` envelope to grant or
@@ -1620,7 +1775,11 @@ impl RoomClient {
             let mut pending = self.pending.lock().await;
             pending.entry(expected.clone()).or_default().push(tx);
         }
-        if let Err(e) = self.signaling.send_envelope(env).await {
+        // P7-T01: route through the buffering
+        // wrapper so a request made while the WS is
+        // reconnecting is held (and re-sent after the
+        // next AUTH_OK) instead of failing fast.
+        if let Err(e) = self.send_or_buffer(env).await {
             // Roll back the registration so a future
             // request doesn't pick up our sender.
             let mut pending = self.pending.lock().await;
@@ -1629,7 +1788,7 @@ impl RoomClient {
                     senders.remove(0);
                 }
             }
-            return Err(RoomClientError::Signaling(e.to_string()));
+            return Err(e);
         }
         let res = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
         match res {

@@ -85,6 +85,9 @@ async fn room_create_and_join_via_room_client() {
         rooms: rooms.clone(),
         clock: clock.clone(),
         signal_relay: Default::default(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -172,6 +175,9 @@ async fn migration_on_handoff_via_room_client() {
         rooms: rooms.clone(),
         clock: clock.clone(),
         signal_relay: Default::default(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -264,6 +270,9 @@ async fn presence_loop_propagates_participant_joins_and_leaves() {
         rooms: rooms.clone(),
         clock: clock.clone(),
         signal_relay: Default::default(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

@@ -61,6 +61,12 @@ pub struct AppState {
     /// AUTH_OK (the connection's `outbound_tx`); unregistered
     /// when the connection's `connection_loop` exits.
     pub signal_relay: rooms::SignalRelay,
+    /// P7-T01: server-wide monotonic counter used to bind
+    /// every minted bearer to a unique `connection_epoch`.
+    /// The counter advances on every fresh HELLO so a bearer
+    /// stolen from connection N cannot be replayed on
+    /// connection N+1.
+    pub epoch_counter: Arc<std::sync::Mutex<crate::auth::EpochCounter>>,
 }
 
 /// Build the axum router. Exposed so tests and integration harnesses can
@@ -162,6 +168,7 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
         rooms,
         clock,
         signal_relay: rooms::SignalRelay::new(),
+        epoch_counter: Arc::new(std::sync::Mutex::new(crate::auth::EpochCounter::default())),
     };
 
     let app = router(state);

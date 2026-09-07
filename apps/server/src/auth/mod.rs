@@ -18,13 +18,38 @@ use thiserror::Error;
 
 use locast_protocol::handshake::AuthFailReason;
 
+/// P7-T01: per-connection epoch counter for bearer binding.
+/// Incremented server-wide on every fresh HELLO that does NOT
+/// carry a valid resume_token. A bearer issued under epoch N
+/// carries that epoch in its `bearer_tokens` row and is only
+/// accepted on a connection whose `connection_epoch` (held
+/// in the [`state::ConnState`]) is also N; an older bearer
+/// presented on a newer connection (stolen-bearer replay) is
+/// rejected by [`BearerBinding::matches`].
+#[derive(Debug, Default)]
+pub struct EpochCounter(pub u64);
+
+impl EpochCounter {
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(1);
+        self.0
+    }
+    pub fn current(&self) -> u64 {
+        self.0
+    }
+}
+
+/// P7-T01: how many AUTH failures an unauthenticated caller
+/// may incur in [`AUTH_FAILURE_WINDOW_MS`] before the server
+/// throttles subsequent AUTH frames. The throttle is
+/// per-connection-state (NOT global) so a noisy client cannot
+/// affect a different connection's path.
+pub const AUTH_FAILURE_THRESHOLD: usize = 5;
+pub const AUTH_FAILURE_WINDOW_MS: i64 = 60_000;
+
 /// Errors raised by the auth path. The `WsError` and `AuthFailReason`
 /// types in this crate close over the wire contract for these.
-///
-/// `Banned` is reserved for the `banned_pubkeys` table from §21.3;
-/// P2-T02 does not implement the table or the lookup, so the
-/// variant is reachable in the type system but not in the dispatch
-/// path today. The P3+ banlist work will wire it in.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
     #[error("bad signature")]
@@ -34,7 +59,6 @@ pub enum AuthError {
     Expired,
 
     #[error("pubkey is banned")]
-    #[allow(dead_code)] // wired in with the §21.3 banlist in P3+
     Banned,
 
     #[error("rate limited")]

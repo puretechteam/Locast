@@ -126,6 +126,24 @@ mod tests {
     }
 
     #[test]
+    fn jitter_band_is_exactly_zero_point_eight_to_one_point_two() {
+        // The brief pins the band as base * (0.8..1.2).
+        // 1024 samples; each must fall in the [0.8, 1.2]
+        // ratio band relative to the base it was drawn
+        // against.
+        let mut b = Backoff::with_rng(SmallRng::seed_from_u64(0xBEEF));
+        for _ in 0..1024 {
+            let base = b.base_seconds() as f64;
+            let ms = b.next_delay().as_millis() as f64;
+            let ratio = ms / (base * 1000.0);
+            assert!(
+                (0.8..=1.2).contains(&ratio),
+                "ratio {ratio} out of [0.8, 1.2] for base {base}"
+            );
+        }
+    }
+
+    #[test]
     fn base_seconds_walks_schedule() {
         // Deterministic PRNG; the schedule is independent of
         // the PRNG state.

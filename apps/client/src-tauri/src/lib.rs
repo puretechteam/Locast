@@ -195,6 +195,26 @@ pub fn run() {
             let webrtc_for_state = webrtc_manager.clone();
             tauri::async_runtime::block_on(async {
                 room_client.init().await;
+                // P7-T01: install a post-AUTH_OK hook so
+                // the RoomClient can re-issue ROOM_JOIN
+                // if the user was in a room before the
+                // WS reconnect.
+                {
+                    let rc_for_resume = room_client.clone();
+                    signaling_client
+                        .on_authenticated(move || {
+                            let rc = rc_for_resume.clone();
+                            tauri::async_runtime::spawn(async move {
+                                if let Err(e) = rc.rejoin_active_room().await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "post-AUTH_OK rejoin failed"
+                                    );
+                                }
+                            });
+                        })
+                        .await;
+                }
                 // P2-T05: install the Tauri `AppHandle` so
                 // the client can emit `room://state` and
                 // `room://event` events. The Tauri-backed

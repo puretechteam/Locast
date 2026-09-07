@@ -337,6 +337,7 @@ async fn fake_connection(mut socket: WebSocket, state: FakeState) {
                 expires_ms: now_ms() + 900_000,
             },
             pubkey: pubkey.to_vec(),
+            resume_token: None,
         })
         .expect("encode auth_ok"),
     };
@@ -425,13 +426,24 @@ fn backoff_schedule_matches_architecture() {
     assert!((JITTER_PCT - 0.20).abs() < f64::EPSILON);
     let mut b = Backoff::with_rng(SmallRng::seed_from_u64(0xC0FFEE));
     // Walk 10 attempts; the 7th and later must clamp to 30s.
+    // Each emitted delay must satisfy base * (1 - JITTER_PCT)
+    // <= delay <= base * (1 + JITTER_PCT), so we bound by
+    // `secs >= base * 0.8` against the current base.
     for _ in 0..10 {
+        let base = b.base_seconds();
         let d = b.next_delay();
         let secs = d.as_secs();
         // base * (1 +/- 0.20) => within 20% of the schedule entry.
-        // We don't know which schedule entry the PRNG picked;
-        // bound by the absolute min/max.
-        assert!(secs <= 36, "delay {secs}s above 30+20%");
+        let lower = base * 8 / 10;
+        let upper = base + base / 5 + 1;
+        assert!(
+            secs >= lower,
+            "delay {secs}s below base*0.8 ({lower}s) for base {base}s",
+        );
+        assert!(
+            secs <= upper,
+            "delay {secs}s above base*1.2 ({upper}s) for base {base}s",
+        );
     }
     assert!(b.attempt() >= 10);
 }
@@ -644,14 +656,19 @@ async fn five_cycle_reconnect_within_jitter_tolerance() {
     client.shutdown().await;
 
     // Each cycle: server-close grace (250ms) + reconnect
-    // sleep (1s +/- 20%) + dial + handshake. The reconnect
-    // sleep alone should be in [800ms, 1200ms]. We allow
-    // generous overhead for dial/handshake up to 2s.
+    // sleep (1s +/- 20% => in [800ms, 1200ms]) + dial +
+    // handshake. The reconnect sleep alone must fall in
+    // [800ms, 1200ms]. The cycle window adds the 250ms
+    // close-grace and a generous 550ms for dial/handshake,
+    // so the full cycle is bounded in [800ms, 2000ms] --
+    // no more 5x slack on the upper bound.
     for (i, d) in cycle_durations.iter().enumerate() {
         let ms = d.as_millis();
         assert!(
-            (800..=3200).contains(&ms),
-            "cycle {i} took {ms}ms outside [800, 3200]ms (this suggests the backoff did not pace the loop)"
+            (800..=2000).contains(&ms),
+            "cycle {i} took {ms}ms outside [800, 2000]ms \
+             (this suggests the backoff did not pace the loop \
+             or the upper bound allowed too much dial/handshake slack)"
         );
     }
 }
@@ -1120,6 +1137,9 @@ async fn end_to_end_with_real_server() {
         rooms,
         clock,
         signal_relay: Default::default(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app = router(state);
 

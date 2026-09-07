@@ -23,6 +23,24 @@ pub struct HelloPayload {
     pub device_id: String,
 }
 
+/// HELLO with a resume token (P7-T01). The v1 protocol
+/// accepts EITHER a plain HELLO (which always starts a
+/// fresh CHALLENGE/AUTH round trip) or HELLO carrying an
+/// opaque `resume_token` previously issued by the server
+/// in an AUTH_OK envelope. A valid resume token lets the
+/// client skip CHALLENGE and re-bind the same user_id +
+/// bearer + connection_epoch + room_id binding in a single
+/// AUTH_RESUME frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct HelloResume {
+    /// Server-issued opaque token (NOT the bearer). The
+    /// server stores `sha256(token)` and rejects any HELLO
+    /// whose resume_token is unknown / expired / revoked.
+    /// The token TTL is 15 minutes by default (§22.3.1).
+    pub resume_token: Vec<u8>,
+}
+
 /// The client OS. v1 supports win, mac, linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export_to = "ts/index.ts")]
@@ -84,6 +102,31 @@ pub struct AuthPayload {
     pub sig: Vec<u8>,
 }
 
+/// P7-T01: AUTH_RESUME (C -> S). Sent in place of AUTH
+/// after a HELLO that carried a valid `resume_token`. The
+/// server looks up the bearer-bound session and re-issues a
+/// fresh bearer keyed to the current
+/// `(user_id, connection_epoch, room_id)` binding; a stolen
+/// resume_token + signature therefore cannot be replayed
+/// against a different connection_epoch or room.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct AuthResumePayload {
+    /// Server-assigned UUID v7 of the resumed user (echoed
+    /// from the previous AUTH_OK so the client can confirm
+    /// the binding before sending the signed nonce).
+    pub user_id: Uuid,
+    /// The 32-byte plaintext bearer issued by the prior
+    /// AUTH_OK. The server hashes it (sha256) and looks up
+    /// the row in `bearer_tokens`.
+    pub bearer: Vec<u8>,
+    /// 64-byte Ed25519 signature over the raw 32-byte nonce
+    /// from the new CHALLENGE this connection sent. The
+    /// signature verifies against the user_identities
+    /// pubkey bound to the bearer row.
+    pub signed_nonce: Vec<u8>,
+}
+
 /// AUTH_OK (S -> C).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export_to = "ts/index.ts")]
@@ -96,6 +139,16 @@ pub struct AuthOkPayload {
     /// user. Echoes the value the client sent in AUTH so the
     /// client can confirm the binding.
     pub pubkey: Vec<u8>,
+    /// P7-T01: opaque `session_resume_token`. The client
+    /// holds it in memory only; the server stores
+    /// `sha256(token)`. On a subsequent WS connection the
+    /// client can include `resume_token` in HELLO (see
+    /// [`HelloResume`]) and skip the full CHALLENGE/AUTH
+    /// round trip. 15-minute TTL by default (§22.3.1).
+    /// `None` if the server is not currently issuing resume
+    /// tokens (e.g. the connection is a one-shot read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_token: Option<Vec<u8>>,
 }
 
 /// A bearer token issued by the server on successful AUTH.

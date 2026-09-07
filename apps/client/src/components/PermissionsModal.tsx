@@ -3,7 +3,7 @@ import type { MouseEvent } from "react";
 import { useRoomStore } from "../stores/useRoomStore";
 import { grantCapability, CAP } from "../services/permissions";
 import type { Cap } from "../services/permissions";
-import "./permissions-modal.css";
+import "../styles/permissions-modal.css";
 
 type Preset = "viewer" | "editor" | "co-host";
 

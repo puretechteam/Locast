@@ -282,8 +282,17 @@ impl DownloadStore {
         }
 
         let mut tx = self.pool.begin().await?;
+        // P7-T01: `INSERT OR IGNORE` on the downloads
+        // row so a re-entrant `download_open` for the
+        // same id does not raise `UNIQUE constraint
+        // failed: downloads.id`; the existing one wins.
+        // The downstream chunk INSERT below still
+        // pre-populates the chunk rows for a fresh
+        // download; a race where two callers both won
+        // the SELECT and got here is resolved by the
+        // chunk UNIQUE (download_id, "index") index.
         sqlx::query(
-            "INSERT INTO downloads
+            "INSERT OR IGNORE INTO downloads
                  (id, media_id, room_id, user_id, state, total_bytes, transferred_bytes,
                   started_at, source_peer_id, chunk_size_bytes, manifest_version, last_error)
              VALUES (?, ?, ?, ?, 'pending', ?, 0, ?, ?, ?, ?, NULL)",
@@ -303,9 +312,12 @@ impl DownloadStore {
         // Bulk insert chunks. SQLite has a 999-parameter limit per
         // statement. Each chunk row has 6 bound parameters; we use
         // 100 rows per INSERT (600 params) to stay well under.
+        // P7-T01: `INSERT OR IGNORE` so a duplicate
+        // (download_id, "index") is absorbed silently
+        // instead of raising UNIQUE.
         for batch in chunks.chunks(100) {
             let mut sql = String::from(
-                "INSERT INTO download_chunks
+                "INSERT OR IGNORE INTO download_chunks
                      (id, download_id, \"index\", offset, length, sha256, state)
                  VALUES ",
             );
@@ -406,6 +418,77 @@ impl DownloadStore {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// P7-T01: caller-visible completion bitmap. `verified` +
+    /// `received` chunk indices packed as one bit per
+    /// chunk, LSB-first within each byte, MSB-first
+    /// across bytes (so chunk `i` lives at
+    /// `bitmap[i / 8] & (1 << (i % 8))`). The compact
+    /// form is what the scheduler and the room-rejoin
+    /// path ship across the WS; the verbose form
+    /// ([`Self::completed_chunk_indices`]) is kept for
+    /// callers that need to walk the indices directly.
+    pub async fn completed_chunk_bitmap(
+        &self,
+        download_id: &str,
+    ) -> Result<Vec<u8>, ChunkStateError> {
+        let indices = self.completed_chunk_indices(download_id).await?;
+        let total = self.fetch_total_chunks(download_id).await? as usize;
+        let bytes = total.div_ceil(8).max(1);
+        let mut out = vec![0u8; bytes];
+        for i in indices {
+            let slot = (i / 8) as usize;
+            let bit = i % 8;
+            if slot < out.len() {
+                out[slot] |= 1u8 << bit;
+            }
+        }
+        Ok(out)
+    }
+
+    /// P7-T01: reset every `in_flight` chunk for the
+    /// given download back to `pending`. Called from the
+    /// transport layer when the signaling WS reconnects
+    /// (the post-AUTH_OK hook fires `downloads_resumed`
+    /// here) so a chunk the host was mid-flight on before
+    /// the disconnect is re-offered to the scheduler on
+    /// the resumed connection. Idempotent: a download
+    /// with no `in_flight` rows is a no-op.
+    pub async fn reset_in_flight_to_pending(
+        &self,
+        download_id: &str,
+    ) -> Result<u64, ChunkStateError> {
+        let res = sqlx::query(
+            "UPDATE download_chunks
+             SET state = 'pending'
+             WHERE download_id = ?1 AND state = 'in_flight'",
+        )
+        .bind(download_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// P7-T01: idempotently insert a fresh downloads row
+    /// without pre-checking for an existing one. Returns
+    /// `true` when a row was created, `false` when an
+    /// existing row's `download_id` matched. Used by the
+    /// `download_open` path so two concurrent open calls
+    /// for the same media do not race the partial UNIQUE
+    /// index.
+    pub async fn insert_download_idempotent(
+        &self,
+        new: &NewDownload,
+        chunks: &[(u32, u64, u32, String)],
+    ) -> Result<bool, ChunkStateError> {
+        match self.create(new, chunks).await {
+            Ok(()) => Ok(true),
+            Err(ChunkStateError::Sqlx(msg)) if msg.contains("UNIQUE constraint failed") => {
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Returns the set of chunk indices currently in `verified`

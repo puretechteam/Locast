@@ -68,6 +68,15 @@ pub enum MessageKind {
     AuthOk,
     #[serde(rename = "AUTH_FAIL")]
     AuthFail,
+    // ----- P7-T01: post-handshake session resume -----
+    // AUTH_RESUME is the client -> server envelope that
+    // re-validates a session after a transient WS
+    // disconnect without forcing a full HELLO/CHALLENGE
+    // round trip. The server verifies the signed nonce
+    // against the bearer-bound public key (see
+    // `AuthResumePayload` in `handshake.rs`).
+    #[serde(rename = "AUTH_RESUME")]
+    AuthResume,
     // ----- P2-T04: room lifecycle (create / join / leave / state / host migration) -----
     #[serde(rename = "ROOM_CREATE")]
     RoomCreate,
@@ -233,6 +242,7 @@ impl MessageKind {
             MessageKind::Auth => "AUTH",
             MessageKind::AuthOk => "AUTH_OK",
             MessageKind::AuthFail => "AUTH_FAIL",
+            MessageKind::AuthResume => "AUTH_RESUME",
             MessageKind::RoomCreate => "ROOM_CREATE",
             MessageKind::RoomCreated => "ROOM_CREATED",
             MessageKind::RoomJoinRequest => "ROOM_JOIN_REQUEST",
@@ -363,6 +373,15 @@ impl MessageKind {
     /// `true` for the P6-T03 CHAT_MESSAGE envelope.
     pub fn is_chat_message(&self) -> bool {
         matches!(self, MessageKind::ChatMessage)
+    }
+
+    /// P7-T01: `true` for the `AUTH_RESUME` envelope. Used
+    /// by the WS layer to route the resume handshake the
+    /// same way `AUTH` is routed (the connection must be
+    /// in the post-HELLO pre-AUTH state, and the payload is
+    /// bound to the previously-issued bearer).
+    pub fn is_auth_resume(&self) -> bool {
+        matches!(self, MessageKind::AuthResume)
     }
 }
 

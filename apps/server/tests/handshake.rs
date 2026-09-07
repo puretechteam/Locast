@@ -107,6 +107,9 @@ async fn spawn_server(config: Config) -> (SocketAddr, tokio::task::JoinHandle<()
         rooms,
         clock,
         signal_relay: locast_server::SignalRelay::new(),
+        epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
+            locast_server::auth::EpochCounter::default(),
+        )),
     };
     let app: Router = locast_server::router(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -576,8 +579,15 @@ async fn test_malformed_message() {
 
 #[tokio::test]
 async fn test_unknown_message_type() {
-    // Per §20.4.1: 3 bad-msg strikes -> close. A single
-    // unknown-type envelope is one strike.
+    // P7-T01: per §18.11 + roadmap acceptance, an
+    // unknown envelope kind during the handshake is
+    // LOGGED and SKIPPED, not rejected. The connection
+    // stays open; a client that speaks a kind the v1
+    // server does not yet understand can still
+    // complete the handshake by following up with a
+    // HELLO/CHALLENGE/AUTH sequence. The test sends
+    // three junk envelopes then verifies the server
+    // does NOT close the connection.
     let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
     let mut ws = connect(addr).await;
     // Send raw msgpack with an unknown type string.
@@ -607,8 +617,31 @@ async fn test_unknown_message_type() {
         let r = ws.send(Message::Binary(bytes)).await;
         assert!(r.is_ok(), "send should not fail locally");
     }
+    // The server must still accept a real HELLO on the
+    // same connection; permissive decoding did not
+    // close the socket.
+    let hello = Envelope {
+        v: 1,
+        r#type: MessageKind::Hello,
+        id: Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: 0,
+        seq: 0,
+        payload: json!({
+            "client_version": "test",
+            "platform": "linux",
+            "device_id": "dev-1",
+        }),
+    };
+    ws.send(Message::Binary(encode(&hello)))
+        .await
+        .expect("send HELLO");
     let res = read_binary(&mut ws).await;
-    assert!(res.is_none());
+    assert!(
+        res.is_some(),
+        "server still serves WELCOME after unknown kinds"
+    );
 }
 
 #[tokio::test]
@@ -868,6 +901,7 @@ async fn test_protocol_serialization_roundtrip() {
         sig: vec![4u8; 64],
     };
     let ok = AuthOkPayload {
+        resume_token: None,
         user_id: Uuid::now_v7(),
         bearer: AuthBearer {
             token: vec![5u8; 32],
@@ -1061,9 +1095,11 @@ async fn test_bearer_mismatch_rejected() {
 }
 
 #[tokio::test]
-async fn test_unknown_message_type_in_handshake_rejected() {
-    // Per the dispatch path, an envelope whose type is not
-    // HELLO or AUTH during the handshake is closed.
+async fn test_unknown_message_type_in_handshake_skipped() {
+    // P7-T01: per §18.11, unknown envelope kinds
+    // during the handshake are LOGGED and SKIPPED,
+    // not closed. The connection stays open and the
+    // caller can follow up with a real HELLO.
     let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
     let mut ws = connect(addr).await;
     #[derive(serde::Serialize)]
@@ -1089,10 +1125,15 @@ async fn test_unknown_message_type_in_handshake_rejected() {
     };
     let bytes = rmp_serde::to_vec_named(&raw).expect("encode raw");
     ws.send(Message::Binary(bytes)).await.expect("send");
+    // The server must STILL serve a real HELLO on the
+    // same connection after an unknown-kind envelope.
+    ws.send(Message::Binary(encode(&hello_envelope())))
+        .await
+        .expect("send HELLO");
     let res = read_binary(&mut ws).await;
     assert!(
-        res.is_none(),
-        "expected server to close on unknown handshake type"
+        res.is_some(),
+        "expected server to still serve WELCOME after unknown handshake type"
     );
 }
 
