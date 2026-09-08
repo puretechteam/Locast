@@ -40,6 +40,11 @@ pub mod rooms;
 /// unchanged.
 pub mod manifests;
 
+/// P7-T04 added the download repository (`storage::downloads`). It
+/// wraps the `DownloadStore` from `transfer/state.rs` with a focused
+/// API for Tauri commands. The `Storage` type itself is unchanged.
+pub mod downloads;
+
 /// Default pool size per `docs/ARCHITECTURE.md` section 7.
 pub const DEFAULT_POOL_SIZE: u32 = 8;
 

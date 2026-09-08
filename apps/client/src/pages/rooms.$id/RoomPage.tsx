@@ -23,6 +23,7 @@ import { useClockSkewStore } from "../../stores/useClockSkewStore";
 import { useCapabilityStore } from "../../stores/useCapabilityStore";
 import { ParticipantStrip } from "./ParticipantStrip";
 import { RoomFooter } from "./RoomFooter";
+import { RoomTopBar } from "../../components/RoomTopBar";
 
 export function RoomPage(): JSX.Element {
     const params = useParams<{ id: string }>();
@@ -337,17 +338,20 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
 
     if (summary === null) {
         return (
-            <div className="room-page room-page--empty" data-testid="room-empty">
-                <p>Not in a room.</p>
-                <p>
-                    <Link to="/rooms/new">Create a room</Link> or{" "}
-                    <Link to="/rooms/join">join one</Link>.
-                </p>
-                {params.id !== undefined && (
-                    <p className="room-page__hint">
-                        (URL id: <code>{params.id}</code>)
+            <div className="room-page">
+                <RoomTopBar summary={null} />
+                <div className="room-page room-page--empty" data-testid="room-empty">
+                    <p>Not in a room.</p>
+                    <p>
+                        <Link to="/rooms/new">Create a room</Link> or{" "}
+                        <Link to="/rooms/join">join one</Link>.
                     </p>
-                )}
+                    {params.id !== undefined && (
+                        <p className="room-page__hint">
+                            (URL id: <code>{params.id}</code>)
+                        </p>
+                    )}
+                </div>
             </div>
         );
     }
@@ -356,8 +360,9 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const idMismatch =
         expectedId !== undefined && expectedId.length > 0 && expectedId !== summary.id;
 
-return (
+    return (
         <div className="room-page">
+            <RoomTopBar summary={summary} />
             <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
             <ParticipantStrip summary={summary} />
             {isHost && (

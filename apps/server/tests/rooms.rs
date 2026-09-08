@@ -537,11 +537,11 @@ async fn host_rejoin_within_grace_restores_host() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Host absent past grace: server elects new host.
+// 5. Host absent past grace: server ends room (v1, no migration).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn host_absent_past_grace_migrates() {
+async fn host_absent_past_grace_ends_room() {
     let harness = spawn_test_server().await;
     let (kp_a, _) = fresh_keypair();
     let (kp_b, _) = fresh_keypair();
@@ -564,18 +564,14 @@ async fn host_absent_past_grace_migrates() {
     // B sees HOST_DISCONNECTED.
     let env = expect_envelope(&mut ws_b, MessageKind::HostDisconnected).await;
     let _: HostDisconnectedPayload = serde_json::from_value(env.payload).unwrap();
-    // The 50ms background ticker (started by the harness)
-    // reads the AppState clock and calls tick_grace, which
-    // elects the new host once `now_ms >= deadline`. The
-    // AppState clock in the test harness is a `MockClock`
-    // that the ticker syncs to wall-clock on every tick,
-    // so the 200ms grace resolves within ~4-5 ticks. Wait
-    // up to 1s for B to receive HOST_MIGRATED.
+    // The 50ms background ticker advances the MockClock and
+    // calls tick_grace; v1 ends the room once the 200ms grace
+    // elapses. Wait up to 1s for B to receive ROOM_CLOSED.
     let mut got = None;
     for _ in 0..100 {
         let env = next_envelope(&mut ws_b).await;
         match env.r#type {
-            MessageKind::HostMigrated => {
+            MessageKind::RoomClosed => {
                 got = Some(env);
                 break;
             }
@@ -587,10 +583,59 @@ async fn host_absent_past_grace_migrates() {
             other => panic!("unexpected {other:?}"),
         }
     }
-    let env = got.expect("expected HostMigrated within 1s");
-    let hm: HostMigratedPayload = serde_json::from_value(env.payload).unwrap();
-    assert_eq!(hm.previous_host_user_id, a.user_id);
-    assert_eq!(hm.new_host_user_id, b.user_id);
+    let env = got.expect("expected RoomClosed within 1s");
+    let closed: RoomClosedPayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(closed.reason, "host_disconnected_no_migration");
+}
+
+// ---------------------------------------------------------------------------
+// 5a. Host disconnect grace expiry via MockClock advance.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_disconnect_grace_expiry_via_mock_clock_advance() {
+    let mut config = test_config();
+    config.host_disconnect_grace_ms = 30_000;
+    let harness = spawn_test_server_with_config(config).await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+
+    send_envelope(&mut ws_a, &room_create_envelope(a.token, "M", true)).await;
+    let env = expect_envelope(&mut ws_a, MessageKind::RoomCreated).await;
+    let code = serde_json::from_value::<RoomCreatedPayload>(env.payload)
+        .unwrap()
+        .room
+        .code;
+
+    send_envelope(&mut ws_b, &room_join_envelope(b.token, &code, "B")).await;
+    let _ = expect_envelope(&mut ws_b, MessageKind::RoomJoined).await;
+    let _ = expect_envelope(&mut ws_a, MessageKind::ParticipantJoined).await;
+
+    drop(ws_a);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let env = expect_envelope(&mut ws_b, MessageKind::HostDisconnected).await;
+    let _: HostDisconnectedPayload = serde_json::from_value(env.payload).unwrap();
+
+    let store: Arc<dyn locast_server::rooms::RoomStore> =
+        Arc::new(locast_server::rooms::DbRoomStore::new(harness.db.clone()));
+
+    harness.clock.advance(30_001);
+    let _events = harness
+        .rooms
+        .tick_grace(store.as_ref(), harness.clock.now_ms())
+        .await;
+
+    let env = expect_envelope(&mut ws_b, MessageKind::RoomClosed).await;
+    let closed: RoomClosedPayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(closed.reason, "host_disconnected_no_migration");
+
+    drop(ws_b);
+    drop(harness);
 }
 
 // ---------------------------------------------------------------------------

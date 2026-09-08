@@ -1498,6 +1498,21 @@ impl RoomClient {
                     }
                 }
             }
+            MessageKind::HostDisconnected => {
+                if let Ok(m) =
+                    decode_payload::<locast_protocol::room::HostDisconnectedPayload>(&env)
+                {
+                    let mut g = self.state.lock().await;
+                    if let Some(s) = g.as_mut() {
+                        s.host_disconnected = true;
+                        s.host_disconnect_deadline_ms = Some(m.reconnect_deadline_ms);
+                    }
+                    if let Some(s) = g.as_ref() {
+                        self.emit_state(s).await;
+                        self.emit_event(s).await;
+                    }
+                }
+            }
             MessageKind::ParticipantJoined => {
                 if let Ok(p) =
                     decode_payload::<locast_protocol::room::ParticipantJoinedPayload>(&env)

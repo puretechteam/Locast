@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+pub mod download;
 pub mod envelope;
 pub mod handshake;
 pub mod room;
@@ -338,8 +339,59 @@ mod tests {
                 .expect("render PlaybackAcceptedEvent bindings"),
         );
         rendered.push('\n');
+        // P7-T04: download pause/resume/list wire types.
+        rendered.push_str(
+            &crate::download::DownloadPauseRequestPayload::export_to_string(&cfg)
+                .expect("render DownloadPauseRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadPauseResponsePayload::export_to_string(&cfg)
+                .expect("render DownloadPauseResponsePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadResumeRequestPayload::export_to_string(&cfg)
+                .expect("render DownloadResumeRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadResumeResponsePayload::export_to_string(&cfg)
+                .expect("render DownloadResumeResponsePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadCancelRequestPayload::export_to_string(&cfg)
+                .expect("render DownloadCancelRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadCancelResponsePayload::export_to_string(&cfg)
+                .expect("render DownloadCancelResponsePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadListRequestPayload::export_to_string(&cfg)
+                .expect("render DownloadListRequestPayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadListResponsePayload::export_to_string(&cfg)
+                .expect("render DownloadListResponsePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadSummaryIpc::export_to_string(&cfg)
+                .expect("render DownloadSummaryIpc bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::download::DownloadStateIpc::export_to_string(&cfg)
+                .expect("render DownloadStateIpc bindings"),
+        );
+        rendered.push('\n');
         // P4-T03: POSITION_REPORT payload. The server
-        // is a pure relay per architecture §12.8 +
+        // is a pure relay per architecture Â§12.8 +
         // roadmap P4-T03 ("server forwards without
         // modification"). The payload is the local
         // viewer's media observation; the server stamps

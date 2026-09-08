@@ -26,7 +26,9 @@ pub mod scan;
 pub mod signaling;
 pub mod temp_files;
 
-pub use download::{download_open, DownloadSessionIpc};
+pub use download::{
+    download_list, download_open, download_pause, download_resume, DownloadSessionIpc,
+};
 pub use drawing::{drawing_send, DrawingSendInput, DrawingSendResult};
 pub use error::AppError;
 pub use identity::{identity_get, identity_rotate, identity_set_display_name};

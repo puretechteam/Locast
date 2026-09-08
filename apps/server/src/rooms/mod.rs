@@ -14,6 +14,7 @@ pub mod codes;
 pub mod dispatch;
 pub mod drawing;
 pub mod error;
+pub mod host;
 pub mod manifest;
 pub mod permissions;
 pub mod playback;

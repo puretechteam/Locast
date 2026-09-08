@@ -892,3 +892,59 @@ async fn upsert_media_item_from_manifest(
         .map_err(|e| AppError::other(format!("media_items SELECT post-INSERT: {e}")))?;
     Ok(id.0)
 }
+
+/// P7-T04: pause an in-flight download.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_pause(
+    storage: TauriState<'_, Storage>,
+    download_id: String,
+) -> Result<(), AppError> {
+    let repo = crate::storage::downloads::DownloadRepository::new(&storage.inner().pool());
+    repo.transition(&download_id, crate::transfer::state::DownloadState::Paused)
+        .await
+        .map_err(|e| AppError::other(format!("pause download: {e}")))?;
+    Ok(())
+}
+
+/// P7-T04: resume a paused download.
+#[tauri::command]
+#[specta::specta]
+pub async fn download_resume(
+    storage: TauriState<'_, Storage>,
+    download_id: String,
+) -> Result<(), AppError> {
+    let repo = crate::storage::downloads::DownloadRepository::new(&storage.inner().pool());
+    repo.transition(
+        &download_id,
+        crate::transfer::state::DownloadState::Transferring,
+    )
+    .await
+    .map_err(|e| AppError::other(format!("resume download: {e}")))?;
+    Ok(())
+}
+
+/// P7-T04: list downloads for the current user (optionally filtered by room).
+#[tauri::command]
+#[specta::specta]
+pub async fn download_list(
+    storage: TauriState<'_, Storage>,
+    room_id: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<crate::transfer::state::DownloadSummary>, AppError> {
+    let repo = crate::storage::downloads::DownloadRepository::new(&storage.inner().pool());
+    let downloads = repo
+        .list(limit.unwrap_or(100) as i64)
+        .await
+        .map_err(|e| AppError::other(format!("list downloads: {e}")))?;
+    // Filter by room_id if provided
+    if let Some(rid) = room_id {
+        let filtered: Vec<_> = downloads
+            .into_iter()
+            .filter(|d| d.room_id.as_deref() == Some(&rid))
+            .collect();
+        Ok(filtered)
+    } else {
+        Ok(downloads)
+    }
+}
