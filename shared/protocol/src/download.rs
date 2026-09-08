@@ -162,7 +162,7 @@ mod tests {
         let mut bitmap = [0u8; 2];
         bitmap[0] |= 1 << 0; // chunk 0
         bitmap[0] |= 1 << 2; // chunk 2
-        bitmap[1] |= 1 << 5; // chunk 5 (bit 5 of byte 0? wait, chunk 5 = byte 0, bit 5)
+        bitmap[0] |= 1 << 5; // chunk 5 (bit 5 of byte 0)
                              // Actually: chunk i is at bitmap[i/8] & (1 << (i%8))
                              // chunk 0: byte 0, bit 0
                              // chunk 2: byte 0, bit 2
