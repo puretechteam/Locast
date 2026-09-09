@@ -120,6 +120,19 @@ impl DownloadEventSink for RecordingSink {
     }
 }
 
+/// In-memory event sink for panic boundary tests.
+/// Captures emitted state events without rate limiting.
+#[derive(Default)]
+pub struct MemoryDownloadEventEmitter {
+    pub states: StdMutex<Vec<DownloadStateEvent>>,
+}
+
+impl DownloadEventSink for MemoryDownloadEventEmitter {
+    fn emit_state(&self, ev: &DownloadStateEvent) {
+        self.states.lock().expect("states lock").push(ev.clone());
+    }
+}
+
 /// Coalescing wrapper around an [`DownloadEventSink`]. The
 /// receiver session holds one of these per download and
 /// calls `record_state` / `record_progress` at every state

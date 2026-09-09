@@ -585,6 +585,31 @@ impl DownloadStore {
         Ok(())
     }
 
+    /// Atomically set `last_error` and transition to `Failed`.
+    /// Valid from-states: Pending, Connecting, Transferring, Verifying.
+    /// Returns `InvalidTransition` if the current state cannot go to Failed.
+    pub async fn mark_failed(
+        &self,
+        download_id: &str,
+        error_message: &str,
+    ) -> Result<(), ChunkStateError> {
+        let current = self.fetch_state(download_id).await?;
+        if !is_valid_transition(current, DownloadState::Failed) {
+            return Err(ChunkStateError::InvalidTransition {
+                from: current,
+                to: DownloadState::Failed,
+            });
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE downloads SET last_error = ?, state = 'failed' WHERE id = ?")
+            .bind(error_message)
+            .bind(download_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn fetch_state(&self, download_id: &str) -> Result<DownloadState, ChunkStateError> {
         let row = sqlx::query("SELECT state FROM downloads WHERE id = ?")
             .bind(download_id)

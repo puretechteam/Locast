@@ -490,31 +490,45 @@ pub async fn open_download_inner(
 
             // Spawn the orchestrator. Register the
             // CancellationToken with the TransferRegistry so
-            // room_leave / app shutdown can cancel_all. After
-            // the orchestrator returns (Ok or Err) the spawn
-            // closure unregisters the id, so the registry does
-            // not leak entries for transfers that completed
-            // gracefully. P3-T13 review fix A#4/D#19: the
-            // JoinHandle is now owned by the closure (not the
-            // registry), which makes the unregister step
-            // straightforward.
+            // room_leave / app shutdown can cancel_all. The
+            // RegisterGuard ensures unregister on any exit path
+            // including panic (P7-T05). Wrapped in panic_boundary
+            // to catch panics and transition to Failed state.
             let registry_for_task = registry.clone();
             let download_id_for_task = active_download_id.clone();
             let cancel_for_registry = receiver.cancel_handle();
+            let cancel_for_panic = cancel_for_registry.clone();
             let filename_for_task = entry.filename.clone();
+            let storage_for_panic = Arc::new(storage.clone());
+            let media_id_for_panic = resolved_media_id.clone();
+            let download_id_for_panic = download_id_for_task.clone();
+            let download_id_for_err = download_id_for_task.clone();
             tokio::spawn(async move {
-                registry_for_task
+                let _guard = registry_for_task
                     .register(download_id_for_task.clone(), cancel_for_registry)
                     .await;
-                let result = run_multi_source(receiver, filename_for_task).await;
-                registry_for_task.unregister(&download_id_for_task).await;
-                match result {
-                    Ok(state) => {
-                        info!(?state, download_id = %download_id_for_task, "download complete")
-                    }
-                    Err(e) => {
-                        warn!(download_id = %download_id_for_task, error = %e, "download failed")
-                    }
+                // P7-T05: wrap in panic boundary
+                if let Err(e) = crate::transfer::panic_boundary::spawn_panic_safe(
+                    download_id_for_panic.clone(),
+                    media_id_for_panic.clone(),
+                    storage_for_panic.clone(),
+                    Some(registry_for_task.clone()),
+                    Some(cancel_for_panic),
+                    None,
+                    move || async move {
+                        let result = run_multi_source(receiver, filename_for_task).await;
+                        match result {
+                            Ok(state) => {
+                                info!(?state, download_id = %download_id_for_panic, "download complete")
+                            }
+                            Err(e) => {
+                                warn!(download_id = %download_id_for_panic, error = %e, "download failed")
+                            }
+                        }
+                    },
+                ).await {
+                    // Panic was caught and handled by panic_boundary
+                    warn!(download_id = %download_id_for_err, error = %e, "download task panicked and was caught");
                 }
             });
             let _ = registry_for_task;

@@ -60,6 +60,7 @@ pub mod assemble;
 pub mod events;
 pub mod host_dispatch;
 pub mod multi_source;
+pub mod panic_boundary;
 pub mod plan;
 pub mod registry;
 pub mod scheduler;

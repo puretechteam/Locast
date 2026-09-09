@@ -11,6 +11,9 @@
 //! shape caused when an orchestrator completed normally: the
 //! join handle stayed parked in the registry until the next
 //! `register`/`cancel`/`cancel_all` on the same id.
+//!
+//! P7-T05: adds `RegisterGuard` for RAII-based unregister on
+//! any exit path including panic.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +28,36 @@ struct RegistryInner {
 #[derive(Clone, Default)]
 pub struct TransferRegistry(Arc<Mutex<RegistryInner>>);
 
+/// RAII guard that unregisters a download from the registry on drop.
+/// Guarantees cleanup even if the registering task panics.
+pub struct RegisterGuard {
+    registry: TransferRegistry,
+    download_id: String,
+}
+
+impl RegisterGuard {
+    /// Create a new guard. The caller must ensure the download_id is
+    /// registered before creating this guard.
+    pub fn new(registry: TransferRegistry, download_id: String) -> Self {
+        Self {
+            registry,
+            download_id,
+        }
+    }
+}
+
+impl Drop for RegisterGuard {
+    fn drop(&mut self) {
+        // Unregister on any exit path (normal return, panic, early return)
+        let registry = self.registry.clone();
+        let download_id = self.download_id.clone();
+        // Use a blocking task since Drop is synchronous
+        tokio::task::spawn(async move {
+            registry.unregister(&download_id).await;
+        });
+    }
+}
+
 impl TransferRegistry {
     pub fn new() -> Self {
         Self::default()
@@ -33,13 +66,15 @@ impl TransferRegistry {
     /// Register the cancellation token for a fresh transfer. If
     /// an entry already exists for `download_id`, the prior
     /// token is cancelled (the previous transfer is told to
-    /// abort) and replaced.
-    pub async fn register(&self, download_id: String, cancel: CancellationToken) {
+    /// abort) and replaced. Returns a `RegisterGuard` that
+    /// unregisters on drop (RAII pattern for panic safety).
+    pub async fn register(&self, download_id: String, cancel: CancellationToken) -> RegisterGuard {
         let mut g = self.0.lock().await;
         if let Some(old_t) = g.tokens.remove(&download_id) {
             old_t.cancel();
         }
-        g.tokens.insert(download_id, cancel);
+        g.tokens.insert(download_id.clone(), cancel);
+        RegisterGuard::new(self.clone(), download_id)
     }
 
     /// Remove the entry for `download_id`. Idempotent.
