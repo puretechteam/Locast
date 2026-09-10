@@ -865,6 +865,14 @@ impl RoomClient {
         self.state.lock().await.clone()
     }
 
+    /// Read the local user's server-assigned `user_id` (Uuid v7).
+    /// Set on successful `room_create` / `room_join` and
+    /// cleared on `room_leave`. Returns `None` if the user
+    /// is not currently in a room.
+    pub async fn local_user_id(&self) -> Option<Uuid> {
+        *self.local_user_id.lock().await
+    }
+
     /// Send a `ROOM_CREATE` envelope and return the server's
     /// `ROOM_CREATED` summary.
     pub async fn room_create(

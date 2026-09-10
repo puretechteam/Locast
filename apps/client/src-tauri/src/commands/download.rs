@@ -41,7 +41,8 @@ use crate::transfer::multi_source::{run_multi_source, MultiSourceReceiver, Sourc
 use crate::transfer::plan::plan_download;
 use crate::transfer::registry::TransferRegistry;
 use crate::transfer::scheduler::Scheduler;
-use crate::transfer::state::{DownloadStore, NewDownload};
+use crate::transfer::state::DownloadStore;
+use crate::transfer::state::NewDownload;
 use crate::transfer::transport::Transport;
 use crate::transfer::webrtc_transport::WebRtcTransport;
 
@@ -657,7 +658,24 @@ async fn find_or_create_download_row(
     .await
     .map_err(|e| AppError::other(format!("downloads SELECT: {e}")))?;
     if let Some((id,)) = existing {
-        return Ok((id, false));
+        // P7-T07: existing download row found — reconcile manifest version
+        // and chunk hashes against the new manifest.
+        let changed = store
+            .reconcile_manifest_version(&id, manifest_version, chunk_hashes)
+            .await;
+        match changed {
+            Ok(changed_count) => {
+                if changed_count > 0 {
+                    tracing::info!(download_id = %id, changed_chunks = changed_count, "manifest republish: reconciled download row with new manifest version and chunk hashes");
+                }
+                return Ok((id, false));
+            }
+            Err(e) => {
+                // If reconciliation fails (e.g., version not newer), just reuse row as-is
+                tracing::warn!(download_id = %id, error = %e, "manifest reconciliation failed; reusing existing row");
+                return Ok((id, false));
+            }
+        }
     }
     // Build the NewDownload / chunks and try to insert. If the
     // partial UNIQUE index fires (another caller won the race
@@ -926,8 +944,54 @@ pub async fn download_pause(
 #[specta::specta]
 pub async fn download_resume(
     storage: TauriState<'_, Storage>,
+    room_client: TauriState<'_, crate::net::room::RoomClient>,
     download_id: String,
 ) -> Result<(), AppError> {
+    // P7-T07: trigger manifest reconciliation on resume
+    // 1. Fetch the download row to get media_id and room_id
+    let download = {
+        let repo = crate::storage::downloads::DownloadRepository::new(&storage.inner().pool());
+        repo.fetch(&download_id)
+            .await
+            .map_err(|e| AppError::other(format!("fetch download: {e}")))?
+    };
+
+    // 2. Get current manifest from RoomClient for the room
+    let room_id = Uuid::parse_str(&download.room_id.unwrap_or_default())
+        .map_err(|e| AppError::other(format!("parse room_id: {e}")))?;
+
+    if let Some(manifest) = room_client.verified_manifest(room_id) {
+        // Find the media entry matching our media_id
+        if let Some(entry) = manifest.media.iter().find(|e| e.id == download.media_id) {
+            // Extract chunk hashes from the first source
+            if let Some(source) = entry.sources.first() {
+                let chunk_hashes: Vec<(u32, String)> = source
+                    .chunk_hashes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sha)| (i as u32, sha.clone()))
+                    .collect();
+
+                // Reconcile manifest version and chunk hashes
+                let store =
+                    crate::transfer::state::DownloadStore::new(storage.inner().pool().clone());
+                if let Err(e) = store
+                    .reconcile_manifest_version(
+                        &download_id,
+                        manifest.manifest_version as i64,
+                        &chunk_hashes,
+                    )
+                    .await
+                {
+                    tracing::warn!(download_id = %download_id, error = %e, "manifest reconciliation on resume failed");
+                } else {
+                    tracing::info!(download_id = %download_id, "manifest reconciliation on resume succeeded");
+                }
+            }
+        }
+    }
+
+    // Transition to Transferring state
     let repo = crate::storage::downloads::DownloadRepository::new(&storage.inner().pool());
     repo.transition(
         &download_id,

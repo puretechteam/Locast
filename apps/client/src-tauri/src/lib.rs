@@ -14,6 +14,7 @@
 
 use tauri::Manager as _;
 use tauri_plugin_log::{Target, TargetKind};
+use uuid::Uuid;
 
 pub mod commands;
 pub mod core;
@@ -148,7 +149,7 @@ pub fn run() {
                     .expect("open storage");
             let accountant = core::quota::QuotaAccountant::new(storage.clone());
             let library_root = data_dir.clone();
-            let protocol_handler = ProtocolHandler::new(storage.clone(), library_root);
+            let protocol_handler = ProtocolHandler::new(storage.clone(), library_root.clone());
             let identity_service = std::sync::Arc::new(IdentityService::new(storage.clone()));
 
             // P3-T04 prerequisite 4: clone the storage pool
@@ -156,6 +157,9 @@ pub fn run() {
             // `app.manage` below, so the RoomClient can be
             // given a copy for persistence.
             let storage_pool = storage.pool();
+            // P7-T07: clone values needed for auto-republish callback
+            let library_root_for_manifest = library_root.clone();
+            let storage_for_manifest = storage_pool.clone();
             app.manage(storage.clone());
             app.manage(accountant);
             app.manage(protocol_handler);
@@ -201,15 +205,45 @@ pub fn run() {
                 // WS reconnect.
                 {
                     let rc_for_resume = room_client.clone();
+                    let identity_for_manifest = identity_service.clone();
+                    let signaling_for_manifest = signaling_client.clone();
+                    let storage_for_manifest = storage_for_manifest.clone();
+                    let library_root_for_manifest = library_root_for_manifest.clone();
                     signaling_client
                         .on_authenticated(move || {
                             let rc = rc_for_resume.clone();
+                            let identity = identity_for_manifest.clone();
+                            let signaling = signaling_for_manifest.clone();
+                            let storage = storage_for_manifest.clone();
+                            let library_root = library_root_for_manifest.clone();
                             tauri::async_runtime::spawn(async move {
                                 if let Err(e) = rc.rejoin_active_room().await {
                                     tracing::warn!(
                                         error = %e,
                                         "post-AUTH_OK rejoin failed"
                                     );
+                                } else if let Some(summary) = rc.state().await {
+                                    // P7-T07: auto-republish manifest on host reconnect
+                                    // Check if we are the host of the room we just rejoined
+                                    if let (Ok(rid), Ok(host_uid), Some(local_uid)) = (
+                                        Uuid::parse_str(&summary.id),
+                                        Uuid::parse_str(&summary.host_user_id),
+                                        rc.local_user_id().await,
+                                    ) {
+                                        if host_uid == local_uid {
+                                            tracing::info!(room_id = %rid, "host reconnect detected; republishing manifest");
+                                            if let Err(e) = crate::room::host::build_sign_and_publish(
+                                                identity.clone(),
+                                                signaling.clone(),
+                                                rc.clone(),
+                                                storage.clone(),
+                                                library_root.clone(),
+                                                rid,
+                                            ).await {
+                                                tracing::warn!(error = %e, "auto-republish manifest failed");
+                                            }
+                                        }
+                                    }
                                 }
                             });
                         })

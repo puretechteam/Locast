@@ -195,7 +195,7 @@ async fn rehydrate_rooms(rooms: &Arc<RoomRegistry>, db: &Db) -> Result<(), Strin
             .list_room_participants(row.id)
             .await
             .map_err(|e| e.to_string())?;
-        if let Err(e) = rooms.rehydrate(row, parts).await {
+        if let Err(e) = rooms.rehydrate(row, parts, Some(db)).await {
             tracing::warn!(error = %e, "locast-server rehydrate row failed");
         }
     }

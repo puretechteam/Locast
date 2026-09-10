@@ -35,6 +35,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
+use uuid::Uuid;
 
 /// The current `schema_version` we expect in `downloads.schema_version`.
 /// P3-T04 = 1. Bumped only by a deliberate migration.
@@ -734,7 +735,7 @@ impl DownloadStore {
 
     /// Read the manifest version without a full
     /// [`Self::fetch`]. Used by `bind_manifest_version`.
-    async fn fetch_manifest_version(&self, download_id: &str) -> Result<i64, ChunkStateError> {
+    pub async fn fetch_manifest_version(&self, download_id: &str) -> Result<i64, ChunkStateError> {
         let row = sqlx::query("SELECT manifest_version FROM downloads WHERE id = ?")
             .bind(download_id)
             .fetch_optional(&self.pool)
@@ -744,6 +745,122 @@ impl DownloadStore {
         })?;
         row.try_get("manifest_version")
             .map_err(ChunkStateError::from)
+    }
+
+    /// Reconcile a download's manifest version AND chunk hashes
+    /// against a new manifest. This is the P7-T07 "republish"
+    /// path: when the host republishes a manifest with a new
+    /// version, the viewer's existing download row must be updated
+    /// to the new version AND its chunk hashes reconciled against
+    /// the new manifest's chunk hashes.
+    ///
+    /// Returns the number of chunks whose hashes changed (and were
+    /// reset to `pending`). A non-zero return value means the
+    /// download must restart from the changed chunks.
+    pub async fn reconcile_manifest_version(
+        &self,
+        download_id: &str,
+        new_version: i64,
+        new_chunk_hashes: &[(u32, String)],
+    ) -> Result<u32, ChunkStateError> {
+        if new_version < 1 {
+            return Err(ChunkStateError::InvalidManifestVersion { value: new_version });
+        }
+        let current = self.fetch_manifest_version(download_id).await?;
+        if new_version <= current {
+            return Err(ChunkStateError::ManifestVersionMismatch {
+                download_version: current,
+                current_version: new_version,
+            });
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        // Update manifest_version
+        sqlx::query("UPDATE downloads SET manifest_version = ? WHERE id = ?")
+            .bind(new_version)
+            .bind(download_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Reconcile chunk hashes: compare existing DB hashes with new manifest hashes
+        let mut changed_count = 0u32;
+        for (index, new_sha256) in new_chunk_hashes {
+            // Get the current hash from DB
+            let existing: Option<(String,)> = sqlx::query_as(
+                "SELECT sha256 FROM download_chunks WHERE download_id = ? AND \"index\" = ?",
+            )
+            .bind(download_id)
+            .bind(*index as i64)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((existing_sha256,)) = existing {
+                if existing_sha256 != *new_sha256 {
+                    // Hash changed: reset chunk to pending with new expected hash
+                    sqlx::query(
+                        "UPDATE download_chunks SET sha256 = ?, state = 'pending' WHERE download_id = ? AND \"index\" = ?",
+                    )
+                    .bind(new_sha256)
+                    .bind(download_id)
+                    .bind(*index as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                    changed_count += 1;
+                }
+            } else {
+                // New chunk that didn't exist before (manifest grew)
+                // Insert as pending
+                let chunk_size = crate::transfer::CHUNK_SIZE_BYTES as u64;
+                let offset = (*index as u64) * chunk_size;
+                let length = chunk_size;
+                sqlx::query(
+                    "INSERT OR IGNORE INTO download_chunks (id, download_id, \"index\", offset, length, sha256, state) VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(download_id)
+                .bind(*index as i64)
+                .bind(offset as i64)
+                .bind(length as i64)
+                .bind(new_sha256)
+                .execute(&mut *tx)
+                .await?;
+                changed_count += 1;
+            }
+        }
+
+        // Handle case where manifest has fewer chunks than DB (truncated file)
+        // Mark excess chunks as 'failed' so they don't block completion
+        let total_new = new_chunk_hashes.len() as i64;
+        sqlx::query(
+            "UPDATE download_chunks SET state = 'failed' WHERE download_id = ? AND \"index\" >= ?",
+        )
+        .bind(download_id)
+        .bind(total_new)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(changed_count)
+    }
+
+    /// Fetch the list of (index, sha256) for all chunks in a download.
+    /// Used by the reconciliation logic to compare DB hashes with new manifest.
+    pub async fn fetch_chunk_hashes(
+        &self,
+        download_id: &str,
+    ) -> Result<Vec<(u32, String)>, ChunkStateError> {
+        let rows = sqlx::query("SELECT \"index\", sha256 FROM download_chunks WHERE download_id = ? ORDER BY \"index\"")
+            .bind(download_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let idx: i64 = row.try_get("index").map_err(ChunkStateError::from)?;
+            let sha: String = row.try_get("sha256").map_err(ChunkStateError::from)?;
+            out.push((idx as u32, sha));
+        }
+        Ok(out)
     }
 
     /// Set the download's `last_error`. Used by the transport

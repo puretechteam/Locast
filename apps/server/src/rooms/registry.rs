@@ -28,6 +28,8 @@ use locast_protocol::room::{
     RoomErrorCode, RoomErrorPayload, RoomJoinedPayload, RoomStatePayload, RoomSummary,
 };
 use rand::rngs::OsRng;
+
+use crate::Db;
 use tokio::sync::broadcast;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -1477,6 +1479,7 @@ impl RoomRegistry {
         &self,
         room: RoomRow,
         participants: Vec<RoomParticipantRow>,
+        db: Option<&Db>,
     ) -> Result<(), RoomError> {
         if room.state != "open" {
             // Per the spec, do not rehydrate ended rooms.
@@ -1607,6 +1610,26 @@ impl RoomRegistry {
             let (tx, _rx) = broadcast::channel(256);
             let mut room_tx = self.room_tx.write().await;
             room_tx.insert(id, tx);
+        }
+        // P7-T07: rehydrate manifest cache so mid-room joiners
+        // can fetch the latest manifest after server restart.
+        if let Some(db) = db {
+            if let Ok(Some(manifest_row)) = db.get_latest_room_manifest(id).await {
+                let manifest: locast_manifest::MediaManifest =
+                    serde_json::from_str(&manifest_row.manifest_json)
+                        .map_err(|e| RoomError::Internal(format!("deserialize manifest: {e}")))?;
+                self.put_current_manifest(
+                    id,
+                    CachedManifest {
+                        version: manifest_row.version,
+                        manifest,
+                        host_user_id: manifest_row.host_user_id,
+                        published_at_ms: manifest_row.created_at,
+                        manifest_hash: manifest_row.manifest_hash,
+                    },
+                )
+                .await;
+            }
         }
         Ok(())
     }
@@ -2318,7 +2341,7 @@ mod tests {
             part_row(host, true, "connected"),
             part_row(viewer, false, "connected"),
         ];
-        r.rehydrate(row, parts).await.expect("rehydrate");
+        r.rehydrate(row, parts, None).await.expect("rehydrate");
         // Code resolves; both participants present.
         let code_id = r.get_by_code("ABCDEF").await.expect("code");
         assert_eq!(code_id, id);
@@ -2333,7 +2356,7 @@ mod tests {
         let id = uid(10);
         let mut row = room_row(id, uid(1), None);
         row.state = "ended".into();
-        r.rehydrate(row, vec![]).await.expect("rehydrate");
+        r.rehydrate(row, vec![], None).await.expect("rehydrate");
         assert!(r.get_by_code("ABCDEF").await.is_none());
         assert!(r.snapshot_for_room(id).await.is_none());
     }
@@ -2347,7 +2370,7 @@ mod tests {
             part_row(uid(1), true, "connected"),
             part_row(uid(2), false, "connected"),
         ];
-        r.rehydrate(row, parts).await.expect("rehydrate");
+        r.rehydrate(row, parts, None).await.expect("rehydrate");
         let handle = r.get_by_id(id).await.expect("handle");
         let s = handle.read().await;
         let host = s.host().expect("host");
@@ -2369,7 +2392,7 @@ mod tests {
             part_row(uid(1), true, "connected"),
             part_row(uid(2), false, "left"),
         ];
-        r.rehydrate(row, parts).await.expect("rehydrate");
+        r.rehydrate(row, parts, None).await.expect("rehydrate");
         let snap = r.snapshot_for_room(id).await.expect("snap");
         assert_eq!(snap.room.participants.len(), 1);
     }
@@ -2381,7 +2404,7 @@ mod tests {
         let deadline = 5_000i64;
         let row = room_row(id, uid(1), Some(deadline));
         let parts = vec![part_row(uid(1), true, "connected")];
-        r.rehydrate(row, parts).await.expect("rehydrate");
+        r.rehydrate(row, parts, None).await.expect("rehydrate");
         let snap = r.snapshot_for_room(id).await.expect("snap");
         assert_eq!(snap.host_disconnect_deadline_ms, Some(deadline));
         let handle = r.get_by_id(id).await.expect("handle");
@@ -2410,6 +2433,7 @@ mod tests {
                 last_activity_ms: 1_000,
             },
             vec![part_row(uid(1), true, "connected")],
+            None,
         )
         .await
         .expect("a");
@@ -2428,6 +2452,7 @@ mod tests {
                 last_activity_ms: 2_000,
             },
             vec![part_row(uid(2), true, "connected")],
+            None,
         )
         .await
         .expect("b");
@@ -2448,7 +2473,7 @@ mod tests {
         let row = room_row(id, uid(1), None);
         // No host row; only a viewer.
         let parts = vec![part_row(uid(2), false, "connected")];
-        r.rehydrate(row, parts).await.expect("rehydrate");
+        r.rehydrate(row, parts, None).await.expect("rehydrate");
         let handle = r.get_by_id(id).await.expect("handle");
         let s = handle.read().await;
         assert!(s.host().is_some());
@@ -2552,7 +2577,7 @@ mod tests {
             assert_eq!(rows.len(), 1);
             for row in rows {
                 let parts = db.list_room_participants(row.id).await.expect("parts");
-                r2.rehydrate(row, parts).await.expect("rehydrate");
+                r2.rehydrate(row, parts, None).await.expect("rehydrate");
             }
             // The new registry must resolve the same code.
             let code_id = r2.get_by_code(&summary.code).await.expect("code");
@@ -2582,7 +2607,7 @@ mod tests {
             // Rehydrate all open rooms.
             for row in db.list_open_rooms().await.expect("list") {
                 let parts = db.list_room_participants(row.id).await.expect("parts");
-                r.rehydrate(row, parts).await.expect("rehydrate");
+                r.rehydrate(row, parts, None).await.expect("rehydrate");
             }
             // The ended room is NOT in the registry.
             assert!(r.get_by_code("ZZZZZZ").await.is_none());
