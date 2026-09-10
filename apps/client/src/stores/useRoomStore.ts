@@ -6,15 +6,19 @@ export type { RoomSummaryIpc, ParticipantIpc, ParticipantStatusIpc } from "../se
 interface RoomState {
     summary: RoomSummaryIpc | null;
     signaling: ConnectionState | null;
+    lastKnownHostPositionMs: number | null;
     setSummary: (summary: RoomSummaryIpc | null) => void;
     setSignaling: (signaling: ConnectionState) => void;
+    setLastKnownHostPositionMs: (positionMs: number | null) => void;
     clear: () => void;
 }
 
 export const useRoomStore = create<RoomState>((set) => ({
     summary: null,
     signaling: null,
+    lastKnownHostPositionMs: null,
     setSummary: (summary) => set({ summary }),
     setSignaling: (signaling) => set({ signaling }),
-    clear: () => set({ summary: null }),
+    setLastKnownHostPositionMs: (lastKnownHostPositionMs) => set({ lastKnownHostPositionMs }),
+    clear: () => set({ summary: null, signaling: null, lastKnownHostPositionMs: null }),
 }));

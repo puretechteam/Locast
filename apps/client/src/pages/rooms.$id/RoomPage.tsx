@@ -5,6 +5,7 @@ import { getRoomState } from "../../services/room";
 import { getSignalingState } from "../../services/signaling";
 import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
 import type { ChatMessage } from "../../services/chat";
+import type { PositionReportEvent } from "../../bindings";
 import { useRoomStore } from "../../stores/useRoomStore";
 import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
@@ -31,6 +32,7 @@ export function RoomPage(): JSX.Element {
     const signaling = useRoomStore((s) => s.signaling);
     const setSummary = useRoomStore((s) => s.setSummary);
     const setSignaling = useRoomStore((s) => s.setSignaling);
+    const setLastKnownHostPositionMs = useRoomStore((s) => s.setLastKnownHostPositionMs);
     const clear = useRoomStore((s) => s.clear);
     const [hydrated, setHydrated] = useState(false);
     const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -298,6 +300,23 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                     return;
                 }
                 unlistens.push(u4);
+
+                // P7-T06: listen for position://report events to track
+                // the host's last known position. The host is the
+                // participant with is_host === true in the summary.
+                const u5 = await events.positionReport((next: PositionReportEvent) => {
+                    if (cancelled) return;
+                    if (summary === null) return;
+                    const host = summary.participants.find((p) => p.is_host);
+                    if (host && next.sender_id === host.user_id) {
+                        setLastKnownHostPositionMs(next.media_position_ms);
+                    }
+                });
+                if (cancelled) {
+                    u5();
+                    return;
+                }
+                unlistens.push(u5);
             } finally {
                 if (!cancelled) {
                     setHydrated(true);
@@ -496,6 +515,8 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                 summary={summary}
                 signaling={signaling}
                 onLeft={handleLeft}
+                isHost={isHost}
+                lastKnownHostPositionMs={useRoomStore.getState().lastKnownHostPositionMs}
             />
             {showPermissions && (
                 <PermissionsModal onClose={() => setShowPermissions(false)} />
