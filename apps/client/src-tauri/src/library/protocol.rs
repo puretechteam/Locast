@@ -40,7 +40,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 
-use crate::core::paths;
+use crate::core::paths::{validate_library_path, validate_sha};
 use crate::storage::Storage;
 
 /// Errors raised by the `locast://` protocol. The enum is closed
@@ -394,50 +394,15 @@ impl ProtocolHandler {
         filename: &str,
         range_header: Option<&str>,
     ) -> Result<ProtocolResponse, ProtocolError> {
-        // Validate the relative_path components. A `relative_path`
-        // is `<sha[0..2]>/<sha[2..4]>/<sha>/<filename>`; the
-        // first three components are hex of `sha`, so they
-        // cannot contain `..` or path separators. The filename
-        // was sanitized at import time and cannot contain
-        // separators. We re-validate the sha anyway as
-        // defense in depth.
-        paths::validate_sha(sha).map_err(|e| ProtocolError::Paths(e.to_string()))?;
-        // Build the absolute path. The relative path uses `/`
-        // (SQLite convention) regardless of host OS; on Windows
-        // the path is interpreted with `\` separators by the
-        // filesystem layer. We join manually to keep the
-        // semantics explicit.
-        let mut abs = self.inner.library_root.clone();
-        for seg in rel_path.split('/') {
-            if seg.is_empty() || seg == "." || seg == ".." {
-                return Err(ProtocolError::OutOfLibrary(format!(
-                    "bad relative_path {rel_path:?}"
-                )));
-            }
-            abs.push(seg);
-        }
-        // Library-root containment. Canonicalize the resolved
-        // path and assert it starts with the canonical root.
-        let canonical_root = tokio::fs::canonicalize(&self.inner.library_root)
+        // P8-T01: Use consolidated path validator (section 21.7)
+        // This consolidates all traversal and malicious filename checks.
+        let canonical = validate_library_path(&self.inner.library_root, rel_path)
             .await
-            .map_err(ProtocolError::Io)?;
-        let canonical = match tokio::fs::canonicalize(&abs).await {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ProtocolError::NotFound(format!(
-                    "file not on disk: {}",
-                    abs.display()
-                )));
-            }
-            Err(e) => return Err(ProtocolError::Io(e)),
-        };
-        if !canonical.starts_with(&canonical_root) {
-            return Err(ProtocolError::OutOfLibrary(format!(
-                "{} escapes {}",
-                canonical.display(),
-                canonical_root.display()
-            )));
-        }
+            .map_err(|e| ProtocolError::OutOfLibrary(e.to_string()))?;
+
+        // Validate sha as defense in depth
+        validate_sha(sha).map_err(|e| ProtocolError::Paths(e.to_string()))?;
+
         let meta = tokio::fs::metadata(&canonical)
             .await
             .map_err(ProtocolError::Io)?;

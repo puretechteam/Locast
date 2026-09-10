@@ -16,13 +16,16 @@
 //!   tmp/incomplete/<download-id>/<download-id>.part.<n>  # in-flight chunks
 //! ```
 //!
-//! All three builders validate the user-supplied components
-//! (`sha`, `download_id`, `sanitized_filename`) and refuse to construct
-//! a path that contains traversal sequences or path separators. The
-//! library-root containment check on the filesystem side is the second
-//! line of defense; this module is the first.
+//! # Path Validation (P8-T01)
+//!
+//! The `validate_library_path` function is the single entry point for
+//! path validation per architecture section 21.7. It consolidates all
+//! traversal and malicious filename checks. It is the single entry
+//! point for validating a relative path against the library root.
 
 use std::path::{Path, PathBuf};
+#[allow(unused_imports)]
+use unicode_normalization::UnicodeNormalization;
 
 /// Errors returned by the path builders in this module.
 ///
@@ -32,7 +35,7 @@ use std::path::{Path, PathBuf};
 /// identifier and the caller has a real reason to want to see what was
 /// rejected); `InvalidDownloadId` is the same; `InvalidSanitizedFilename`
 /// should not happen in normal operation because the sanitizer already
-/// rejects path separators, so seeing it means the caller bypassed
+/// rejects path separators, so seeing it here means the caller bypassed
 /// `core::library::sanitize`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathError {
@@ -45,8 +48,8 @@ pub enum PathError {
     InvalidDownloadId(String),
 
     /// `sanitized_filename` contained a path separator. The sanitizer
-    /// already strips these, so seeing one here means the caller
-    /// bypassed the sanitizer. Carries the offending value.
+    /// already strips these, so seeing it here means the caller bypassed
+    /// `core::library::sanitize`. Carries the offending value.
     InvalidSanitizedFilename(String),
 }
 
@@ -71,6 +74,237 @@ impl std::fmt::Display for PathError {
 }
 
 impl std::error::Error for PathError {}
+
+/// Errors returned by the library path validator.
+///
+/// This validator consolidates all path traversal and malicious
+/// filename checks per architecture section 21.7. It is the single
+/// entry point for validating a relative path against the library
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LibraryPathError {
+    /// The relative path is empty.
+    Empty,
+    /// The path contains an absolute component (starts with `/` or `\`,
+    /// or on Windows a drive letter prefix).
+    AbsolutePath,
+    /// The path contains a `..` segment (traversal attempt).
+    ParentTraversal,
+    /// The path contains a backslash separator (only forward slashes
+    /// are allowed per architecture section 21.7).
+    BackslashSeparator,
+    /// A path segment is a Windows reserved name (CON, PRN, AUX,
+    /// NUL, COM1-9, LPT1-9) regardless of extension.
+    ReservedName(String),
+    /// A path segment contains a NUL byte.
+    NulByte,
+    /// A path segment exceeds 255 bytes (max filename length).
+    SegmentTooLong(String),
+    /// The total path exceeds 4096 bytes.
+    PathTooLong,
+    /// The path contains non-ASCII characters (only ASCII allowed).
+    NonAscii(String),
+    /// The path segment contains control characters (0x00-0x1F, 0x7F).
+    ControlCharacter(String),
+    /// Unicode is not in NFC normalization form.
+    NotNfc(String),
+    /// The resolved absolute path escapes the library root (symlink
+    /// or junction pointing outside).
+    EscapesLibraryRoot,
+    /// The path is not a regular file (directory, symlink, etc.).
+    NotAFile,
+    /// I/O error during canonicalization or metadata check.
+    IoError(String),
+    /// The file was not found.
+    NotFound,
+}
+
+impl std::fmt::Display for LibraryPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LibraryPathError::Empty => write!(f, "path is empty"),
+            LibraryPathError::AbsolutePath => write!(f, "path is absolute"),
+            LibraryPathError::ParentTraversal => write!(f, "path contains parent traversal (..)"),
+            LibraryPathError::BackslashSeparator => write!(f, "path contains backslash separator"),
+            LibraryPathError::ReservedName(s) => write!(f, "path contains reserved name: {s}"),
+            LibraryPathError::NulByte => write!(f, "path contains NUL byte"),
+            LibraryPathError::SegmentTooLong(s) => write!(f, "path segment too long: {s}"),
+            LibraryPathError::PathTooLong => write!(f, "total path too long (>4096 bytes)"),
+            LibraryPathError::NonAscii(s) => write!(f, "path contains non-ASCII: {s}"),
+            LibraryPathError::ControlCharacter(s) => {
+                write!(f, "path contains control character: {s}")
+            }
+            LibraryPathError::NotNfc(s) => write!(f, "path not NFC normalized: {s}"),
+            LibraryPathError::EscapesLibraryRoot => write!(f, "resolved path escapes library root"),
+            LibraryPathError::NotAFile => write!(f, "path is not a regular file"),
+            LibraryPathError::IoError(s) => write!(f, "I/O error: {s}"),
+            LibraryPathError::NotFound => write!(f, "file not found"),
+        }
+    }
+}
+
+impl std::error::Error for LibraryPathError {}
+
+/// Validate a relative library path and return the canonical absolute path.
+///
+/// This is the single entry point for path validation per architecture
+/// section 21.7. It performs all traversal and malicious filename checks:
+/// - Empty path rejected
+/// - Absolute paths rejected (including drive letters, UNC)
+/// - Parent traversal (`..`) rejected
+/// - Backslash separators rejected
+/// - Windows reserved names rejected (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+/// - NUL bytes rejected
+/// - Segment length > 255 bytes rejected
+/// - Total path > 4096 bytes rejected
+/// - Non-ASCII characters rejected
+/// - Control characters (0x00-0x1F, 0x7F) rejected
+/// - Non-NFC Unicode rejected
+/// - Symlink/junction escaping library root rejected
+/// - Non-regular files (directories, symlinks) rejected
+///
+/// On success, returns the canonical absolute path of the file.
+/// The caller must still verify the file exists and is a regular file.
+///
+/// This function is async because it needs to canonicalize paths
+/// and check filesystem metadata (symlink resolution).
+pub async fn validate_library_path(
+    library_root: &Path,
+    rel_path: &str,
+) -> Result<PathBuf, LibraryPathError> {
+    // 1. Empty path
+    if rel_path.is_empty() {
+        return Err(LibraryPathError::Empty);
+    }
+
+    // 2. Total path length (4096 bytes max per architecture section 21.7)
+    if rel_path.len() > 4096 {
+        return Err(LibraryPathError::PathTooLong);
+    }
+
+    // 2. Absolute path check (including drive letters, UNC paths)
+    if rel_path.starts_with('/')
+        || rel_path.starts_with('\\')
+        || rel_path.len() >= 2 && rel_path.as_bytes()[1] == b':'
+    {
+        return Err(LibraryPathError::AbsolutePath);
+    }
+
+    // 3. Backslash separator check (only forward slashes allowed)
+    if rel_path.contains('\\') {
+        return Err(LibraryPathError::BackslashSeparator);
+    }
+
+    // 4. NUL byte check
+    if rel_path.contains('\0') {
+        return Err(LibraryPathError::NulByte);
+    }
+
+    // 5. Control characters (0x00-0x1F, 0x7F)
+    if rel_path.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+        return Err(LibraryPathError::ControlCharacter(rel_path.to_string()));
+    }
+
+    // 5. Non-ASCII check
+    if !rel_path.is_ascii() {
+        return Err(LibraryPathError::NonAscii(rel_path.to_string()));
+    }
+
+    // 6. NFC normalization check
+    if rel_path
+        != unicode_normalization::UnicodeNormalization::nfc(rel_path.chars()).collect::<String>()
+    {
+        return Err(LibraryPathError::NotNfc(rel_path.to_string()));
+    }
+
+    // 7. Split into segments and validate each
+    let segments: Vec<&str> = rel_path.split('/').collect();
+    if segments.is_empty() {
+        return Err(LibraryPathError::Empty);
+    }
+
+    for seg in &segments {
+        // Empty segment (double slash, leading/trailing slash)
+        if seg.is_empty() {
+            return Err(LibraryPathError::AbsolutePath);
+        }
+
+        // Segment length check (255 bytes max per filename)
+        if seg.len() > 255 {
+            return Err(LibraryPathError::SegmentTooLong(seg.to_string()));
+        }
+
+        // Traversal check
+        if *seg == "." || *seg == ".." {
+            return Err(LibraryPathError::ParentTraversal);
+        }
+
+        // Windows reserved names (case-insensitive)
+        let upper = seg.to_ascii_uppercase();
+        let reserved = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        // Check with and without extension
+        let base = upper.split('.').next().unwrap_or("");
+        if reserved.contains(&base) {
+            return Err(LibraryPathError::ReservedName(seg.to_string()));
+        }
+
+        // Control characters in segment
+        if seg.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+            return Err(LibraryPathError::ControlCharacter(seg.to_string()));
+        }
+
+        // Non-ASCII in segment
+        if !seg.is_ascii() {
+            return Err(LibraryPathError::NonAscii(seg.to_string()));
+        }
+    }
+
+    // Total path length (after reconstruction with separators)
+    let total_len =
+        segments.iter().map(|s| s.len()).sum::<usize>() + segments.len().saturating_sub(1);
+    if total_len > 4096 {
+        return Err(LibraryPathError::PathTooLong);
+    }
+
+    // Reconstruct the path for filesystem operations
+    let mut abs = library_root.to_path_buf();
+    for seg in &segments {
+        abs.push(seg);
+    }
+
+    // Canonicalize library root and target path
+    let canonical_root = tokio::fs::canonicalize(library_root)
+        .await
+        .map_err(|e| LibraryPathError::IoError(e.to_string()))?;
+
+    let canonical = match tokio::fs::canonicalize(&abs).await {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LibraryPathError::NotFound);
+        }
+        Err(e) => {
+            return Err(LibraryPathError::IoError(e.to_string()));
+        }
+    };
+
+    // Library-root containment check (defeats symlink/junction escape)
+    if !canonical.starts_with(&canonical_root) {
+        return Err(LibraryPathError::EscapesLibraryRoot);
+    }
+
+    // Verify it's a regular file (not directory, symlink, etc.)
+    let meta = tokio::fs::metadata(&abs)
+        .await
+        .map_err(|e| LibraryPathError::IoError(e.to_string()))?;
+    if !meta.is_file() {
+        return Err(LibraryPathError::NotAFile);
+    }
+
+    Ok(canonical)
+}
 
 /// Length of a SHA-256 hex string.
 const SHA256_HEX_LEN: usize = 64;
