@@ -2855,6 +2855,7 @@ dependencies = [
  "libfuzzer-sys",
  "locast-client",
  "rmp-serde",
+ "tokio",
 ]
 
 [[package]]

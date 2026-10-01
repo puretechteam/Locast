@@ -358,6 +358,36 @@ async fn protocol_rejects_unknown_media_id() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protocol_missing_file_on_disk_is_not_found() {
+    // A DB row whose file was removed from disk is a 404
+    // (`NotFound`), not a 403 (`OutOfLibrary`): the path is
+    // inside the library, it just does not exist.
+    let tmp = TempDir::new().expect("tempdir");
+    let lib_root = tmp.path().to_path_buf();
+    let storage = open_storage(&lib_root).await;
+    let handler = build_handler(storage.clone(), lib_root.clone());
+
+    let bytes: Vec<u8> = (0u32..128).map(|i| (i ^ 0x5A) as u8).collect();
+    let staging = lib_root.join("staging.bin");
+    tokio::fs::write(&staging, &bytes).await.unwrap();
+    let id = insert_media_row(&storage, &lib_root, &staging, &bytes).await;
+    let url = resolve_media_url(&storage, &id).await.unwrap();
+
+    let sha = hex::encode(Sha256::digest(&bytes));
+    let rel = format!("library/{}/{}/{}/test.mp4", &sha[..2], &sha[2..4], sha);
+    tokio::fs::remove_file(lib_root.join(rel)).await.unwrap();
+
+    let res = handler.handle(&url, "GET", None).await;
+    assert!(
+        matches!(
+            res,
+            Err(locast_client_lib::library::protocol::ProtocolError::NotFound(_))
+        ),
+        "expected NotFound"
+    );
+}
+
 // Silence "unused import" warnings for `MockKeyring` and `Arc`
 // in builds that do not exercise the identity service.
 #[allow(dead_code)]

@@ -722,4 +722,305 @@ mod tests {
         assert_ne!(comps_a[comps_a.len() - 4], comps_b[comps_b.len() - 4]);
         assert_ne!(comps_a[comps_a.len() - 3], comps_b[comps_b.len() - 3]);
     }
+
+    // ----- validate_library_path (P8-T01 crafted-path battery)
+
+    use tempfile::TempDir;
+
+    /// A real library root with one regular file at
+    /// `library/ab/cd/Movie.mkv` and one directory `library/dir`.
+    fn lib_fixture() -> TempDir {
+        let tmp = TempDir::new().expect("tempdir");
+        let nested = tmp.path().join("library").join("ab").join("cd");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("Movie.mkv"), b"bytes").unwrap();
+        std::fs::create_dir_all(tmp.path().join("library").join("dir")).unwrap();
+        tmp
+    }
+
+    async fn check(root: &Path, rel: &str, want: LibraryPathError) {
+        assert_eq!(
+            validate_library_path(root, rel).await,
+            Err(want),
+            "input {rel:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vlp_accepts_legit_nested_file() {
+        let tmp = lib_fixture();
+        let got = validate_library_path(tmp.path(), "library/ab/cd/Movie.mkv")
+            .await
+            .expect("legit path");
+        let want = std::fs::canonicalize(tmp.path().join("library/ab/cd/Movie.mkv")).unwrap();
+        assert_eq!(got, want);
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        assert!(got.starts_with(root));
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_empty() {
+        let tmp = lib_fixture();
+        check(tmp.path(), "", LibraryPathError::Empty).await;
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_parent_traversal() {
+        let tmp = lib_fixture();
+        for rel in [
+            "..",
+            "../etc/passwd",
+            "library/../../outside.mkv",
+            "library/ab/..",
+            "library/./ab/cd/Movie.mkv",
+            ".",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::ParentTraversal).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_absolute_drive_unc_and_device_paths() {
+        let tmp = lib_fixture();
+        for rel in [
+            "/etc/passwd",
+            "\\Windows\\System32",
+            "C:\\Windows\\System32\\cmd.exe",
+            "C:/Windows/System32/cmd.exe",
+            "c:foo.mkv",
+            "C:",
+            "\\\\server\\share\\x.mkv",
+            "//server/share/x.mkv",
+            "\\\\?\\C:\\Windows",
+            "//?/C:/Windows",
+            "\\\\.\\PhysicalDrive0",
+            "//./PhysicalDrive0",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::AbsolutePath).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_empty_segments() {
+        let tmp = lib_fixture();
+        for rel in ["library//ab", "library/ab/", "library/ab/cd/Movie.mkv/"] {
+            check(tmp.path(), rel, LibraryPathError::AbsolutePath).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_backslash_and_mixed_separators() {
+        let tmp = lib_fixture();
+        for rel in [
+            "library\\ab\\cd\\Movie.mkv",
+            "library/ab\\..\\..\\outside.mkv",
+            "library/ab/cd\\Movie.mkv",
+            "..\\outside.mkv",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::BackslashSeparator).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_nul_byte() {
+        let tmp = lib_fixture();
+        for rel in [
+            "\0",
+            "library/ab/cd/Movie.mkv\0",
+            "library/ab/cd/Movie.mkv\0.txt",
+            "library\0/../x",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::NulByte).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_control_characters() {
+        let tmp = lib_fixture();
+        for rel in ["library/a\x01b", "library/\x1f", "library/a\x7fb", "a\nb"] {
+            check(
+                tmp.path(),
+                rel,
+                LibraryPathError::ControlCharacter(rel.to_string()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_non_ascii() {
+        let tmp = lib_fixture();
+        for rel in [
+            "library/caf\u{e9}.mkv",
+            "library/e\u{301}.mkv",
+            "\u{ff0e}\u{ff0e}/x",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::NonAscii(rel.to_string())).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_reserved_names_any_segment_any_case() {
+        let tmp = lib_fixture();
+        for (rel, seg) in [
+            ("CON", "CON"),
+            ("library/nul.txt", "nul.txt"),
+            ("library/Aux/x.mkv", "Aux"),
+            ("library/ab/lpt9.mkv", "lpt9.mkv"),
+            ("com1.tar.gz", "com1.tar.gz"),
+            ("library/PRN", "PRN"),
+        ] {
+            check(
+                tmp.path(),
+                rel,
+                LibraryPathError::ReservedName(seg.to_string()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_overlong_segment_and_total() {
+        let tmp = lib_fixture();
+        let seg = "a".repeat(256);
+        check(
+            tmp.path(),
+            &format!("library/{seg}"),
+            LibraryPathError::SegmentTooLong(seg.clone()),
+        )
+        .await;
+        // 255 bytes is the inclusive limit: lexically fine, then
+        // the file simply does not exist.
+        check(
+            tmp.path(),
+            &format!("library/{}", "a".repeat(255)),
+            LibraryPathError::NotFound,
+        )
+        .await;
+        let long = vec!["a".repeat(200); 21].join("/");
+        assert!(long.len() > 4096);
+        check(tmp.path(), &long, LibraryPathError::PathTooLong).await;
+    }
+
+    #[tokio::test]
+    async fn vlp_treats_url_encoding_literally() {
+        // The validator does not percent-decode: `%2e%2e` is a
+        // literal (non-existent) segment, never a traversal.
+        let tmp = lib_fixture();
+        check(
+            tmp.path(),
+            "%2e%2e/%2e%2e/x.mkv",
+            LibraryPathError::NotFound,
+        )
+        .await;
+        check(tmp.path(), "library/..%2fx", LibraryPathError::NotFound).await;
+    }
+
+    #[tokio::test]
+    async fn vlp_reports_missing_file_and_directory() {
+        let tmp = lib_fixture();
+        check(
+            tmp.path(),
+            "library/ab/cd/Missing.mkv",
+            LibraryPathError::NotFound,
+        )
+        .await;
+        check(tmp.path(), "library/dir", LibraryPathError::NotAFile).await;
+    }
+
+    #[tokio::test]
+    async fn vlp_missing_root_is_io_error() {
+        let tmp = TempDir::new().expect("tempdir");
+        let gone = tmp.path().join("no-such-root");
+        assert!(matches!(
+            validate_library_path(&gone, "library/x.mkv").await,
+            Err(LibraryPathError::IoError(_))
+        ));
+    }
+
+    /// Lay out `<tmp>/root/library` plus `<tmp>/outside/secret.mkv`
+    /// so a link inside the root can point at the sibling.
+    fn escape_fixture() -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("library")).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.mkv"), b"secret").unwrap();
+        (tmp, root, outside)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vlp_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let (_tmp, root, outside) = escape_fixture();
+        symlink(outside.join("secret.mkv"), root.join("library/link.mkv")).unwrap();
+        symlink(&outside, root.join("library/linkdir")).unwrap();
+        check(
+            &root,
+            "library/link.mkv",
+            LibraryPathError::EscapesLibraryRoot,
+        )
+        .await;
+        check(
+            &root,
+            "library/linkdir/secret.mkv",
+            LibraryPathError::EscapesLibraryRoot,
+        )
+        .await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn vlp_rejects_symlink_escape() {
+        // Creating a symlink on Windows needs SeCreateSymbolicLink
+        // (admin or Developer Mode). Skip only when it is not
+        // granted (ERROR_PRIVILEGE_NOT_HELD, 1314); the junction
+        // test below covers the escape without it.
+        let (_tmp, root, outside) = escape_fixture();
+        let link = root.join("library").join("link.mkv");
+        match std::os::windows::fs::symlink_file(outside.join("secret.mkv"), &link) {
+            Ok(()) => {
+                check(
+                    &root,
+                    "library/link.mkv",
+                    LibraryPathError::EscapesLibraryRoot,
+                )
+                .await;
+            }
+            Err(e) if e.raw_os_error() == Some(1314) => {
+                eprintln!("skipping symlink escape test: {e}")
+            }
+            Err(e) => panic!("symlink_file failed: {e}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn vlp_rejects_junction_escape() {
+        // Directory junctions need no privilege and `mklink /J` is
+        // a cmd builtin, so a failure here is a real error.
+        let (_tmp, root, outside) = escape_fixture();
+        let junction = root.join("library").join("jdir");
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&junction)
+            .arg(&outside)
+            .stdout(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                check(
+                    &root,
+                    "library/jdir/secret.mkv",
+                    LibraryPathError::EscapesLibraryRoot,
+                )
+                .await;
+            }
+            other => panic!("mklink /J failed: {other:?}"),
+        }
+    }
 }

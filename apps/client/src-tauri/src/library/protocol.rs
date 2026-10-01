@@ -40,7 +40,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
 
-use crate::core::paths::{validate_library_path, validate_sha};
+use crate::core::paths::{validate_library_path, validate_sha, LibraryPathError};
 use crate::storage::Storage;
 
 /// Errors raised by the `locast://` protocol. The enum is closed
@@ -396,9 +396,22 @@ impl ProtocolHandler {
     ) -> Result<ProtocolResponse, ProtocolError> {
         // P8-T01: Use consolidated path validator (section 21.7)
         // This consolidates all traversal and malicious filename checks.
+        // Only validation rejects are 403. A DB row whose file is
+        // missing on disk stays 404, I/O failures stay `Io`, and a
+        // non-regular file stays 400, matching the pre-P8-T01
+        // behavior (architecture section 5, custom protocol, step 3).
         let canonical = validate_library_path(&self.inner.library_root, rel_path)
             .await
-            .map_err(|e| ProtocolError::OutOfLibrary(e.to_string()))?;
+            .map_err(|e| match e {
+                LibraryPathError::NotFound => {
+                    ProtocolError::NotFound(format!("file not on disk: {rel_path}"))
+                }
+                LibraryPathError::IoError(m) => ProtocolError::Io(std::io::Error::other(m)),
+                LibraryPathError::NotAFile => {
+                    ProtocolError::BadUrl(format!("not a regular file: {rel_path}"))
+                }
+                other => ProtocolError::OutOfLibrary(other.to_string()),
+            })?;
 
         // Validate sha as defense in depth
         validate_sha(sha).map_err(|e| ProtocolError::Paths(e.to_string()))?;

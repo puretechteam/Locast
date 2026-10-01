@@ -5,6 +5,8 @@ coverage/
 
 # libFuzzer writes new corpus entries (hash-named, no extension)
 # into corpus/<target>/ during a run. Keep only the committed,
-# descriptively named .msgpack seeds.
+# descriptively named seeds (.msgpack for wire_decode, .txt for
+# path_validator).
 corpus/*/*
 !corpus/*/*.msgpack
+!corpus/*/*.txt
