@@ -33,6 +33,27 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "subtitle_srt"
+path = "fuzz_targets/subtitle_srt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subtitle_vtt"
+path = "fuzz_targets/subtitle_vtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "subtitle_ass"
+path = "fuzz_targets/subtitle_ass.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 # `build-override` applies only to host artifacts (build scripts

@@ -1,0 +1,7 @@
+[Script Info]
+Title: t
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,4294967296,4294967296,4294967296,,File size: 4GB
+Dialogue: 0,4294967296:00:00.00,4294967296:00:01.4294967296,Default,,0,0,0,,Huge fields.

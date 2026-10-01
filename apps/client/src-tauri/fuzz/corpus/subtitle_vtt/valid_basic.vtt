@@ -1,0 +1,8 @@
+WEBVTT
+
+00:01.000 --> 00:03.500
+Hello, world.
+
+cue2
+00:00:04.000 --> 00:00:06.000 line:90%
+Second &amp; last.

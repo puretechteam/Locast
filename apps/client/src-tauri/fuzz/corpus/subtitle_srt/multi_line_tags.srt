@@ -1,0 +1,12 @@
+1
+00:00:01,000 --> 00:00:04,000 X1:100 X2:200
+<i>Italic</i> and {\an8}top
+<b>bold <u>nested</b> unclosed <
+
+2
+00:00:02,5 --> 00:00:03,25
+Line one
+Line two <<<<
+
+3
+no timing here

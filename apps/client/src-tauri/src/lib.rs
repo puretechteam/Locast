@@ -21,6 +21,7 @@ pub mod core;
 pub mod events;
 pub mod identity;
 pub mod library;
+pub mod media;
 pub mod net;
 pub mod probe;
 pub mod room;

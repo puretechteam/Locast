@@ -1,0 +1,16 @@
+WEBVTT
+
+NOTE this is a comment
+across two lines
+
+STYLE
+::cue { color: red }
+
+REGION
+id:r1
+width:40%
+
+id-only-block
+
+00:00:01.000 --> 00:00:02.000 region:r1
+<v Bob>Hi &lt;there&gt;&nbsp;&lrm;<c.x>ok</c>
