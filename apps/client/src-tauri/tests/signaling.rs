@@ -144,6 +144,13 @@ struct FakeServerConfig {
     /// assert "the token bytes do not appear in the log" use
     /// this to make the token deterministic.
     deterministic_token: Option<[u8; 32]>,
+    /// P8-T02: if true, the WELCOME envelope carries `v = 99`.
+    welcome_v99: bool,
+    /// P8-T02: if true, send a structurally valid envelope
+    /// with `v = 99` shortly after AUTH_OK and hold the
+    /// socket open, so only the client's version gate can
+    /// end the session.
+    send_v99_after_auth: bool,
     /// The number of connections accepted so far (atomic
     /// counter, shared between tests via Arc).
     #[allow(dead_code)]
@@ -162,6 +169,8 @@ impl Default for FakeServerConfig {
             drop_listener_after_one: false,
             silent: false,
             deterministic_token: None,
+            welcome_v99: false,
+            send_v99_after_auth: false,
             connections: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -244,7 +253,7 @@ async fn fake_connection(mut socket: WebSocket, state: FakeState) {
         },
     };
     let welcome_env = Envelope {
-        v: 1,
+        v: if state.cfg.welcome_v99 { 99 } else { 1 },
         r#type: MessageKind::Welcome,
         id: Uuid::now_v7(),
         room_id: None,
@@ -342,6 +351,29 @@ async fn fake_connection(mut socket: WebSocket, state: FakeState) {
         .expect("encode auth_ok"),
     };
     if send_envelope(&mut socket, &ok_env).await.is_err() {
+        return;
+    }
+
+    if state.cfg.send_v99_after_auth {
+        // Let the client reach Authenticated, then send a
+        // well-formed envelope with an unsupported version.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let v99_env = Envelope {
+            v: 99,
+            r#type: MessageKind::Other("ROOM_STATE".to_string()),
+            id: Uuid::now_v7(),
+            room_id: None,
+            sender: None,
+            ts_ms: now_ms(),
+            seq: 1,
+            payload: serde_json::json!({}),
+        };
+        if send_envelope(&mut socket, &v99_env).await.is_err() {
+            return;
+        }
+        // Hold well past the client's wait window so a
+        // ServerClose cannot be mistaken for the gate firing.
+        tokio::time::sleep(Duration::from_secs(10)).await;
         return;
     }
 
@@ -745,6 +777,61 @@ async fn malformed_server_message_triggers_protocol_error() {
     assert!(!snap.connected);
     assert!(snap.last_error.is_some());
     client.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 9b. P8-T02: wrong protocol version is a bad_msg.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn v99_welcome_during_handshake_is_protocol_error() {
+    let mut cfg = FakeServerConfig::default();
+    cfg.welcome_v99 = true;
+    let (addr, _state, _h) = start_fake(cfg).await;
+    let (_dir, storage) = open_storage().await;
+    let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
+    let client = make_client(ws_url(addr), keyring, storage).await;
+    client.start().await.expect("start");
+    let snap = wait_for_phase(&client, ConnPhase::Reconnecting, Duration::from_secs(5)).await;
+    assert!(!snap.connected);
+    let err = snap.last_error.expect("last_error set");
+    assert!(
+        err.starts_with("ProtocolError: bad_msg"),
+        "expected a bad_msg protocol error, got {err:?}"
+    );
+    // The version gate fired (not a msgpack decode failure).
+    assert!(
+        err.contains("unsupported v: 99"),
+        "expected the version-specific rejection text, got {err:?}"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn v99_frame_after_auth_is_protocol_error_not_forwarded() {
+    let mut cfg = FakeServerConfig::default();
+    cfg.send_v99_after_auth = true;
+    let (addr, _state, _h) = start_fake(cfg).await;
+    let (_dir, storage) = open_storage().await;
+    let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
+    let client = make_client(ws_url(addr), keyring, storage).await;
+    let mut rx = client.subscribe().await;
+    client.start().await.expect("start");
+    wait_for_phase(&client, ConnPhase::Authenticated, Duration::from_secs(5)).await;
+    // The fake holds the socket open for 10s after the v99
+    // frame, so reaching Reconnecting within 5s can only be
+    // the client's version gate closing the session.
+    let snap = wait_for_phase(&client, ConnPhase::Reconnecting, Duration::from_secs(5)).await;
+    assert!(!snap.connected);
+    assert_eq!(
+        snap.last_error.as_deref(),
+        Some("ProtocolError"),
+        "v99 frame must end the session as a protocol error"
+    );
+    client.shutdown().await;
+    while let Ok(env) = rx.try_recv() {
+        assert_eq!(env.v, 1, "a v != 1 envelope reached a subscriber");
+    }
 }
 
 // ---------------------------------------------------------------------------

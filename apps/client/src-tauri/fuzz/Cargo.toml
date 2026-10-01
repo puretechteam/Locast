@@ -1,0 +1,39 @@
+[package]
+name = "locast-client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rmp-serde = "1"
+
+[dependencies.locast-client]
+path = ".."
+
+# Keep the fuzz targets out of `cargo test` and `cargo doc` of
+# this workspace; each target is a `[[bin]]` with the standard
+# cargo-fuzz scaffolding below.
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+# `build-override` applies only to host artifacts (build scripts
+# and proc macros), not to the fuzzed code. cargo-fuzz builds the
+# target with `-Cdebug-assertions`, but that RUSTFLAG does not reach
+# host artifacts. tauri-utils gates `ResolvedCommand::referenced_by`
+# on `cfg(debug_assertions)`, so without this the host-side
+# `generate_context!` codegen and the target-side struct would
+# disagree on `cfg(debug_assertions)` and fail with E0063. This
+# setting only aligns that cfg between host and target; it does not
+# control overflow checks or debug assertions in the fuzzed code.
+[profile.release.build-override]
+debug-assertions = true

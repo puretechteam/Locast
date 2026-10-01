@@ -11,6 +11,9 @@
 //! - [`signaling`] - the connection loop that performs the
 //!   HELLO / WELCOME / CHALLENGE / AUTH handshake and keeps the
 //!   bearer token in memory.
+//! - [`wire`] - the MessagePack envelope decoder and the v1
+//!   version gate (P8-T02); the module the `wire_decode` fuzz
+//!   target exercises.
 //!
 //! The WebView never sees the raw WebSocket. React reads only
 //! [`state::ConnectionState`] via the `signaling_get_state`
@@ -26,6 +29,7 @@ pub mod signaling;
 pub mod state;
 pub mod webrtc;
 pub mod webrtc_canonical;
+pub mod wire;
 
 pub use config::SignalingConfig;
 pub use locast_protocol::handshake::Platform;

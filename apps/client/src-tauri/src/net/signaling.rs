@@ -797,7 +797,11 @@ async fn run_handshake(
                 return HandshakeResult::Oversized { bytes };
             }
             Err(FrameError::Decode(e)) => {
-                return HandshakeResult::ProtocolError(format!("msgpack decode: {e}"));
+                // The full decoder error goes to the native log
+                // only; the string that reaches `last_error`
+                // (and so the WebView) is a fixed summary.
+                warn!(error = %e, "bad_msg during handshake");
+                return HandshakeResult::ProtocolError(wire_reject_summary(&e));
             }
             Err(FrameError::Text) => {
                 return HandshakeResult::ProtocolError("text frame during handshake".to_string());
@@ -807,9 +811,16 @@ async fn run_handshake(
             }
         };
 
-        // Envelope validation: v=1, room_id absent.
-        if frame.v != 1 {
-            return HandshakeResult::ProtocolError(format!("unsupported v: {}", frame.v));
+        // Envelope validation: v=1, room_id absent. The v
+        // check is already enforced by the wire gate in
+        // `read_frame` (P8-T02); it is kept here as a cheap
+        // defense-in-depth guard in case a future read path
+        // bypasses `wire::decode_and_validate`.
+        if frame.v != crate::net::wire::PROTOCOL_VERSION {
+            // Same wording as the wire gate so `last_error` is consistent.
+            return HandshakeResult::ProtocolError(wire_reject_summary(
+                &crate::net::wire::WireReject::Version(frame.v),
+            ));
         }
         if frame.room_id.is_some() {
             return HandshakeResult::ProtocolError("room_id set during handshake".to_string());
@@ -1087,7 +1098,7 @@ async fn idle_until_disconnect(
                         reason = Some(DisconnectReason::ProtocolError);
                     }
                     Err(FrameError::Decode(e)) => {
-                        warn!(error = %e, "decode error in idle; closing");
+                        warn!(error = %e, "bad_msg (decode or version) in idle; closing");
                         let _ = socket.close(None).await;
                         reason = Some(DisconnectReason::ProtocolError);
                     }
@@ -1125,7 +1136,12 @@ async fn read_frame_async(
                         cap: config.max_frame_bytes,
                     });
                 }
-                let env: Envelope = rmp_serde::from_slice(&bytes).map_err(FrameError::Decode)?;
+                // P8-T02: every inbound binary frame goes
+                // through the single validating decoder, so a
+                // wrong `v` is rejected here exactly like
+                // malformed MessagePack (both are `bad_msg`).
+                let env: Envelope =
+                    crate::net::wire::decode_and_validate(&bytes).map_err(FrameError::Decode)?;
                 return Ok(Some(env));
             }
             WsMessage::Text(_) => return Err(FrameError::Text),
@@ -1139,6 +1155,17 @@ async fn read_frame_async(
 // Frame I/O
 // ---------------------------------------------------------------------------
 
+/// Fixed, WebView-safe summary of a wire rejection. The raw
+/// MessagePack decoder text is deliberately not included (it
+/// echoes attacker-controlled bytes); callers log the full
+/// `WireReject` natively instead.
+fn wire_reject_summary(e: &crate::net::wire::WireReject) -> String {
+    match e {
+        crate::net::wire::WireReject::Decode(_) => "bad_msg: msgpack decode failed".to_string(),
+        crate::net::wire::WireReject::Version(v) => format!("bad_msg: unsupported v: {v}"),
+    }
+}
+
 enum FrameError {
     Oversized {
         bytes: usize,
@@ -1148,7 +1175,10 @@ enum FrameError {
         #[allow(dead_code)]
         cap: usize,
     },
-    Decode(rmp_serde::decode::Error),
+    /// The frame was rejected by [`crate::net::wire::decode_and_validate`]:
+    /// either malformed MessagePack or a protocol version other
+    /// than v1. Both map to `DisconnectReason::ProtocolError`.
+    Decode(crate::net::wire::WireReject),
     Text,
     /// The underlying tungstenite error. Boxed to keep the
     /// enum's `Result<_, FrameError>` small enough that
@@ -1174,7 +1204,12 @@ async fn read_frame(
                         cap: config.max_frame_bytes,
                     });
                 }
-                let env: Envelope = rmp_serde::from_slice(&bytes).map_err(FrameError::Decode)?;
+                // P8-T02: every inbound binary frame goes
+                // through the single validating decoder, so a
+                // wrong `v` is rejected here exactly like
+                // malformed MessagePack (both are `bad_msg`).
+                let env: Envelope =
+                    crate::net::wire::decode_and_validate(&bytes).map_err(FrameError::Decode)?;
                 return Ok(Some(env));
             }
             WsMessage::Text(_) => return Err(FrameError::Text),
