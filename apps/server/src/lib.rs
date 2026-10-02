@@ -23,6 +23,7 @@ use axum::{Json, Router};
 use serde::Serialize;
 use tracing::info;
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
@@ -161,8 +162,11 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
         std::time::Duration::from_millis(500),
     );
 
+    // Move (not clone) the config into shared state: it owns the
+    // `sensitive` secrets, which must exist exactly once.
+    let bind_addr = config.bind_addr;
     let state = AppState {
-        config: Arc::new(config.clone()),
+        config: Arc::new(config),
         metrics: Metrics::new(),
         db,
         rooms,
@@ -172,8 +176,8 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
     };
 
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    let local = listener.local_addr().unwrap_or(config.bind_addr);
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    let local = listener.local_addr().unwrap_or(bind_addr);
     info!(addr = %local, "locast-server listening");
 
     axum::serve(listener, app)

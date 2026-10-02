@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize = "1"
 axum = { version = "0.7", features = ["ws", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "sync"] }
 tokio-stream = "0.1"

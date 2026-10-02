@@ -57,6 +57,7 @@ fn test_config() -> Config {
         room_create_max_collisions: 5,
         participant_stale_after_ms: 300_000,
         participant_disconnect_after_ms: 15_000,
+        sensitive: Default::default(),
     }
 }
 
