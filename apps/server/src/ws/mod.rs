@@ -244,11 +244,17 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // the failure-handling code stays uniform.
     let auth_failures: Arc<Mutex<VecDeque<i64>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut authed: Option<(Uuid, [u8; 32])> = None;
-    // The user's current room, for the broadcast forwarder
-    // task spawned below. `None` if the user is not in a
-    // room (or not yet authed).
-    let current_room: Arc<tokio::sync::Mutex<Option<Uuid>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    // The room the connection loop last subscribed the
+    // forwarder to (`None` if the user is not in a room or
+    // not yet authed). The loop itself takes each room's
+    // broadcast `Receiver` synchronously, BEFORE the reply
+    // that makes the user a member is written, and hands it
+    // to the forwarder task through `sub_tx`. This closes the
+    // window where a broadcast published right after
+    // RoomCreated / RoomJoined was lost because the
+    // forwarder had not subscribed yet.
+    let mut last_room: Option<Uuid> = None;
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<RoomSubscription>();
     // The connection's authenticated user_id, so the
     // forwarder can filter out events the user originated.
     let self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>> =
@@ -256,10 +262,6 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // mpsc::Sender the forwarder pushes outbound envelopes
     // into. The main loop drains it on every iteration.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
-    // Notify the forwarder when the user's room changes,
-    // so it can re-subscribe immediately rather than
-    // waiting for its 20ms sleep to elapse.
-    let room_changed = Arc::new(tokio::sync::Notify::new());
 
     debug!(request_id = %request_id, "ws connection open");
 
@@ -267,29 +269,20 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // the TCP accept, per the architecture's connection lifecycle.
     let handshake_deadline = now_ms() + state.config.handshake_timeout_ms;
 
-    // Spawn the broadcast forwarder. It watches
-    // `current_room`, subscribes to the new room's broadcast
-    // channel when the user joins, and forwards events to
-    // the main loop via `outbound_tx`. The task exits when
-    // the connection closes (`fwd_cancel` is notified).
+    // Spawn the broadcast forwarder. It receives the already
+    // taken broadcast `Receiver` for the user's current room
+    // from the connection loop (`sub_rx`) and forwards events
+    // to the main loop via `outbound_tx`. The task exits when
+    // the connection closes (`fwd_cancel` is notified, or
+    // `sub_tx` is dropped).
     let fwd_cancel = Arc::new(tokio::sync::Notify::new());
     {
         let state = state.clone();
-        let current_room = current_room.clone();
         let fwd_cancel = fwd_cancel.clone();
         let outbound_tx = outbound_tx.clone();
-        let room_changed = room_changed.clone();
         let self_user_id = self_user_id.clone();
         tokio::spawn(async move {
-            room_bcast_forwarder(
-                state,
-                current_room,
-                outbound_tx,
-                fwd_cancel,
-                room_changed,
-                self_user_id,
-            )
-            .await;
+            room_bcast_forwarder(state, sub_rx, outbound_tx, fwd_cancel, self_user_id).await;
         });
     }
 
@@ -316,9 +309,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         }
         // Select: wake on the next inbound frame, the
         // forwarder producing a new envelope, or a cancel
-        // notification.
+        // notification. Deliberately NOT `biased`, so inbound and
+        // outbound each win a fair share of contested polls and a
+        // busy inbound socket cannot keep queued outbound envelopes
+        // waiting behind it.
         let frame = tokio::select! {
-            biased;
+            // Currently unreachable: `fwd_cancel` is only notified
+            // after this loop has exited.
             _ = fwd_cancel.notified() => {
                 debug!(request_id = %request_id, "ws forwarder cancelled");
                 break;
@@ -332,12 +329,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 None => break,
             },
             env = outbound_rx.recv() => {
-                if let Some(env) = env {
-                    if let Ok(msg) = encode_envelope_message(&env) {
-                        if let Err(e) = sender.send(msg).await {
-                            debug!(request_id = %request_id, error = %e, "ws send failed");
-                            break;
-                        }
+                // `None` means every sender is gone; exit instead
+                // of re-polling a closed channel in a tight loop.
+                let Some(env) = env else { break };
+                if let Ok(msg) = encode_envelope_message(&env) {
+                    if let Err(e) = sender.send(msg).await {
+                        debug!(request_id = %request_id, error = %e, "ws send failed");
+                        break;
                     }
                 }
                 continue;
@@ -536,6 +534,16 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         )
         .await;
 
+        // Subscribe the forwarder to the user's room NOW, before
+        // any reply (ROOM_CREATED / ROOM_JOINED) is written. The
+        // client treats that reply as "I am a member", so any
+        // broadcast published after it must already be buffered
+        // in this connection's Receiver. tokio broadcast does not
+        // replay messages sent before `subscribe`.
+        if let Some((uid, _)) = authed {
+            sync_room_subscription(&state, uid, &mut last_room, &sub_tx).await;
+        }
+
         let mut should_break = false;
         for action in outcome.actions {
             match action {
@@ -562,6 +570,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                         let mut g = self_user_id.lock().await;
                         *g = Some(user_id);
                     }
+                    // AUTH / AUTH_RESUME skipped the pre-reply sync
+                    // above (not yet authed). Upgrade is the first
+                    // action, so subscribing here still happens
+                    // before AUTH_OK / HOST_RECONNECTED are written,
+                    // and a resumed member cannot miss a broadcast
+                    // published right after the reply.
+                    sync_room_subscription(&state, user_id, &mut last_room, &sub_tx).await;
                     // P3-T05: register the connection's
                     // outbound_tx with the SignalRelay so
                     // the SIGNAL dispatcher can deliver
@@ -595,26 +610,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         if should_break {
             break;
         }
-
-        // Refresh the forwarder's view of the user's current
-        // room. Cheap (one read on the by_id map per authed
-        // message); the forwarder compares against its own
-        // last-known room and re-subscribes if it changed.
-        if let Some((uid, _)) = authed {
-            let r = state.rooms.get_user_room(uid).await;
-            let mut g = current_room.lock().await;
-            if *g != r {
-                *g = r;
-                drop(g);
-                room_changed.notify_waiters();
-            }
-        }
     }
 
-    // Stop the forwarder task. `outbound_tx` will also be
-    // dropped when the function returns, which is what the
-    // forwarder uses as the secondary exit signal.
+    // Stop the forwarder task. Dropping `sub_tx` closes its
+    // `sub_rx`, which is the reliable exit signal (the notify
+    // only reaches a forwarder that is currently parked).
     fwd_cancel.notify_waiters();
+    drop(sub_tx);
     drop(outbound_tx);
 
     // Mark the state machine closed.
@@ -1735,11 +1737,57 @@ fn encode_envelope_message(env: &Envelope) -> Result<Message, rmp_serde::encode:
     Ok(Message::Binary(bytes))
 }
 
-/// Per-connection room-broadcast forwarder. Watches the
-/// `current_room` cell; when the user joins a new room,
-/// subscribes to its broadcast channel; forwards every
-/// received item to the connection's `outbound_tx`. Exits
-/// when `cancel` is notified (the connection is closing).
+/// What the connection loop hands the forwarder: the broadcast
+/// `Receiver` for the user's current room, or `None` when the
+/// user is not in a room (drop any subscription).
+type RoomSubscription = Option<(
+    Uuid,
+    tokio::sync::broadcast::Receiver<crate::rooms::registry::BroadcastItem>,
+)>;
+
+/// Bring the forwarder's subscription in line with the user's
+/// current room. Called from the connection loop, so the
+/// `Receiver` exists (and buffers events) before the caller
+/// writes the reply that tells the client it is in the room.
+/// A no-op when the room is unchanged. If the room cannot be
+/// subscribed to (it vanished), the forwarder drops its old
+/// subscription and the next call retries.
+async fn sync_room_subscription(
+    state: &AppState,
+    user_id: Uuid,
+    last_room: &mut Option<Uuid>,
+    sub_tx: &tokio::sync::mpsc::UnboundedSender<RoomSubscription>,
+) {
+    // Sticky: while the user is still a member of the room we are
+    // subscribed to, keep that subscription. `get_user_room` picks
+    // an arbitrary room for a user who is in several, so
+    // re-deriving it on every message would flip the subscription
+    // at random.
+    if let Some(cur) = *last_room {
+        if state.rooms.is_user_in_room(user_id, cur).await {
+            return;
+        }
+    }
+    let room = state.rooms.get_user_room(user_id).await;
+    if room == *last_room {
+        return;
+    }
+    let sub: RoomSubscription = match room {
+        Some(rid) => state.rooms.subscribe(rid).await.map(|rx| (rid, rx)),
+        None => None,
+    };
+    // Always mirror what the forwarder will hold: on a failed
+    // subscribe this is `None`, so the next call retries.
+    *last_room = sub.as_ref().map(|(r, _)| *r);
+    let _ = sub_tx.send(sub);
+}
+
+/// Per-connection room-broadcast forwarder. Receives the
+/// already-taken broadcast `Receiver` for the user's current
+/// room from the connection loop (`sub_rx`; a newer one
+/// replaces and drops the old); forwards every received item to
+/// the connection's `outbound_tx`. Exits when `cancel` is
+/// notified or the connection loop is gone (`sub_rx` closed).
 ///
 /// The `self_user_id` is the connection's authenticated
 /// user_id; the forwarder uses it to filter the originator
@@ -1748,53 +1796,43 @@ fn encode_envelope_message(env: &Envelope) -> Result<Message, rmp_serde::encode:
 /// originated by another user or by the server.)
 async fn room_bcast_forwarder(
     state: AppState,
-    current_room: Arc<tokio::sync::Mutex<Option<Uuid>>>,
+    mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<RoomSubscription>,
     outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
     cancel: Arc<tokio::sync::Notify>,
-    room_changed: Arc<tokio::sync::Notify>,
     self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>>,
 ) {
-    let mut subscribed: Option<(
-        Uuid,
-        tokio::sync::broadcast::Receiver<crate::rooms::registry::BroadcastItem>,
-    )> = None;
+    let mut subscribed: RoomSubscription = None;
     loop {
-        // 1) Detect a room change. If the user moved, drop
-        // the old subscription and grab a new one.
-        let now_room = {
-            let g = current_room.lock().await;
-            *g
-        };
-        match (subscribed.as_ref(), now_room) {
-            (Some((cur, _)), Some(now)) if *cur == now => {}
-            (None, None) => {}
-            _ => {
-                subscribed = match now_room {
-                    Some(rid) => state.rooms.subscribe(rid).await.map(|rx| (rid, rx)),
-                    None => None,
-                };
-            }
-        }
-        // 2) Wait for a room change, or pull the next item
-        // from the current subscription.
-        let (room_id, item) = if let Some(s) = subscribed.as_mut() {
-            let (rid, rx) = s;
-            match rx.recv().await {
-                Ok(item) => (*rid, item),
+        // Wait for a new subscription from the connection loop
+        // (checked first, so a room change always wins over
+        // draining the old room), or the next item from the
+        // current subscription. `sub_rx.recv()` is cancel-safe
+        // and queues, so a room change is never missed.
+        let (room_id, item) = tokio::select! {
+            biased;
+            _ = cancel.notified() => return,
+            new = sub_rx.recv() => match new {
+                Some(s) => {
+                    // Replacing drops the old Receiver.
+                    subscribed = s;
+                    continue;
+                }
+                // Connection loop is gone.
+                None => return,
+            },
+            res = async {
+                match subscribed.as_mut() {
+                    Some((rid, rx)) => rx.recv().await.map(|item| (*rid, item)),
+                    None => std::future::pending().await,
+                }
+            } => match res {
+                Ok(pair) => pair,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     subscribed = None;
                     continue;
                 }
-            }
-        } else {
-            // No subscription. Wait for either a room
-            // change notification or a small sleep tick.
-            tokio::select! {
-                _ = cancel.notified() => return,
-                _ = room_changed.notified() => continue,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
-            }
+            },
         };
         // Filter events: skip if the originator is the
         // current user (they already got the direct reply),

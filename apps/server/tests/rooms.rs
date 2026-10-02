@@ -345,6 +345,38 @@ async fn expect_envelope(
     env
 }
 
+/// Like [`expect_envelope`], but with a caller-chosen timeout and
+/// a context label, and every failure message includes the
+/// received kind, `room_id` and payload. Used by the multi-room
+/// and immediate-join tests so a CI log can tell a lost broadcast
+/// apart from an event delivered for the wrong room.
+async fn expect_envelope_verbose(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    expected: MessageKind,
+    budget: Duration,
+    ctx: &str,
+) -> Envelope {
+    let started = std::time::Instant::now();
+    let bytes = match tokio::time::timeout(budget, read_binary(ws)).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => panic!("{ctx}: connection closed while waiting for {expected:?}"),
+        Err(_) => panic!("{ctx}: no frame within {budget:?} while waiting for {expected:?}"),
+    };
+    let env = decode(&bytes);
+    assert_eq!(
+        env.r#type,
+        expected,
+        "{ctx}: expected {expected:?}, got {:?} after {:?} (room_id={:?}, payload={})",
+        env.r#type,
+        started.elapsed(),
+        env.room_id,
+        env.payload
+    );
+    env
+}
+
 /// Read the next envelope but allow skipping over `MessageKind::Other`
 /// types if they ever appear.
 async fn next_envelope(
@@ -879,10 +911,21 @@ async fn concurrent_creates_distinct_codes() {
 // ---------------------------------------------------------------------------
 // 17. Multiple rooms in parallel: A creates room 1, B creates room 2,
 //     A joins room 2, B joins room 1. A is host of 1 and viewer in 2.
+//
+//     Covers two rooms alive at the same time with a cross-join (each
+//     user hosts one room and views the other). The final step (A
+//     receiving ParticipantJoined for B joining R1 while A is also a
+//     member of R2) relies on the server's current single-room
+//     subscription per connection, which sticks to the first room the
+//     user joined (R1 for A). Delivery for users in several rooms at
+//     once is unspecified by the architecture, so this step encodes
+//     current behaviour, not a documented guarantee. The room_id
+//     checks below make a future change in that rule fail loudly.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_rooms_in_parallel() {
+    const BUDGET: Duration = Duration::from_secs(30);
     let harness = spawn_test_server().await;
     let (kp_a, _) = fresh_keypair();
     let (kp_b, _) = fresh_keypair();
@@ -891,25 +934,151 @@ async fn multiple_rooms_in_parallel() {
     let a = complete_handshake(&mut ws_a, &kp_a).await;
     let b = complete_handshake(&mut ws_b, &kp_b).await;
     send_envelope(&mut ws_a, &room_create_envelope(a.token, "R1", false)).await;
-    let env_a1 = expect_envelope(&mut ws_a, MessageKind::RoomCreated).await;
+    let env_a1 =
+        expect_envelope_verbose(&mut ws_a, MessageKind::RoomCreated, BUDGET, "A create R1").await;
     let r1: RoomSummary = serde_json::from_value::<RoomCreatedPayload>(env_a1.payload)
         .unwrap()
         .room;
     let r1_id = r1.id;
     send_envelope(&mut ws_b, &room_create_envelope(b.token, "R2", false)).await;
-    let env_b1 = expect_envelope(&mut ws_b, MessageKind::RoomCreated).await;
+    let env_b1 =
+        expect_envelope_verbose(&mut ws_b, MessageKind::RoomCreated, BUDGET, "B create R2").await;
     let r2: RoomSummary = serde_json::from_value::<RoomCreatedPayload>(env_b1.payload)
         .unwrap()
         .room;
+    let r2_id = r2.id;
+    assert_ne!(r1_id, r2_id);
     // A joins R2.
     send_envelope(&mut ws_a, &room_join_envelope(a.token, &r2.code, "A")).await;
-    let _ = expect_envelope(&mut ws_a, MessageKind::RoomJoined).await;
-    let _ = expect_envelope(&mut ws_b, MessageKind::ParticipantJoined).await;
+    let env = expect_envelope_verbose(
+        &mut ws_a,
+        MessageKind::RoomJoined,
+        BUDGET,
+        "A join R2 reply",
+    )
+    .await;
+    let joined: RoomJoinedPayload = serde_json::from_value(env.payload.clone()).unwrap();
+    assert_eq!(
+        joined.room.id, r2_id,
+        "A join R2 reply: wrong room (room_id={:?}, payload={})",
+        env.room_id, env.payload
+    );
+    let env = expect_envelope_verbose(
+        &mut ws_b,
+        MessageKind::ParticipantJoined,
+        BUDGET,
+        "B told A joined R2",
+    )
+    .await;
+    assert_eq!(
+        env.room_id,
+        Some(r2_id),
+        "B told A joined R2: wrong room_id (payload={})",
+        env.payload
+    );
+    let pj: ParticipantJoinedPayload = serde_json::from_value(env.payload.clone()).unwrap();
+    assert_eq!(
+        pj.participant.user_id, a.user_id,
+        "B told A joined R2: wrong participant (room_id={:?}, payload={})",
+        env.room_id, env.payload
+    );
     // B joins R1.
     send_envelope(&mut ws_b, &room_join_envelope(b.token, &r1.code, "B")).await;
-    let _ = expect_envelope(&mut ws_b, MessageKind::RoomJoined).await;
-    let _ = expect_envelope(&mut ws_a, MessageKind::ParticipantJoined).await;
-    let _ = r1_id;
+    let env = expect_envelope_verbose(
+        &mut ws_b,
+        MessageKind::RoomJoined,
+        BUDGET,
+        "B join R1 reply",
+    )
+    .await;
+    let joined: RoomJoinedPayload = serde_json::from_value(env.payload.clone()).unwrap();
+    assert_eq!(
+        joined.room.id, r1_id,
+        "B join R1 reply: wrong room (room_id={:?}, payload={})",
+        env.room_id, env.payload
+    );
+    // Relies on the sticky first-room subscription (see header).
+    let env = expect_envelope_verbose(
+        &mut ws_a,
+        MessageKind::ParticipantJoined,
+        BUDGET,
+        "A told B joined R1",
+    )
+    .await;
+    assert_eq!(
+        env.room_id,
+        Some(r1_id),
+        "A told B joined R1: wrong room_id (payload={})",
+        env.payload
+    );
+    let pj: ParticipantJoinedPayload = serde_json::from_value(env.payload.clone()).unwrap();
+    assert_eq!(
+        pj.participant.user_id, b.user_id,
+        "A told B joined R1: wrong participant (room_id={:?}, payload={})",
+        env.room_id, env.payload
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a room creator must always be told about a joiner that joins
+// immediately after RoomCreated (no lost broadcast before the creator's
+// forwarder subscribes). The 6 s per-frame budget is generous enough for a
+// loaded CI runner yet well under the 15 s presence timeout, so a lost event
+// fails fast with a clear message instead of surfacing as the presence-timeout
+// ParticipantLeft.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_creator_always_sees_immediate_joiner_announced() {
+    const FRAME_BUDGET: Duration = Duration::from_secs(6);
+    let harness = spawn_test_server().await;
+    for iter in 0..100usize {
+        let (kp_a, _) = fresh_keypair();
+        let (kp_b, _) = fresh_keypair();
+        let mut ws_a = connect(harness.addr).await;
+        let mut ws_b = connect(harness.addr).await;
+        let a = complete_handshake(&mut ws_a, &kp_a).await;
+        let b = complete_handshake(&mut ws_b, &kp_b).await;
+        send_envelope(&mut ws_b, &room_create_envelope(b.token, "R", false)).await;
+        let env_b = expect_envelope(&mut ws_b, MessageKind::RoomCreated).await;
+        let room: RoomSummary = serde_json::from_value::<RoomCreatedPayload>(env_b.payload)
+            .unwrap()
+            .room;
+        // Immediately (no sleep) join from the already-authenticated A.
+        send_envelope(&mut ws_a, &room_join_envelope(a.token, &room.code, "A")).await;
+        let _ = expect_envelope(&mut ws_a, MessageKind::RoomJoined).await;
+        let ctx = format!("iteration {iter}: creator waiting for ParticipantJoined");
+        let env = expect_envelope_verbose(
+            &mut ws_b,
+            MessageKind::ParticipantJoined,
+            FRAME_BUDGET,
+            &ctx,
+        )
+        .await;
+        assert_eq!(
+            env.room_id,
+            Some(room.id),
+            "iteration {iter}: ParticipantJoined for wrong room (expected {}, payload={})",
+            room.id,
+            env.payload
+        );
+        let pj: ParticipantJoinedPayload = serde_json::from_value(env.payload.clone())
+            .unwrap_or_else(|e| {
+                panic!(
+                    "iteration {iter}: bad ParticipantJoined payload ({e}): room_id={:?}, payload={}",
+                    env.room_id, env.payload
+                )
+            });
+        assert_eq!(
+            pj.participant.user_id, a.user_id,
+            "iteration {iter}: ParticipantJoined names the wrong user (room_id={:?}, payload={})",
+            env.room_id, env.payload
+        );
+        // Close both sockets with a close frame so the server tears the
+        // connections down promptly instead of waiting on a dead TCP peer.
+        let _ = ws_a.close(None).await;
+        let _ = ws_b.close(None).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
