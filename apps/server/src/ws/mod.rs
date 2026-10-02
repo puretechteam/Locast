@@ -1846,7 +1846,13 @@ async fn room_bcast_forwarder(
             if item.originator == Some(uid) {
                 continue;
             }
-            if !state.rooms.is_user_in_room(uid, room_id).await {
+            // ROOM_CLOSED is published just before the registry
+            // removes the room, so by the time this forwarder runs
+            // the room (and the membership) may already be gone;
+            // it must still reach everyone who was in the room.
+            if item.kind != MessageKind::RoomClosed
+                && !state.rooms.is_user_in_room(uid, room_id).await
+            {
                 continue;
             }
         }
