@@ -165,6 +165,33 @@ jobs:
       - name: pnpm test
         run: pnpm -r test
 
+  # P8-T04: supply-chain gates (docs/ARCHITECTURE.md section 21.13).
+  # cargo-deny checks advisories, licenses, bans, and sources per deny.toml.
+  # pnpm audit fails the build on high or critical production advisories.
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm audit (production, high and above)
+        run: pnpm audit --prod --audit-level=high
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

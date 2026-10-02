@@ -1,0 +1,67 @@
+# cargo-deny policy for Locast (P8-T04).
+#
+# Mirrors docs/ARCHITECTURE.md section 21.13: license allowlist, RustSec
+# advisories, banned crates, and a crates.io-only source allowlist.
+# The exact license allowlist is an open decision (Appendix A) and is expected
+# to be tightened in v1.5.
+#
+# Run locally with:  cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Every entry below is an "unmaintained" notice (no known exploitable flaw) on a
+# transitive dependency we cannot upgrade ourselves. Revisit when the upstream
+# crate moves. A real vulnerability must be fixed, never added here.
+ignore = [
+    # paste: proc-macro only, pulled in by specta (tauri-specta).
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro; transitive via specta/tauri-specta" },
+    # proc-macro-error: proc-macro only, pulled in by gtk3-macros (tauri on Linux).
+    { id = "RUSTSEC-2024-0370", reason = "unmaintained proc-macro; transitive via gtk3-macros/tauri" },
+    # rust-unic family: pulled in by urlpattern <- tauri-utils.
+    { id = "RUSTSEC-2025-0075", reason = "unic-char-range unmaintained; transitive via urlpattern/tauri-utils" },
+    { id = "RUSTSEC-2025-0080", reason = "unic-common unmaintained; transitive via urlpattern/tauri-utils" },
+    { id = "RUSTSEC-2025-0081", reason = "unic-char-property unmaintained; transitive via urlpattern/tauri-utils" },
+    { id = "RUSTSEC-2025-0098", reason = "unic-ucd-version unmaintained; transitive via urlpattern/tauri-utils" },
+    { id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident unmaintained; transitive via urlpattern/tauri-utils" },
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "OpenSSL",
+    "curl",
+    "libpng-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+# Crates that must never enter the dependency graph.
+deny = [
+    # Native OpenSSL bindings are not used; TLS goes through rustls.
+    { crate = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

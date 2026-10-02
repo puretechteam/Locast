@@ -51,6 +51,20 @@ else
     fail "cargo clippy reported warnings or errors"
 fi
 
+step "cargo deny check (deny.toml)"
+if cargo deny --all-features check; then
+    ok
+else
+    fail "cargo deny check failed (install with: cargo install cargo-deny --locked)"
+fi
+
+step "pnpm audit --prod --audit-level=high"
+if pnpm audit --prod --audit-level=high; then
+    ok
+else
+    fail "pnpm audit found high or critical production advisories"
+fi
+
 step "cargo test --workspace"
 if cargo test --workspace; then
     ok

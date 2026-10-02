@@ -52,6 +52,16 @@ cargo clippy --workspace --all-targets -j 1 -- -D warnings
 if ($LASTEXITCODE -ne 0) { Fail "cargo clippy reported warnings or errors" }
 Ok
 
+Step "cargo deny check (deny.toml)"
+cargo deny --all-features check
+if ($LASTEXITCODE -ne 0) { Fail "cargo deny check failed (install with: cargo install cargo-deny --locked)" }
+Ok
+
+Step "pnpm audit --prod --audit-level=high"
+pnpm audit --prod --audit-level=high
+if ($LASTEXITCODE -ne 0) { Fail "pnpm audit found high or critical production advisories" }
+Ok
+
 Step "cargo test --workspace -j 1"
 cargo test --workspace -j 1
 if ($LASTEXITCODE -ne 0) { Fail "cargo test --workspace had failing tests" }
