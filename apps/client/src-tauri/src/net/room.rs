@@ -184,6 +184,13 @@ pub struct RoomSummaryIpc {
     /// in `ROOM_CREATED` / `ROOM_JOINED`. `None` until the
     /// room summary is loaded from a create/join response.
     pub you_cap_set: Option<u32>,
+    /// The local user's server-assigned `user_id`, filled from
+    /// the `RoomClient`'s `local_user_id` whenever the summary
+    /// is read (`room_get_state`) or emitted (`room://state`,
+    /// `room://event`). Lets the webview tell host from viewer
+    /// (`you_user_id == host_user_id`). Display only: the
+    /// server enforces every host-only action.
+    pub you_user_id: Option<String>,
 }
 
 impl From<RoomSummary> for RoomSummaryIpc {
@@ -199,6 +206,7 @@ impl From<RoomSummary> for RoomSummaryIpc {
             host_disconnected: s.host_disconnected,
             host_disconnect_deadline_ms: s.host_disconnect_deadline_ms,
             you_cap_set: None,
+            you_user_id: None,
         }
     }
 }
@@ -759,6 +767,12 @@ pub struct RoomClient {
     /// `rejoin_active_room` to re-issue ROOM_JOIN_REQUEST
     /// after a WS reconnect.
     active_room_code: StdMutex<Option<(String, String)>>,
+    /// The library item ids the host explicitly chose to share
+    /// with `manifest_publish`. `None` means "all permanent
+    /// items" (the pre-selection behaviour). Kept so the
+    /// post-reconnect auto-republish re-shares the same media
+    /// instead of silently widening the selection.
+    host_media_selection: StdMutex<Option<Vec<String>>>,
 }
 
 impl RoomClient {
@@ -779,6 +793,7 @@ impl RoomClient {
             local_user_id: Mutex::new(None),
             pending_outbound: StdMutex::new(Vec::new()),
             active_room_code: StdMutex::new(None),
+            host_media_selection: StdMutex::new(None),
         }
     }
 
@@ -812,6 +827,60 @@ impl RoomClient {
             .expected_host_pubkey
             .lock()
             .expect("expected_host_pubkey lock") = Some(pubkey);
+    }
+
+    /// Drop the trust anchor. Called before a join that has no
+    /// invite `h=` key so an anchor from a previous room can
+    /// never vouch for this room's manifests; with no anchor
+    /// every manifest is rejected with `NoTrustAnchor`.
+    pub fn clear_expected_host_pubkey(&self) {
+        *self
+            .expected_host_pubkey
+            .lock()
+            .expect("expected_host_pubkey lock") = None;
+    }
+
+    /// Remember the media ids the host chose to share (see
+    /// [`RoomClient::host_media_selection`]).
+    pub fn set_host_media_selection(&self, selection: Option<Vec<String>>) {
+        *self
+            .host_media_selection
+            .lock()
+            .expect("host_media_selection lock") = selection;
+    }
+
+    /// The media ids the host last chose to share, if any.
+    pub fn host_media_selection(&self) -> Option<Vec<String>> {
+        self.host_media_selection
+            .lock()
+            .expect("host_media_selection lock")
+            .clone()
+    }
+
+    /// The server-assigned version of the verified manifest
+    /// cached for `room_id`, if any.
+    pub fn verified_manifest_version(&self, room_id: Uuid) -> Option<i64> {
+        self.current_versions
+            .lock()
+            .expect("current_versions lock")
+            .get(&room_id)
+            .copied()
+    }
+
+    /// Mirror a server room snapshot into the local `rooms` /
+    /// `room_participants` / `user_identities` tables so the
+    /// download path can resolve the room and its peers. No-op
+    /// when no storage pool is installed (unit tests).
+    async fn mirror_room_snapshot(&self, room: &RoomSummary, local_user_id: Option<Uuid>) {
+        let pool = self.pool.lock().ok().and_then(|g| g.clone());
+        if let Some(pool) = pool {
+            crate::storage::room_snapshot::persist_room_snapshot_best_effort(
+                &pool,
+                room,
+                local_user_id,
+            )
+            .await;
+        }
     }
 
     /// Read the current trust anchor, if any.
@@ -862,7 +931,19 @@ impl RoomClient {
     /// updated every time the client receives a
     /// `ROOM_STATE` or one of the create/join/leave replies.
     pub async fn state(&self) -> Option<RoomSummaryIpc> {
-        self.state.lock().await.clone()
+        let summary = self.state.lock().await.clone();
+        match summary {
+            Some(s) => Some(self.with_you(&s).await),
+            None => None,
+        }
+    }
+
+    /// Copy of `summary` with `you_user_id` set from the
+    /// current `local_user_id`.
+    async fn with_you(&self, summary: &RoomSummaryIpc) -> RoomSummaryIpc {
+        let mut out = summary.clone();
+        out.you_user_id = self.local_user_id.lock().await.map(|u| u.to_string());
+        out
     }
 
     /// Read the local user's server-assigned `user_id` (Uuid v7).
@@ -989,6 +1070,7 @@ impl RoomClient {
         if let Ok(mut g) = self.active_room_code.lock() {
             *g = None;
         }
+        self.set_host_media_selection(None);
         self.abort_presence_loop().await;
         Ok(())
     }
@@ -1420,13 +1502,15 @@ impl RoomClient {
         //    cache so a request that completes in the
         //    same frame as a broadcast sees the reply
         //    first, then any state changes follow.
-        self.deliver_to_pending(&env).await;
+        let resolved = self.deliver_to_pending(&env).await;
         // 2) Update the cached state and emit Tauri
         //    events for the types that callers care
         //    about.
         match env.r#type {
             MessageKind::RoomState => {
                 if let Ok(state) = decode_payload::<RoomStatePayload>(&env) {
+                    let local = *self.local_user_id.lock().await;
+                    self.mirror_room_snapshot(&state.room, local).await;
                     let summary = RoomSummaryIpc::from(state.room);
                     *self.state.lock().await = Some(summary.clone());
                     self.emit_state(&summary).await;
@@ -1434,6 +1518,8 @@ impl RoomClient {
             }
             MessageKind::RoomJoined => {
                 if let Ok(p) = decode_payload::<locast_protocol::room::RoomJoinedPayload>(&env) {
+                    self.mirror_room_snapshot(&p.room, Some(p.you.user_id))
+                        .await;
                     let mut summary = RoomSummaryIpc::from(p.room);
                     summary.you_cap_set = Some(p.you.cap_set);
                     *self.state.lock().await = Some(summary.clone());
@@ -1456,6 +1542,8 @@ impl RoomClient {
             }
             MessageKind::RoomCreated => {
                 if let Ok(p) = decode_payload::<locast_protocol::room::RoomCreatedPayload>(&env) {
+                    self.mirror_room_snapshot(&p.room, Some(p.you.user_id))
+                        .await;
                     let mut summary = RoomSummaryIpc::from(p.room);
                     summary.you_cap_set = Some(p.you.cap_set);
                     *self.state.lock().await = Some(summary.clone());
@@ -1473,6 +1561,8 @@ impl RoomClient {
                     // behavior of updating only the host
                     // fields.
                     if let Some(boxed) = m.summary {
+                        let local = *self.local_user_id.lock().await;
+                        self.mirror_room_snapshot(&boxed, local).await;
                         let summary = RoomSummaryIpc::from(*boxed);
                         *self.state.lock().await = Some(summary.clone());
                         self.emit_state(&summary).await;
@@ -1559,6 +1649,13 @@ impl RoomClient {
                         self.emit_event(s).await;
                     }
                 }
+            }
+            // A ROOM_ERROR answering a manifest fetch (e.g. the
+            // late-join fetch before the host has published
+            // anything) fails that request only; it does not
+            // end the room.
+            MessageKind::RoomError if resolved == Some(MessageKind::ManifestResponse) => {
+                tracing::debug!("ROOM_ERROR answered a manifest fetch; room state kept");
             }
             MessageKind::RoomClosed | MessageKind::RoomError => {
                 *self.state.lock().await = None;
@@ -1729,9 +1826,11 @@ impl RoomClient {
                     decode_payload::<locast_protocol::room::CapabilityUpdatePayload>(&env)
                 {
                     let mut g = self.state.lock().await;
-                    let local_user_id = self.local_user_id.lock().await;
+                    // Copy, do not hold: `emit_state` re-locks
+                    // `local_user_id` to fill `you_user_id`.
+                    let local_user_id = *self.local_user_id.lock().await;
                     if let Some(s) = g.as_mut() {
-                        if Some(payload.target_user_id) == *local_user_id {
+                        if Some(payload.target_user_id) == local_user_id {
                             s.you_cap_set = Some(payload.cap_set);
                         } else if let Some(participant) = s
                             .participants
@@ -1757,7 +1856,10 @@ impl RoomClient {
     /// (the first error to arrive resolves the pending
     /// request regardless of which kind the caller
     /// expects).
-    async fn deliver_to_pending(&self, env: &Envelope) {
+    ///
+    /// Returns the reply kind of the request the envelope
+    /// resolved, if any.
+    async fn deliver_to_pending(&self, env: &Envelope) -> Option<MessageKind> {
         // RoomError resolves any pending request that has
         // not been satisfied yet. Pop the first sender
         // for the envelope's own kind first, then fall
@@ -1767,20 +1869,21 @@ impl RoomClient {
             if !senders.is_empty() {
                 let tx = senders.remove(0);
                 let _ = tx.send(env.clone());
-                return;
+                return Some(env.r#type.clone());
             }
         }
         if env.r#type == MessageKind::RoomError {
             // Route the error to the first pending
             // request of any kind.
-            for senders in pending.values_mut() {
+            for (kind, senders) in pending.iter_mut() {
                 if !senders.is_empty() {
                     let tx = senders.remove(0);
                     let _ = tx.send(env.clone());
-                    return;
+                    return Some(kind.clone());
                 }
             }
         }
+        None
     }
 
     /// Send an envelope and wait for a specific reply
@@ -1843,9 +1946,10 @@ impl RoomClient {
     /// Best-effort emit of the `room://state` event. A
     /// missing sink is a no-op.
     async fn emit_state(&self, summary: &RoomSummaryIpc) {
+        let summary = self.with_you(summary).await;
         let g = self.sink.lock().await;
         if let Some(s) = g.as_ref() {
-            s.emit_state(summary);
+            s.emit_state(&summary);
         }
     }
 
@@ -1864,9 +1968,10 @@ impl RoomClient {
     /// React layer can update its cache and react to the
     /// delta with a single listener.
     async fn emit_event(&self, summary: &RoomSummaryIpc) {
+        let summary = self.with_you(summary).await;
         let g = self.sink.lock().await;
         if let Some(s) = g.as_ref() {
-            s.emit_event(summary);
+            s.emit_event(&summary);
         }
     }
 
@@ -2229,6 +2334,34 @@ mod tests {
         );
         rc.handle_inbound(env).await;
         assert!(rc.state().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn room_error_for_a_manifest_fetch_keeps_the_room() {
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+        let (tx, rx) = oneshot::channel();
+        rc.pending
+            .lock()
+            .await
+            .entry(MessageKind::ManifestResponse)
+            .or_default()
+            .push(tx);
+        let env = env_of(
+            MessageKind::RoomError,
+            serde_json::to_value(RoomErrorPayload {
+                code: RoomErrorCode::InvalidState,
+                message: "no manifest".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        assert_eq!(rx.await.expect("waiter").r#type, MessageKind::RoomError);
+        assert!(
+            rc.state().await.is_some(),
+            "a failed fetch must not end the room"
+        );
     }
 
     #[tokio::test]
@@ -2771,6 +2904,63 @@ mod tests {
         ));
         // No manifest cached.
         assert!(rc.verified_manifest(room_uuid).is_none());
+    }
+
+    #[tokio::test]
+    async fn cleared_trust_anchor_rejects_a_previously_trusted_host() {
+        // A code-only join clears the anchor; an anchor from an
+        // earlier invite must not vouch for the new room.
+        let seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03,
+            0x1c, 0xae, 0x7f, 0x60,
+        ];
+        let sign = |room: Uuid| {
+            locast_manifest::sign_manifest(
+                &seed,
+                &locast_manifest::MediaManifest {
+                    manifest_version: 1,
+                    room_id: room.to_string(),
+                    media: vec![],
+                    subtitles: vec![],
+                    created_at: 1_700_000_000_000,
+                    host_signature: None,
+                },
+            )
+            .expect("sign")
+        };
+        let first = sign(Uuid::now_v7());
+        let pk_b64 = first
+            .host_signature
+            .as_ref()
+            .expect("signed")
+            .public_key
+            .clone();
+        let pk: [u8; 32] = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(pk_b64)
+                .expect("b64")
+                .try_into()
+                .expect("32 bytes")
+        };
+
+        let rc = fresh_room_client().await;
+        rc.set_expected_host_pubkey(pk);
+        rc.accept_manifest(first, 1, 0, "MANIFEST_RESPONSE")
+            .await
+            .expect("trusted host accepted");
+
+        rc.clear_expected_host_pubkey();
+        assert!(rc.expected_host_pubkey().is_none());
+        let second = sign(Uuid::now_v7());
+        let second_room = Uuid::parse_str(&second.room_id).expect("uuid");
+        let err = rc
+            .accept_manifest(second, 1, 0, "MANIFEST_PUBLISHED")
+            .await
+            .expect_err("no anchor after clear");
+        assert!(matches!(err, super::ManifestAcceptError::NoTrustAnchor));
+        assert!(rc.verified_manifest(second_room).is_none());
     }
 
     #[tokio::test]

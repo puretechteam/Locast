@@ -35,7 +35,7 @@ use crate::transfer::registry::TransferRegistry;
 #[tauri::command]
 #[specta::specta]
 pub async fn room_connect_signaling(
-    signaling: TauriState<'_, SignalingClient>,
+    signaling: TauriState<'_, std::sync::Arc<SignalingClient>>,
 ) -> Result<(), AppError> {
     signaling
         .start()
@@ -48,26 +48,154 @@ pub async fn room_connect_signaling(
 #[tauri::command]
 #[specta::specta]
 pub async fn room_create(
-    room: TauriState<'_, RoomClient>,
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
     title: String,
     migration_enabled: bool,
 ) -> Result<RoomSummaryIpc, AppError> {
+    // A trust anchor or media selection left over from a
+    // previous room must not leak into this one. The host
+    // installs its own key on its first publish.
+    room.clear_expected_host_pubkey();
+    room.set_host_media_selection(None);
     room.room_create(title, migration_enabled)
         .await
         .map_err(room_err_to_app)
 }
 
 /// Join a room by 6-char code and display name.
+///
+/// `invite_url` is the host's `locast://join/<code>?h=<key>&v=1`
+/// invite. When present it is parsed by the strict
+/// [`crate::room::invite::parse_invite`], its room code must match
+/// `code`, and its `h=` key becomes the manifest trust anchor
+/// BEFORE the join is sent (so a manifest broadcast that races the
+/// join reply is checked against it). Without an invite the anchor
+/// is cleared: the viewer can sit in the room but every manifest is
+/// rejected with `NoTrustAnchor`, so nothing is downloaded.
 #[tauri::command]
 #[specta::specta]
 pub async fn room_join(
-    room: TauriState<'_, RoomClient>,
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
     code: String,
     display_name: String,
+    invite_url: Option<String>,
 ) -> Result<RoomSummaryIpc, AppError> {
+    let anchor = invite_anchor_for(&code, invite_url.as_deref())?;
+    match anchor {
+        Some(pk) => room.set_expected_host_pubkey(pk),
+        None => room.clear_expected_host_pubkey(),
+    }
     room.room_join(code, display_name)
         .await
         .map_err(room_err_to_app)
+}
+
+/// Parse an optional invite URL and check it belongs to `code`.
+/// Returns the host pubkey to use as the manifest trust anchor.
+pub fn invite_anchor_for(
+    code: &str,
+    invite_url: Option<&str>,
+) -> Result<Option<[u8; 32]>, AppError> {
+    let Some(url) = invite_url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = crate::room::invite::parse_invite(INVITE_SCHEME, url)
+        .map_err(|e| AppError::other(format!("invalid invite link: {e}")))?;
+    if !parsed.room_code.eq_ignore_ascii_case(code) {
+        return Err(AppError::other(
+            "invite link is for a different room code".to_string(),
+        ));
+    }
+    Ok(Some(parsed.host_pubkey))
+}
+
+/// The URL scheme used for invite links.
+const INVITE_SCHEME: &str = "locast";
+
+/// Return the invite link for the current room. Host only: the
+/// link carries the host's own public key as the viewers' trust
+/// anchor, so only the host can vouch for it. A viewer gets an
+/// error rather than a link built from a key it learned from the
+/// server.
+#[tauri::command]
+#[specta::specta]
+pub async fn room_invite_url(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    identity: TauriState<'_, std::sync::Arc<crate::identity::keystore::IdentityService>>,
+) -> Result<String, AppError> {
+    let summary = room
+        .state()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    let local = room
+        .local_user_id()
+        .await
+        .ok_or_else(|| AppError::other("not in a room".to_string()))?;
+    if summary.host_user_id != local.to_string() {
+        return Err(AppError::other(
+            "only the host can share the invite link".to_string(),
+        ));
+    }
+    let kp = identity
+        .load_keypair()
+        .await
+        .map_err(|e| AppError::other(format!("identity: {e}")))?;
+    crate::room::host::build_invite_url(
+        INVITE_SCHEME,
+        &summary.code,
+        kp.signing.verifying_key().to_bytes(),
+    )
+    .map_err(|e| AppError::other(e.to_string()))
+}
+
+/// One shared media item, as the room UI needs it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct SharedMediaIpc {
+    pub id: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub mime: String,
+    pub sha256: String,
+}
+
+/// The verified manifest currently cached for the room.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
+pub struct SharedManifestIpc {
+    pub room_id: String,
+    pub version: Option<i64>,
+    pub media: Vec<SharedMediaIpc>,
+}
+
+/// Return the manifest the local client has ACCEPTED for the
+/// current room (signature + trust anchor checked by
+/// `RoomClient::accept_manifest`), or `None`. Read-only: it never
+/// contacts the server and never bypasses verification, because
+/// only verified manifests enter the cache.
+#[tauri::command]
+#[specta::specta]
+pub async fn manifest_current(
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
+) -> Result<Option<SharedManifestIpc>, AppError> {
+    let Some(summary) = room.state().await else {
+        return Ok(None);
+    };
+    let room_id = Uuid::parse_str(&summary.id)
+        .map_err(|e| AppError::other(format!("bad cached room id: {e}")))?;
+    Ok(room.verified_manifest(room_id).map(|m| SharedManifestIpc {
+        room_id: summary.id.clone(),
+        version: room.verified_manifest_version(room_id),
+        media: m
+            .media
+            .into_iter()
+            .map(|e| SharedMediaIpc {
+                id: e.id,
+                filename: e.filename,
+                size_bytes: e.size_bytes,
+                mime: e.mime,
+                sha256: e.sha256,
+            })
+            .collect(),
+    }))
 }
 
 /// Leave the current room. The server broadcasts
@@ -84,7 +212,7 @@ pub async fn room_join(
 #[tauri::command]
 #[specta::specta]
 pub async fn room_leave(
-    room: TauriState<'_, RoomClient>,
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
     registry: TauriState<'_, std::sync::Arc<TransferRegistry>>,
 ) -> Result<(), AppError> {
     let res = room.room_leave().await.map_err(room_err_to_app);
@@ -96,7 +224,7 @@ pub async fn room_leave(
 #[tauri::command]
 #[specta::specta]
 pub async fn room_get_state(
-    room: TauriState<'_, RoomClient>,
+    room: TauriState<'_, std::sync::Arc<RoomClient>>,
 ) -> Result<Option<RoomSummaryIpc>, AppError> {
     Ok(room.state().await)
 }
@@ -186,7 +314,13 @@ pub async fn manifest_publish(
     identity: TauriState<'_, std::sync::Arc<crate::identity::keystore::IdentityService>>,
     signaling: TauriState<'_, std::sync::Arc<SignalingClient>>,
     storage: TauriState<'_, Storage>,
+    media_ids: Option<Vec<String>>,
 ) -> Result<(), AppError> {
+    if matches!(&media_ids, Some(ids) if ids.is_empty()) {
+        return Err(AppError::other(
+            "select at least one media item to share".to_string(),
+        ));
+    }
     let summary = room
         .state()
         .await
@@ -199,13 +333,14 @@ pub async fn manifest_publish(
     // on-disk media file for `Source::chunk_hashes`.
     let library_root = crate::core::paths::library_root_for(storage.path())
         .ok_or_else(|| AppError::other("library root has no parent".to_string()))?;
-    crate::room::host::build_sign_and_publish(
+    crate::room::host::build_sign_and_publish_selected(
         identity.inner().clone(),
         signaling.inner().clone(),
         room.inner().clone(),
         storage.pool(),
         library_root,
         room_id,
+        media_ids,
     )
     .await
     .map_err(|e| AppError::other(e.to_string()))
@@ -258,4 +393,43 @@ pub async fn room_chat_message(
     room.chat_message(room_id, text, reply_to_uuid)
         .await
         .map_err(|e| AppError::other(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::invite_anchor_for;
+
+    const PK: [u8; 32] = [7u8; 32];
+
+    fn invite(code: &str) -> String {
+        crate::room::host::build_invite_url("locast", code, PK).expect("url")
+    }
+
+    #[test]
+    fn no_invite_means_no_anchor() {
+        assert_eq!(invite_anchor_for("ABCDEF", None).unwrap(), None);
+        assert_eq!(invite_anchor_for("ABCDEF", Some("  ")).unwrap(), None);
+    }
+
+    #[test]
+    fn matching_invite_yields_the_host_key() {
+        let url = invite("ABCDEF");
+        assert_eq!(invite_anchor_for("ABCDEF", Some(&url)).unwrap(), Some(PK));
+        assert_eq!(invite_anchor_for("abcdef", Some(&url)).unwrap(), Some(PK));
+    }
+
+    #[test]
+    fn invite_for_another_room_is_rejected() {
+        let url = invite("ABCDEF");
+        assert!(invite_anchor_for("ZZZZZZ", Some(&url)).is_err());
+    }
+
+    #[test]
+    fn malformed_invite_is_rejected() {
+        assert!(invite_anchor_for("ABCDEF", Some("locast://join/ABCDEF")).is_err());
+        assert!(
+            invite_anchor_for("ABCDEF", Some("https://evil.example/join/ABCDEF?h=AAAA")).is_err()
+        );
+        assert!(invite_anchor_for("ABCDEF", Some("locast://join/ABCDEF?h=AAAA&v=1")).is_err());
+    }
 }

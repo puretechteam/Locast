@@ -97,6 +97,13 @@ fn is_unique_violation_chunk(e: &crate::transfer::state::ChunkStateError) -> boo
 /// `state` is one of the `DownloadState` strings ("pending",
 /// "complete", "failed", ...). `dedup_hit` is true when the
 /// command resolved locally without a transfer.
+///
+/// `transfer_started` is true when a transfer task is running for
+/// this download (spawned by this call or already registered).
+/// `state == "pending" && !dedup_hit && !transfer_started` means no
+/// source peer had an open DataChannel yet; calling `download_open`
+/// again later reuses the same row and starts the transfer once a
+/// peer is connected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct DownloadSessionIpc {
     pub download_id: String,
@@ -106,6 +113,7 @@ pub struct DownloadSessionIpc {
     pub total_bytes: u64,
     pub transferred_bytes: u64,
     pub on_disk_path: Option<String>,
+    pub transfer_started: bool,
 }
 
 /// Tauri command: open (or resume) a download for one media item
@@ -256,6 +264,7 @@ pub async fn open_download_inner(
             total_bytes: 0,
             transferred_bytes: 0,
             on_disk_path: None,
+            transfer_started: false,
         });
     }
 
@@ -307,6 +316,7 @@ pub async fn open_download_inner(
                 total_bytes: entry.size_bytes,
                 transferred_bytes: entry.size_bytes,
                 on_disk_path: Some(on_disk_path),
+                transfer_started: false,
             })
         }
         DedupOutcome::PromotedFromTemporary { on_disk_path, .. } => {
@@ -347,6 +357,7 @@ pub async fn open_download_inner(
                 total_bytes: entry.size_bytes,
                 transferred_bytes: entry.size_bytes,
                 on_disk_path: Some(on_disk_path),
+                transfer_started: false,
             })
         }
         DedupOutcome::Missing => {
@@ -376,6 +387,28 @@ pub async fn open_download_inner(
                 &chunk_hashes,
             )
             .await?;
+            // A retry (or a duplicate call) for a row whose
+            // transfer is already running must not spawn a
+            // second orchestrator: `TransferRegistry::register`
+            // would cancel the running one.
+            if registry.is_active(&active_download_id).await {
+                let (state, transferred): (String, i64) =
+                    sqlx::query_as("SELECT state, transferred_bytes FROM downloads WHERE id = ?1")
+                        .bind(&active_download_id)
+                        .fetch_one(&storage.pool())
+                        .await
+                        .map_err(|e| AppError::other(format!("downloads SELECT: {e}")))?;
+                return Ok(DownloadSessionIpc {
+                    download_id: active_download_id,
+                    media_id: resolved_media_id,
+                    state,
+                    dedup_hit: false,
+                    total_bytes: entry.size_bytes,
+                    transferred_bytes: transferred.max(0) as u64,
+                    on_disk_path: None,
+                    transfer_started: true,
+                });
+            }
             // P3-T13: wire the actual transfer on the Missing
             // path. We need:
             //   1. a `user_id -> [u8;32] pubkey` lookup table
@@ -466,6 +499,7 @@ pub async fn open_download_inner(
                     total_bytes: entry.size_bytes,
                     transferred_bytes: 0,
                     on_disk_path: None,
+                    transfer_started: false,
                 });
             }
 
@@ -504,10 +538,11 @@ pub async fn open_download_inner(
             let media_id_for_panic = resolved_media_id.clone();
             let download_id_for_panic = download_id_for_task.clone();
             let download_id_for_err = download_id_for_task.clone();
+            let guard = registry_for_task
+                .register(download_id_for_task, cancel_for_registry)
+                .await;
             tokio::spawn(async move {
-                let _guard = registry_for_task
-                    .register(download_id_for_task.clone(), cancel_for_registry)
-                    .await;
+                let _guard = guard;
                 // P7-T05: wrap in panic boundary
                 if let Err(e) = crate::transfer::panic_boundary::spawn_panic_safe(
                     download_id_for_panic.clone(),
@@ -549,6 +584,7 @@ pub async fn open_download_inner(
                 total_bytes: entry.size_bytes,
                 transferred_bytes: 0,
                 on_disk_path: None,
+                transfer_started: true,
             })
         }
     }
@@ -944,7 +980,7 @@ pub async fn download_pause(
 #[specta::specta]
 pub async fn download_resume(
     storage: TauriState<'_, Storage>,
-    room_client: TauriState<'_, crate::net::room::RoomClient>,
+    room_client: TauriState<'_, Arc<crate::net::room::RoomClient>>,
     download_id: String,
 ) -> Result<(), AppError> {
     // P7-T07: trigger manifest reconciliation on resume

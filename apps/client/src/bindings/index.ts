@@ -55,6 +55,13 @@
 // `libraryList`, `libraryMakePermanent`, and `libraryDelete`
 // commands (and the `LibraryItem` type) and corrected the
 // `mediaImport` invoke name to the Rust command's `media_import`.
+// Slice 3 (host share / viewer download) added the
+// `manifestPublish`, `manifestFetch`, `manifestCurrent`, and
+// `roomInviteUrl` commands (and the `SharedManifestIpc` /
+// `SharedMediaIpc` / `ManifestResponsePayload` types), the
+// `inviteUrl` argument of `roomJoin`, `you_user_id` on
+// `RoomSummaryIpc`, `transfer_started` on `DownloadSessionIpc`, and
+// the `manifestState` event listener (`manifest://state`).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -119,8 +126,34 @@ export const commands = {
   ): Promise<RoomSummaryIpc> {
     return await __TAURI_INVOKE("room_create", { title, migrationEnabled });
   },
-  async roomJoin(code: string, displayName: string): Promise<RoomSummaryIpc> {
-    return await __TAURI_INVOKE("room_join", { code, displayName });
+  // `inviteUrl` is the host's `locast://join/<code>?h=<key>&v=1`
+  // link; its `h=` key is the manifest trust anchor. Without it
+  // the viewer can join but every manifest is rejected.
+  async roomJoin(
+    code: string,
+    displayName: string,
+    inviteUrl: string | null = null,
+  ): Promise<RoomSummaryIpc> {
+    return await __TAURI_INVOKE("room_join", { code, displayName, inviteUrl });
+  },
+  // Host only: the invite link carrying the host's public key.
+  async roomInviteUrl(): Promise<string> {
+    return await __TAURI_INVOKE("room_invite_url");
+  },
+  // Host only (server-enforced): sign and publish a manifest for
+  // the chosen library items (`null` = every permanent item).
+  async manifestPublish(mediaIds: string[] | null): Promise<void> {
+    await __TAURI_INVOKE("manifest_publish", { mediaIds });
+  },
+  // Late-join fetch of the room's current manifest. The result is
+  // accepted only after signature + trust-anchor checks in Rust.
+  // `mediaId` is informational (the server returns the latest).
+  async manifestFetch(mediaId: string): Promise<ManifestResponsePayload> {
+    return await __TAURI_INVOKE("manifest_fetch", { mediaId });
+  },
+  // The verified manifest cached for the current room, if any.
+  async manifestCurrent(): Promise<SharedManifestIpc | null> {
+    return await __TAURI_INVOKE("manifest_current");
   },
   async roomLeave(): Promise<void> {
     await __TAURI_INVOKE("room_leave");
@@ -335,6 +368,7 @@ export type RoomSummaryIpc = {
   host_disconnected: boolean;
   host_disconnect_deadline_ms: number | null;
   you_cap_set?: number;
+  you_user_id?: string | null;
 };
 
 export type ParticipantIpc = {
@@ -500,6 +534,35 @@ export type DownloadSessionIpc = {
   total_bytes: number;
   transferred_bytes: number;
   on_disk_path: string | null;
+  transfer_started: boolean;
+};
+
+export type SharedMediaIpc = {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  mime: string;
+  sha256: string;
+};
+
+export type SharedManifestIpc = {
+  room_id: string;
+  version: number | null;
+  media: SharedMediaIpc[];
+};
+
+// The signed manifest itself is opaque to the webview; only the
+// Rust side verifies and reads it.
+export type ManifestResponsePayload = {
+  manifest: unknown;
+  version: number;
+  published_at_ms: number;
+};
+
+export type ManifestStateEvent = {
+  room_id: string;
+  manifest_hash: string;
+  version: number;
 };
 
 // P4-T06: the SKEW_PROBE round-trip's 4-timestamp sample
@@ -562,6 +625,10 @@ export const events = {
   ),
   downloadProgress: <EventListener<DownloadProgressEvent>>((h) =>
     __listenAs__("download://progress", h)
+  ),
+  // Emitted after a manifest passes signature + trust-anchor checks.
+  manifestState: <EventListener<ManifestStateEvent>>((h) =>
+    __listenAs__("manifest://state", h)
   ),
   // P4-T02: server-authoritative playback state. Emitted
   // every time the server accepts a host PLAYBACK_CMD

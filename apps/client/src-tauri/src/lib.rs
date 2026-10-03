@@ -233,13 +233,17 @@ pub fn run() {
                                     ) {
                                         if host_uid == local_uid {
                                             tracing::info!(room_id = %rid, "host reconnect detected; republishing manifest");
-                                            if let Err(e) = crate::room::host::build_sign_and_publish(
+                                            // Re-share the media the host chose, not
+                                            // the whole permanent library.
+                                            let selection = rc.host_media_selection();
+                                            if let Err(e) = crate::room::host::build_sign_and_publish_selected(
                                                 identity.clone(),
                                                 signaling.clone(),
                                                 rc.clone(),
                                                 storage.clone(),
                                                 library_root.clone(),
                                                 rid,
+                                                selection,
                                             ).await {
                                                 tracing::warn!(error = %e, "auto-republish manifest failed");
                                             }
@@ -418,6 +422,8 @@ pub fn run() {
             commands::room::recent_room_upsert,
             commands::room::manifest_publish,
             commands::room::manifest_fetch,
+            commands::room::manifest_current,
+            commands::room::room_invite_url,
             commands::room::room_permission_set,
             commands::room::room_chat_message,
             commands::download::download_open,

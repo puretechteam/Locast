@@ -11,6 +11,7 @@ function isValidCodeChar(ch: string): boolean {
 export function JoinRoomPage(): JSX.Element {
     const navigate = useNavigate();
     const [code, setCode] = useState("");
+    const [invite, setInvite] = useState("");
     const [displayName, setDisplayName] = useState("");
     const [submitting, setSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -18,6 +19,25 @@ export function JoinRoomPage(): JSX.Element {
     const codeUpper = code.toUpperCase();
     const codeValid = codeUpper.length === 6 && [...codeUpper].every(isValidCodeChar);
     const nameValid = displayName.trim().length > 0 && displayName.trim().length <= 32;
+
+    // The invite link carries the host's key (the trust anchor for
+    // shared media). Pasting one also fills the room code; Rust parses
+    // and checks the link strictly on join.
+    function onInviteChange(e: React.ChangeEvent<HTMLInputElement>): void {
+        const value = e.target.value;
+        setInvite(value);
+        const m = /\/join\/([A-Za-z0-9]{6})(?:[?#]|$)/.exec(value.trim());
+        if (m !== null && m[1] !== undefined) {
+            setCode(
+                m[1]
+                    .toUpperCase()
+                    .split("")
+                    .filter(isValidCodeChar)
+                    .join("")
+                    .slice(0, 6),
+            );
+        }
+    }
 
     function onCodeChange(e: React.ChangeEvent<HTMLInputElement>): void {
         const filtered = e.target.value
@@ -36,7 +56,12 @@ export function JoinRoomPage(): JSX.Element {
         setError(null);
         try {
             await connectSignaling();
-            const summary = await joinRoom(codeUpper, displayName.trim());
+            const inviteUrl = invite.trim();
+            const summary = await joinRoom(
+                codeUpper,
+                displayName.trim(),
+                inviteUrl.length > 0 ? inviteUrl : null,
+            );
             navigate(`/rooms/${summary.id}`);
         } catch (err) {
             setError(err instanceof Error ? err.message : String(err));
@@ -46,6 +71,20 @@ export function JoinRoomPage(): JSX.Element {
 
     return (
         <form className="form" onSubmit={onSubmit}>
+            <label className="form__label">
+                <span>Invite link (needed to receive shared media)</span>
+                <input
+                    className="form__input"
+                    type="text"
+                    value={invite}
+                    onChange={onInviteChange}
+                    placeholder="locast://join/ABCDEF?h=...&v=1"
+                    autoComplete="off"
+                    spellCheck={false}
+                    disabled={submitting}
+                    data-testid="join-invite"
+                />
+            </label>
             <label className="form__label">
                 <span>Room code</span>
                 <input

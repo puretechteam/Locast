@@ -23,6 +23,7 @@ import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
 import { useClockSkewStore } from "../../stores/useClockSkewStore";
 import { useCapabilityStore } from "../../stores/useCapabilityStore";
 import { ParticipantStrip } from "./ParticipantStrip";
+import { RoomMediaPanel } from "./RoomMediaPanel";
 import { RoomFooter } from "./RoomFooter";
 import { RoomTopBar } from "../../components/RoomTopBar";
 
@@ -402,6 +403,7 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
             <RoomTopBar summary={summary} />
             <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
             <ParticipantStrip summary={summary} />
+            <RoomMediaPanel />
             {isHost && (
                 <button
                     className="room-page__permissions-btn"

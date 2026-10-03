@@ -29,12 +29,15 @@ export async function createRoom(
     return await commands.roomCreate(title, migrationEnabled);
 }
 
-/** Join a room by 6-char code and display name. */
+/** Join a room by 6-char code and display name. `inviteUrl` (the
+ * host's invite link) supplies the manifest trust anchor; without it
+ * shared media cannot be accepted. */
 export async function joinRoom(
     code: string,
     displayName: string,
+    inviteUrl: string | null = null,
 ): Promise<RoomSummaryIpc> {
-    return await commands.roomJoin(code, displayName);
+    return await commands.roomJoin(code, displayName, inviteUrl);
 }
 
 /** Leave the current room. */

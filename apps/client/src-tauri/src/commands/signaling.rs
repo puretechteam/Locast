@@ -31,7 +31,7 @@ use crate::net::state::ConnectionState;
 #[tauri::command]
 #[specta::specta]
 pub async fn signaling_get_state(
-    client: TauriState<'_, SignalingClient>,
+    client: TauriState<'_, std::sync::Arc<SignalingClient>>,
 ) -> Result<ConnectionState, AppError> {
     Ok(client.snapshot().await)
 }
@@ -40,7 +40,9 @@ pub async fn signaling_get_state(
 /// second call while the loop is alive is a no-op.
 #[tauri::command]
 #[specta::specta]
-pub async fn signaling_connect(client: TauriState<'_, SignalingClient>) -> Result<(), AppError> {
+pub async fn signaling_connect(
+    client: TauriState<'_, std::sync::Arc<SignalingClient>>,
+) -> Result<(), AppError> {
     client
         .start()
         .await
@@ -51,7 +53,9 @@ pub async fn signaling_connect(client: TauriState<'_, SignalingClient>) -> Resul
 /// exit. Safe to call multiple times.
 #[tauri::command]
 #[specta::specta]
-pub async fn signaling_disconnect(client: TauriState<'_, SignalingClient>) -> Result<(), AppError> {
+pub async fn signaling_disconnect(
+    client: TauriState<'_, std::sync::Arc<SignalingClient>>,
+) -> Result<(), AppError> {
     client.shutdown().await;
     Ok(())
 }

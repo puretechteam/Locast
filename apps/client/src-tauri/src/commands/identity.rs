@@ -35,7 +35,7 @@ use crate::identity::keystore::IdentityService;
 #[tauri::command]
 #[specta::specta]
 pub async fn identity_get(
-    service: TauriState<'_, IdentityService>,
+    service: TauriState<'_, std::sync::Arc<IdentityService>>,
     display_name: String,
 ) -> Result<crate::identity::Identity, AppError> {
     service
@@ -52,7 +52,7 @@ pub async fn identity_get(
 #[tauri::command]
 #[specta::specta]
 pub async fn identity_rotate(
-    service: TauriState<'_, IdentityService>,
+    service: TauriState<'_, std::sync::Arc<IdentityService>>,
     display_name: String,
 ) -> Result<crate::identity::Identity, AppError> {
     service.rotate(&display_name).await.map_err(AppError::from)
@@ -65,7 +65,7 @@ pub async fn identity_rotate(
 #[tauri::command]
 #[specta::specta]
 pub async fn identity_set_display_name(
-    service: TauriState<'_, IdentityService>,
+    service: TauriState<'_, std::sync::Arc<IdentityService>>,
     display_name: String,
 ) -> Result<crate::identity::Identity, AppError> {
     service.get(&display_name).await.map_err(AppError::from)

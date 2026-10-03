@@ -57,6 +57,10 @@ pub enum HostError {
     /// publish.
     #[error("no media items to publish")]
     NoMedia,
+    /// A media id passed to `manifest_publish` is not in the
+    /// local library.
+    #[error("media item {0} is not in the library")]
+    UnknownMedia(String),
     /// A SQL query against the local `media_items` table
     /// failed.
     #[error("storage error: {0}")]
@@ -153,14 +157,47 @@ pub async fn build_manifest(
     room_id: Uuid,
     host_pubkey: [u8; 32],
 ) -> Result<MediaManifest, HostError> {
-    let rows: Vec<MediaItemRow> = sqlx::query_as(
-        "SELECT id, filename, sha256, blake3, relative_path, size_bytes, mime, duration_ms, \
-                width, height, video_codec, audio_codec, container \
-         FROM media_items WHERE status = 'permanent' \
-         ORDER BY created_at ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    build_manifest_for(pool, library_root, room_id, host_pubkey, None).await
+}
+
+/// [`build_manifest`] with an explicit host selection.
+///
+/// `selection = None` keeps the original behaviour (every
+/// `permanent` library item). `Some(ids)` publishes exactly
+/// those library items, in the given order, whatever their
+/// status: the host chose them and has them on disk. Every id
+/// must exist; an unknown id is an error rather than a
+/// silently shorter manifest.
+pub async fn build_manifest_for(
+    pool: &SqlitePool,
+    library_root: &Path,
+    room_id: Uuid,
+    host_pubkey: [u8; 32],
+    selection: Option<&[String]>,
+) -> Result<MediaManifest, HostError> {
+    const COLUMNS: &str = "SELECT id, filename, sha256, blake3, relative_path, size_bytes, mime, \
+                duration_ms, width, height, video_codec, audio_codec, container \
+         FROM media_items";
+    let rows: Vec<MediaItemRow> = match selection {
+        None => {
+            sqlx::query_as(&format!(
+                "{COLUMNS} WHERE status = 'permanent' ORDER BY created_at ASC"
+            ))
+            .fetch_all(pool)
+            .await?
+        }
+        Some(ids) => {
+            let mut rows = Vec::with_capacity(ids.len());
+            for id in ids {
+                let row: Option<MediaItemRow> = sqlx::query_as(&format!("{COLUMNS} WHERE id = ?1"))
+                    .bind(id)
+                    .fetch_optional(pool)
+                    .await?;
+                rows.push(row.ok_or_else(|| HostError::UnknownMedia(id.clone()))?);
+            }
+            rows
+        }
+    };
 
     if rows.is_empty() {
         return Err(HostError::NoMedia);
@@ -354,12 +391,46 @@ pub async fn build_sign_and_publish(
     library_root: std::path::PathBuf,
     room_id: Uuid,
 ) -> Result<(), HostError> {
+    build_sign_and_publish_selected(
+        identity,
+        signaling,
+        room_client,
+        storage_pool,
+        library_root,
+        room_id,
+        None,
+    )
+    .await
+}
+
+/// [`build_sign_and_publish`] with an explicit host selection
+/// (see [`build_manifest_for`]). On success the selection is
+/// remembered on the `RoomClient` so a reconnect republish
+/// shares the same media.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_sign_and_publish_selected(
+    identity: Arc<IdentityService>,
+    signaling: Arc<SignalingClient>,
+    room_client: Arc<RoomClient>,
+    storage_pool: SqlitePool,
+    library_root: std::path::PathBuf,
+    room_id: Uuid,
+    selection: Option<Vec<String>>,
+) -> Result<(), HostError> {
     let host_pubkey = {
         let kp = identity.load_keypair().await?;
         kp.signing.verifying_key().to_bytes()
     };
-    let manifest = build_manifest(&storage_pool, &library_root, room_id, host_pubkey).await?;
+    let manifest = build_manifest_for(
+        &storage_pool,
+        &library_root,
+        room_id,
+        host_pubkey,
+        selection.as_deref(),
+    )
+    .await?;
     sign_and_publish(&identity, &signaling, &manifest).await?;
+    room_client.set_host_media_selection(selection);
     // P3-T15: the host is its own trust anchor. Install
     // the local pubkey as the expected host pubkey, then
     // accept our own manifest into the verified cache.
@@ -622,6 +693,86 @@ mod tests {
         let url = build_invite_url("locast", "AAAAAA", TEST_PUBKEY).expect("url");
         assert!(url.starts_with("locast://join/AAAAAA?h="));
         assert!(url.ends_with("&v=1"));
+    }
+
+    #[tokio::test]
+    async fn build_manifest_for_selection_publishes_only_chosen_items() {
+        let dir = TempDir::new().expect("tempdir");
+        write_temp_file(&dir, "library/a/one.mp4", 1024);
+        write_temp_file(&dir, "library/b/two.mp4", 2048);
+        let pool = fresh_pool_with_row(
+            "one.mp4",
+            "library/a/one.mp4",
+            1024,
+            "00".repeat(32).as_str(),
+            "11".repeat(32).as_str(),
+        )
+        .await;
+        // A second, temporary item: the default build skips it,
+        // an explicit selection includes it.
+        sqlx::query(
+            "INSERT INTO media_items (id, filename, sha256, blake3, relative_path, size_bytes, mime, duration_ms, status)              VALUES ('mid-2', 'two.mp4', ?1, ?2, 'library/b/two.mp4', 2048, 'video/mp4', 0, 'temporary')",
+        )
+        .bind("22".repeat(32))
+        .bind("33".repeat(32))
+        .execute(&pool)
+        .await
+        .expect("insert second");
+
+        let all = build_manifest(&pool, dir.path(), Uuid::now_v7(), TEST_PUBKEY)
+            .await
+            .expect("build all");
+        assert_eq!(
+            all.media.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            ["mid-1"]
+        );
+
+        let chosen = vec!["mid-2".to_string()];
+        let m = build_manifest_for(
+            &pool,
+            dir.path(),
+            Uuid::now_v7(),
+            TEST_PUBKEY,
+            Some(&chosen),
+        )
+        .await
+        .expect("build selected");
+        assert_eq!(m.media.len(), 1);
+        assert_eq!(m.media[0].id, "mid-2");
+        assert_eq!(m.media[0].size_bytes, 2048);
+    }
+
+    #[tokio::test]
+    async fn build_manifest_for_unknown_selection_is_an_error() {
+        let dir = TempDir::new().expect("tempdir");
+        write_temp_file(&dir, "library/a/one.mp4", 1024);
+        let pool = fresh_pool_with_row(
+            "one.mp4",
+            "library/a/one.mp4",
+            1024,
+            "00".repeat(32).as_str(),
+            "11".repeat(32).as_str(),
+        )
+        .await;
+        let chosen = vec!["mid-1".to_string(), "missing".to_string()];
+        let err = build_manifest_for(
+            &pool,
+            dir.path(),
+            Uuid::now_v7(),
+            TEST_PUBKEY,
+            Some(&chosen),
+        )
+        .await
+        .expect_err("unknown id must reject");
+        assert!(matches!(err, HostError::UnknownMedia(ref id) if id == "missing"));
+    }
+
+    #[test]
+    fn invite_url_round_trips_through_the_strict_parser() {
+        let url = build_invite_url("locast", "ABCDEF", TEST_PUBKEY).expect("url");
+        let parsed = crate::room::invite::parse_invite("locast", &url).expect("parse");
+        assert_eq!(parsed.room_code, "ABCDEF");
+        assert_eq!(parsed.host_pubkey, TEST_PUBKEY);
     }
 
     #[test]

@@ -22,15 +22,25 @@
 //!    signaling server.
 //! 3. HOST seeds a ~1 MiB deterministic binary fixture at the
 //!    canonical content-addressed path and inserts a
-//!    `permanent` `media_items` row, then publishes a
-//!    signed manifest via `room::host::build_sign_and_publish`.
-//! 4. VIEWER subscribes to the manifest, verifies the host's
-//!    signature via `locast_manifest::verify_manifest`, then
-//!    triggers `commands::download::open_download_inner` and
-//!    polls `downloads.state` until completion.
-//! 5. Asserts the on-disk file matches by SHA-256 / BLAKE3 /
-//!    size.
-//! 6. Writes a safe-only `result.json` summarising the run.
+//!    `permanent` `media_items` row, creates a room, and
+//!    publishes a signed manifest for exactly that item via
+//!    `room::host::build_sign_and_publish_selected` (the
+//!    `manifest_publish` command path).
+//! 4. VIEWER joins through the host's invite link: the
+//!    `room_join` command's `invite_anchor_for` turns the
+//!    invite `h=` key into the manifest trust anchor. The
+//!    viewer's `RoomClient` mirrors the room snapshot into its
+//!    local `rooms` / `room_participants` / `user_identities`
+//!    tables (no hand-seeded rows).
+//! 5. VIEWER verifies the manifest, then calls
+//!    `commands::download::open_download_inner` the way the UI
+//!    does (retrying while no source DataChannel is open yet)
+//!    and polls `downloads.state` until completion.
+//! 6. Asserts the on-disk file matches by SHA-256 / BLAKE3 /
+//!    size, is a library item, that re-opening the same media
+//!    is a dedup hit that starts no transfer, and that the
+//!    `locast://` handler serves it with a bounded Range.
+//! 7. Writes a safe-only `result.json` summarising the run.
 
 #![allow(clippy::needless_return)]
 #![allow(clippy::field_reassign_with_default)]
@@ -41,14 +51,16 @@ use std::time::{Duration, Instant};
 
 use blake3::Hasher as Blake3Hasher;
 use locast_client_lib::commands::download::{open_download_inner, DownloadSessionIpc};
+use locast_client_lib::commands::room::invite_anchor_for;
 use locast_client_lib::core::paths;
 use locast_client_lib::identity::keystore::{IdentityKeyring, IdentityService, MockKeyring};
+use locast_client_lib::library::protocol::{resolve_media_url, ProtocolHandler};
 use locast_client_lib::net::config::SignalingConfig;
 use locast_client_lib::net::room::RoomClient;
 use locast_client_lib::net::signaling::SignalingClient;
 use locast_client_lib::net::state::ConnPhase;
 use locast_client_lib::net::webrtc::WebRtcManager;
-use locast_client_lib::room::host::build_sign_and_publish;
+use locast_client_lib::room::host::{build_invite_url, build_sign_and_publish_selected};
 use locast_client_lib::storage::Storage;
 use locast_client_lib::transfer::state::{DownloadState, DownloadStore};
 use locast_client_lib::transfer::{HostDispatchContext, HostSenderDispatcher, TransferRegistry};
@@ -550,81 +562,12 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     // downloader uses against `user_identities` /
     // `room_participants` must be seeded with the UUID,
     // not the sha256 hex.
-    let host_signaling_user_id: String;
-    // Filled in immediately after a successful `room_join`
-    // below. Declared up front so clippy doesn't flag
-    // the late-init in that subsequent block.
-    #[allow(unused_assignments)]
-    let mut viewer_signaling_user_id: String = String::new();
     match host.room.room_create("smoke-room".into(), false).await {
         Ok(summary) => {
             room_id = Uuid::parse_str(&summary.id).expect("room_id uuid");
             room_code = summary.code.clone();
             result.room_id = summary.id.clone();
             result.room_code = summary.code.clone();
-            host_signaling_user_id = host
-                .signaling
-                .snapshot()
-                .await
-                .user_id
-                .clone()
-                .expect("host signaling user_id");
-            // Pre-install the host's expected pubkey on the
-            // viewer so the manifest's trust check passes
-            // before any network round trip introduces drift.
-            viewer.room.set_expected_host_pubkey(host.pubkey);
-            // Seed the host's local `rooms` row. The host's
-            // local DB is otherwise empty (the RoomClient
-            // does not INSERT into `rooms` on a successful
-            // ROOM_CREATE reply), which would prevent the
-            // host from opening a download for any media in
-            // the room. In production this row is populated
-            // via the room://state event hookup.
-            let _ = sqlx::query(
-                "INSERT INTO rooms (id, code, host_user_id, created_at, ended_at, state, settings) \
-                 VALUES (?1, ?2, ?3, 1, NULL, 'open', '{}') \
-                 ON CONFLICT(id) DO NOTHING",
-            )
-            .bind(room_id.to_string())
-            .bind(&room_code)
-            .bind(&host_signaling_user_id)
-            .execute(&host.storage.pool())
-            .await;
-            // Seed the host's local room_participants rows
-            // using the signaling-issued UUIDs (NOT the
-            // sha256 hex) so the lookup closure used by
-            // `download_open` -> `lookup_dc_by_peer_id`
-            // can resolve each participant's pubkey from
-            // the WebRtcManager's UUID-keyed peer map.
-            for (uid, role, name) in [
-                (&host_signaling_user_id, "host", "smoke-host"),
-                // viewer's signaling_user_id is filled in
-                // after room_join (below) -- we patch the
-                // host's local row in a second pass.
-            ] {
-                let _ = sqlx::query(
-                    "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
-                     VALUES (?1, '', ?2, 1, 1) \
-                     ON CONFLICT(id) DO NOTHING",
-                )
-                .bind(uid)
-                .bind(name)
-                .execute(&host.storage.pool())
-                .await;
-                let _ = sqlx::query(
-                    "INSERT INTO room_participants \
-                        (id, room_id, user_id, display_name, role, joined_at, connection_state, capabilities) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1, 'connected', '{}') \
-                     ON CONFLICT(room_id, user_id) DO NOTHING",
-                )
-                .bind(Uuid::new_v4().to_string())
-                .bind(room_id.to_string())
-                .bind(uid)
-                .bind(name)
-                .bind(role)
-                .execute(&host.storage.pool())
-                .await;
-            }
         }
         Err(e) => {
             finalize_failure(
@@ -639,7 +582,24 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     }
     result.stages_passed.push("room_create".to_string());
 
-    // 5. VIEWER joins.
+    // 5. VIEWER joins through the host's invite link, exactly
+    //    as the `room_join` command does: the strict invite
+    //    parser yields the host key, which becomes the
+    //    manifest trust anchor BEFORE the join is sent.
+    let invite = build_invite_url("locast", &room_code, host.pubkey).expect("invite url");
+    match invite_anchor_for(&room_code, Some(&invite)) {
+        Ok(Some(pk)) => viewer.room.set_expected_host_pubkey(pk),
+        other => {
+            finalize_failure(
+                &mut result,
+                "room_join",
+                format!("invite anchor: {other:?}"),
+                overall_start,
+                Some(server_cancel.clone()),
+            );
+            return;
+        }
+    }
     if let Err(e) = viewer
         .room
         .room_join(room_code.clone(), "smoke-viewer".into())
@@ -655,48 +615,19 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         );
         return;
     }
-    viewer_signaling_user_id = viewer
-        .signaling
-        .snapshot()
-        .await
-        .user_id
-        .clone()
-        .expect("viewer signaling user_id");
-    // The viewer did not exist in the host's local DB
-    // before join. Patch the host's seed to include the
-    // viewer's signaling-issued UUID now that we have it.
-    let _ = sqlx::query(
-        "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
-         VALUES (?1, '', 'smoke-viewer', 1, 1) \
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(&viewer_signaling_user_id)
-    .execute(&host.storage.pool())
-    .await;
-    let _ = sqlx::query(
-        "INSERT INTO room_participants \
-            (id, room_id, user_id, display_name, role, joined_at, connection_state, capabilities) \
-         VALUES (?1, ?2, ?3, 'smoke-viewer', 'guest', 1, 'connected', '{}') \
-         ON CONFLICT(room_id, user_id) DO NOTHING",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(room_id.to_string())
-    .bind(&viewer_signaling_user_id)
-    .execute(&host.storage.pool())
-    .await;
     result.stages_passed.push("room_join".to_string());
 
-    // 6. HOST publishes the signed manifest. Also
-    //    subscribe to the host's own inbound envelopes so
-    //    we can see the server's reply to MANIFEST_PUBLISH
-    //    (or its absence).
-    if let Err(e) = build_sign_and_publish(
+    // 6. HOST publishes a signed manifest for exactly the
+    //    seeded item (the `manifest_publish` command path
+    //    with a host selection).
+    if let Err(e) = build_sign_and_publish_selected(
         host.identity.clone(),
         host.signaling.clone(),
         host.room.clone(),
         host.storage.pool(),
         host.library_root.clone(),
         room_id,
+        Some(vec![media_id.clone()]),
     )
     .await
     .map_err(|e| e.to_string())
@@ -734,258 +665,118 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
             return;
         }
     };
+    if verified_manifest.media.len() != 1 || verified_manifest.media[0].id != media_id {
+        finalize_failure(
+            &mut result,
+            "wait_for_manifest",
+            "manifest does not carry exactly the selected item".to_string(),
+            overall_start,
+            Some(server_cancel.clone()),
+        );
+        return;
+    }
     result.stages_passed.push("wait_for_manifest".to_string());
 
-    // 7c. Give the WebRtcManager a moment to negotiate. The
-    //     manager polls room state every 200ms and only
-    //     creates peer entries when the room summary
-    //     signature changes. On a localhost LAN (or in a
-    //     single process), ICE gathering + SDP exchange
-    //     typically completes within 1-3 seconds.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // 7b. Seed the viewer's local `user_identities` and
-    //     `rooms` rows so the `downloads.room_id` and
-    //     `rooms.host_user_id` foreign keys have something
-    //     to point at. In production, the Tauri webview
-    //     would populate these via the `room://state` /
-    //     `manifest://state` events; the test bypasses the
-    //     webview and seeds the rows directly using the
-    //     verified manifest's host_signature.public_key
-    //     (which is already the base64-encoded 32-byte
-    //     Ed25519 verifying key, so we can pass it
-    //     through verbatim).
-    let host_pubkey_b64 = verified_manifest
-        .host_signature
-        .as_ref()
-        .expect("verified manifest has host_signature")
-        .public_key
-        .clone();
-    // Seed `user_identities` BEFORE `rooms` because the
-    // `rooms.host_user_id` FK references `user_identities.id`.
-    // The viewer needs TWO rows in `user_identities`:
-    //   1. host keyed by `host_signaling_user_id` (the
-    //      UUID the server minted) so
-    //      `WebRtcManager::lookup_dc_by_peer_id`'s closure
-    //      can find the host's pubkey from the
-    //      WebRtcManager's UUID-keyed peer map.
-    //   2. viewer keyed by `viewer.user_id` (the
-    //      sha256(public_key) hex) because
-    //      `downloads.user_id` is set by
-    //      `IdentityService::ensure_user_row` to that
-    //      hex, and `downloads.user_id` FKs into
-    //      `user_identities.id`.
-    // Both rows need a `public_key` field; the lookup
-    // closure only ever reads the host's row's pubkey.
-    let _viewer_sha_user_id = match viewer.identity.ensure_user_row().await {
-        Ok(u) => u,
-        Err(e) => {
-            finalize_failure(
-                &mut result,
-                "seed_viewer_room",
-                format!("ensure_user_row: {e}"),
-                overall_start,
-                Some(server_cancel.clone()),
-            );
-            return;
-        }
+    // 7b. The viewer's RoomClient mirrored the ROOM_JOINED
+    //     snapshot: the room row, and the host as a participant
+    //     whose identity row carries the host pubkey.
+    let host_server_id = viewer
+        .room
+        .state()
+        .await
+        .map(|s| s.host_user_id)
+        .unwrap_or_default();
+    let mirrored: i64 = {
+        use base64::Engine as _;
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM room_participants rp \
+             JOIN rooms r ON r.id = rp.room_id \
+             JOIN user_identities ui ON ui.id = rp.user_id \
+             WHERE rp.room_id = ?1 AND rp.user_id = ?2 AND ui.public_key = ?3",
+        )
+        .bind(room_id.to_string())
+        .bind(&host_server_id)
+        .bind(base64::engine::general_purpose::STANDARD.encode(host.pubkey))
+        .fetch_one(&viewer.storage.pool())
+        .await
+        .map(|r| r.0)
+        .unwrap_or(0)
     };
-    let _viewer_pubkey_b64 = {
-        use base64::Engine;
-        let kp = match viewer.identity.load_keypair().await {
-            Ok(k) => k,
-            Err(e) => {
+    if mirrored != 1 {
+        finalize_failure(
+            &mut result,
+            "mirror_room",
+            format!("expected the host mirrored on the viewer, found {mirrored} rows"),
+            overall_start,
+            Some(server_cancel.clone()),
+        );
+        return;
+    }
+    result.stages_passed.push("mirror_room".to_string());
+
+    // 8. VIEWER opens the download the way the UI does: call
+    //    `download_open` and retry while no source DataChannel
+    //    is open yet (`pending` without `transfer_started`).
+    //    Arguments mirror the `download_open` command: the
+    //    room's host id and the local identity row id.
+    let (manifest_ref, host_ref, viewer_ref, media_ref) =
+        (&verified_manifest, &host_server_id, &viewer, &media_id);
+    let open = move |download_id: String| async move {
+        open_download_inner(
+            manifest_ref.clone(),
+            room_id,
+            host_ref,
+            &viewer_ref.user_id,
+            &viewer_ref.storage,
+            &viewer_ref.library_root,
+            media_ref,
+            &download_id,
+            &viewer_ref.webrtc,
+            &viewer_ref.registry,
+            viewer_ref.identity.clone(),
+        )
+        .await
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let ipc: DownloadSessionIpc = loop {
+        match open(Uuid::new_v4().to_string()).await {
+            Ok(i) if i.transfer_started || i.dedup_hit || i.state != "pending" => break i,
+            Ok(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Ok(i) => {
                 finalize_failure(
                     &mut result,
-                    "seed_viewer_room",
-                    format!("load_keypair: {e}"),
+                    "open_download",
+                    format!("no source transport within 20 s: {i:?}"),
                     overall_start,
                     Some(server_cancel.clone()),
                 );
                 return;
             }
-        };
-        base64::engine::general_purpose::STANDARD.encode(kp.signing.verifying_key().to_bytes())
-    };
-    if let Err(e) = sqlx::query(
-        "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
-         VALUES (?1, ?2, 'host', 1, 1) \
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(&host_signaling_user_id)
-    .bind(&host_pubkey_b64)
-    .execute(&viewer.storage.pool())
-    .await
-    .map_err(|e| e.to_string())
-    {
-        finalize_failure(
-            &mut result,
-            "seed_viewer_room",
-            format!("seed host user_identities (signaling): {e}"),
-            overall_start,
-            Some(server_cancel.clone()),
-        );
-        return;
-    }
-    // The viewer's sha256-hex row was already seeded by
-    // `IdentityService::ensure_user_row()` in build_rig.
-    // We also need a row keyed by the signaling UUID so
-    // room_participants.user_id -> user_identities.id
-    // resolves correctly. `public_key` is UNIQUE so we
-    // use empty string for the UUID-keyed mirror row
-    // (the lookup closure only ever reads the SHA-hex
-    // row's pubkey for the viewer; the host's UUID-keyed
-    // row carries the real pubkey).
-    if let Err(e) = sqlx::query(
-        "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
-         VALUES (?1, '', 'viewer', 1, 1) \
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(&viewer_signaling_user_id)
-    .execute(&viewer.storage.pool())
-    .await
-    .map_err(|e| e.to_string())
-    {
-        finalize_failure(
-            &mut result,
-            "seed_viewer_room",
-            format!("seed viewer user_identities (signaling): {e}"),
-            overall_start,
-            Some(server_cancel.clone()),
-        );
-        return;
-    }
-    if let Err(e) = sqlx::query(
-        "INSERT INTO rooms (id, code, host_user_id, created_at, ended_at, state, settings) \
-         VALUES (?1, ?2, ?3, 1, NULL, 'open', '{}') \
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(room_id.to_string())
-    .bind(&room_code)
-    .bind(&host_signaling_user_id)
-    .execute(&viewer.storage.pool())
-    .await
-    .map_err(|e| e.to_string())
-    {
-        finalize_failure(
-            &mut result,
-            "seed_viewer_room",
-            e,
-            overall_start,
-            Some(server_cancel.clone()),
-        );
-        return;
-    }
-    // Seed room_participants rows for both the host and
-    // the viewer. The viewer's `download_open`'s Missing
-    // arm uses `load_room_participant_user_ids` ->
-    // `build_user_pubkey_cache` to populate the closure
-    // passed to `WebRtcManager::lookup_dc_by_peer_id`.
-    // That closure is keyed by the WebRtcManager's
-    // participant UUID (which is the signaling-issued
-    // user_id), so we must seed both room_participants
-    // and user_identities keyed by the UUID -- NOT by
-    // the sha256(public_key) hex that
-    // `IdentityService::ensure_user_row` normally uses.
-    if let Err(e) = sqlx::query(
-        "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen) \
-         VALUES (?1, ?2, 'host', 1, 1) \
-         ON CONFLICT(id) DO NOTHING",
-    )
-    .bind(&host_signaling_user_id)
-    .bind(&host_pubkey_b64)
-    .execute(&viewer.storage.pool())
-    .await
-    .map_err(|e| e.to_string())
-    {
-        finalize_failure(
-            &mut result,
-            "seed_viewer_room",
-            format!("seed host user_identities: {e}"),
-            overall_start,
-            Some(server_cancel.clone()),
-        );
-        return;
-    }
-    for (uid, role, name) in [
-        (&host_signaling_user_id, "host", "smoke-host"),
-        (&viewer_signaling_user_id, "guest", "smoke-viewer"),
-    ] {
-        if let Err(e) = sqlx::query(
-            "INSERT INTO room_participants \
-                (id, room_id, user_id, display_name, role, joined_at, connection_state, capabilities) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, 'connected', '{}') \
-             ON CONFLICT(room_id, user_id) DO NOTHING",
-        )
-        .bind(Uuid::new_v4().to_string())
-        .bind(room_id.to_string())
-        .bind(uid)
-        .bind(name)
-        .bind(role)
-        .execute(&viewer.storage.pool())
-        .await
-        .map_err(|e| e.to_string())
-        {
-            finalize_failure(
-                &mut result,
-                "seed_viewer_room",
-                format!("seed room_participants {name}: {e}"),
-                overall_start,
-                Some(server_cancel.clone()),
-            );
-            return;
-        }
-    }
-    result.stages_passed.push("seed_viewer_room".to_string());
-
-    // 8. VIEWER triggers open_download_inner. The
-    //    orchestrator is spawned inside; we receive
-    //    `state = "pending"` immediately. The caller is
-    //    expected to pass the signaling-issued UUIDs
-    //    (NOT the sha256(public_key) hex) for both
-    //    `room_host_user_id` (which lands on the downloads
-    //    row's `source_peer_id` cache via the manifest's
-    //    `pick_primary_source_peer`) and `user_id`
-    //    (which must match the `downloads.user_id` FK
-    //    pointing at `user_identities.id`).
-    let download_id = Uuid::new_v4().to_string();
-    let ipc: DownloadSessionIpc = match open_download_inner(
-        verified_manifest.clone(),
-        room_id,
-        &host_signaling_user_id,
-        &viewer_signaling_user_id,
-        &viewer.storage,
-        &viewer.library_root,
-        &media_id,
-        &download_id,
-        &viewer.webrtc,
-        &viewer.registry,
-        viewer.identity.clone(),
-    )
-    .await
-    {
-        Ok(i) => i,
-        Err(e) => {
-            finalize_failure(
-                &mut result,
-                "open_download",
-                format!("{e}"),
-                overall_start,
-                Some(server_cancel.clone()),
-            );
-            return;
+            Err(e) => {
+                finalize_failure(
+                    &mut result,
+                    "open_download",
+                    format!("{e}"),
+                    overall_start,
+                    Some(server_cancel.clone()),
+                );
+                return;
+            }
         }
     };
-    if ipc.state != "pending" {
+    if ipc.dedup_hit || !ipc.transfer_started {
         finalize_failure(
             &mut result,
             "open_download",
-            format!("expected state=pending, got {}", ipc.state),
+            format!("expected a real transfer, got {ipc:?}"),
             overall_start,
             Some(server_cancel.clone()),
         );
         return;
     }
+    let download_id = ipc.download_id.clone();
     result.stages_passed.push("open_download".to_string());
 
     // 9. Poll downloads.state + transferred_bytes until
@@ -1045,6 +836,79 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         return;
     }
     result.stages_passed.push("verify_on_disk".to_string());
+
+    // 10b. The installed file is a library item pointing at
+    //      the verified on-disk file.
+    let item: Option<(String, String)> =
+        sqlx::query_as("SELECT status, relative_path FROM media_items WHERE id = ?1")
+            .bind(&ipc.media_id)
+            .fetch_optional(&viewer.storage.pool())
+            .await
+            .ok()
+            .flatten();
+    match &item {
+        Some((_, rel)) if viewer.library_root.join(rel) == on_disk => {}
+        other => {
+            finalize_failure(
+                &mut result,
+                "library_item",
+                format!("library row does not point at the installed file: {other:?}"),
+                overall_start,
+                Some(server_cancel.clone()),
+            );
+            return;
+        }
+    }
+    result.stages_passed.push("library_item".to_string());
+
+    // 10c. Dedup: re-opening the same media resolves locally
+    //      and starts no transfer.
+    match open(Uuid::new_v4().to_string()).await {
+        Ok(i) if i.dedup_hit && !i.transfer_started && i.state == "complete" => {}
+        other => {
+            finalize_failure(
+                &mut result,
+                "dedup_reopen",
+                format!("expected a dedup hit without a transfer, got {other:?}"),
+                overall_start,
+                Some(server_cancel.clone()),
+            );
+            return;
+        }
+    }
+    result.stages_passed.push("dedup_reopen".to_string());
+
+    // 10d. Playback: the P1-T10 `locast://` handler serves the
+    //      downloaded item with a bounded 206 Range response.
+    let handler = ProtocolHandler::new(viewer.storage.clone(), viewer.library_root.clone());
+    let served = match resolve_media_url(&viewer.storage, &ipc.media_id).await {
+        Ok(url) => handler.handle(&url, "GET", Some("bytes=0-")).await.ok(),
+        Err(_) => None,
+    };
+    let content_range = served.as_ref().and_then(|r| {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Range"))
+            .map(|(_, v)| v.clone())
+    });
+    let range_ok = served.as_ref().map(|r| r.status) == Some(206)
+        && content_range
+            .as_deref()
+            .is_some_and(|v| v.ends_with(&format!("/{source_size}")));
+    if !range_ok {
+        finalize_failure(
+            &mut result,
+            "playback",
+            format!(
+                "locast:// did not serve a 206 for the download: status={:?} range={content_range:?}",
+                served.as_ref().map(|r| r.status)
+            ),
+            overall_start,
+            Some(server_cancel.clone()),
+        );
+        return;
+    }
+    result.stages_passed.push("playback".to_string());
 
     // 11. Final invariants.
     if host.user_id == viewer.user_id {

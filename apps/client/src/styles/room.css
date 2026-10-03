@@ -1003,3 +1003,108 @@ code {
     font-size: 0.9rem;
     color: #aab2ba;
 }
+
+/* Slice 3: shared media (host share / viewer download). */
+.room-media {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    background: #101317;
+    border: 1px solid #1f242a;
+    border-radius: 6px;
+    padding: 0.6rem 0.75rem;
+}
+
+.room-media__title {
+    margin: 0;
+    font-size: 0.95rem;
+}
+
+.room-media__host {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+.room-media__row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+}
+
+.room-media__row > span {
+    min-width: 5.5rem;
+    color: #aab2ba;
+}
+
+.room-media__invite,
+.room-media__select {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    background: #1a1f24;
+    color: #e6e6e6;
+    border: 1px solid #2a3138;
+    border-radius: 4px;
+    padding: 0.4rem 0.6rem;
+}
+
+.room-media__invite {
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 0.8rem;
+}
+
+.room-media__btn {
+    background: #1a1f25;
+    color: #d4d8de;
+    border: 1px solid #2a313a;
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+    font-size: 0.85rem;
+    transition: background 120ms ease;
+}
+
+.room-media__btn:hover:not(:disabled) {
+    background: #232a32;
+}
+
+.room-media__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.room-media__item {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+    font-size: 0.85rem;
+}
+
+.room-media__name {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+
+.room-media__size,
+.room-media__status,
+.room-media__empty {
+    color: #aab2ba;
+}
+
+.room-media__empty {
+    margin: 0;
+    font-size: 0.85rem;
+}
+
+.room-media__error {
+    margin: 0;
+    color: #ff8a80;
+    font-size: 0.85rem;
+}

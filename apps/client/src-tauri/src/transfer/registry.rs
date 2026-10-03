@@ -77,6 +77,12 @@ impl TransferRegistry {
         RegisterGuard::new(self.clone(), download_id)
     }
 
+    /// True when a transfer is registered (running) for
+    /// `download_id`.
+    pub async fn is_active(&self, download_id: &str) -> bool {
+        self.0.lock().await.tokens.contains_key(download_id)
+    }
+
     /// Remove the entry for `download_id`. Idempotent.
     pub async fn unregister(&self, download_id: &str) {
         let mut g = self.0.lock().await;
