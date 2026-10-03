@@ -11,6 +11,17 @@
 # preflight job, and a signature that does not verify fails its build job,
 # so no unsigned installer can reach a release.
 #
+# P9-T03: every run also produces, next to the installers,
+#   locast-client.sbom.json     CycloneDX 1.5 SBOM of the client (Rust crate
+#                               graph for all targets; bundled JS deps are a
+#                               known gap, see apps/client/scripts/sbom.sh)
+#   locast-server.sbom.json     CycloneDX 1.5 SBOM of the server crate
+#   locast-client.intoto.jsonl  SLSA provenance (slsa-github-generator), one
+#                               signed in-toto statement whose subjects are
+#                               every installer and both SBOMs
+# The SBOMs are schema-validated with cyclonedx-cli and the provenance is
+# verified with slsa-verifier; either failing stops the run.
+#
 # A manual run (workflow_dispatch) with `unsigned_check` builds clearly
 # labeled UNSIGNED installers as workflow artifacts to validate packaging
 # without credentials. It never creates a release.
@@ -279,9 +290,138 @@ jobs:
           path: installers/*
           if-no-files-found: error
 
+  # ---- P9-T03: CycloneDX SBOMs ----
+  sbom:
+    name: SBOM (CycloneDX)
+    needs: preflight
+    runs-on: ubuntu-latest
+    env:
+      CARGO_CYCLONEDX_VERSION: 0.5.9
+      CYCLONEDX_CLI_VERSION: v0.33.1
+      CYCLONEDX_CLI_SHA256: bfc8b2538da86fe239bc53658bbb63c1c8c510a293c1e6891aa5bea5d3c58746
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx (pinned)
+        run: cargo install cargo-cyclonedx --version "$CARGO_CYCLONEDX_VERSION" --locked
+
+      - name: Install cyclonedx-cli (pinned, sha256-verified)
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl --fail --silent --show-error --location -o "$bin/cyclonedx" \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/${CYCLONEDX_CLI_VERSION}/cyclonedx-linux-x64"
+          echo "${CYCLONEDX_CLI_SHA256}  $bin/cyclonedx" | sha256sum --check --strict
+          chmod +x "$bin/cyclonedx"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Generate and validate SBOMs
+        run: |
+          bash apps/client/scripts/sbom.sh sbom-out
+          bash apps/server/scripts/sbom.sh sbom-out
+          ls -l sbom-out
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-out/*.sbom.json
+          if-no-files-found: error
+
+  # ---- P9-T03: SLSA provenance ----
+  hashes:
+    name: provenance subjects
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    outputs:
+      subjects: ${{ steps.hash.outputs.subjects }}
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.SIGNED == 'true' && 'installers-*' || 'UNSIGNED-installers-*' }}
+          path: subjects
+          merge-multiple: true
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: subjects
+
+      - name: Hash every release file
+        id: hash
+        working-directory: subjects
+        run: |
+          set -euo pipefail
+          sha256sum -- * | tee /dev/stderr > ../subjects.sha256
+          echo "subjects=$(base64 -w0 ../subjects.sha256)" >> "$GITHUB_OUTPUT"
+
+  # The official SLSA generator (Build L3 isolation): signs an in-toto
+  # statement with a SLSA provenance predicate, keyless via Sigstore and the
+  # workflow's OIDC identity. Reusable workflows must be pinned by tag.
+  provenance:
+    needs: hashes
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.subjects }}
+      provenance-name: locast-client.intoto.jsonl
+      upload-assets: false
+
+  verify-provenance:
+    name: verify provenance
+    needs: [hashes, provenance]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.SIGNED == 'true' && 'installers-*' || 'UNSIGNED-installers-*' }}
+          path: dist
+          merge-multiple: true
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
+      - name: Download provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.provenance.outputs.provenance-name }}
+          path: dist
+
+      - name: Install slsa-verifier (pinned)
+        uses: slsa-framework/slsa-verifier/actions/installer@v2.7.1
+
+      - name: Verify the provenance for every release file
+        working-directory: dist
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$REF_TYPE" = tag ]; then ref=(--source-tag "$REF_NAME"); else ref=(--source-branch "$REF_NAME"); fi
+          for f in *; do
+            [ "$f" = locast-client.intoto.jsonl ] && continue
+            slsa-verifier verify-artifact "$f" \
+              --provenance-path locast-client.intoto.jsonl \
+              --source-uri "github.com/${GITHUB_REPOSITORY}" "${ref[@]}"
+          done
+
   release:
     name: draft GitHub release
-    needs: build
+    needs: [build, sbom, provenance, verify-provenance]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -294,7 +434,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Check every required installer is present
+      - name: Download SBOMs
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
+      - name: Download provenance
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.provenance.outputs.provenance-name }}
+          path: dist
+
+      - name: Check every required release file is present
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -302,6 +454,12 @@ jobs:
             files=( dist/*."$ext" )
             if [ "${#files[@]}" -eq 0 ]; then
               echo "::error::Missing .${ext} installer; refusing to create a partial release."
+              exit 1
+            fi
+          done
+          for f in locast-client.sbom.json locast-server.sbom.json locast-client.intoto.jsonl; do
+            if [ ! -s "dist/$f" ]; then
+              echo "::error::Missing ${f}; refusing to create a release without SBOM and provenance."
               exit 1
             fi
           done
