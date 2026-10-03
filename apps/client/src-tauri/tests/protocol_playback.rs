@@ -83,8 +83,8 @@ async fn range_bytes(path: &Path, start: u64, length: u64) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolve_encodes_awkward_file_names_and_the_handler_serves_them() {
     let f = fixture().await;
-    // ASCII, because the library path validator (P8-T01) rejects non-ASCII
-    // paths; names that need percent-encoding are still common.
+    // Reserved URL characters that need percent-encoding. Unicode names
+    // are covered end to end in tests/library_catalog.rs.
     let name = "Movie Night #1 (final) & more.mp4";
     let bytes: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
     let (id, _) = add_media(&f, name, &bytes).await;

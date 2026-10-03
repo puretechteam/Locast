@@ -102,9 +102,7 @@ pub enum LibraryPathError {
     SegmentTooLong(String),
     /// The total path exceeds 4096 bytes.
     PathTooLong,
-    /// The path contains non-ASCII characters (only ASCII allowed).
-    NonAscii(String),
-    /// The path segment contains control characters (0x00-0x1F, 0x7F).
+    /// The path contains a control character (C0, DEL or C1).
     ControlCharacter(String),
     /// Unicode is not in NFC normalization form.
     NotNfc(String),
@@ -130,7 +128,6 @@ impl std::fmt::Display for LibraryPathError {
             LibraryPathError::NulByte => write!(f, "path contains NUL byte"),
             LibraryPathError::SegmentTooLong(s) => write!(f, "path segment too long: {s}"),
             LibraryPathError::PathTooLong => write!(f, "total path too long (>4096 bytes)"),
-            LibraryPathError::NonAscii(s) => write!(f, "path contains non-ASCII: {s}"),
             LibraryPathError::ControlCharacter(s) => {
                 write!(f, "path contains control character: {s}")
             }
@@ -157,9 +154,16 @@ impl std::error::Error for LibraryPathError {}
 /// - NUL bytes rejected
 /// - Segment length > 255 bytes rejected
 /// - Total path > 4096 bytes rejected
-/// - Non-ASCII characters rejected
-/// - Control characters (0x00-0x1F, 0x7F) rejected
+/// - Control characters (C0, DEL and C1) rejected
 /// - Non-NFC Unicode rejected
+///
+/// Non-ASCII names are accepted: this validates LOCAL library paths, whose
+/// filenames the importer keeps as given (NFC-normalized, architecture
+/// section 6). The ASCII-only rule of section 21.7 applies to host-published
+/// manifest paths, which are validated elsewhere. Unicode never creates a
+/// separator or traversal here: only `/` splits segments, segments are
+/// compared without compatibility normalization (fullwidth U+FF0E U+FF0E is a
+/// literal name, not `..`), and the resolved path must stay inside the root.
 /// - Symlink/junction escaping library root rejected
 /// - Non-regular files (directories, symlinks) rejected
 ///
@@ -200,14 +204,12 @@ pub async fn validate_library_path(
         return Err(LibraryPathError::NulByte);
     }
 
-    // 5. Control characters (0x00-0x1F, 0x7F)
-    if rel_path.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+    // 5. Control characters: C0 (0x00-0x1F), DEL (0x7F) and C1
+    //    (U+0080-U+009F). Library filenames may be any other Unicode
+    //    (architecture section 6: the importer keeps the original name,
+    //    NFC-normalized), so the C1 range must be checked explicitly.
+    if rel_path.chars().any(char::is_control) {
         return Err(LibraryPathError::ControlCharacter(rel_path.to_string()));
-    }
-
-    // 5. Non-ASCII check
-    if !rel_path.is_ascii() {
-        return Err(LibraryPathError::NonAscii(rel_path.to_string()));
     }
 
     // 6. NFC normalization check
@@ -252,13 +254,8 @@ pub async fn validate_library_path(
         }
 
         // Control characters in segment
-        if seg.bytes().any(|b| b <= 0x1F || b == 0x7F) {
+        if seg.chars().any(char::is_control) {
             return Err(LibraryPathError::ControlCharacter(seg.to_string()));
-        }
-
-        // Non-ASCII in segment
-        if !seg.is_ascii() {
-            return Err(LibraryPathError::NonAscii(seg.to_string()));
         }
     }
 
@@ -848,15 +845,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vlp_rejects_non_ascii() {
+    async fn vlp_accepts_unicode_filenames() {
+        // Architecture section 6: imported names keep their Unicode (NFC).
+        // "Amelie.mp4" with an accented e, a Japanese katakana name, and a
+        // mixed Latin + CJK name with spaces.
+        let tmp = lib_fixture();
+        let dir = tmp.path().join("library").join("ab").join("cd");
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for name in [
+            "Am\u{e9}lie.mp4",
+            "\u{30b9}\u{30dd}\u{30ef}.mp4",
+            "caf\u{e9} \u{96fb}\u{5f71} 2.mp4",
+        ] {
+            std::fs::write(dir.join(name), b"bytes").unwrap();
+            let rel = format!("library/ab/cd/{name}");
+            let got = validate_library_path(tmp.path(), &rel)
+                .await
+                .unwrap_or_else(|e| panic!("{rel:?} rejected: {e}"));
+            assert_eq!(got, std::fs::canonicalize(dir.join(name)).unwrap());
+            assert!(got.starts_with(&root));
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_decomposed_unicode() {
+        // e + combining acute, and katakana HO + combining handakuten (NFC: PO).
         let tmp = lib_fixture();
         for rel in [
-            "library/caf\u{e9}.mkv",
+            "library/Ame\u{301}lie.mp4",
             "library/e\u{301}.mkv",
-            "\u{ff0e}\u{ff0e}/x",
+            "library/\u{30db}\u{309a}.mp4",
         ] {
-            check(tmp.path(), rel, LibraryPathError::NonAscii(rel.to_string())).await;
+            check(tmp.path(), rel, LibraryPathError::NotNfc(rel.to_string())).await;
         }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_c1_control_characters() {
+        let tmp = lib_fixture();
+        for rel in [
+            "library/a\u{80}b.mp4",
+            "library/Am\u{e9}lie\u{85}.mp4",
+            "library/\u{9b}31m.mp4",
+            "library/x\u{9f}",
+        ] {
+            check(
+                tmp.path(),
+                rel,
+                LibraryPathError::ControlCharacter(rel.to_string()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_traversal_and_separators_around_unicode() {
+        let tmp = lib_fixture();
+        for rel in [
+            "library/\u{96fb}\u{5f71}/../../outside.mkv",
+            "Am\u{e9}lie/../x.mp4",
+            "library/caf\u{e9}/./x.mp4",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::ParentTraversal).await;
+        }
+        for rel in ["library/\u{96fb}\u{5f71}\\..\\x.mp4", "Am\u{e9}lie\\x.mp4"] {
+            check(tmp.path(), rel, LibraryPathError::BackslashSeparator).await;
+        }
+        for rel in [
+            "/\u{96fb}\u{5f71}.mp4",
+            "C:/Am\u{e9}lie.mp4",
+            "//server/caf\u{e9}/x.mp4",
+        ] {
+            check(tmp.path(), rel, LibraryPathError::AbsolutePath).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_fullwidth_punctuation_is_literal_never_traversal() {
+        // NFC (unlike NFKC) leaves fullwidth U+FF0E and U+FF0F alone, and only
+        // `/` separates segments, so these are literal names: they resolve
+        // to nothing and can never reach the sibling `outside/secret.mkv`.
+        let (_tmp, root, _outside) = escape_fixture();
+        for rel in [
+            "\u{ff0e}\u{ff0e}/outside/secret.mkv",
+            "library/\u{ff0e}\u{ff0e}/\u{ff0e}\u{ff0e}/outside/secret.mkv",
+            "library\u{ff0f}..\u{ff0f}..\u{ff0f}outside\u{ff0f}secret.mkv",
+            "library/\u{2024}\u{2024}/x.mkv",
+        ] {
+            check(&root, rel, LibraryPathError::NotFound).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_reserved_names_still_rejected_beside_unicode() {
+        let tmp = lib_fixture();
+        for (rel, seg) in [
+            ("library/\u{96fb}\u{5f71}/CON.mp4", "CON.mp4"),
+            ("library/nul.caf\u{e9}.mp4", "nul.caf\u{e9}.mp4"),
+            ("Am\u{e9}lie/Lpt1", "Lpt1"),
+        ] {
+            check(
+                tmp.path(),
+                rel,
+                LibraryPathError::ReservedName(seg.to_string()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_length_limits_count_bytes_for_unicode() {
+        let tmp = lib_fixture();
+        // 86 x U+96FB is 86 characters but 258 bytes: over the limit.
+        let seg = "\u{96fb}".repeat(86);
+        assert!(seg.len() > 255 && seg.chars().count() < 255);
+        check(
+            tmp.path(),
+            &format!("library/{seg}"),
+            LibraryPathError::SegmentTooLong(seg.clone()),
+        )
+        .await;
+        // 85 x U+96FB is exactly 255 bytes: allowed (the file is absent).
+        let at_limit = "\u{96fb}".repeat(85);
+        assert_eq!(at_limit.len(), 255);
+        check(
+            tmp.path(),
+            &format!("library/{at_limit}"),
+            LibraryPathError::NotFound,
+        )
+        .await;
+        let long = vec!["\u{96fb}".repeat(80); 18].join("/");
+        assert!(long.len() > 4096);
+        check(tmp.path(), &long, LibraryPathError::PathTooLong).await;
     }
 
     #[tokio::test]

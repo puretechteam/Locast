@@ -301,3 +301,59 @@ async fn delete_refuses_a_row_whose_path_escapes_the_library() {
     assert!(matches!(err, AppError::OutOfLibrary { .. }), "{err:?}");
     assert_eq!(f.row_count().await, 1, "row is left alone");
 }
+
+/// Regression (P1-T10): files with Unicode names import fine, so they must
+/// also play through `locast://` and delete. The importer keeps the name
+/// (NFC-normalized); the library path validator must accept it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unicode_named_files_import_play_and_delete() {
+    use locast_client_lib::library::protocol::{resolve_media_url, ProtocolHandler};
+
+    let f = fixture().await;
+    let handler = ProtocolHandler::new(f.storage.clone(), f.root.clone());
+    // "Amelie.mp4" with an accented e, a Japanese katakana name, a mixed
+    // Latin + CJK name with spaces, and a decomposed "Amelie" (e +
+    // combining acute) that the importer stores as NFC.
+    let cases = [
+        ("Am\u{e9}lie.mp4", "Am\u{e9}lie.mp4"),
+        (
+            "\u{30b9}\u{30dd}\u{30ef}.mp4",
+            "\u{30b9}\u{30dd}\u{30ef}.mp4",
+        ),
+        (
+            "caf\u{e9} \u{96fb}\u{5f71} 2.mp4",
+            "caf\u{e9} \u{96fb}\u{5f71} 2.mp4",
+        ),
+        ("Ame\u{301}lie 2.mp4", "Am\u{e9}lie 2.mp4"),
+    ];
+    for (seed, (source_name, stored_name)) in (1u8..).zip(cases) {
+        let imported = f.import(source_name, seed).await;
+        assert_eq!(
+            imported.filename, stored_name,
+            "importer keeps the name as NFC"
+        );
+
+        let url = resolve_media_url(&f.storage, &imported.id)
+            .await
+            .expect("resolve");
+        let resp = handler
+            .handle(&url, "GET", None)
+            .await
+            .unwrap_or_else(|e| panic!("{stored_name:?} must play: {e:?}"));
+        assert_eq!(resp.status, 200, "{stored_name:?}");
+
+        delete_item(&f.storage, &f.root, &imported.id)
+            .await
+            .unwrap_or_else(|e| panic!("{stored_name:?} must delete: {e:?}"));
+        let trashed: Vec<PathBuf> = files_under(&f.root.join("trash"))
+            .into_iter()
+            .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some(stored_name))
+            .collect();
+        assert_eq!(trashed.len(), 1, "{stored_name:?} moved to the trash");
+        assert!(
+            handler.handle(&url, "GET", None).await.is_err(),
+            "{stored_name:?} no longer served after delete"
+        );
+    }
+    assert_eq!(f.row_count().await, 0);
+}
