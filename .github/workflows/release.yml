@@ -1,11 +1,31 @@
-# Locast release workflow.
+# Locast release workflow (P9-T01).
 #
-# P0-T04 establishes this as a no-op stub that triggers only on a
-# pushed git tag of the form `v<semver>`. The real release work -
-# building the Tauri bundles per OS, signing them, generating the
-# release notes, and publishing to the GitHub release - is owned by
-# P9-T01 (Beta packaging, docs, release). Per AGENTS.md, the only
-# thing in the project that should produce a tag is this workflow;
+# A pushed `v<semver>` tag builds the installers on each OS, signs them,
+# verifies the signatures, and uploads them to a DRAFT GitHub release:
+#
+#   Windows  MSI          signed (Authenticode, Tauri certificateThumbprint)
+#   macOS    DMG          signed (Developer ID) and notarized + stapled
+#   Linux    .deb, .AppImage   (the roadmap does not require Linux signing)
+#
+# Signing is fail-closed: a signed run with missing credentials stops in the
+# preflight job, and a signature that does not verify fails its build job,
+# so no unsigned installer can reach a release.
+#
+# A manual run (workflow_dispatch) with `unsigned_check` builds clearly
+# labeled UNSIGNED installers as workflow artifacts to validate packaging
+# without credentials. It never creates a release.
+#
+# Required repository secrets for signed runs (values are never printed):
+#   WINDOWS_CERTIFICATE           base64 of the code-signing .pfx
+#   WINDOWS_CERTIFICATE_PASSWORD  password of that .pfx
+#   APPLE_CERTIFICATE             base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD    password of that .p12
+#   APPLE_SIGNING_IDENTITY        e.g. "Developer ID Application: <name> (<team>)"
+#   APPLE_ID                      Apple ID used for notarization
+#   APPLE_PASSWORD                app-specific password for that Apple ID
+#   APPLE_TEAM_ID                 Apple Developer team id
+#
+# Per AGENTS.md, only this workflow's trigger should produce a release tag;
 # do not tag locally without explicit user instruction.
 
 name: release
@@ -15,6 +35,11 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
+    inputs:
+      unsigned_check:
+        description: "Build UNSIGNED installers for validation only (no release is created)"
+        type: boolean
+        default: false
 
 # A release is intentionally never cancelled by a newer push.
 concurrency:
@@ -22,16 +47,270 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  # "true" for tag pushes and for manual runs that did not ask for an
+  # unsigned check.
+  SIGNED: ${{ github.event_name == 'push' || !inputs.unsigned_check }}
 
 jobs:
-  noop:
-    name: placeholder (filled in by P9-T01)
+  preflight:
+    name: signing preflight
     runs-on: ubuntu-latest
     steps:
-      - name: Release workflow is a stub in P0-T04
+      - name: Require signing credentials
+        if: env.SIGNED == 'true'
+        env:
+          # Booleans only: these expressions never expose a secret value.
+          HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+          HAS_WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+          HAS_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          HAS_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          HAS_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+          HAS_APPLE_ID: ${{ secrets.APPLE_ID != '' }}
+          HAS_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD != '' }}
+          HAS_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
         run: |
-          echo "release workflow is a no-op stub in P0-T04."
-          echo "Real release work is implemented by P9-T01 (Beta packaging, docs, release)."
-          echo "Triggered by: ${{ github.ref }}"
-          echo "Event:        ${{ github.event_name }}"
+          missing=""
+          for name in WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD \
+            APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+            APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            flag="HAS_${name}"
+            if [ "${!flag}" != "true" ]; then
+              missing="${missing} ${name}"
+            fi
+          done
+          if [ -n "${missing}" ]; then
+            echo "::error::Signed release builds require these repository secrets, which are not set:${missing}. Add them under Settings > Secrets and variables > Actions, or run the workflow manually with unsigned_check to validate packaging only."
+            exit 1
+          fi
+          echo "All signing secrets are present."
+
+      - name: Unsigned check notice
+        if: env.SIGNED != 'true'
+        run: echo "::warning::UNSIGNED validation build. Installers are NOT signed or notarized and no release will be created."
+
+  build:
+    name: installers (${{ matrix.platform }})
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+          - platform: macos
+            runner: macos-latest
+          - platform: linux
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (Tauri 2 bundling)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libfuse2
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      # ---- Windows: MSI, signed via Tauri's certificateThumbprint ----
+      - name: Import Windows code-signing certificate
+        if: matrix.platform == 'windows' && env.SIGNED == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $pw = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw |
+              Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+          if (-not $cert) { throw 'The Windows signing certificate has no private key.' }
+          # The thumbprint identifies the certificate; it is not secret.
+          $cfgPath = Join-Path $env:RUNNER_TEMP 'tauri.windows-signing.json'
+          @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint } } } |
+            ConvertTo-Json -Depth 4 | Set-Content -Path $cfgPath -Encoding utf8
+          "TAURI_WINDOWS_SIGNING_CONFIG=$cfgPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build Windows MSI (signed)
+        if: matrix.platform == 'windows' && env.SIGNED == 'true'
+        working-directory: apps/client
+        shell: pwsh
+        run: pnpm tauri build --bundles msi --config "$env:TAURI_WINDOWS_SIGNING_CONFIG"
+
+      - name: Verify Windows signatures
+        if: matrix.platform == 'windows' && env.SIGNED == 'true'
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem target/release/bundle/msi/*.msi) + @(Get-Item target/release/locast-client.exe)
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature -FilePath $f.FullName
+            if ($sig.Status -ne 'Valid') { throw "$($f.Name): signature status is '$($sig.Status)', expected Valid." }
+            if (-not $sig.TimeStamperCertificate) { throw "$($f.Name): signature is not timestamped." }
+            Write-Host "$($f.Name): Valid, signed by '$($sig.SignerCertificate.Subject)', timestamped by '$($sig.TimeStamperCertificate.Subject)'"
+          }
+
+      # ---- macOS: DMG, signed (Developer ID) and notarized ----
+      - name: Build macOS DMG (signed + notarized app)
+        if: matrix.platform == 'macos' && env.SIGNED == 'true'
+        working-directory: apps/client
+        env:
+          # Tauri imports the certificate into a temporary keychain, signs
+          # the app and the DMG with the hardened runtime, and notarizes and
+          # staples the app.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm tauri build --bundles dmg
+
+      - name: Notarize and staple the DMG
+        if: matrix.platform == 'macos' && env.SIGNED == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for dmg in target/release/bundle/dmg/*.dmg; do
+            xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" --wait --timeout 30m
+            xcrun stapler staple "$dmg"
+          done
+
+      - name: Verify macOS signatures and notarization
+        if: matrix.platform == 'macos' && env.SIGNED == 'true'
+        run: |
+          set -euo pipefail
+          for dmg in target/release/bundle/dmg/*.dmg; do
+            codesign --verify --strict --verbose=2 "$dmg"
+            xcrun stapler validate "$dmg"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+            mnt="$(mktemp -d)"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg"
+            app="$(find "$mnt" -maxdepth 1 -name '*.app' -print -quit)"
+            codesign --verify --deep --strict --verbose=2 "$app"
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose=2 "$app"
+            hdiutil detach "$mnt"
+          done
+
+      # ---- Linux: .deb and .AppImage (no signing required) ----
+      - name: Build Linux packages
+        if: matrix.platform == 'linux'
+        working-directory: apps/client
+        run: pnpm tauri build --bundles deb,appimage
+
+      # ---- Unsigned validation builds (manual unsigned_check only) ----
+      - name: Build UNSIGNED installer (validation only)
+        if: matrix.platform != 'linux' && env.SIGNED != 'true'
+        working-directory: apps/client
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            pnpm tauri build --bundles msi
+          else
+            pnpm tauri build --bundles dmg
+          fi
+
+      - name: Collect installers (fail if a required format is missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p installers
+          case "${{ matrix.platform }}" in
+            windows) patterns=("target/release/bundle/msi/*.msi") ;;
+            macos) patterns=("target/release/bundle/dmg/*.dmg") ;;
+            linux) patterns=("target/release/bundle/deb/*.deb" "target/release/bundle/appimage/*.AppImage") ;;
+          esac
+          for pattern in "${patterns[@]}"; do
+            files=( $pattern )
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::error::No installer matched ${pattern}"
+              exit 1
+            fi
+            cp "${files[@]}" installers/
+          done
+          ls -l installers
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SIGNED == 'true' && 'installers' || 'UNSIGNED-installers' }}-${{ matrix.platform }}
+          path: installers/*
+          if-no-files-found: error
+
+  release:
+    name: draft GitHub release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed installers
+        uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check every required installer is present
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for ext in msi dmg deb AppImage; do
+            files=( dist/*."$ext" )
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::error::Missing .${ext} installer; refusing to create a partial release."
+              exit 1
+            fi
+          done
+          ls -l dist
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --title "Locast $TAG" --generate-notes

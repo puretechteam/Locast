@@ -29,11 +29,18 @@
     }
   },
   "bundle": {
-    "active": false,
-    "targets": "all",
+    "active": true,
+    "targets": ["msi", "dmg", "deb", "appimage"],
+    "publisher": "Pure Tech",
+    "category": "Video",
+    "shortDescription": "Watch local media together, in sync.",
     "icon": [
       "icons/icon.png",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
+    }
   }
 }

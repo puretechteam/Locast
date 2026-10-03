@@ -20,7 +20,10 @@
     "test:perf": "playwright test --config=tests/perf/playwright.config.ts",
     "perf:flag": "node tests/perf/flag-long-tasks.mjs",
     "lint": "echo \"locast-client: no linter yet (eslint lands in P0-T04)\" && exit 0",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle:windows": "tauri build --bundles msi",
+    "bundle:macos": "tauri build --bundles dmg",
+    "bundle:linux": "tauri build --bundles deb,appimage"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
