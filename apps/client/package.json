@@ -17,6 +17,8 @@
     "smoke:stroke-renderer": "node --experimental-strip-types --no-warnings src/drawing/strokeRenderer.smoke.ts",
     "smoke:drawing": "node --experimental-strip-types --no-warnings src/drawing/coalescing.smoke.ts",
     "test:e2e": "playwright test --config=tests/playwright/playwright.config.ts",
+    "test:perf": "playwright test --config=tests/perf/playwright.config.ts",
+    "perf:flag": "node tests/perf/flag-long-tasks.mjs",
     "lint": "echo \"locast-client: no linter yet (eslint lands in P0-T04)\" && exit 0",
     "tauri": "tauri"
   },

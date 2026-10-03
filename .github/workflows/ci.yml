@@ -247,6 +247,52 @@ jobs:
           path: perf-results.json
           if-no-files-found: ignore
 
+  # P8-T07: webview performance trace (ARCHITECTURE 28.11). Plays a looping
+  # video for 60 s while sustaining 120 Hz pen input for 5 minutes, captures a
+  # Playwright trace and a Chromium DevTools timeline trace, uploads them, and
+  # flags every Long Task above 50 ms. Long tasks are reported as warnings, not
+  # failures: the architecture says to investigate them, and the harness runs an
+  # unminified Vite dev build on a shared runner.
+  webview-perf:
+    name: webview perf trace (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        working-directory: apps/client
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Capture trace (60 s playback, 5 min drawing)
+        working-directory: apps/client
+        run: pnpm test:perf
+
+      - name: Flag long tasks (> 50 ms)
+        if: always()
+        working-directory: apps/client
+        run: pnpm perf:flag
+
+      - name: Upload trace artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: webview-perf-trace
+          path: apps/client/perf-results/
+          if-no-files-found: warn
+
   build:
     name: build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
