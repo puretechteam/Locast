@@ -3,7 +3,9 @@
 //! participants are in them; the SQLite tables mirror the
 //! durable subset (rooms and room_participants).
 //!
-//! Concurrency: every map is a `tokio::sync::RwLock<HashMap<...>>`.
+//! Concurrency: every map is a `tokio::sync::RwLock<HashMap<...>>`,
+//! except the broadcast channel map, which is a `std` lock so the
+//! synchronous publish path can wait for it instead of skipping.
 //! A single room is also held behind a `RwLock` so a long
 //! snapshot (e.g. building the `RoomSummary` for a `ROOM_STATE`
 //! reply) does not block another connection's read on a
@@ -204,7 +206,12 @@ pub struct RoomRegistry {
     /// etc.) is also published to the room's broadcast
     /// channel. WS connections subscribe to the channel of
     /// the room their user is in via [`RoomRegistry::subscribe`].
-    room_tx: RwLock<HashMap<Uuid, broadcast::Sender<BroadcastItem>>>,
+    ///
+    /// A `std` lock, not `tokio`: every critical section is a
+    /// single map get / insert / remove with no `.await`, so
+    /// [`RoomRegistry::publish`] (which is synchronous) can take a
+    /// blocking read that waits out a writer instead of failing.
+    room_tx: std::sync::RwLock<HashMap<Uuid, broadcast::Sender<BroadcastItem>>>,
     /// P3-T03: in-memory cache of the latest manifest per
     /// room. Kept as a separate map (rather than a field
     /// on `RoomState`) so the manifest's larger payload
@@ -290,7 +297,7 @@ impl RoomRegistry {
         Self {
             by_id: RwLock::new(HashMap::new()),
             by_code: RwLock::new(HashMap::new()),
-            room_tx: RwLock::new(HashMap::new()),
+            room_tx: std::sync::RwLock::new(HashMap::new()),
             manifest_cache: RwLock::new(HashMap::new()),
             config,
         }
@@ -317,8 +324,29 @@ impl RoomRegistry {
     /// Subscribe to the broadcast channel of a room. Returns
     /// `None` if the room does not exist.
     pub async fn subscribe(&self, room_id: Uuid) -> Option<broadcast::Receiver<BroadcastItem>> {
-        let map = self.room_tx.read().await;
+        let map = self.room_tx_read();
         map.get(&room_id).map(|tx| tx.subscribe())
+    }
+
+    /// Read access to the channel map. Blocks only while a writer
+    /// inserts or removes one entry. A poisoned lock is recovered:
+    /// no critical section can leave the map half-updated.
+    fn room_tx_read(
+        &self,
+    ) -> std::sync::RwLockReadGuard<'_, HashMap<Uuid, broadcast::Sender<BroadcastItem>>> {
+        self.room_tx
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Write access to the channel map. Never hold the guard across
+    /// an `.await`.
+    fn room_tx_write(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<Uuid, broadcast::Sender<BroadcastItem>>> {
+        self.room_tx
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Publish one `RoomEvent` to the room's broadcast
@@ -328,13 +356,13 @@ impl RoomRegistry {
     /// which converts a batch of `RoomEvent`s into
     /// `BroadcastItem`s.
     fn publish(&self, room_id: Uuid, item: BroadcastItem) {
-        // Use try_send so we don't await while holding
-        // locks; the broadcast::Sender is internally
-        // synchronized.
-        if let Ok(map) = self.room_tx.try_read() {
-            if let Some(tx) = map.get(&room_id) {
-                let _ = tx.send(item);
-            }
+        // A blocking read, never `try_read`: a concurrent write
+        // (another room being created or removed) must delay this
+        // publish, not drop it. `send` does not block, and a send
+        // error only means the room has no subscribers right now.
+        let map = self.room_tx_read();
+        if let Some(tx) = map.get(&room_id) {
+            let _ = tx.send(item);
         }
     }
 
@@ -742,7 +770,7 @@ impl RoomRegistry {
         }
         {
             let (tx, _rx) = broadcast::channel(256);
-            let mut room_tx = self.room_tx.write().await;
+            let mut room_tx = self.room_tx_write();
             room_tx.insert(id, tx);
         }
         Ok((summary, self_view))
@@ -1432,7 +1460,7 @@ impl RoomRegistry {
             let code = h.read().await.code.clone();
             let mut by_code = self.by_code.write().await;
             by_code.remove(&code);
-            let mut room_tx = self.room_tx.write().await;
+            let mut room_tx = self.room_tx_write();
             room_tx.remove(&id);
         }
         // P3-T03: also drop the cached manifest so a
@@ -1608,7 +1636,7 @@ impl RoomRegistry {
         }
         {
             let (tx, _rx) = broadcast::channel(256);
-            let mut room_tx = self.room_tx.write().await;
+            let mut room_tx = self.room_tx_write();
             room_tx.insert(id, tx);
         }
         // P7-T07: rehydrate manifest cache so mid-room joiners
@@ -1801,6 +1829,70 @@ mod tests {
 
     fn store() -> super::super::NoopRoomStore {
         super::super::NoopRoomStore
+    }
+
+    /// Regression (CI run 37123484117, macOS): `publish` used
+    /// `try_read` on the channel map and silently dropped the
+    /// event whenever any `room_tx` write was held or queued,
+    /// for example the ticker's `remove_room` of an unrelated,
+    /// expired room. Here a separate thread holds the write lock
+    /// while a join publishes; the subscriber must still get
+    /// `ParticipantJoined` once the lock is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_broadcast_survives_contended_channel_map() {
+        let r = Arc::new(RoomRegistry::new(cfg()));
+        let (summary, _) = r
+            .create(&store(), "R".into(), uid(1), keypair(1), true, 1_000)
+            .await
+            .expect("create");
+        let mut rx = r.subscribe(summary.id).await.expect("subscribe");
+
+        // Hold the channel-map write lock on another OS thread,
+        // as a concurrent `remove_room` / `create` would.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let r = r.clone();
+            std::thread::spawn(move || {
+                let guard = r.room_tx_write();
+                held_tx.send(()).expect("signal held");
+                release_rx.recv().expect("wait for release");
+                drop(guard);
+            })
+        };
+        tokio::task::spawn_blocking(move || held_rx.recv().expect("held"))
+            .await
+            .expect("join held");
+
+        let join = {
+            let r = r.clone();
+            let code = summary.code.clone();
+            tokio::spawn(async move {
+                r.join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
+                    .await
+                    .expect("join")
+            })
+        };
+        // `join` mutates the room, drops the room lock, and then
+        // publishes with no `.await` in between. Once the joiner
+        // is visible it has reached (or is inside) `publish`
+        // while the map is still write-locked.
+        while !r.is_user_in_room(uid(2), summary.id).await {
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).expect("release");
+        join.await.expect("join task");
+        holder.join().expect("holder thread");
+
+        // The join task has finished, so `publish` has run: the item
+        // is either in the channel now or was dropped.
+        let item = rx.try_recv().expect("ParticipantJoined must be delivered");
+        assert_eq!(
+            item.kind,
+            locast_protocol::envelope::MessageKind::ParticipantJoined
+        );
+        assert_eq!(item.room_id, summary.id);
+        assert_eq!(item.originator, Some(uid(2)));
     }
 
     #[tokio::test]
