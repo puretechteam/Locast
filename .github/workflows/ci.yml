@@ -192,6 +192,28 @@ jobs:
       - name: pnpm audit (production, high and above)
         run: pnpm audit --prod --audit-level=high
 
+  # P8-T08: hardening checklist (docs/ARCHITECTURE.md section 21.17).
+  # Builds the real server image and asserts: the binary is compiled with
+  # the hardening RUSTFLAGS (statically linked), the container runs as a
+  # non-root user, compose sets cgroup limits, and the no-`unsafe` lint is
+  # on. `needs: supply-chain` makes a clean cargo-deny a precondition.
+  hardening:
+    name: hardening checklist
+    runs-on: ubuntu-latest
+    needs: supply-chain
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Static checklist (Dockerfile, compose, lints, CI)
+        run: bash scripts/check-hardening.sh static
+
+      - name: Build the server image
+        run: docker build -f apps/server/Dockerfile -t locast-server:hardening .
+
+      - name: Image checklist (non-root, static binary, starts)
+        run: bash scripts/check-hardening.sh image locast-server:hardening
+
   # P8-T06: criterion hot-path benches (ARCHITECTURE 28.10) compared against
   # the checked-in per-platform baseline in
   # apps/client/src-tauri/benches/baseline/. Only Linux is gated: absolute
