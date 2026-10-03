@@ -51,7 +51,10 @@
 // `clockSkewProbe` command (returning `SkewSample`); the
 // 60 s cadence and the 4-sample burst live in the React
 // `useClockSkew` hook and the pure-math reducer lives in
-// `apps/client/src-tauri/src/room/skew.rs`.
+// `apps/client/src-tauri/src/room/skew.rs`. P1-T09 added the
+// `libraryList`, `libraryMakePermanent`, and `libraryDelete`
+// commands (and the `LibraryItem` type) and corrected the
+// `mediaImport` invoke name to the Rust command's `media_import`.
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -62,7 +65,7 @@ export const commands = {
     return await __TAURI_INVOKE("greet");
   },
   async mediaImport(paths: string[]): Promise<ImportedMedia[]> {
-    return await __TAURI_INVOKE("mediaImport", { paths });
+    return await __TAURI_INVOKE("media_import", { paths });
   },
   async quotaGet(): Promise<QuotaInfo> {
     return await __TAURI_INVOKE("quota_get");
@@ -72,6 +75,19 @@ export const commands = {
   },
   async libraryScan(): Promise<ScanResult> {
     return await __TAURI_INVOKE("library_scan");
+  },
+  async libraryList(
+    query: string | null,
+    limit: number | null,
+    offset: number | null,
+  ): Promise<LibraryItem[]> {
+    return await __TAURI_INVOKE("library_list", { query, limit, offset });
+  },
+  async libraryMakePermanent(id: string): Promise<void> {
+    await __TAURI_INVOKE("library_make_permanent", { id });
+  },
+  async libraryDelete(id: string): Promise<void> {
+    await __TAURI_INVOKE("library_delete", { id });
   },
   async mediaResolveUrl(mediaId: string): Promise<string> {
     return await __TAURI_INVOKE("media_resolve_url", { mediaId });
@@ -247,6 +263,24 @@ export type ImportedMedia = {
   size_bytes: number;
   filename: string;
   relative_path: string;
+};
+
+export type LibraryItem = {
+  id: string;
+  sha256: string;
+  filename: string;
+  size_bytes: number;
+  /** Probe-derived; `None` when ffprobe was unavailable at import. */
+  duration_ms: number | null;
+  width: number | null;
+  height: number | null;
+  video_codec: string | null;
+  audio_codec: string | null;
+  container: string | null;
+  /** `"permanent"` or `"temporary"` (the schema's CHECK constraint). */
+  status: string;
+  /** Unix milliseconds. */
+  created_at: number;
 };
 
 export type QuotaInfo = {

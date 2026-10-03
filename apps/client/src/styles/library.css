@@ -1,0 +1,173 @@
+/* P1-T09: Library page. Reuses the palette from room.css. */
+
+.library {
+    width: 100%;
+    max-width: 72rem;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.library__toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.library__search {
+    flex: 1 1 14rem;
+    min-width: 10rem;
+    font: inherit;
+    background: #1a1f24;
+    color: #e6e6e6;
+    border: 1px solid #2a3138;
+    border-radius: 4px;
+    padding: 0.4rem 0.6rem;
+}
+
+.library__search:focus {
+    outline: 1px solid #4a8bff;
+    border-color: #4a8bff;
+}
+
+.library__links {
+    display: flex;
+    gap: 0.9rem;
+    font-size: 0.9rem;
+}
+
+.library-btn {
+    background: #1a1f24;
+    color: #e6e6e6;
+    border: 1px solid #2a3138;
+    border-radius: 4px;
+    padding: 0.4rem 0.8rem;
+}
+
+.library-btn:hover:not(:disabled) {
+    background: #232a31;
+}
+
+.library-btn:focus-visible,
+.library-tile:focus-visible {
+    outline: 2px solid #4a8bff;
+    outline-offset: 2px;
+}
+
+.library-btn--primary {
+    background: #2a64d4;
+    border-color: #2a64d4;
+    color: #fff;
+}
+
+.library-btn--primary:hover:not(:disabled) {
+    background: #356fde;
+}
+
+.library-btn--danger {
+    border-color: #a64545;
+    color: #f5a3a3;
+}
+
+.library__notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin: 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 4px;
+    border: 1px solid #2a3138;
+    background: #14181c;
+}
+
+.library__notice--error {
+    border-color: #a64545;
+    color: #f5a3a3;
+}
+
+.library__state {
+    text-align: center;
+    color: #aab2ba;
+    margin: 2rem 0;
+}
+
+.library__state p {
+    margin: 0.35rem 0;
+}
+
+.library__state--error {
+    color: #f5a3a3;
+}
+
+.library-grid {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+    gap: 0.75rem;
+}
+
+.library-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    height: 100%;
+    box-sizing: border-box;
+    padding: 0.8rem;
+    background: #14181c;
+    border: 1px solid #1f242a;
+    border-radius: 6px;
+}
+
+.library-tile__name {
+    margin: 0;
+    font-size: 0.95rem;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.library-tile__meta {
+    margin: 0;
+    font-size: 0.8rem;
+    color: #aab2ba;
+    min-height: 1.1em;
+}
+
+.library-tile__badge {
+    margin: 0;
+    align-self: flex-start;
+    font-size: 0.72rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid #2a3138;
+}
+
+.library-tile__badge--temporary {
+    border-color: #8a6d1f;
+    color: #e6c667;
+}
+
+.library-tile__badge--permanent {
+    border-color: #2f6b45;
+    color: #8fd1a8;
+}
+
+.library-tile__actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: auto;
+    padding-top: 0.4rem;
+}
+
+.library-tile__confirm-text {
+    font-size: 0.85rem;
+    flex-basis: 100%;
+}

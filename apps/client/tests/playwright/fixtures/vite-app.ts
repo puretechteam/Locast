@@ -215,6 +215,78 @@ const SHIM_SOURCE = `
                 return Promise.resolve(999);
             }
             if (name === "room_get_state") return Promise.resolve(null);
+            // P1-T09: an in-memory stand-in for the library database
+            // (media_items). Tests seed w.__locast_library.items, set
+            // nextPick for the file dialog, and read the rows back to
+            // prove an action reached "SQLite". The search mimics the
+            // backend: every word is a prefix match on the file name.
+            if (name === "library_list" || name === "library_make_permanent" ||
+                name === "library_delete" || name === "media_import" ||
+                name === "plugin:dialog|open") {
+                var lib = w.__locast_library;
+                if (!lib) {
+                    lib = w.__locast_library = {
+                        items: [], failList: false, nextPick: null,
+                        imported: [], serial: 1,
+                    };
+                }
+                var words = function(text) {
+                    return text.toLowerCase().split(/[^a-z0-9]+/).filter(function(x) { return x.length > 0; });
+                };
+                if (name === "library_list") {
+                    if (lib.failList) return Promise.reject(new Error("database is locked"));
+                    var q = args && typeof args.query === "string" ? args.query : "";
+                    var wanted = words(q);
+                    var rows = lib.items.slice().sort(function(a, b) {
+                        return b.created_at - a.created_at;
+                    });
+                    if (q.trim() !== "") {
+                        rows = wanted.length === 0 ? [] : rows.filter(function(item) {
+                            var have = words(item.filename);
+                            return wanted.every(function(t) {
+                                return have.some(function(h) { return h.indexOf(t) === 0; });
+                            });
+                        });
+                    }
+                    return Promise.resolve(rows.map(function(r) { return Object.assign({}, r); }));
+                }
+                if (name === "library_make_permanent" || name === "library_delete") {
+                    var idx = -1;
+                    for (var i = 0; i < lib.items.length; i++) {
+                        if (lib.items[i].id === args.id) idx = i;
+                    }
+                    if (idx < 0) return Promise.reject({ kind: "NotFound", message: "no library item with id " + args.id });
+                    if (name === "library_delete") lib.items.splice(idx, 1);
+                    else {
+                        lib.items[idx].status = "permanent";
+                    }
+                    return Promise.resolve(null);
+                }
+                if (name === "media_import") {
+                    lib.imported.push(args.paths);
+                    var made = args.paths.map(function(p) {
+                        var base = String(p).split("/").pop().split(String.fromCharCode(92)).pop();
+                        var n = lib.serial++;
+                        var row = {
+                            id: "imported-" + n, sha256: ("0".repeat(63) + n).slice(-64),
+                            filename: base, size_bytes: 1048576 * n, duration_ms: null,
+                            width: null, height: null, video_codec: null, audio_codec: null,
+                            container: null, status: "permanent", created_at: Date.now() + n,
+                        };
+                        lib.items.push(row);
+                        return {
+                            id: row.id, sha256: row.sha256, blake3: row.sha256,
+                            size_bytes: row.size_bytes, filename: base,
+                            relative_path: "library/" + row.id + "/" + base,
+                        };
+                    });
+                    return Promise.resolve(made);
+                }
+                // plugin:dialog|open
+                var pick = lib.nextPick;
+                lib.nextPick = null;
+                return Promise.resolve(pick);
+            }
             if (name === "signaling_get_state") return Promise.resolve({
                 phase: "Disconnected",
                 server_url: "",
