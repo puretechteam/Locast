@@ -66,6 +66,7 @@ webrtc = { version = "0.20", default-features = false, features = ["runtime-toki
 bytes = "1"
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
 tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 tauri-specta = { version = "=2.0.0-rc.25", features = ["derive", "typescript"] }
@@ -83,3 +84,31 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1"
 webrtc = { version = "0.20", default-features = false, features = ["runtime-tokio"] }
+
+# P8-T06: criterion benches for the ARCHITECTURE 28.10 hot paths.
+# `harness = false` hands main() to criterion. Run them with
+# `scripts/check-perf.sh`, which also compares against the checked-in
+# baseline in benches/baseline/.
+[[bench]]
+name = "library_scan"
+harness = false
+
+[[bench]]
+name = "library_list"
+harness = false
+
+[[bench]]
+name = "manifest"
+harness = false
+
+[[bench]]
+name = "scheduler"
+harness = false
+
+[[bench]]
+name = "reassembly"
+harness = false
+
+[[bench]]
+name = "events"
+harness = false

@@ -1,0 +1,37 @@
+{
+  "platform": "win32",
+  "benches": {
+    "events/record_progress_1000": {
+      "median_ns": 195050,
+      "threshold_pct": 10
+    },
+    "library_list/fts_search_10k_rows": {
+      "median_ns": 355284,
+      "threshold_pct": 50
+    },
+    "library_list/page_10k_rows": {
+      "median_ns": 397386,
+      "threshold_pct": 50
+    },
+    "library_scan/full_1000_files": {
+      "median_ns": 1438170900,
+      "threshold_pct": 50
+    },
+    "library_scan/incremental_1000_files": {
+      "median_ns": 916231075,
+      "threshold_pct": 50
+    },
+    "manifest/serialize_commit_10gib": {
+      "median_ns": 61468260,
+      "threshold_pct": 10
+    },
+    "reassembly/assemble_16mib": {
+      "median_ns": 65787476,
+      "threshold_pct": 50
+    },
+    "scheduler/schedule_256x1mib_4_peers": {
+      "median_ns": 527193,
+      "threshold_pct": 25
+    }
+  }
+}
