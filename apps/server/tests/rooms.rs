@@ -20,8 +20,12 @@ use std::time::Duration;
 use axum::Router;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
+use locast_protocol::envelope::Sender;
 use locast_protocol::envelope::{Envelope, MessageKind};
-use locast_protocol::room::{cap, PlaybackAcceptedEvent, PlaybackAction, PlaybackCommandPayload};
+use locast_protocol::room::{
+    cap, PermissionSetPayload, PlaybackAcceptedEvent, PlaybackAction, PlaybackCommandPayload,
+    StrokeBeginPayload, StrokeEndPayload, StrokePointPayload, StrokeTool,
+};
 use locast_protocol::room::{
     HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
     ParticipantLeftPayload, RoomClosedPayload, RoomCreatePayload, RoomCreatedPayload,
@@ -1476,5 +1480,505 @@ async fn playback_cohost_follows_the_permission_set_capability() {
     .await;
     let third = next_playback(&mut ws_c, "C").await;
     assert_eq!((third.server_seq, third.sender_id), (3, a.user_id));
+    drop(harness);
+}
+
+// ---------------------------------------------------------------------------
+// Room message routing (CHAT_MESSAGE, DRAW_*, PERMISSION_SET) and room-scoped
+// authorization, over the real WebSocket path.
+// ---------------------------------------------------------------------------
+
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn chat_envelope(token: [u8; 32], room_id: Uuid, sender: Uuid, text: &str) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::ChatMessage,
+        room_id,
+        json!({ "sender_id": sender, "text": text, "sent_ms": 0 }),
+    )
+}
+
+fn permission_envelope(token: [u8; 32], room_id: Uuid, target: Uuid, add: u32) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::PermissionSet,
+        room_id,
+        serde_json::to_value(PermissionSetPayload {
+            target_user_id: target,
+            add_cap_set: add,
+            remove_cap_set: 0,
+        })
+        .unwrap(),
+    )
+}
+
+/// A DRAW_BEGIN signed the way the client signs it.
+fn draw_begin_envelope(
+    token: [u8; 32],
+    room_id: Uuid,
+    kp: &SigningKey,
+    user_id: Uuid,
+    stroke_id: Uuid,
+) -> Envelope {
+    let payload = StrokeBeginPayload {
+        stroke_id,
+        tool: StrokeTool::Pen,
+        color: "#ff0000".into(),
+        width: 2.0,
+        x: 0.25,
+        y: 0.5,
+        pressure: 0.5,
+        ts_ms: 1,
+    };
+    let signed = locast_crypto::drawing_signed_bytes(&payload).expect("signed bytes");
+    let mut env = room_scoped_envelope(
+        token,
+        MessageKind::StrokeBegin,
+        room_id,
+        serde_json::to_value(&payload).unwrap(),
+    );
+    env.sender = Some(Sender {
+        user_id,
+        pubkey: kp.verifying_key().to_bytes().to_vec(),
+        sig: kp.sign(&signed).to_bytes().to_vec(),
+    });
+    env
+}
+
+fn signed_manifest_envelope(token: [u8; 32], room_id: Uuid, kp: &SigningKey) -> Envelope {
+    let manifest = locast_manifest::sign_manifest(
+        &kp.to_bytes(),
+        &locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: room_id.to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1,
+            host_signature: None,
+        },
+    )
+    .expect("sign manifest");
+    room_scoped_envelope(
+        token,
+        MessageKind::ManifestPublish,
+        room_id,
+        json!({ "manifest": manifest }),
+    )
+}
+
+async fn expect_room_error(ws: &mut Ws, code: RoomErrorCode, ctx: &str) {
+    let env = next_of_kind(ws, MessageKind::RoomError, ctx).await;
+    let p: RoomErrorPayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(p.code, code, "{ctx}: {}", p.message);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_permission_and_drawing_messages_reach_their_handlers() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    // CHAT_MESSAGE: a viewer chats (CHAT is a default capability);
+    // the other participants get it attributed to the bearer.
+    send_envelope(
+        &mut ws_b,
+        &chat_envelope(b.token, room_id, c.user_id, "hello room"),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_a, "A"), (&mut ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::ChatMessage, who).await;
+        assert_eq!(env.room_id, Some(room_id), "{who}");
+        assert_eq!(env.payload["text"], "hello room", "{who}");
+        assert_eq!(
+            env.payload["sender_id"],
+            json!(b.user_id),
+            "{who}: sender comes from the bearer, not the payload"
+        );
+    }
+
+    // DRAW_BEGIN before any grant: the handler is reached and the
+    // capability gate refuses it (viewers do not have DRAW).
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, stroke),
+    )
+    .await;
+    expect_room_error(&mut ws_b, RoomErrorCode::NotHost, "B draws without DRAW").await;
+
+    // PERMISSION_SET from a viewer is refused; from the host it is
+    // applied and CAPABILITY_UPDATE reaches everyone.
+    send_envelope(
+        &mut ws_c,
+        &permission_envelope(c.token, room_id, b.user_id, cap::DRAW),
+    )
+    .await;
+    expect_room_error(&mut ws_c, RoomErrorCode::NotHost, "viewer PERMISSION_SET").await;
+    send_envelope(
+        &mut ws_a,
+        &permission_envelope(a.token, room_id, b.user_id, cap::DRAW),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_a, "A"), (&mut ws_b, "B"), (&mut ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::CapabilityUpdate, who).await;
+        assert_eq!(env.payload["target_user_id"], json!(b.user_id), "{who}");
+        let bits = env.payload["cap_set"].as_u64().expect("cap_set") as u32;
+        assert_ne!(bits & cap::DRAW, 0, "{who}: DRAW granted");
+        assert_eq!(
+            bits & cap::PLAYBACK_CONTROL,
+            0,
+            "{who}: nothing else granted"
+        );
+    }
+
+    // DRAW_BEGIN / DRAW_POINT / DRAW_END now flow to the others.
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, stroke),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_c, MessageKind::StrokeBegin, "C sees B's stroke").await;
+    assert_eq!(env.payload["stroke_id"], json!(stroke));
+    // The host also holds DRAW, but may not end B's stroke.
+    send_envelope(
+        &mut ws_a,
+        &room_scoped_envelope(
+            a.token,
+            MessageKind::StrokeEnd,
+            room_id,
+            serde_json::to_value(StrokeEndPayload {
+                stroke_id: stroke,
+                ts_ms: 3,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    expect_room_error(&mut ws_a, RoomErrorCode::InvalidState, "A ends B's stroke").await;
+    send_envelope(
+        &mut ws_b,
+        &room_scoped_envelope(
+            b.token,
+            MessageKind::StrokePoint,
+            room_id,
+            serde_json::to_value(StrokePointPayload {
+                stroke_id: stroke,
+                x: 0.3,
+                y: 0.6,
+                pressure: 0.5,
+                ts_ms: 2,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    send_envelope(
+        &mut ws_b,
+        &room_scoped_envelope(
+            b.token,
+            MessageKind::StrokeEnd,
+            room_id,
+            serde_json::to_value(StrokeEndPayload {
+                stroke_id: stroke,
+                ts_ms: 3,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    // The stroke survived A's attempt: B's point and end go through.
+    for (ws, who) in [(&mut ws_a, "A"), (&mut ws_c, "C")] {
+        for kind in [MessageKind::StrokePoint, MessageKind::StrokeEnd] {
+            let env = next_of_kind(ws, kind.clone(), who).await;
+            assert_eq!(env.room_id, Some(room_id), "{who} {kind:?}");
+            assert_eq!(env.payload["stroke_id"], json!(stroke), "{who} {kind:?}");
+        }
+    }
+    drop(harness);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_privileges_in_one_room_do_not_authorize_another_room() {
+    let harness = spawn_test_server().await;
+    let (kp_x, _) = fresh_keypair();
+    let (kp_y, _) = fresh_keypair();
+    let (kp_z, _) = fresh_keypair();
+    let mut ws_x = connect(harness.addr).await;
+    let mut ws_y = connect(harness.addr).await;
+    let mut ws_z = connect(harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    let y = complete_handshake(&mut ws_y, &kp_y).await;
+    let z = complete_handshake(&mut ws_z, &kp_z).await;
+
+    // X hosts several rooms (so the old "pick one of the user's
+    // rooms" gate would almost always land on a hosted one) ...
+    let mut hosted = Vec::new();
+    for i in 0..3 {
+        send_envelope(
+            &mut ws_x,
+            &room_create_envelope(x.token, &format!("X{i}"), false),
+        )
+        .await;
+        let env = next_of_kind(&mut ws_x, MessageKind::RoomCreated, "X create").await;
+        let created: RoomCreatedPayload = serde_json::from_value(env.payload).unwrap();
+        hosted.push(created.room.id);
+    }
+    let room_a = hosted[0];
+    // ... and is a plain viewer in Y's room B.
+    send_envelope(&mut ws_y, &room_create_envelope(y.token, "B", false)).await;
+    let env = next_of_kind(&mut ws_y, MessageKind::RoomCreated, "Y create").await;
+    let room_b: RoomCreatedPayload = serde_json::from_value(env.payload).unwrap();
+    let (room_b, code_b) = (room_b.room.id, room_b.room.code);
+    send_envelope(&mut ws_x, &room_join_envelope(x.token, &code_b, "X")).await;
+    next_of_kind(&mut ws_x, MessageKind::RoomJoined, "X joins B").await;
+    next_of_kind(&mut ws_y, MessageKind::ParticipantJoined, "Y sees X").await;
+    // Z hosts room C, which X never joins.
+    send_envelope(&mut ws_z, &room_create_envelope(z.token, "C", false)).await;
+    let env = next_of_kind(&mut ws_z, MessageKind::RoomCreated, "Z create").await;
+    let room_c = serde_json::from_value::<RoomCreatedPayload>(env.payload)
+        .unwrap()
+        .room
+        .id;
+
+    // Every host / capability action X attempts in B is refused,
+    // every time, and nothing reaches B.
+    for round in 0..3u64 {
+        let ctx = format!("round {round}");
+        send_envelope(&mut ws_x, &signed_manifest_envelope(x.token, room_b, &kp_x)).await;
+        expect_room_error(
+            &mut ws_x,
+            RoomErrorCode::NotHost,
+            &format!("{ctx}: manifest in B"),
+        )
+        .await;
+        send_envelope(
+            &mut ws_x,
+            &permission_envelope(x.token, room_b, y.user_id, cap::DRAW),
+        )
+        .await;
+        expect_room_error(
+            &mut ws_x,
+            RoomErrorCode::NotHost,
+            &format!("{ctx}: permission in B"),
+        )
+        .await;
+        send_envelope(
+            &mut ws_x,
+            &playback_cmd(x.token, room_b, PlaybackAction::Play, round + 1, 0),
+        )
+        .await;
+        expect_room_error(
+            &mut ws_x,
+            RoomErrorCode::NotHost,
+            &format!("{ctx}: playback in B"),
+        )
+        .await;
+        send_envelope(
+            &mut ws_x,
+            &draw_begin_envelope(x.token, room_b, &kp_x, x.user_id, Uuid::now_v7()),
+        )
+        .await;
+        expect_room_error(
+            &mut ws_x,
+            RoomErrorCode::NotHost,
+            &format!("{ctx}: draw in B"),
+        )
+        .await;
+        let stray = Uuid::now_v7();
+        for (kind, payload) in [
+            (
+                MessageKind::StrokePoint,
+                serde_json::to_value(StrokePointPayload {
+                    stroke_id: stray,
+                    x: 0.1,
+                    y: 0.1,
+                    pressure: 0.0,
+                    ts_ms: 1,
+                })
+                .unwrap(),
+            ),
+            (
+                MessageKind::StrokeEnd,
+                serde_json::to_value(StrokeEndPayload {
+                    stroke_id: stray,
+                    ts_ms: 1,
+                })
+                .unwrap(),
+            ),
+        ] {
+            send_envelope(
+                &mut ws_x,
+                &room_scoped_envelope(x.token, kind.clone(), room_b, payload),
+            )
+            .await;
+            expect_room_error(
+                &mut ws_x,
+                RoomErrorCode::NotHost,
+                &format!("{ctx}: {kind:?} in B"),
+            )
+            .await;
+        }
+    }
+    for kind in [
+        MessageKind::ManifestPublished,
+        MessageKind::CapabilityUpdate,
+        MessageKind::PlaybackCmd,
+        MessageKind::StrokeBegin,
+    ] {
+        assert_no_kind_within(
+            &mut ws_y,
+            kind.clone(),
+            Duration::from_millis(200),
+            "B host",
+        )
+        .await;
+    }
+
+    // What X may do as a viewer of B still works: chat.
+    send_envelope(
+        &mut ws_x,
+        &chat_envelope(x.token, room_b, x.user_id, "hi B"),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_y, MessageKind::ChatMessage, "Y gets X's chat").await;
+    assert_eq!(env.room_id, Some(room_b));
+
+    // The same privileged actions succeed in a room X hosts.
+    send_envelope(&mut ws_x, &signed_manifest_envelope(x.token, room_a, &kp_x)).await;
+    let env = next_of_kind(&mut ws_x, MessageKind::ManifestPublished, "manifest in A").await;
+    assert_eq!(env.room_id, Some(room_a));
+    send_envelope(
+        &mut ws_x,
+        &playback_cmd(x.token, room_a, PlaybackAction::Play, 1, 0),
+    )
+    .await;
+    send_envelope(
+        &mut ws_x,
+        &draw_begin_envelope(x.token, room_a, &kp_x, x.user_id, Uuid::now_v7()),
+    )
+    .await;
+    assert_no_kind_within(
+        &mut ws_x,
+        MessageKind::RoomError,
+        Duration::from_millis(300),
+        "A",
+    )
+    .await;
+    // B's own host keeps full control of B.
+    send_envelope(
+        &mut ws_y,
+        &playback_cmd(y.token, room_b, PlaybackAction::Play, 1, 0),
+    )
+    .await;
+    assert_no_kind_within(
+        &mut ws_y,
+        MessageKind::RoomError,
+        Duration::from_millis(300),
+        "B",
+    )
+    .await;
+
+    // A room X is not in at all: nothing X sends reaches it (the WS
+    // layer's membership check drops it before dispatch).
+    send_envelope(
+        &mut ws_x,
+        &chat_envelope(x.token, room_c, x.user_id, "intruder"),
+    )
+    .await;
+    send_envelope(&mut ws_x, &signed_manifest_envelope(x.token, room_c, &kp_x)).await;
+    for kind in [MessageKind::ChatMessage, MessageKind::ManifestPublished] {
+        assert_no_kind_within(
+            &mut ws_z,
+            kind.clone(),
+            Duration::from_millis(200),
+            "C host",
+        )
+        .await;
+    }
+    drop(harness);
+}
+
+fn room_leave_in(token: [u8; 32], room_id: Uuid) -> Envelope {
+    let mut env = room_leave_envelope(token);
+    env.room_id = Some(room_id);
+    env
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_leave_with_a_room_id_leaves_exactly_that_room() {
+    let harness = spawn_test_server().await;
+    let (kp_x, _) = fresh_keypair();
+    let (kp_w, _) = fresh_keypair();
+    let (kp_y, _) = fresh_keypair();
+    let mut ws_x = connect(harness.addr).await;
+    let mut ws_w = connect(harness.addr).await;
+    let mut ws_y = connect(harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    let w = complete_handshake(&mut ws_w, &kp_w).await;
+    let y = complete_handshake(&mut ws_y, &kp_y).await;
+
+    // X hosts room A (migration off: X leaving A would end it) with
+    // W in it, and is a viewer in Y's room B.
+    send_envelope(&mut ws_x, &room_create_envelope(x.token, "A", false)).await;
+    let a: RoomCreatedPayload = serde_json::from_value(
+        next_of_kind(&mut ws_x, MessageKind::RoomCreated, "X create")
+            .await
+            .payload,
+    )
+    .unwrap();
+    send_envelope(&mut ws_w, &room_join_envelope(w.token, &a.room.code, "W")).await;
+    next_of_kind(&mut ws_w, MessageKind::RoomJoined, "W joins A").await;
+    send_envelope(&mut ws_y, &room_create_envelope(y.token, "B", false)).await;
+    let b: RoomCreatedPayload = serde_json::from_value(
+        next_of_kind(&mut ws_y, MessageKind::RoomCreated, "Y create")
+            .await
+            .payload,
+    )
+    .unwrap();
+    send_envelope(&mut ws_x, &room_join_envelope(x.token, &b.room.code, "X")).await;
+    next_of_kind(&mut ws_x, MessageKind::RoomJoined, "X joins B").await;
+    next_of_kind(&mut ws_y, MessageKind::ParticipantJoined, "Y sees X").await;
+
+    // X leaves B by name.
+    send_envelope(&mut ws_x, &room_leave_in(x.token, b.room.id)).await;
+    let left = next_of_kind(&mut ws_y, MessageKind::ParticipantLeft, "Y sees X leave").await;
+    assert_eq!(left.room_id, Some(b.room.id));
+    let p: ParticipantLeftPayload = serde_json::from_value(left.payload).unwrap();
+    assert_eq!(p.user_id, x.user_id);
+    // Published once (not again by the WS layer), and B is not closed.
+    assert_no_kind_within(
+        &mut ws_y,
+        MessageKind::ParticipantLeft,
+        Duration::from_millis(300),
+        "Y",
+    )
+    .await;
+    assert_no_kind_within(
+        &mut ws_y,
+        MessageKind::RoomClosed,
+        Duration::from_millis(100),
+        "Y",
+    )
+    .await;
+    // Room A is untouched: W is not told it closed, and X is still its host.
+    assert_no_kind_within(
+        &mut ws_w,
+        MessageKind::RoomClosed,
+        Duration::from_millis(300),
+        "W",
+    )
+    .await;
+    assert!(harness.rooms.is_room_host(a.room.id, x.user_id).await);
+    assert!(!harness.rooms.is_user_in_room(x.user_id, b.room.id).await);
     drop(harness);
 }

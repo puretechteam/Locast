@@ -14,8 +14,8 @@
 // the rest:
 //!
 //! 1. Decode the payload into a typed [`PlaybackCommandPayload`].
-// 2. Look up the room state via `RoomRegistry::get_user_room` + a
-//    handle helper, and check the room lifecycle against the
+// 2. Look up the room named by `envelope.room_id`, re-check the
+//    caller's authorization there, and check the room lifecycle against the
 //    requested action (PLAY requires Open/Paused, PAUSE requires
 //    Playing, SEEK requires Playing/Paused). See `state.rs:43-58`
 //    for the lifecycle variants.
@@ -160,7 +160,11 @@ pub async fn handle_playback_cmd(
         let caller = state
             .participants
             .iter()
-            .find(|p| p.user_id == user_id)
+            // The live record, never a stale `Left` one from
+            // before a rejoin.
+            .find(|p| {
+                p.user_id == user_id && p.status != locast_protocol::room::ParticipantStatus::Left
+            })
             .ok_or(PlaybackError::NotJoined)?;
         (
             caller.pubkey == pubkey,

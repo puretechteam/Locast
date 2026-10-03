@@ -27,12 +27,14 @@
 //! Authorization:
 //!
 //! - The capability gate in `super::caps` ensures the
-//!   caller is a current room member (DRAW cap is
-//!   granted to every participant at create/join).
-//! - Cross-room injection is rejected by the dispatcher
-//!   (the per-type handler checks `envelope.room_id`
-//!   matches the bearer's current room; see
-//!   `dispatch.rs`).
+//!   caller is a current member of the room named by
+//!   `envelope.room_id` and holds DRAW there (the host has
+//!   every bit; other participants need a PERMISSION_SET
+//!   grant).
+//! - Cross-room injection is rejected: the gate and the
+//!   per-type dispatcher both check membership of the
+//!   envelope's room, never "the user's current room"; see
+//!   `dispatch.rs`.
 //! - Replays of the same BEGIN signature are bound to the
 //!   `stroke_id` field: a second BEGIN with the same id
 //!   is rejected (the existing pending map already has
@@ -237,18 +239,21 @@ pub async fn handle_stroke_end(
         Ok(p) => p,
         Err(e) => return err_outcome(&envelope, format!("bad DRAW_END payload: {e}")),
     };
-    let binding = match state.drawing.pending.remove(&payload.stroke_id) {
-        Some(b) => b,
+    // Check ownership BEFORE removing: another participant must
+    // not be able to end (and so cancel) someone else's stroke.
+    match state.drawing.pending.get(&payload.stroke_id) {
+        Some(b) if b.sender_id == user_id => {}
+        Some(_) => {
+            return err_outcome(
+                &envelope,
+                reason(DrawingError::StrokeIdMismatch).to_string(),
+            );
+        }
         None => {
             return err_outcome(&envelope, reason(DrawingError::UnknownStroke).to_string());
         }
-    };
-    if binding.sender_id != user_id {
-        return err_outcome(
-            &envelope,
-            reason(DrawingError::StrokeIdMismatch).to_string(),
-        );
     }
+    state.drawing.pending.remove(&payload.stroke_id);
     let evt = super::registry::RoomEvent::StrokeEnd {
         room_id: envelope.room_id.unwrap_or(state.id),
         sender_id: user_id,

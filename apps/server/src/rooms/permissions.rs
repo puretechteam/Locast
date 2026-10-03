@@ -78,7 +78,10 @@ async fn handle_permission_set_payload(
         let participant = state
             .participants
             .iter()
-            .find(|p| p.user_id == target_user_id)
+            .find(|p| {
+                p.user_id == target_user_id
+                    && p.status != locast_protocol::room::ParticipantStatus::Left
+            })
             .ok_or_else(|| {
                 RoomError::Internal("PERMISSION_SET: target is not a room participant".into())
             })?;

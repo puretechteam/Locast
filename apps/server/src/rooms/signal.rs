@@ -175,18 +175,14 @@ pub async fn handle_signal(
         return error_outcome(SignalError::SelfSignal, now_ms);
     }
 
-    // 5. Room-membership check. The caller's current room
-    //    must equal envelope.room_id, and the recipient must
-    //    be a current participant of the same room.
-    let caller_room = match registry.get_user_room(bearer_user_id).await {
-        Some(r) => r,
-        None => return error_outcome(SignalError::SenderNotInRoom, now_ms),
-    };
+    // 5. Room-membership check. The caller must be a current
+    //    participant of envelope.room_id, and so must the
+    //    recipient.
     let signal_room = match envelope.room_id {
         Some(r) => r,
         None => return error_outcome(SignalError::SenderNotInRoom, now_ms),
     };
-    if caller_room != signal_room {
+    if !registry.is_user_in_room(bearer_user_id, signal_room).await {
         return error_outcome(SignalError::SenderNotInRoom, now_ms);
     }
     if !registry

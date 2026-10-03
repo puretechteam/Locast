@@ -839,17 +839,12 @@ async fn dispatch_authed(
     if envelope.r#type.is_skew_probe() {
         return handle_skew_probe(envelope, state.clock.as_ref(), request_id).await;
     }
-    // The message passed bearer validation. Route ROOM_*
-    // envelopes to the room dispatcher. Other envelope
-    // types (future PLAY/PAUSE/SEEK/DRAW/LASER/CHAT/MANIFEST_*)
-    // are not implemented in v1 / P2-T04 and are silently
-    // accepted.
-    if envelope.r#type.is_room_lifecycle()
-        || envelope.r#type.is_manifest_lifecycle()
-        || envelope.r#type.is_signal_lifecycle()
-        || envelope.r#type.is_playback_lifecycle()
-        || envelope.r#type.is_position_report()
-    {
+    // The message passed bearer validation. Route every
+    // client-originated room envelope to the room dispatcher,
+    // which runs the capability gate and the per-type handler.
+    // Envelope types with no server handler are still accepted
+    // and ignored.
+    if routes_to_room_dispatch(&envelope.r#type) {
         let store: Arc<dyn crate::rooms::RoomStore> =
             Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
         let ctx = crate::rooms::DispatchContext {
@@ -1870,6 +1865,27 @@ async fn room_bcast_forwarder(
             return;
         }
     }
+}
+
+/// `true` for every envelope type the room dispatcher handles.
+/// Keep in step with the `match` in `rooms::dispatch_room_message`:
+/// a type missing here is accepted by the WS layer and then
+/// silently dropped (CHAT_MESSAGE, DRAW_* and PERMISSION_SET
+/// were, until they were added below).
+fn routes_to_room_dispatch(kind: &MessageKind) -> bool {
+    kind.is_room_lifecycle()
+        || kind.is_manifest_lifecycle()
+        || kind.is_signal_lifecycle()
+        || kind.is_playback_lifecycle()
+        || kind.is_position_report()
+        || matches!(
+            kind,
+            MessageKind::ChatMessage
+                | MessageKind::StrokeBegin
+                | MessageKind::StrokePoint
+                | MessageKind::StrokeEnd
+                | MessageKind::PermissionSet
+        )
 }
 
 fn now_ms() -> i64 {

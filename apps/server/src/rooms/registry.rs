@@ -867,12 +867,15 @@ impl RoomRegistry {
     /// loss (the dispatch layer calls this with
     /// `intentional = false` from `on_connection_lost`).
     ///
-    /// Returns the events the WS layer should broadcast.
-    /// The list is in the order: any migration-or-close
-    /// announcement FIRST, then the per-participant LEFT
-    /// events, so the recipient's UI updates correctly
-    /// regardless of which delivery order the WS layer
-    /// chooses.
+    /// The events are ALREADY PUBLISHED to the left room's
+    /// broadcast channel when this returns; the returned list
+    /// is for the caller's information (and tests). Callers
+    /// must not publish them again. The list is in the order:
+    /// any migration-or-close announcement FIRST, then the
+    /// per-participant LEFT events.
+    ///
+    /// Leaves the first room found for a user in several rooms;
+    /// use [`RoomRegistry::leave_room`] to name the room.
     pub async fn leave(
         &self,
         store: &dyn RoomStore,
@@ -880,11 +883,30 @@ impl RoomRegistry {
         intentional: bool,
         now_ms: i64,
     ) -> Result<(Vec<RoomEvent>, Option<RoomSummary>), RoomError> {
-        // Find the room the user is in.
+        self.leave_room(store, user_id, None, intentional, now_ms)
+            .await
+    }
+
+    /// [`RoomRegistry::leave`] for a specific room. With
+    /// `room_id = Some(r)` the user leaves exactly room `r`
+    /// (`NotJoined` if they are not a current participant of
+    /// it), never another room they are also in.
+    pub async fn leave_room(
+        &self,
+        store: &dyn RoomStore,
+        user_id: Uuid,
+        room_id: Option<Uuid>,
+        intentional: bool,
+        now_ms: i64,
+    ) -> Result<(Vec<RoomEvent>, Option<RoomSummary>), RoomError> {
+        // Find the room to leave.
         let handle = {
             let by_id = self.by_id.read().await;
             let mut found = None;
             for (rid, h) in by_id.iter() {
+                if room_id.is_some_and(|wanted| wanted != *rid) {
+                    continue;
+                }
                 let s = h.read().await;
                 if s.participants
                     .iter()
@@ -1355,7 +1377,7 @@ impl RoomRegistry {
         let participant = state
             .participants
             .iter_mut()
-            .find(|p| p.user_id == target_user_id)
+            .find(|p| p.user_id == target_user_id && p.status != ParticipantStatus::Left)
             .ok_or_else(|| RoomError::Internal("cap_set update: target not found".into()))?;
         participant.cap_set = new_cap_set;
         Ok(())

@@ -119,7 +119,12 @@ pub async fn can(
     state
         .participants
         .iter()
-        .find(|p| p.user_id == user_id)
+        // The live record: a user who left and rejoined has an
+        // old `Left` record ahead of the current one, and its
+        // capabilities must not count.
+        .find(|p| {
+            p.user_id == user_id && p.status != locast_protocol::room::ParticipantStatus::Left
+        })
         .is_some_and(|p| participant_can(p, scope, action))
 }
 
@@ -168,21 +173,18 @@ pub enum Command {
     FetchManifest,
     /// P3-T05: the per-target WebRTC `SIGNAL` envelope
     /// (SDP offer/answer, ICE candidates). The capability
-    /// check is "caller is a member of SOME room". The
-    /// per-type handler additionally checks that
-    /// `envelope.room_id` matches the caller's current
-    /// room AND that `to_user_id` is a member of the
-    /// same room (defense against cross-room relay and
-    /// stale peer sessions). Non-members are denied with
-    /// `CapsError::NotMember`.
+    /// check is "caller is a member of the room named in
+    /// `envelope.room_id`". The per-type handler
+    /// additionally checks that `to_user_id` is a member
+    /// of the same room (defense against cross-room relay
+    /// and stale peer sessions). Non-members are denied
+    /// with `CapsError::NotMember`.
     Signal,
-    /// P4-T01: host-only PLAYBACK_CMD envelope (PLAY / PAUSE /
-    /// SEEK per docs/ARCHITECTURE.md §13). The capability
-    /// check is identical in shape to `PublishManifest`: the
-    /// caller must be a participant of the room named in
-    /// `envelope.room_id` AND must be marked as host in the
-    /// CURRENT room state. We do not trust `cap_set` for the
-    /// host check (the bitfield is historical). The per-type
+    /// P4-T01: PLAYBACK_CMD envelope (PLAY / PAUSE / SEEK per
+    /// docs/ARCHITECTURE.md §13). The caller must be a
+    /// participant of the room named in `envelope.room_id`
+    /// and either its host or holding PLAYBACK_CONTROL there
+    /// (`can()`). The per-type
     /// handler additionally validates the room lifecycle
     /// state (PLAY requires Ready/Paused, PAUSE requires
     /// Playing, SEEK requires Playing/Paused) and the
@@ -192,11 +194,10 @@ pub enum Command {
     /// P4-T03: non-authoritative POSITION_REPORT envelope
     /// (1 Hz local-playback snapshot per
     /// docs/ARCHITECTURE.md §13.1). The capability check is
-    /// "caller is a member of some room" (mirrors
-    /// `FetchManifest` / `Signal` shape). The per-type
-    /// handler additionally checks that `envelope.room_id`
-    /// matches the caller's current room so cross-room
-    /// injection is denied. Non-members are denied with
+    /// "caller is a member of the room named in
+    /// `envelope.room_id`" (mirrors `FetchManifest` /
+    /// `Signal`), so cross-room injection is denied; the
+    /// per-type handler re-checks it. Non-members are denied with
     /// `CapsError::NotMember`. There is no host-only check:
     /// every participant (host or viewer) reports its own
     /// local state at 1 Hz.
@@ -261,101 +262,69 @@ impl Command {
 pub async fn check_capability(
     registry: &RoomRegistry,
     user_id: Uuid,
+    room_id: Option<Uuid>,
     command: Command,
 ) -> Result<(), CapsError> {
-    if let Some((scope, action)) = command.to_scope_action() {
-        if let Some(rid) = registry.get_user_room(user_id).await {
-            if !can(registry, user_id, rid, scope, action).await {
-                return Err(CapsError::NotHost);
-            }
+    // Room lifecycle entry points carry no room to authorize
+    // against (ROOM_CREATE / ROOM_JOIN_REQUEST address a room by
+    // code; ROOM_LEAVE is handled by the registry).
+    match command {
+        Command::RoomCreate | Command::RoomJoinRequest | Command::RoomLeave => return Ok(()),
+        // PRESENCE is a per-user keepalive (the client sends it
+        // without a room_id) and grants nothing; it only needs
+        // the caller to be in some room. A room_id, if present,
+        // must be one the caller is in.
+        Command::Presence => {
+            let member = match room_id {
+                Some(rid) => registry.is_user_in_room(user_id, rid).await,
+                None => registry.get_user_room(user_id).await.is_some(),
+            };
+            return if member {
+                Ok(())
+            } else {
+                Err(CapsError::NotMember)
+            };
         }
+        _ => {}
+    }
+
+    // Every other command acts on ONE room: the room named by the
+    // envelope. Membership and capabilities are checked against
+    // that room only. A user may be in several rooms; the gate
+    // never picks "a room the user is in" on its own, because a
+    // privilege held in one room must not authorize an action in
+    // another.
+    let Some(rid) = room_id else {
+        return Err(CapsError::NotMember);
+    };
+    if !registry.is_user_in_room(user_id, rid).await {
+        return Err(CapsError::NotMember);
     }
     match command {
-        Command::RoomCreate => Ok(()),
-        Command::RoomJoinRequest => Ok(()),
-        Command::RoomLeave => Ok(()),
-        Command::Presence => {
-            if registry.get_user_room(user_id).await.is_none() {
-                Err(CapsError::NotMember)
-            } else {
-                Ok(())
-            }
-        }
-        Command::PublishManifest => {
-            if let Some(rid) = registry.get_user_room(user_id).await {
-                if registry.is_room_host(rid, user_id).await {
-                    Ok(())
-                } else {
-                    Err(CapsError::NotHost)
-                }
-            } else {
-                Err(CapsError::NotMember)
-            }
-        }
-        Command::FetchManifest => {
-            if registry.get_user_room(user_id).await.is_some() {
+        // Host-only.
+        Command::PublishManifest | Command::PermissionSet => {
+            if registry.is_room_host(rid, user_id).await {
                 Ok(())
             } else {
-                Err(CapsError::NotMember)
+                Err(CapsError::NotHost)
             }
         }
-        Command::Signal => {
-            if registry.get_user_room(user_id).await.is_some() {
+        // Capability-bit gated (host, or a participant the host
+        // granted the bit to).
+        Command::PlaybackControl | Command::Draw | Command::ChatMessage => {
+            let (scope, action) = command
+                .to_scope_action()
+                .expect("capability-gated command has a scope/action");
+            if can(registry, user_id, rid, scope, action).await {
                 Ok(())
             } else {
-                Err(CapsError::NotMember)
+                Err(CapsError::NotHost)
             }
         }
-        Command::PlaybackControl => {
-            if let Some(rid) = registry.get_user_room(user_id).await {
-                if can(
-                    registry,
-                    user_id,
-                    rid,
-                    Scope::Playback,
-                    Action::IssuePlaybackCommand,
-                )
-                .await
-                {
-                    Ok(())
-                } else {
-                    Err(CapsError::NotHost)
-                }
-            } else {
-                Err(CapsError::NotMember)
-            }
-        }
-        Command::PositionReport => {
-            if registry.get_user_room(user_id).await.is_some() {
-                Ok(())
-            } else {
-                Err(CapsError::NotMember)
-            }
-        }
-        Command::Draw => {
-            if registry.get_user_room(user_id).await.is_some() {
-                Ok(())
-            } else {
-                Err(CapsError::NotMember)
-            }
-        }
-        Command::PermissionSet => {
-            if let Some(rid) = registry.get_user_room(user_id).await {
-                if registry.is_room_host(rid, user_id).await {
-                    Ok(())
-                } else {
-                    Err(CapsError::NotHost)
-                }
-            } else {
-                Err(CapsError::NotMember)
-            }
-        }
-        Command::ChatMessage => {
-            if registry.get_user_room(user_id).await.is_some() {
-                Ok(())
-            } else {
-                Err(CapsError::NotMember)
-            }
+        // Membership only.
+        Command::FetchManifest | Command::Signal | Command::PositionReport => Ok(()),
+        Command::RoomCreate | Command::RoomJoinRequest | Command::RoomLeave | Command::Presence => {
+            Ok(())
         }
     }
 }
@@ -548,10 +517,10 @@ mod tests {
     #[tokio::test]
     async fn room_create_is_allowed_for_anyone() {
         let (reg, _clock) = fresh_registry();
-        assert!(check_capability(&reg, uid(1), Command::RoomCreate)
+        assert!(check_capability(&reg, uid(1), None, Command::RoomCreate)
             .await
             .is_ok());
-        assert!(check_capability(&reg, uid(99), Command::RoomCreate)
+        assert!(check_capability(&reg, uid(99), None, Command::RoomCreate)
             .await
             .is_ok());
     }
@@ -559,15 +528,17 @@ mod tests {
     #[tokio::test]
     async fn room_join_request_is_allowed_for_anyone() {
         let (reg, _clock) = fresh_registry();
-        assert!(check_capability(&reg, uid(1), Command::RoomJoinRequest)
-            .await
-            .is_ok());
+        assert!(
+            check_capability(&reg, uid(1), None, Command::RoomJoinRequest)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn room_leave_is_allowed_in_v1() {
         let (reg, _clock) = fresh_registry();
-        assert!(check_capability(&reg, uid(1), Command::RoomLeave)
+        assert!(check_capability(&reg, uid(1), None, Command::RoomLeave)
             .await
             .is_ok());
     }
@@ -575,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn presence_is_denied_when_user_is_not_in_a_room() {
         let (reg, _clock) = fresh_registry();
-        let err = check_capability(&reg, uid(1), Command::Presence)
+        let err = check_capability(&reg, uid(1), None, Command::Presence)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
@@ -584,7 +555,7 @@ mod tests {
     #[tokio::test]
     async fn signal_is_denied_when_user_is_not_in_any_room() {
         let (reg, _clock) = fresh_registry();
-        let err = check_capability(&reg, uid(1), Command::Signal)
+        let err = check_capability(&reg, uid(1), None, Command::Signal)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
@@ -593,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn publish_manifest_is_denied_when_user_is_not_in_any_room() {
         let (reg, _clock) = fresh_registry();
-        let err = check_capability(&reg, uid(1), Command::PublishManifest)
+        let err = check_capability(&reg, uid(1), None, Command::PublishManifest)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
@@ -603,9 +574,9 @@ mod tests {
     async fn publish_manifest_is_denied_when_user_is_not_host() {
         let (reg, clock) = fresh_registry();
         let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
-        let host_ok = check_capability(&reg, uid(1), Command::PublishManifest).await;
+        let host_ok = check_capability(&reg, uid(1), Some(room_id), Command::PublishManifest).await;
         assert!(host_ok.is_ok(), "host should be allowed to publish");
-        let viewer_err = check_capability(&reg, uid(2), Command::PublishManifest)
+        let viewer_err = check_capability(&reg, uid(2), Some(room_id), Command::PublishManifest)
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
@@ -616,13 +587,17 @@ mod tests {
     async fn fetch_manifest_is_allowed_for_any_member_but_denied_for_non_member() {
         let (reg, clock) = fresh_registry();
         let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
-        assert!(check_capability(&reg, uid(1), Command::FetchManifest)
-            .await
-            .is_ok());
-        assert!(check_capability(&reg, uid(2), Command::FetchManifest)
-            .await
-            .is_ok());
-        let err = check_capability(&reg, uid(3), Command::FetchManifest)
+        assert!(
+            check_capability(&reg, uid(1), Some(room_id), Command::FetchManifest)
+                .await
+                .is_ok()
+        );
+        assert!(
+            check_capability(&reg, uid(2), Some(room_id), Command::FetchManifest)
+                .await
+                .is_ok()
+        );
+        let err = check_capability(&reg, uid(3), Some(room_id), Command::FetchManifest)
             .await
             .expect_err("non-member must be denied");
         assert!(matches!(err, CapsError::NotMember));
@@ -632,7 +607,7 @@ mod tests {
     #[tokio::test]
     async fn playback_control_is_denied_when_user_is_not_in_any_room() {
         let (reg, _clock) = fresh_registry();
-        let err = check_capability(&reg, uid(1), Command::PlaybackControl)
+        let err = check_capability(&reg, uid(1), None, Command::PlaybackControl)
             .await
             .expect_err("expected NotMember");
         assert!(matches!(err, CapsError::NotMember));
@@ -642,12 +617,12 @@ mod tests {
     async fn playback_control_is_denied_when_user_is_not_host() {
         let (reg, clock) = fresh_registry();
         let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
-        let host_ok = check_capability(&reg, uid(1), Command::PlaybackControl).await;
+        let host_ok = check_capability(&reg, uid(1), Some(room_id), Command::PlaybackControl).await;
         assert!(
             host_ok.is_ok(),
             "host should be allowed to playback-control"
         );
-        let viewer_err = check_capability(&reg, uid(2), Command::PlaybackControl)
+        let viewer_err = check_capability(&reg, uid(2), Some(room_id), Command::PlaybackControl)
             .await
             .expect_err("viewer must be denied");
         assert!(matches!(viewer_err, CapsError::NotHost));
@@ -683,7 +658,8 @@ mod tests {
         )
         .await
         .expect("grant playback control to cohost");
-        let result = check_capability(&reg, cohost_id, Command::PlaybackControl).await;
+        let result =
+            check_capability(&reg, cohost_id, Some(room_id), Command::PlaybackControl).await;
         assert!(
             result.is_ok(),
             "co-host with PLAYBACK_CONTROL bit should be allowed"
@@ -714,10 +690,132 @@ mod tests {
         reg.update_participant_cap_set(room_id, cohost_id, cap_bits::DRAW, clock.now_ms())
             .await
             .expect("grant draw (not playback) to cohost");
-        let err = check_capability(&reg, cohost_id, Command::PlaybackControl)
+        let err = check_capability(&reg, cohost_id, Some(room_id), Command::PlaybackControl)
             .await
             .expect_err("co-host without PLAYBACK_CONTROL bit must be denied");
         assert!(matches!(err, CapsError::NotHost));
         let _ = room_id;
+    }
+
+    /// uid(1) hosts room A; uid(3) hosts room B, which uid(1)
+    /// joins as a plain viewer. Every privilege uid(1) holds in A
+    /// must be evaluated against the room each request names.
+    #[tokio::test]
+    async fn privileges_are_checked_against_the_named_room_only() {
+        use super::super::store::NoopRoomStore;
+        let (reg, clock) = fresh_registry();
+        let s = NoopRoomStore;
+        let (a, _) = reg
+            .create(&s, "A".into(), uid(1), [1u8; 32], true, clock.now_ms())
+            .await
+            .expect("create A");
+        let (b, _) = reg
+            .create(&s, "B".into(), uid(3), [3u8; 32], true, clock.now_ms())
+            .await
+            .expect("create B");
+        reg.join(
+            &s,
+            &b.code,
+            uid(1),
+            [1u8; 32],
+            "a-host".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("uid(1) joins B as a viewer");
+        let gated = [
+            Command::PublishManifest,
+            Command::PermissionSet,
+            Command::PlaybackControl,
+            Command::Draw,
+        ];
+        // The old gate authorized against whichever of the user's
+        // rooms `get_user_room` returned. Asserting success in A
+        // AND refusal in B fails for either choice.
+        {
+            for cmd in gated {
+                assert!(
+                    check_capability(&reg, uid(1), Some(a.id), cmd)
+                        .await
+                        .is_ok(),
+                    "{cmd:?} in the room uid(1) hosts"
+                );
+                assert!(
+                    matches!(
+                        check_capability(&reg, uid(1), Some(b.id), cmd).await,
+                        Err(CapsError::NotHost)
+                    ),
+                    "{cmd:?} in the room uid(1) only views"
+                );
+            }
+            // Membership-level commands still work in both rooms.
+            for rid in [a.id, b.id] {
+                for cmd in [
+                    Command::ChatMessage,
+                    Command::FetchManifest,
+                    Command::Signal,
+                ] {
+                    assert!(check_capability(&reg, uid(1), Some(rid), cmd).await.is_ok());
+                }
+            }
+        }
+        // A room the user is not in, and a missing room id.
+        let not_in = Uuid::now_v7();
+        for cmd in [
+            Command::ChatMessage,
+            Command::PublishManifest,
+            Command::PositionReport,
+        ] {
+            assert!(matches!(
+                check_capability(&reg, uid(1), Some(not_in), cmd).await,
+                Err(CapsError::NotMember)
+            ));
+            assert!(matches!(
+                check_capability(&reg, uid(1), None, cmd).await,
+                Err(CapsError::NotMember)
+            ));
+        }
+    }
+
+    /// A participant granted DRAW who leaves and rejoins gets a
+    /// fresh record with the default capabilities; the old `Left`
+    /// record (still first in the list) must not authorize them.
+    #[tokio::test]
+    async fn capabilities_of_a_left_record_do_not_survive_a_rejoin() {
+        use super::super::store::NoopRoomStore;
+        let (reg, clock) = fresh_registry();
+        let s = NoopRoomStore;
+        let (room_id, _host) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let viewer = uid(2);
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::DRAW, clock.now_ms())
+            .await
+            .expect("grant DRAW");
+        assert!(can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
+
+        reg.leave_room(&s, viewer, Some(room_id), true, clock.now_ms())
+            .await
+            .expect("viewer leaves");
+        let code = reg
+            .get_by_id(room_id)
+            .await
+            .expect("room")
+            .read()
+            .await
+            .code
+            .clone();
+        reg.join(&s, &code, viewer, [2u8; 32], "again".into(), clock.now_ms())
+            .await
+            .expect("viewer rejoins");
+
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
+        assert!(matches!(
+            check_capability(&reg, viewer, Some(room_id), Command::Draw).await,
+            Err(CapsError::NotHost)
+        ));
+        // A new grant lands on the live record.
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::DRAW, clock.now_ms())
+            .await
+            .expect("grant again");
+        assert!(can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
     }
 }

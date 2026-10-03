@@ -75,18 +75,15 @@ use super::registry::{RoomEvent, RoomRegistry};
 /// The handler is intentionally narrow: it never touches
 /// `RoomState` (no lock acquisition, no state read or write).
 /// The membership check is done against `RoomRegistry`'s
-/// read-only snapshots (`get_user_room` and
-/// `is_user_in_room`) so a flood of 1 Hz reports does not
-/// contend with playback / manifest / room-lifecycle
-/// mutations.
+/// read-only snapshot (`is_user_in_room`) so a flood of
+/// 1 Hz reports does not contend with playback / manifest /
+/// room-lifecycle mutations.
 ///
 /// `envelope.room_id` is the room the caller claims to be
-/// reporting on. The handler independently verifies this
-/// matches the caller's current room via
-/// `registry.get_user_room`; a mismatch is treated as
-/// `NotJoined` (cross-room injection is denied, mirroring
-/// MANIFEST_REQUEST's strict per-room check at
-/// `apps/server/src/rooms/dispatch.rs:878`).
+/// reporting on. The handler verifies the caller is a
+/// current participant of THAT room; otherwise `NotJoined`
+/// (cross-room injection is denied, mirroring
+/// MANIFEST_REQUEST's strict per-room check).
 pub async fn handle_position_report(
     envelope: &Envelope,
     registry: &RoomRegistry,
@@ -111,27 +108,17 @@ pub async fn handle_position_report(
     //       in the context of a room the caller is in); a
     //       missing room_id is a protocol error.
     //    b) The caller MUST currently be a participant in
-    //       the named room. We compare against the
-    //       registry's view of the caller's current room
-    //       (NOT the envelope's room_id) so a cross-room
-    //       injection (caller is in room X, sends a report
-    //       claiming room Y) is denied.
+    //       the named room, so a cross-room injection
+    //       (caller is in room X, sends a report claiming
+    //       room Y) is denied. A user in several rooms may
+    //       report in any of them.
     let room_id = envelope.room_id.ok_or(PresenceError::BadPayload(
         "POSITION_REPORT requires room_id".into(),
     ))?;
-    let user_room = registry.get_user_room(user_id).await;
-    let Some(user_room) = user_room else {
-        return Err(PresenceError::NotJoined);
-    };
-    if user_room != room_id {
-        // Cross-room injection: caller is in a different
-        // room than the envelope claims. Deny.
-        return Err(PresenceError::NotJoined);
-    }
     if !registry.is_user_in_room(user_id, room_id).await {
-        // Belt-and-suspenders: the participant may have
-        // just left between the get_user_room snapshot
-        // and this call. Deny.
+        // Cross-room injection (the caller is not a member of
+        // the room the envelope claims) or a caller who just
+        // left. Deny.
         return Err(PresenceError::NotJoined);
     }
 

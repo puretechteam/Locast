@@ -96,7 +96,9 @@ pub async fn dispatch_room_message(
         _ => None,
     };
     if let Some(cmd) = command {
-        if let Err(e) = caps::check_capability(registry, user_id, cmd).await {
+        // Authorize against the room the envelope names (never a
+        // room picked from the user's memberships).
+        if let Err(e) = caps::check_capability(registry, user_id, envelope.room_id, cmd).await {
             // For PublishManifest + FetchManifest + Signal +
             // PlaybackControl (P4-T01), surface the error to
             // the caller as a ROOM_ERROR. P5-T02's drawing
@@ -142,7 +144,9 @@ pub async fn dispatch_room_message(
         MessageKind::RoomJoinRequest => {
             handle_room_join_request(envelope, registry, store, user_id, pubkey, now_ms).await
         }
-        MessageKind::RoomLeave => handle_room_leave(registry, store, user_id, now_ms).await,
+        MessageKind::RoomLeave => {
+            handle_room_leave(registry, store, user_id, envelope.room_id, now_ms).await
+        }
         MessageKind::Presence => handle_presence(registry, user_id, now_ms).await,
         MessageKind::ManifestPublish => {
             handle_manifest_publish_dispatch(envelope, registry, db, clock, user_id).await
@@ -341,17 +345,24 @@ fn strip_bearer(mut v: serde_json::Value) -> serde_json::Value {
     v
 }
 
+/// ROOM_LEAVE. With an envelope room_id the user leaves exactly
+/// that room. The registry publishes the leave's events to the
+/// room actually left, so they are NOT returned in `events`: the
+/// WS layer would publish them again on the envelope's room
+/// channel (a duplicate, or a leak into another room).
 async fn handle_room_leave(
     registry: &RoomRegistry,
     store: &dyn RoomStore,
     user_id: Uuid,
+    room_id: Option<Uuid>,
     now_ms: i64,
 ) -> RoomDispatchOutcome {
     let mut out = RoomDispatchOutcome::default();
-    match registry.leave(store, user_id, true, now_ms).await {
-        Ok((events, _summary)) => {
-            out.events.extend(events);
-        }
+    match registry
+        .leave_room(store, user_id, room_id, true, now_ms)
+        .await
+    {
+        Ok((_already_published, _summary)) => {}
         Err(e) => {
             let msg = e.to_string();
             out.to_caller
@@ -499,14 +510,12 @@ async fn handle_stroke_begin_dispatch(
         Some(r) => r,
         None => return default_reject("DRAW_BEGIN requires envelope.room_id"),
     };
-    // Cross-room guard: the envelope's room_id must match
-    // the bearer's current room. Mirrors the SIGNAL
-    // check in `dispatch.rs::handle_signal_dispatch`.
-    match registry.get_user_room(user_id).await {
-        Some(rid) if rid == room_id => {}
-        Some(_) => return default_reject("cross-room drawing message rejected"),
-        None => return default_reject("drawing sender is not in any room"),
-    };
+    // Cross-room guard: the bearer must be a member of the
+    // room the envelope names (the capability gate already
+    // checked DRAW in that room).
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return default_reject("drawing sender is not in the named room");
+    }
     let handle = match registry.get_by_id(room_id).await {
         Some(h) => h,
         None => return default_reject("drawing target room not found"),
@@ -526,11 +535,9 @@ async fn handle_stroke_point_dispatch(
         Some(r) => r,
         None => return default_reject("DRAW_POINT requires envelope.room_id"),
     };
-    match registry.get_user_room(user_id).await {
-        Some(rid) if rid == room_id => {}
-        Some(_) => return default_reject("cross-room drawing message rejected"),
-        None => return default_reject("drawing sender is not in any room"),
-    };
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return default_reject("drawing sender is not in the named room");
+    }
     let handle = match registry.get_by_id(room_id).await {
         Some(h) => h,
         None => return default_reject("drawing target room not found"),
@@ -550,11 +557,9 @@ async fn handle_stroke_end_dispatch(
         Some(r) => r,
         None => return default_reject("DRAW_END requires envelope.room_id"),
     };
-    match registry.get_user_room(user_id).await {
-        Some(rid) if rid == room_id => {}
-        Some(_) => return default_reject("cross-room drawing message rejected"),
-        None => return default_reject("drawing sender is not in any room"),
-    };
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return default_reject("drawing sender is not in the named room");
+    }
     let handle = match registry.get_by_id(room_id).await {
         Some(h) => h,
         None => return default_reject("drawing target room not found"),
