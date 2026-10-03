@@ -75,7 +75,10 @@ impl Harness {
                 cmd: cmd.into(),
                 callback: CallbackFn(0),
                 error: CallbackFn(1),
-                url: "http://tauri.localhost".parse().expect("url"),
+                // The local origin on Linux and macOS (it is `http://tauri.localhost`
+                // only on Windows). Any other origin is treated as remote and is
+                // refused by Tauri's ACL for lack of a remote capability.
+                url: "tauri://localhost".parse().expect("url"),
                 body: InvokeBody::Json(body),
                 headers: Default::default(),
                 invoke_key: INVOKE_KEY.to_string(),
