@@ -59,7 +59,10 @@ static_checks() {
     fi
     for f in $files; do
         local cfg missing
-        cfg=$(docker compose -f "$f" config --format json)
+        # Production compose files require deployment values; these
+        # placeholders exist only to render the config and are never used.
+        cfg=$(LOCAST_DOMAIN=render.invalid LOCAST_TURN_SHARED_SECRET=render-only \
+            docker compose -f "$f" config --format json)
         missing=$(echo "$cfg" | jq -r '.services | to_entries[]
             | select((.value.mem_limit | tostring) != "2147483648" or (.value.cpus | tostring) != "1")
             | .key')

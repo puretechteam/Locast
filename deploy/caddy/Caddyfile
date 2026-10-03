@@ -1,0 +1,52 @@
+# Locast production reverse proxy (P9-T02).
+#
+# Caddy terminates TLS for {$LOCAST_DOMAIN} and obtains / renews the
+# certificate itself (docs/ARCHITECTURE.md 20.10.1, 21.12). The Rust server
+# never terminates TLS and is not published to the host.
+#
+# Certificates: for a public domain Caddy uses Let's Encrypt (pinned below so
+# the certificate path coturn reads is predictable). If DNS for the domain
+# does not point at this host, issuance fails and Caddy keeps retrying; HTTPS
+# then does not serve and there is no plaintext fallback. For `*.localhost`
+# test domains Caddy uses its own local CA instead, with no network calls.
+
+{
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+{$LOCAST_DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Signaling WebSocket. Caddy forwards the HTTP/1.1 Upgrade and keeps the
+	# stream open with no idle timeout; on a config reload, existing
+	# connections get five minutes before they are closed.
+	handle /ws {
+		reverse_proxy locast-server:8787 {
+			stream_close_delay 5m
+		}
+	}
+
+	# TURN discovery: the public coturn endpoints (section 19.5.2). This holds
+	# no credentials; short-lived TURN credentials are minted by the server.
+	handle /turn {
+		header Content-Type "application/json"
+		header Cache-Control "public, max-age=300"
+		respond `{"urls":["turn:{$LOCAST_DOMAIN}:3478?transport=udp","turn:{$LOCAST_DOMAIN}:3478?transport=tcp","turns:{$LOCAST_DOMAIN}:5349?transport=tcp"]}` 200
+	}
+
+	# Public server endpoints (section 20.3). `/metrics` is deliberately not
+	# routed: it is for operators, not the internet.
+	@public path /health /version /rooms/*
+	handle @public {
+		reverse_proxy locast-server:8787
+	}
+
+	handle {
+		respond 404
+	}
+}

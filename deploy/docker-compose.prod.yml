@@ -1,0 +1,143 @@
+# Locast production stack (P9-T02): Caddy (TLS + reverse proxy), the
+# signaling server, and coturn. Run from this directory:
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Required settings (put them in deploy/.env, which is git-ignored, or export
+# them). Compose refuses to start if a required value is missing:
+#   LOCAST_DOMAIN               public DNS name pointing at this host,
+#                               e.g. locast.example
+#   LOCAST_TURN_SHARED_SECRET   coturn shared secret, also given to the server;
+#                               generate with `openssl rand -hex 32`
+# Optional:
+#   LOCAST_DB_KEY               database encryption key (sensitive)
+#   LOCAST_TURN_EXTERNAL_IP     public IP of this host, when it is behind NAT
+#   LOCAST_CERT_ISSUER_DIR      Caddy certificate directory; only `*.localhost`
+#                               test deployments set this (to `local`)
+#
+# Host firewall: TCP 80, 443 (Caddy), TCP/UDP 3478, TCP 5349 (coturn) and
+# UDP 49160-49200 (TURN relay). The server's port 8787 is never published:
+# clients reach it only through Caddy at wss://$LOCAST_DOMAIN/ws.
+#
+# Each container is capped at 2 GB RAM and 1 CPU (ARCHITECTURE 21.17;
+# asserted by the `hardening` CI job).
+
+name: locast
+
+services:
+  locast-server:
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    image: locast/locast-server:prod
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1.0
+    environment:
+      LOCAST_BIND_ADDR: "0.0.0.0:8787"
+      LOCAST_DATABASE_URL: "/var/lib/locast/locast-server.db"
+      LOCAST_LOG: "info"
+      LOCAST_TURN_SHARED_SECRET: "${LOCAST_TURN_SHARED_SECRET:?set LOCAST_TURN_SHARED_SECRET (openssl rand -hex 32)}"
+      LOCAST_DB_KEY: "${LOCAST_DB_KEY:-}"
+    expose:
+      - "8787"
+    volumes:
+      - locast-data:/var/lib/locast
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8787/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  caddy:
+    image: caddy:2.9
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1.0
+    depends_on:
+      locast-server:
+        condition: service_healthy
+    environment:
+      LOCAST_DOMAIN: "${LOCAST_DOMAIN:?set LOCAST_DOMAIN to the public DNS name of this host}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    # Healthy only once the certificate for LOCAST_DOMAIN exists, so coturn
+    # (which needs it for `turns:`) never starts without one.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/caddy/certificates/${LOCAST_CERT_ISSUER_DIR:-acme-v02.api.letsencrypt.org-directory}/${LOCAST_DOMAIN}/${LOCAST_DOMAIN}.crt"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 1.0
+    # Host networking: TURN relay addresses must be the host's own, and the
+    # relay port range needs no per-port NAT. turnserver.conf blocks relaying
+    # to private and loopback ranges.
+    network_mode: host
+    # Starts as root only to read Caddy's private key, then drops to
+    # `nobody` (proc-user in turnserver.conf).
+    user: "0:0"
+    depends_on:
+      caddy:
+        condition: service_healthy
+    environment:
+      TURN_SECRET: "${LOCAST_TURN_SHARED_SECRET:?set LOCAST_TURN_SHARED_SECRET (openssl rand -hex 32)}"
+      TURN_REALM: "${LOCAST_DOMAIN:?set LOCAST_DOMAIN to the public DNS name of this host}"
+      TURN_CERT_DIR: "/caddy-data/caddy/certificates/${LOCAST_CERT_ISSUER_DIR:-acme-v02.api.letsencrypt.org-directory}/${LOCAST_DOMAIN}"
+      TURN_EXTERNAL_IP: "${LOCAST_TURN_EXTERNAL_IP:-}"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - caddy-data:/caddy-data:ro
+    # Append the deployment values to a private copy of the config, so the
+    # shared secret is never on the command line (visible in `ps`).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        conf=/tmp/turnserver.conf
+        cp /etc/coturn/turnserver.conf "$$conf"
+        {
+          echo "static-auth-secret=$$TURN_SECRET"
+          echo "realm=$$TURN_REALM"
+          echo "cert=$$TURN_CERT_DIR/$$TURN_REALM.crt"
+          echo "pkey=$$TURN_CERT_DIR/$$TURN_REALM.key"
+          if [ -n "$$TURN_EXTERNAL_IP" ]; then echo "external-ip=$$TURN_EXTERNAL_IP"; fi
+        } >> "$$conf"
+        exec turnserver -c "$$conf"
+    healthcheck:
+      test: ["CMD", "turnutils_stunclient", "-p", "3478", "127.0.0.1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  backend: {}
+
+volumes:
+  locast-data: {}
+  caddy-data: {}
+  caddy-config: {}

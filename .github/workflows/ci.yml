@@ -214,6 +214,20 @@ jobs:
       - name: Image checklist (non-root, static binary, starts)
         run: bash scripts/check-hardening.sh image locast-server:hardening
 
+  # P9-T02: bring up deploy/docker-compose.prod.yml (Caddy + server + coturn)
+  # with a *.localhost test domain (Caddy's local CA, no public DNS) and check
+  # HTTPS, the /ws WebSocket upgrade, /turn, and coturn STUN/TLS. A real
+  # public domain and Let's Encrypt issuance cannot be tested here.
+  deploy-smoke:
+    name: deploy smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Production compose smoke test
+        run: bash scripts/deploy-smoke.sh
+
   # P8-T06: criterion hot-path benches (ARCHITECTURE 28.10) compared against
   # the checked-in per-platform baseline in
   # apps/client/src-tauri/benches/baseline/. Only Linux is gated: absolute
