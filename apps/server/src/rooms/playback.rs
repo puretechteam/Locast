@@ -1,10 +1,16 @@
 //! P4-T01: server-side PLAYBACK_CMD validation + ordering.
 //!
-//! The single arbiter for host playback commands (PLAY / PAUSE /
+//! The single arbiter for playback commands (PLAY / PAUSE /
 //! SEEK per docs/ARCHITECTURE.md section 13). The dispatcher
 //! routes a `MessageKind::PlaybackCmd` envelope here AFTER the
-//! capability gate has confirmed the caller is the current host
-//! of the room named in `envelope.room_id`. This module does
+//! WS layer has confirmed the caller is a member of the room
+//! named in `envelope.room_id` and the capability gate
+//! (`caps::check_capability(Command::PlaybackControl)`) has
+//! confirmed the caller may issue playback commands: the host,
+//! or a co-host the host granted `PLAYBACK_CONTROL` via
+//! PERMISSION_SET. The same rule (`caps::participant_can`) is
+//! re-checked here inside the room lock, together with the
+//! caller's authenticated pubkey. This module does
 // the rest:
 //!
 //! 1. Decode the payload into a typed [`PlaybackCommandPayload`].
@@ -23,10 +29,13 @@
 //    - transition `RoomState::state` (Open/Paused -> Playing on
 //      PLAY, Playing -> Paused on PAUSE, Playing/Paused -> same
 //      on SEEK)
-// 5. Return a `RoomEvent::PlaybackCommand` carrying the
-//    server-stamped `PlaybackAcceptedEvent`. The WS layer turns
-//    the event into a PLAYBACK_CMD broadcast envelope sent to
-//    every other room participant.
+// 5. Publish a `RoomEvent::PlaybackCommand` carrying the
+//    server-stamped `PlaybackAcceptedEvent` to the room's
+//    broadcast channel WHILE STILL HOLDING the room write lock
+//    that assigned `server_seq`, so broadcast order always equals
+//    `server_seq` order even when the host and a co-host send
+//    concurrently on separate connections. The WS forwarders turn
+//    it into a PLAYBACK_CMD envelope for every other participant.
 //!
 //! Rejected commands produce `Err(PlaybackError)` which the
 //! dispatch layer surfaces as a single-caller ROOM_ERROR. They
@@ -61,6 +70,7 @@ use locast_protocol::envelope::Envelope;
 use locast_protocol::room::{PlaybackAcceptedEvent, PlaybackAction, PlaybackCommandPayload};
 use uuid::Uuid;
 
+use super::caps::{participant_can, Action, Scope};
 use super::error::RoomError;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::state::RoomLifecycle;
@@ -86,7 +96,7 @@ pub enum PlaybackError {
     NotJoined,
     #[error("room is not open for playback commands")]
     RoomClosed,
-    #[error("caller is not the current host")]
+    #[error("caller may not issue playback commands")]
     NotHost,
     #[error("playback monotonic_seq gap (got {got}, expected {expected})")]
     StaleCommand { got: u64, expected: u64 },
@@ -96,12 +106,18 @@ pub enum PlaybackError {
     BadPayload(String),
 }
 
-/// Validate + accept a host playback command. Returns the
-/// `RoomEvent` to broadcast on accept, or a typed
-/// `PlaybackError` on reject. The dispatch layer converts
-/// `PlaybackError` into a wire-level ROOM_ERROR via the
-/// shared `RoomError` -> `RoomErrorCode` mapping; see the
-/// per-error mapping below.
+/// Validate + accept a playback command. On accept the
+/// `RoomEvent::PlaybackCommand` is ALREADY PUBLISHED to the
+/// room's broadcast channel (under the room lock, see step 5
+/// above) and is returned for the caller's information only;
+/// callers must not publish it again. On reject returns a
+/// typed `PlaybackError` and publishes nothing. The dispatch
+/// layer converts `PlaybackError` into a wire-level ROOM_ERROR
+/// via the shared `RoomError` -> `RoomErrorCode` mapping; see
+/// the per-error mapping below.
+///
+/// `pubkey` is the authenticated session's pubkey; it must be
+/// the pubkey on the caller's participant record.
 pub async fn handle_playback_cmd(
     envelope: &Envelope,
     registry: &RoomRegistry,
@@ -123,10 +139,14 @@ pub async fn handle_playback_cmd(
     let payload: PlaybackCommandPayload = serde_json::from_value(payload_value)
         .map_err(|e| PlaybackError::BadPayload(e.to_string()))?;
 
-    // 3. Look up the room state. The capability gate has
-    //    already verified host membership; we use
-    //    `get_by_id` for the actual `RoomHandle` and then
-    //    re-check host + pubkey inside the same lock.
+    // 3. Look up the room state and re-check authorization
+    //    inside the same write lock that will assign
+    //    `server_seq`, against the room the envelope names.
+    //    The capability gate already ran; re-checking here
+    //    keeps the invariant even if a host migration or a
+    //    PERMISSION_SET revocation lands between the gate and
+    //    this lock, or if the gate is bypassed in a future
+    //    refactor.
     let handle = registry
         .get_by_id(room_id)
         .await
@@ -136,23 +156,21 @@ pub async fn handle_playback_cmd(
     if state.state == RoomLifecycle::Ended {
         return Err(PlaybackError::RoomClosed);
     }
-    if state.host_user_id != user_id {
-        // Belt-and-suspenders: capability gate already
-        // rejected this case, but re-check inside the lock
-        // so the invariant holds even if the registry's
-        // gate is bypassed in a future refactor.
-        return Err(PlaybackError::NotHost);
-    }
-    // Bind the host's pubkey to the current state's pubkey
-    // so a future caller that re-uses a stale `user_id`
-    // cannot issue commands after the host was migrated.
-    // The pubkey on the ParticipantRecord is authoritative.
-    let host_pubkey_now = state
-        .participants
-        .iter()
-        .find(|p| p.user_id == state.host_user_id)
-        .map(|p| p.pubkey);
-    if host_pubkey_now != Some(pubkey) {
+    let (pubkey_matches, may_control) = {
+        let caller = state
+            .participants
+            .iter()
+            .find(|p| p.user_id == user_id)
+            .ok_or(PlaybackError::NotJoined)?;
+        (
+            caller.pubkey == pubkey,
+            participant_can(caller, Scope::Playback, Action::IssuePlaybackCommand),
+        )
+    };
+    // The participant record's pubkey is authoritative: a
+    // session whose pubkey differs (e.g. a stale identity
+    // after a rotation) cannot act as this participant.
+    if !pubkey_matches || !may_control {
         return Err(PlaybackError::NotHost);
     }
 
@@ -244,6 +262,14 @@ pub async fn handle_playback_cmd(
         server_seq,
         server_ts_ms,
     });
+
+    // 7. Publish while `state` (the room write lock) is still
+    //    held: the next accepted command cannot take a
+    //    `server_seq` until this one is on the channel, so the
+    //    broadcast order is the `server_seq` order. `publish`
+    //    never awaits.
+    registry.publish_events(std::slice::from_ref(&event), |_| room_id);
+    drop(state);
 
     Ok(event)
 }
@@ -558,5 +584,214 @@ mod tests {
             .await
             .expect_err("expected NotHost");
         assert!(matches!(err, PlaybackError::NotHost), "got {err:?}");
+    }
+
+    /// Grant the viewer (uid(2), pubkey [2u8; 32]) a capability
+    /// set through the existing PERMISSION_SET registry path.
+    async fn grant(reg: &crate::rooms::RoomRegistry, room_id: Uuid, bits: u32, clock: &MockClock) {
+        reg.update_participant_cap_set(room_id, uid(2), bits, clock.now_ms())
+            .await
+            .expect("grant caps");
+    }
+
+    fn decode(item: &crate::rooms::registry::BroadcastItem) -> PlaybackAcceptedEvent {
+        assert_eq!(item.kind, MessageKind::PlaybackCmd);
+        serde_json::from_value(item.payload.clone()).expect("accepted payload")
+    }
+
+    #[tokio::test]
+    async fn viewer_play_pause_seek_are_forbidden_and_never_published() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+        // Put the room in Playing so every action is valid for
+        // the lifecycle; only authorization can reject them.
+        let env = envelope(room_id, host_uid, host_pk, PlaybackAction::Play, 1, 0);
+        handle_playback_cmd(&env, &reg, &clock, host_uid, host_pk)
+            .await
+            .expect("host play");
+        assert_eq!(
+            decode(&rx.try_recv().expect("host broadcast")).server_seq,
+            1
+        );
+
+        for (i, action) in [
+            PlaybackAction::Play,
+            PlaybackAction::Pause,
+            PlaybackAction::Seek,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let env = envelope(room_id, uid(2), [2u8; 32], action, i as u64 + 1, 5_000);
+            let err = handle_playback_cmd(&env, &reg, &clock, uid(2), [2u8; 32])
+                .await
+                .expect_err("viewer must be refused");
+            assert!(matches!(err, PlaybackError::NotHost), "{action:?}: {err:?}");
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused command must not be published"
+        );
+        let st = room_state_snapshot(&reg, room_id).await;
+        let st = st.read().await;
+        assert_eq!(
+            st.playback.server_seq, 1,
+            "refusals do not consume server_seq"
+        );
+        assert_eq!(st.state, RoomLifecycle::Playing);
+        assert!(!st.playback.last_acked_seq.contains_key(&uid(2)));
+    }
+
+    #[tokio::test]
+    async fn cohost_with_playback_control_is_accepted_and_shares_the_room_sequence() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        grant(
+            &reg,
+            room_id,
+            crate::rooms::caps::cap_bits::PLAYBACK_CONTROL,
+            &clock,
+        )
+        .await;
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+
+        let env = envelope(room_id, host_uid, host_pk, PlaybackAction::Play, 1, 0);
+        handle_playback_cmd(&env, &reg, &clock, host_uid, host_pk)
+            .await
+            .expect("host play");
+        // The co-host's own monotonic_seq starts at 1; the room's
+        // server_seq continues from the host's.
+        let env = envelope(room_id, uid(2), [2u8; 32], PlaybackAction::Pause, 1, 7_000);
+        handle_playback_cmd(&env, &reg, &clock, uid(2), [2u8; 32])
+            .await
+            .expect("co-host pause");
+
+        let first = decode(&rx.try_recv().expect("host broadcast"));
+        let second = decode(&rx.try_recv().expect("co-host broadcast"));
+        assert_eq!((first.server_seq, first.sender_id), (1, host_uid));
+        assert_eq!((second.server_seq, second.sender_id), (2, uid(2)));
+        assert_eq!(second.action, PlaybackAction::Pause);
+    }
+
+    #[tokio::test]
+    async fn cohost_without_playback_control_is_forbidden() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        grant(&reg, room_id, crate::rooms::caps::cap_bits::DRAW, &clock).await;
+        let env = envelope(room_id, host_uid, host_pk, PlaybackAction::Play, 1, 0);
+        handle_playback_cmd(&env, &reg, &clock, host_uid, host_pk)
+            .await
+            .expect("host play");
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+        let env = envelope(room_id, uid(2), [2u8; 32], PlaybackAction::Pause, 1, 0);
+        let err = handle_playback_cmd(&env, &reg, &clock, uid(2), [2u8; 32])
+            .await
+            .expect_err("DRAW does not grant playback");
+        assert!(matches!(err, PlaybackError::NotHost), "got {err:?}");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cohost_session_with_a_different_pubkey_is_forbidden() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, _host_pk, _host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        grant(
+            &reg,
+            room_id,
+            crate::rooms::caps::cap_bits::PLAYBACK_CONTROL,
+            &clock,
+        )
+        .await;
+        let env = envelope(room_id, uid(2), [7u8; 32], PlaybackAction::Play, 1, 0);
+        let err = handle_playback_cmd(&env, &reg, &clock, uid(2), [7u8; 32])
+            .await
+            .expect_err("pubkey must match the participant record");
+        assert!(matches!(err, PlaybackError::NotHost), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn server_ts_is_the_server_clock_at_acceptance_not_the_client_ts() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        let mut stamps = Vec::new();
+        for (seq, action) in [
+            PlaybackAction::Play,
+            PlaybackAction::Seek,
+            PlaybackAction::Pause,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            clock.advance(250);
+            let mut env = envelope(room_id, host_uid, host_pk, action, seq as u64 + 1, 0);
+            // A client clock far in the past must not leak into server_ts.
+            env.payload["client_ts_ms"] = json!(42);
+            let evt = handle_playback_cmd(&env, &reg, &clock, host_uid, host_pk)
+                .await
+                .expect("accepted");
+            let RoomEvent::PlaybackCommand(a) = evt else {
+                panic!("expected PlaybackCommand");
+            };
+            assert_eq!(a.server_ts_ms, clock.now_ms());
+            assert_eq!(a.client_ts_ms, 42, "client_ts is echoed verbatim");
+            stamps.push(a.server_ts_ms);
+        }
+        assert_eq!(stamps, vec![1_000_250, 1_000_500, 1_000_750]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_host_and_cohost_broadcast_in_server_seq_order() {
+        let clock = std::sync::Arc::new(fresh_clock());
+        let reg = std::sync::Arc::new(fresh_registry());
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+        grant(
+            &reg,
+            room_id,
+            crate::rooms::caps::cap_bits::PLAYBACK_CONTROL,
+            &clock,
+        )
+        .await;
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+        let env = envelope(room_id, host_uid, host_pk, PlaybackAction::Play, 1, 0);
+        handle_playback_cmd(&env, &reg, &*clock, host_uid, host_pk)
+            .await
+            .expect("host play");
+
+        // Two senders on "separate connections", each with its
+        // own in-order monotonic_seq, racing each other.
+        const PER_SENDER: u64 = 50;
+        let spawn_sender = |sender: Uuid, pk: [u8; 32], first_seq: u64| {
+            let reg = reg.clone();
+            let clock = clock.clone();
+            tokio::spawn(async move {
+                for i in 0..PER_SENDER {
+                    let env = envelope(room_id, sender, pk, PlaybackAction::Seek, first_seq + i, i);
+                    handle_playback_cmd(&env, &reg, &*clock, sender, pk)
+                        .await
+                        .expect("seek accepted");
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let a = spawn_sender(host_uid, host_pk, 2);
+        let b = spawn_sender(uid(2), [2u8; 32], 1);
+        a.await.expect("host task");
+        b.await.expect("co-host task");
+
+        let mut seqs = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            seqs.push(decode(&item).server_seq);
+        }
+        let expected: Vec<u64> = (1..=1 + 2 * PER_SENDER).collect();
+        assert_eq!(
+            seqs, expected,
+            "broadcast order must equal server_seq order"
+        );
     }
 }

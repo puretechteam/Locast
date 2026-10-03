@@ -21,6 +21,7 @@ use axum::Router;
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use locast_protocol::envelope::{Envelope, MessageKind};
+use locast_protocol::room::{cap, PlaybackAcceptedEvent, PlaybackAction, PlaybackCommandPayload};
 use locast_protocol::room::{
     HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
     ParticipantLeftPayload, RoomClosedPayload, RoomCreatePayload, RoomCreatedPayload,
@@ -1150,3 +1151,330 @@ async fn stale_participant_removed_after_disconnect_timeout() {
 // ---------------------------------------------------------------------------
 // Helper: extract RoomSummary (asserts the room_id matches for sanity).
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// P4-T01: PLAYBACK_CMD validation + ordering over the real WebSocket path.
+// ---------------------------------------------------------------------------
+
+/// A room-scoped envelope with the bearer merged into the payload, the
+/// same shape the client sends after the handshake.
+fn room_scoped_envelope(
+    token: [u8; 32],
+    kind: MessageKind,
+    room_id: Uuid,
+    inner: serde_json::Value,
+) -> Envelope {
+    let mut payload = json!({ "bearer": token.to_vec() });
+    let obj = payload.as_object_mut().unwrap();
+    for (k, v) in inner.as_object().unwrap() {
+        obj.insert(k.clone(), v.clone());
+    }
+    Envelope {
+        v: 1,
+        r#type: kind,
+        id: Uuid::now_v7(),
+        room_id: Some(room_id),
+        sender: None,
+        ts_ms: 0,
+        seq: 0,
+        payload,
+    }
+}
+
+fn playback_cmd(
+    token: [u8; 32],
+    room_id: Uuid,
+    action: PlaybackAction,
+    monotonic_seq: u64,
+    media_position_ms: u64,
+) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::PlaybackCmd,
+        room_id,
+        serde_json::to_value(PlaybackCommandPayload {
+            action,
+            monotonic_seq,
+            media_position_ms,
+            // A client clock unrelated to the server's.
+            client_ts_ms: 7,
+        })
+        .unwrap(),
+    )
+}
+
+/// Read until an envelope of `kind` arrives, skipping room chatter
+/// (PARTICIPANT_JOINED, ROOM_STATE, CAPABILITY_UPDATE, ...).
+async fn next_of_kind(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    kind: MessageKind,
+    ctx: &str,
+) -> Envelope {
+    loop {
+        let bytes = tokio::time::timeout(Duration::from_secs(30), read_binary(ws))
+            .await
+            .unwrap_or_else(|_| panic!("{ctx}: no {kind:?} within 30 s"))
+            .unwrap_or_else(|| panic!("{ctx}: connection closed waiting for {kind:?}"));
+        let env = decode(&bytes);
+        if env.r#type == kind {
+            return env;
+        }
+        assert_ne!(
+            env.r#type,
+            MessageKind::PlaybackCmd,
+            "{ctx}: unexpected PLAYBACK_CMD while waiting for {kind:?}: {}",
+            env.payload
+        );
+    }
+}
+
+async fn next_playback(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ctx: &str,
+) -> PlaybackAcceptedEvent {
+    let env = next_of_kind(ws, MessageKind::PlaybackCmd, ctx).await;
+    serde_json::from_value(env.payload).expect("PLAYBACK_CMD payload")
+}
+
+/// No frame of `kind` within `window` (other kinds are ignored).
+async fn assert_no_kind_within(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    kind: MessageKind,
+    window: Duration,
+    ctx: &str,
+) {
+    let deadline = tokio::time::Instant::now() + window;
+    while let Ok(Some(bytes)) = tokio::time::timeout_at(deadline, read_binary(ws)).await {
+        let env = decode(&bytes);
+        assert_ne!(
+            env.r#type, kind,
+            "{ctx}: unexpected {kind:?}: {}",
+            env.payload
+        );
+    }
+}
+
+/// Host A creates a room; B and C join. Returns the room id.
+async fn playback_room(
+    ws_a: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ws_b: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ws_c: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    a: &AuthedClient,
+    b: &AuthedClient,
+    c: &AuthedClient,
+) -> Uuid {
+    send_envelope(ws_a, &room_create_envelope(a.token, "Playback", false)).await;
+    let created: RoomCreatedPayload = serde_json::from_value(
+        expect_envelope(ws_a, MessageKind::RoomCreated)
+            .await
+            .payload,
+    )
+    .unwrap();
+    let code = created.room.code.clone();
+    send_envelope(ws_b, &room_join_envelope(b.token, &code, "B")).await;
+    next_of_kind(ws_b, MessageKind::RoomJoined, "B join").await;
+    send_envelope(ws_c, &room_join_envelope(c.token, &code, "C")).await;
+    next_of_kind(ws_c, MessageKind::RoomJoined, "C join").await;
+    // Everyone has seen C arrive before playback starts.
+    for (ws, who) in [(&mut *ws_a, "A"), (&mut *ws_b, "B")] {
+        loop {
+            let env = next_of_kind(ws, MessageKind::ParticipantJoined, who).await;
+            let pj: ParticipantJoinedPayload = serde_json::from_value(env.payload).unwrap();
+            if pj.participant.user_id == c.user_id {
+                break;
+            }
+        }
+    }
+    created.room.id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn playback_non_host_is_forbidden_and_host_commands_broadcast_in_order() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    // 1-3. Viewer B: PLAY, PAUSE, SEEK are each refused to B alone.
+    for (i, action) in [
+        PlaybackAction::Play,
+        PlaybackAction::Pause,
+        PlaybackAction::Seek,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        send_envelope(
+            &mut ws_b,
+            &playback_cmd(b.token, room_id, action, i as u64 + 1, 1_000),
+        )
+        .await;
+        let err = next_of_kind(&mut ws_b, MessageKind::RoomError, "viewer refusal").await;
+        let p: RoomErrorPayload = serde_json::from_value(err.payload).unwrap();
+        assert_eq!(
+            p.code,
+            RoomErrorCode::NotHost,
+            "{action:?} must be forbidden"
+        );
+    }
+    // Nothing was relayed to the host or the other viewer.
+    assert_no_kind_within(
+        &mut ws_a,
+        MessageKind::PlaybackCmd,
+        Duration::from_millis(300),
+        "A",
+    )
+    .await;
+    assert_no_kind_within(
+        &mut ws_c,
+        MessageKind::PlaybackCmd,
+        Duration::from_millis(300),
+        "C",
+    )
+    .await;
+
+    // 4-6. Host A: four commands sent back to back are accepted and
+    // broadcast to every other participant in server_seq order. The
+    // refusals above consumed no server_seq.
+    let sent = [
+        (PlaybackAction::Play, 0u64),
+        (PlaybackAction::Pause, 2_000),
+        (PlaybackAction::Seek, 9_000),
+        (PlaybackAction::Play, 9_000),
+    ];
+    // The test ticker keeps the server's MockClock on wall time, so
+    // server_ts is checked against a window, not an exact value.
+    let before = harness.clock.now_ms();
+    for (i, (action, pos)) in sent.iter().enumerate() {
+        send_envelope(
+            &mut ws_a,
+            &playback_cmd(a.token, room_id, *action, i as u64 + 1, *pos),
+        )
+        .await;
+    }
+    for (ws, who) in [(&mut ws_b, "B"), (&mut ws_c, "C")] {
+        let mut last_ts = before;
+        for (i, (action, pos)) in sent.iter().enumerate() {
+            let evt = next_playback(ws, who).await;
+            assert_eq!(evt.server_seq, i as u64 + 1, "{who}: server_seq order");
+            assert_eq!(evt.monotonic_seq, i as u64 + 1, "{who}: send order");
+            assert_eq!(evt.action, *action, "{who}: action");
+            assert_eq!(evt.media_position_ms, *pos, "{who}: position");
+            assert_eq!(evt.sender_id, a.user_id, "{who}: sender");
+            // 7. server_ts is the server's clock at acceptance (not the
+            // client's), and never goes backwards along server_seq.
+            assert!(
+                evt.server_ts_ms >= last_ts && evt.server_ts_ms <= harness.clock.now_ms(),
+                "{who}: server_ts {} outside [{last_ts}, now]",
+                evt.server_ts_ms
+            );
+            last_ts = evt.server_ts_ms;
+            assert_eq!(evt.client_ts_ms, 7, "{who}: client_ts echoed");
+        }
+    }
+    // The host gets no error and no echo of its own commands.
+    assert_no_kind_within(
+        &mut ws_a,
+        MessageKind::PlaybackCmd,
+        Duration::from_millis(300),
+        "A",
+    )
+    .await;
+    drop(harness);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn playback_cohost_follows_the_permission_set_capability() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    // The host delegates playback control to B. This is the registry
+    // call the existing P6-T02 PERMISSION_SET handler makes; the
+    // envelope itself is not routed by the WS layer yet (separate
+    // finding), so the grant is applied directly.
+    let set_caps = |bits: u32| {
+        let rooms = harness.rooms.clone();
+        let now = harness.clock.now_ms();
+        let target = b.user_id;
+        async move {
+            rooms
+                .update_participant_cap_set(room_id, target, bits, now)
+                .await
+                .expect("update cap_set")
+        }
+    };
+    set_caps(cap::CHAT | cap::PLAYBACK_CONTROL).await;
+
+    let before = harness.clock.now_ms();
+    send_envelope(
+        &mut ws_a,
+        &playback_cmd(a.token, room_id, PlaybackAction::Play, 1, 0),
+    )
+    .await;
+    let first = next_playback(&mut ws_c, "C").await;
+    assert_eq!((first.server_seq, first.sender_id), (1, a.user_id));
+    assert!(first.server_ts_ms >= before && first.server_ts_ms <= harness.clock.now_ms());
+    // B is a participant too and sees the host's command.
+    assert_eq!(next_playback(&mut ws_b, "B").await.server_seq, 1);
+
+    // B's own monotonic_seq starts at 1; the room sequence continues.
+    send_envelope(
+        &mut ws_b,
+        &playback_cmd(b.token, room_id, PlaybackAction::Pause, 1, 3_000),
+    )
+    .await;
+    let second = next_playback(&mut ws_c, "C").await;
+    assert_eq!((second.server_seq, second.sender_id), (2, b.user_id));
+    assert_eq!(second.action, PlaybackAction::Pause);
+    // The host sees the co-host's command too (B is the originator).
+    let host_view = next_playback(&mut ws_a, "A").await;
+    assert_eq!((host_view.server_seq, host_view.sender_id), (2, b.user_id));
+
+    // Revoking the capability makes B a plain viewer again.
+    set_caps(cap::CHAT).await;
+    send_envelope(
+        &mut ws_b,
+        &playback_cmd(b.token, room_id, PlaybackAction::Play, 2, 3_000),
+    )
+    .await;
+    let err = next_of_kind(&mut ws_b, MessageKind::RoomError, "revoked B").await;
+    let p: RoomErrorPayload = serde_json::from_value(err.payload).unwrap();
+    assert_eq!(p.code, RoomErrorCode::NotHost);
+    // Nothing from B was relayed: C's next command is the host's, at seq 3.
+    send_envelope(
+        &mut ws_a,
+        &playback_cmd(a.token, room_id, PlaybackAction::Play, 2, 3_000),
+    )
+    .await;
+    let third = next_playback(&mut ws_c, "C").await;
+    assert_eq!((third.server_seq, third.sender_id), (3, a.user_id));
+    drop(harness);
+}

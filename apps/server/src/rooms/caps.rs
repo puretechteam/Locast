@@ -21,6 +21,7 @@
 use uuid::Uuid;
 
 use super::registry::RoomRegistry;
+use super::state::ParticipantRecord;
 
 pub use locast_protocol::room::cap as cap_bits;
 
@@ -115,15 +116,20 @@ pub async fn can(
         return false;
     };
     let state = handle.read().await;
-    if let Some(participant) = state.participants.iter().find(|p| p.user_id == user_id) {
-        if participant.is_host {
-            return true;
-        }
-        let bit = scope.action_bit(action);
-        participant.cap_set & bit != 0
-    } else {
-        false
-    }
+    state
+        .participants
+        .iter()
+        .find(|p| p.user_id == user_id)
+        .is_some_and(|p| participant_can(p, scope, action))
+}
+
+/// The per-participant rule behind [`can`]: the host may do
+/// everything; any other participant needs the action's
+/// capability bit (granted by the host via PERMISSION_SET).
+/// Exposed so handlers that already hold the room lock can
+/// re-check with the same rule instead of re-locking.
+pub fn participant_can(participant: &ParticipantRecord, scope: Scope, action: Action) -> bool {
+    participant.is_host || participant.cap_set & scope.action_bit(action) != 0
 }
 
 /// The four initial room envelopes the capability gate
