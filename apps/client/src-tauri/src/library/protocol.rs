@@ -36,6 +36,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::Mutex;
@@ -115,6 +116,68 @@ pub fn mime_for_ext(ext: &str) -> &'static str {
     }
 }
 
+/// The largest slice served for one `Range` request (P1-T10). Tauri's
+/// response body is an in-memory `Vec<u8>`, and browsers open media with
+/// `Range: bytes=0-` (to end of file), so an uncapped range would read the
+/// whole file into memory. The handler answers with a shorter `206` whose
+/// `Content-Range` states what was actually sent; the media element then asks
+/// for the next slice as playback or seeking needs it.
+pub const MAX_RANGE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Characters left unescaped in a generated path segment: the RFC 3986
+/// "unreserved" set.
+const SEGMENT_ESCAPE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// Percent-encode one URL path segment (a file name) so the generated URL is
+/// valid even for names with spaces or non-ASCII characters.
+pub fn encode_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, SEGMENT_ESCAPE).to_string()
+}
+
+/// If `url` is one of the forms a webview can send for this scheme, return
+/// the part after the scheme and authority (`media/<sha>/<name>`):
+///
+/// - `locast://media/...`            (what `media_resolve_url` returns)
+/// - `locast://localhost/media/...`  (macOS and Linux webviews)
+/// - `http://locast.localhost/media/...` and the `https` form (Windows and
+///   Android webviews, which cannot navigate to a custom scheme directly)
+fn strip_scheme(url: &str) -> Option<&str> {
+    for prefix in [
+        "locast://localhost/",
+        "http://locast.localhost/",
+        "https://locast.localhost/",
+        "locast://",
+    ] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    None
+}
+
+/// Percent-decode one segment and refuse anything that could change which
+/// file is addressed: empty segments, path separators, NUL, or `..`.
+fn decode_segment(raw: &str) -> Result<String, ProtocolError> {
+    let decoded = percent_decode_str(raw)
+        .decode_utf8()
+        .map_err(|_| ProtocolError::BadUrl("segment is not valid UTF-8".into()))?
+        .into_owned();
+    if decoded.is_empty() {
+        return Err(ProtocolError::BadUrl("empty segment".into()));
+    }
+    if decoded.contains("..") {
+        return Err(ProtocolError::BadUrl("traversal sequence".into()));
+    }
+    if decoded.contains(['/', '\\', '\0']) {
+        return Err(ProtocolError::BadUrl("separator in segment".into()));
+    }
+    Ok(decoded)
+}
+
 /// A parsed `locast://` URL. The handler constructs one of these
 /// before touching the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,9 +198,10 @@ impl LocastUrl {
     /// is not `locast`, the host is not one of the known shapes,
     /// or any segment is empty / contains a `..` traversal.
     pub fn parse(url: &str) -> Result<Self, ProtocolError> {
-        let rest = url
-            .strip_prefix("locast://")
+        let rest = strip_scheme(url)
             .ok_or_else(|| ProtocolError::BadUrl(format!("not a locast:// URL: {url:?}")))?;
+        // A media element never adds one, but tolerate a query or fragment.
+        let rest = rest.split(['?', '#']).next().unwrap_or("");
         // The remainder looks like `media/<sha-prefix>/<filename>` or
         // `subtitles/<sub-id>/<filename>` or `meta/<media-id>/<name>`.
         // Tauri's URI handler also strips the leading slash before
@@ -153,23 +217,19 @@ impl LocastUrl {
         let seg2 = parts
             .next()
             .ok_or_else(|| ProtocolError::BadUrl("missing filename segment".into()))?;
-        if seg1.is_empty() || seg2.is_empty() {
-            return Err(ProtocolError::BadUrl("empty segment".into()));
-        }
-        if seg1.contains("..") || seg2.contains("..") {
-            return Err(ProtocolError::BadUrl("traversal sequence".into()));
-        }
+        let seg1 = decode_segment(seg1)?;
+        let seg2 = decode_segment(seg2)?;
         match host {
             "media" => Ok(LocastUrl::Media {
-                sha_prefix: seg1.to_string(),
-                filename: seg2.to_string(),
+                sha_prefix: seg1,
+                filename: seg2,
             }),
             "subtitles" => Ok(LocastUrl::Subtitle {
-                sub_id: seg1.to_string(),
-                filename: seg2.to_string(),
+                sub_id: seg1,
+                filename: seg2,
             }),
             "meta" => Ok(LocastUrl::Meta {
-                media_id: seg1.to_string(),
+                media_id: seg1,
                 name: seg2.to_string(),
             }),
             _ => Err(ProtocolError::BadUrl(format!("unknown host {host:?}"))),
@@ -261,7 +321,7 @@ impl ProtocolHandler {
     ) -> Result<ProtocolResponse, ProtocolError> {
         // Some Tauri versions hand us the URL without the
         // `locast://` scheme; tolerate that by prepending it.
-        let url = if url.starts_with("locast://") {
+        let url = if strip_scheme(url).is_some() {
             url.to_string()
         } else {
             format!("locast://{url}")
@@ -468,6 +528,9 @@ impl ProtocolHandler {
                 body: ResponseBody::File(canonical),
             }),
             Some((start, end_inclusive)) => {
+                // Never serve more than MAX_RANGE_BYTES per response; see the
+                // constant's docs. A short 206 is valid and self-describing.
+                let end_inclusive = end_inclusive.min(start.saturating_add(MAX_RANGE_BYTES - 1));
                 let length = end_inclusive - start + 1;
                 Ok(ProtocolResponse {
                     status: 206,
@@ -563,7 +626,10 @@ pub async fn resolve_media_url(storage: &Storage, media_id: &str) -> Result<Stri
             .map_err(|e| ProtocolError::Storage(e.to_string()))?;
     let (sha_prefix, filename) =
         row.ok_or_else(|| ProtocolError::NotFound(format!("media_id {media_id} not found")))?;
-    Ok(format!("locast://media/{sha_prefix}/{filename}"))
+    Ok(format!(
+        "locast://media/{sha_prefix}/{}",
+        encode_segment(&filename)
+    ))
 }
 
 /// Resolve a `subtitle_id` to a `locast://` URL.
@@ -579,7 +645,10 @@ pub async fn resolve_subtitle_url(
             .map_err(|e| ProtocolError::Storage(e.to_string()))?;
     let (_media_id, filename) =
         row.ok_or_else(|| ProtocolError::NotFound(format!("subtitle_id {subtitle_id} not found")))?;
-    Ok(format!("locast://subtitles/{subtitle_id}/{filename}"))
+    Ok(format!(
+        "locast://subtitles/{subtitle_id}/{}",
+        encode_segment(&filename)
+    ))
 }
 
 /// Stream a range of `path` into `out`. This is the helper the

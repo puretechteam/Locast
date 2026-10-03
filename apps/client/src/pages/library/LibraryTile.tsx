@@ -9,6 +9,7 @@ interface LibraryTileProps {
     active: boolean;
     onFocusTile: () => void;
     onKeyDown: KeyboardEventHandler<HTMLElement>;
+    onPlay: (item: LibraryItem) => void;
     onMakePermanent: (id: string) => void;
     onDelete: (id: string) => void;
 }
@@ -22,7 +23,7 @@ function describe(item: LibraryItem): string {
 }
 
 export const LibraryTile = forwardRef<HTMLElement, LibraryTileProps>(function LibraryTile(
-    { item, active, onFocusTile, onKeyDown, onMakePermanent, onDelete },
+    { item, active, onFocusTile, onKeyDown, onPlay, onMakePermanent, onDelete },
     ref,
 ) {
     const [confirming, setConfirming] = useState(false);
@@ -66,6 +67,14 @@ export const LibraryTile = forwardRef<HTMLElement, LibraryTileProps>(function Li
                     </div>
                 ) : (
                     <div className="library-tile__actions">
+                        <button
+                            type="button"
+                            className="library-btn library-btn--primary"
+                            aria-label={`Play ${item.filename}`}
+                            onClick={() => onPlay(item)}
+                        >
+                            Play
+                        </button>
                         {temporary && (
                             <button
                                 type="button"

@@ -180,6 +180,18 @@ const SHIM_SOURCE = `
         w.__TAURI_INTERNALS__.unregisterCallback = function(id) {
             w.__TAURI_CALLBACKS__.delete(id);
         };
+        /*
+         * P1-T10: Tauri's injected convertFileSrc. Windows webviews load the
+         * custom scheme at http://<scheme>.localhost/, macOS and Linux at
+         * <scheme>://localhost/. Tests pick one with w.__locast_scheme_mode
+         * ("windows", the default here, or "unix").
+         */
+        w.__TAURI_INTERNALS__.convertFileSrc = function(p, proto) {
+            var path = encodeURIComponent(p);
+            return w.__locast_scheme_mode === "unix"
+                ? proto + "://localhost/" + path
+                : "http://" + proto + ".localhost/" + path;
+        };
         w.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
             unregisterListener: function(event, eventId) {
                 // In test mode, no-op since we don't have a real backend.
@@ -222,7 +234,7 @@ const SHIM_SOURCE = `
             // backend: every word is a prefix match on the file name.
             if (name === "library_list" || name === "library_make_permanent" ||
                 name === "library_delete" || name === "media_import" ||
-                name === "plugin:dialog|open") {
+                name === "media_resolve_url" || name === "plugin:dialog|open") {
                 var lib = w.__locast_library;
                 if (!lib) {
                     lib = w.__locast_library = {
@@ -249,6 +261,12 @@ const SHIM_SOURCE = `
                         });
                     }
                     return Promise.resolve(rows.map(function(r) { return Object.assign({}, r); }));
+                }
+                if (name === "media_resolve_url") {
+                    // Same shape as the Rust resolver: locast://media/<sha16>/<encoded name>.
+                    var found = lib.items.filter(function(x) { return x.id === args.mediaId; })[0];
+                    if (!found) return Promise.reject({ kind: "NotFound", message: "media_id " + args.mediaId + " not found" });
+                    return Promise.resolve("locast://media/" + found.sha256.slice(0, 16) + "/" + encodeURIComponent(found.filename));
                 }
                 if (name === "library_make_permanent" || name === "library_delete") {
                     var idx = -1;

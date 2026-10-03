@@ -5,6 +5,7 @@ import { LibraryTile } from "./LibraryTile";
 
 interface LibraryGridProps {
     items: LibraryItem[];
+    onPlay: (item: LibraryItem) => void;
     onMakePermanent: (id: string) => void;
     onDelete: (id: string) => void;
 }
@@ -14,7 +15,7 @@ interface LibraryGridProps {
  * Arrow keys move between tiles, Home/End jump to the first/last, and Tab then
  * moves on through the focused tile's buttons.
  */
-export function LibraryGrid({ items, onMakePermanent, onDelete }: LibraryGridProps): JSX.Element {
+export function LibraryGrid({ items, onPlay, onMakePermanent, onDelete }: LibraryGridProps): JSX.Element {
     const [activeIndex, setActiveIndex] = useState(0);
     const tileRefs = useRef<Array<HTMLElement | null>>([]);
     const focusAfterRender = useRef(false);
@@ -93,6 +94,7 @@ export function LibraryGrid({ items, onMakePermanent, onDelete }: LibraryGridPro
                     active={index === activeIndex}
                     onFocusTile={() => setActiveIndex(index)}
                     onKeyDown={(e) => onKeyDown(index, e)}
+                    onPlay={onPlay}
                     onMakePermanent={onMakePermanent}
                     onDelete={onDelete}
                 />

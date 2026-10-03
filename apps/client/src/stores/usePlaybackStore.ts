@@ -65,6 +65,10 @@ interface PlaybackStoreState {
      * no media is loaded yet. */
     mediaSrc: string | null;
 
+    /** Display name of the media chosen from the library
+     * (P1-T10), or null. Informational only. */
+    mediaTitle: string | null;
+
     /** Local-user suppression flag: when true, the
      * Player's <video> element's `play` / `pause` /
      * `seeked` DOM event handlers are NOT allowed to
@@ -122,6 +126,10 @@ interface PlaybackStoreState {
     setMediaReady: (ready: boolean) => void;
     setRoomId: (roomId: string | null) => void;
     setMediaSrc: (src: string | null) => void;
+    /** P1-T10: load a media item picked from the library.
+     * Sets the webview URL and a display title and marks the
+     * element not ready until it fires `canplay` again. */
+    setLocalMedia: (src: string, title: string) => void;
     /** Attempt to accept a server event. Returns
      * `true` if the event was accepted (and either
      * applied or parked), `false` if the event was
@@ -167,6 +175,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
     lastAppliedServerSeq: 0,
     mediaReady: false,
     mediaSrc: null,
+    mediaTitle: null,
     suppressLocalEcho: false,
     hostNextSeq: 1,
     dedupState: initialDedupState(),
@@ -198,6 +207,8 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         }
     },
     setMediaSrc: (src) => set({ mediaSrc: src }),
+    setLocalMedia: (src, title) =>
+        set({ mediaSrc: src, mediaTitle: title, mediaReady: false }),
     setSuppressLocalEcho: (suppress) => set({ suppressLocalEcho: suppress }),
 
     acceptEvent: (event) => {
@@ -308,6 +319,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             lastAppliedServerSeq: 0,
             mediaReady: false,
             mediaSrc: null,
+            mediaTitle: null,
             suppressLocalEcho: false,
             hostNextSeq: 1,
             // P4-T07: a fresh client should not carry

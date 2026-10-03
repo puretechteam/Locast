@@ -37,6 +37,9 @@ export function RoomPage(): JSX.Element {
     const [hydrated, setHydrated] = useState(false);
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [showPermissions, setShowPermissions] = useState(false);
+    // P1-T10: media chosen from the library, played locally.
+    const localMediaSrc = usePlaybackStore((s) => s.mediaSrc);
+    const localMediaTitle = usePlaybackStore((s) => s.mediaTitle);
 
     // P4-T02: on leave, reset BOTH the room store's
     // `summary` AND the playback store's mediaSrc /
@@ -351,6 +354,21 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
         return (
             <div className="room-page room-page--loading">
                 <p>Loading room...</p>
+            </div>
+        );
+    }
+
+    if (summary === null && localMediaSrc !== null) {
+        // Local playback (P1-T10): a library item opened without a room. The
+        // same Player as in a room, minus everything that needs the network.
+        return (
+            <div className="room-page room-page--local" data-testid="room-local">
+                <RoomTopBar summary={null} />
+                <p className="room-page__local-note">
+                    Playing locally: <strong>{localMediaTitle ?? "media"}</strong>.{" "}
+                    <Link to="/library">Back to library</Link>
+                </p>
+                <Player videoRef={videoRef} />
             </div>
         );
     }

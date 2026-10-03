@@ -7,6 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { commands } from "./ipc";
+import { toWebviewUrl } from "./mediaUrl";
 import type { ImportedMedia, LibraryItem } from "../bindings";
 
 export type { ImportedMedia, LibraryItem };
@@ -28,6 +29,14 @@ export async function makePermanent(id: string): Promise<void> {
 /** Delete an item from the library (the file goes to the library trash). */
 export async function deleteFromLibrary(id: string): Promise<void> {
     await commands.libraryDelete(id);
+}
+
+/**
+ * The URL the `<video>` element should load for a library item: the backend's
+ * `locast://` URL for the item, mapped onto this platform's webview scheme.
+ */
+export async function resolveMediaUrl(id: string): Promise<string> {
+    return toWebviewUrl(await commands.mediaResolveUrl(id));
 }
 
 /** Import files by absolute path. */

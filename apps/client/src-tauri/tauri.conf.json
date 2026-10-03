@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: blob: locast:; media-src 'self' blob: locast:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws: wss:; font-src 'self' data:"
+      "csp": "default-src 'self'; img-src 'self' data: blob: locast:; media-src 'self' blob: locast: http://locast.localhost https://locast.localhost; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws: wss:; font-src 'self' data:"
     }
   },
   "bundle": {

@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { Link } from "react-router-dom";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import { sendPositionReport } from "../services/playback";
+import { usePlayerRoomEvents } from "../hooks/usePlayerRoomEvents";
 import { DrawingLayer } from "./DrawingLayer";
 
 /**
@@ -78,6 +80,9 @@ export function Player({
     const localRef = useRef<HTMLVideoElement | null>(null);
     const ref = videoRef ?? localRef;
     const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+    // P1-T10: no-op `room://event` listener for the sync phase.
+    usePlayerRoomEvents();
 
     const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const mediaReady = usePlaybackStore((s) => s.mediaReady);
@@ -210,7 +215,9 @@ export function Player({
 return (
         <div className="room-page__player" data-testid="locast-player">
             {mediaSrc === null ? (
-                <p className="room-page__player-empty">No media loaded yet.</p>
+                <p className="room-page__player-empty">
+                    No media loaded yet. <Link to="/library">Choose a file from your library</Link>.
+                </p>
             ) : (
                 <div className="room-page__player-stage" data-testid="locast-player-stage">
                     <video

@@ -14,7 +14,9 @@ import {
     listLibrary,
     makePermanent as makePermanentIpc,
     pickMediaFiles,
+    resolveMediaUrl,
 } from "../services/mediaCatalog";
+import { usePlaybackStore } from "./usePlaybackStore";
 import type { LibraryItem } from "../services/mediaCatalog";
 
 export type LoadStatus = "idle" | "loading" | "ready" | "error";
@@ -41,6 +43,12 @@ export interface MediaState {
     importFiles: () => Promise<void>;
     makePermanent: (id: string) => Promise<void>;
     remove: (id: string) => Promise<void>;
+    /**
+     * P1-T10: load a library item into the player. Resolves its `locast://`
+     * URL through the backend and hands it to the playback store; returns
+     * whether it succeeded so the caller can navigate to the player.
+     */
+    playItem: (item: LibraryItem) => Promise<boolean>;
     dismissNotice: () => void;
 }
 
@@ -137,6 +145,18 @@ export const useMediaStore = create<MediaState>((set, get) => ({
             set({ items: get().items.filter((i) => i.id !== id), notice: null });
         } catch (err) {
             set({ notice: { kind: "error", message: `Could not delete: ${messageOf(err)}` } });
+        }
+    },
+
+    playItem: async (item) => {
+        try {
+            const url = await resolveMediaUrl(item.id);
+            usePlaybackStore.getState().setLocalMedia(url, item.filename);
+            set({ notice: null });
+            return true;
+        } catch (err) {
+            set({ notice: { kind: "error", message: `Could not play ${item.filename}: ${messageOf(err)}` } });
+            return false;
         }
     },
 

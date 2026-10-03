@@ -56,6 +56,7 @@ async-trait = "0.1"
 locast-protocol = { path = "../../../shared/protocol" }
 locast-manifest = { path = "../../../shared/manifest" }
 url = "2"
+percent-encoding = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 rmp-serde = "1"
 futures-util = "0.3"

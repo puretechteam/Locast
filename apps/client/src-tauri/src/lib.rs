@@ -478,14 +478,15 @@ async fn protocol_response_to_tauri(
             start,
             length,
         } => {
-            let mut out: Vec<u8> = Vec::with_capacity(length.min(8 * 1024 * 1024) as usize);
-            let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
-            let write_result =
-                library::protocol::stream_range(&path, start, length, &mut cursor).await;
-            if write_result.is_ok() {
-                out = cursor.into_inner();
+            let mut cursor = std::io::Cursor::new(Vec::<u8>::with_capacity(
+                length.min(library::protocol::MAX_RANGE_BYTES) as usize,
+            ));
+            match library::protocol::stream_range(&path, start, length, &mut cursor).await {
+                Ok(()) => builder.body(cursor.into_inner()).unwrap(),
+                // Never send a 206 with an empty or short body: the
+                // media element would treat it as a corrupt stream.
+                Err(e) => error_to_tauri(&library::protocol::ProtocolError::Io(e)),
             }
-            builder.body(out).unwrap()
         }
         library::protocol::ResponseBody::File(path) => {
             // For the no-Range 200 path, read the whole file

@@ -1,6 +1,8 @@
 import { useEffect } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useMediaStore } from "../../stores/useMediaStore";
+import { useRoomStore } from "../../stores/useRoomStore";
+import type { LibraryItem } from "../../services/mediaCatalog";
 import { LibraryGrid } from "./LibraryGrid";
 import "../../styles/library.css";
 
@@ -17,6 +19,15 @@ export function LibraryPage(): JSX.Element {
     const makePermanent = useMediaStore((s) => s.makePermanent);
     const remove = useMediaStore((s) => s.remove);
     const dismissNotice = useMediaStore((s) => s.dismissNotice);
+    const playItem = useMediaStore((s) => s.playItem);
+    const roomId = useRoomStore((s) => s.summary?.id ?? null);
+    const navigate = useNavigate();
+
+    // Play opens the player: the current room if the user is in one, otherwise
+    // the local player (`/rooms/local`, no networking).
+    async function onPlay(item: LibraryItem): Promise<void> {
+        if (await playItem(item)) navigate(`/rooms/${roomId ?? "local"}`);
+    }
 
     useEffect(() => {
         void refresh();
@@ -95,6 +106,7 @@ export function LibraryPage(): JSX.Element {
             {items.length > 0 && (
                 <LibraryGrid
                     items={items}
+                    onPlay={(item) => void onPlay(item)}
                     onMakePermanent={(id) => void makePermanent(id)}
                     onDelete={(id) => void remove(id)}
                 />

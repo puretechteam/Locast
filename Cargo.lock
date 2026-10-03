@@ -3025,6 +3025,7 @@ dependencies = [
  "locast-protocol",
  "locast-server",
  "log",
+ "percent-encoding",
  "rand 0.8.8",
  "rmp-serde",
  "serde",

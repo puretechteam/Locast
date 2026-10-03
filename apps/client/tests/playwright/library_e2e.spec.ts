@@ -268,6 +268,8 @@ test("the grid is keyboard navigable", async ({ page }) => {
     // The tile's actions are reachable and operable from the keyboard.
     await page.locator('[data-testid="library-tile"][data-media-id="item-2"]').focus();
     await page.keyboard.press("Tab");
+    await expect(page.getByRole("button", { name: "Play File 2.mkv" })).toBeFocused();
+    await page.keyboard.press("Tab");
     await expect(page.getByRole("button", { name: "Make permanent" })).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(
