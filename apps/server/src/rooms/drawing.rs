@@ -24,6 +24,18 @@
 //!   strengthening the threat model (the BEGIN signature
 //!   already binds the stroke's originator).
 //!
+//! Attribution:
+//!
+//! - Every rebroadcast DRAW_BEGIN / DRAW_POINT / DRAW_END
+//!   carries the stroke owner's server-assigned `user_id` as
+//!   `Envelope::sender.user_id` (stamped by the WS forwarder
+//!   from `BroadcastItem::sender`; `pubkey` / `sig` are
+//!   empty). The id is the one recorded in the pending-stroke
+//!   binding at BEGIN, so it is identical for the whole
+//!   stroke. Inbound `envelope.sender` is only read on BEGIN
+//!   (and must match the connection); on POINT / END it is
+//!   ignored.
+//!
 //! Authorization:
 //!
 //! - The capability gate in `super::caps` ensures the
@@ -213,9 +225,12 @@ pub async fn handle_stroke_point(
             reason(DrawingError::StrokeIdMismatch).to_string(),
         );
     }
+    // Attribute the point to the stroke's recorded owner (equal to
+    // `user_id` after the check above); `envelope.sender` is never
+    // read for POINT.
     let evt = super::registry::RoomEvent::StrokePoint {
         room_id: envelope.room_id.unwrap_or(state.id),
-        sender_id: user_id,
+        sender_id: binding.sender_id,
         payload,
     };
     RoomDispatchOutcome {
@@ -241,8 +256,8 @@ pub async fn handle_stroke_end(
     };
     // Check ownership BEFORE removing: another participant must
     // not be able to end (and so cancel) someone else's stroke.
-    match state.drawing.pending.get(&payload.stroke_id) {
-        Some(b) if b.sender_id == user_id => {}
+    let owner = match state.drawing.pending.get(&payload.stroke_id) {
+        Some(b) if b.sender_id == user_id => b.sender_id,
         Some(_) => {
             return err_outcome(
                 &envelope,
@@ -252,11 +267,13 @@ pub async fn handle_stroke_end(
         None => {
             return err_outcome(&envelope, reason(DrawingError::UnknownStroke).to_string());
         }
-    }
+    };
     state.drawing.pending.remove(&payload.stroke_id);
+    // Attribute the end to the stroke's recorded owner; `envelope.sender`
+    // is never read for END.
     let evt = super::registry::RoomEvent::StrokeEnd {
         room_id: envelope.room_id.unwrap_or(state.id),
-        sender_id: user_id,
+        sender_id: owner,
         payload,
     };
     RoomDispatchOutcome {
@@ -549,6 +566,120 @@ mod tests {
         // The stroke binding is unchanged.
         let binding = state.drawing.pending.get(&stroke_id).expect("bound");
         assert_eq!(binding.sender_id, host_uid);
+    }
+
+    /// POINT / END attribute the event to the stroke's recorded owner
+    /// and never read `envelope.sender`, even when it names another user.
+    #[tokio::test]
+    async fn point_and_end_events_use_the_bound_owner_not_envelope_sender() {
+        let room_id = Uuid::now_v7();
+        let (sk, pk) = fresh_keypair();
+        let host_uid = Uuid::now_v7();
+        let spoofed_uid = Uuid::now_v7();
+        let stroke_id = Uuid::now_v7();
+        let mut state = sample_state(room_id, host_uid, pk);
+        let begin_payload = StrokeBeginPayload {
+            stroke_id,
+            tool: locast_protocol::room::StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 2.0,
+            x: 0.1,
+            y: 0.2,
+            pressure: 0.5,
+            ts_ms: 1000,
+        };
+        let sig = sign_begin(&sk, &begin_payload);
+        let begin_env = begin_envelope(host_uid, pk, sig, room_id, begin_payload);
+        let out = handle_stroke_begin(begin_env, &mut state, host_uid, pk, 1000).await;
+        match &out.events[..] {
+            [super::super::registry::RoomEvent::StrokeBegin { sender_id, .. }] => {
+                assert_eq!(*sender_id, host_uid);
+            }
+            other => panic!("expected one StrokeBegin, got {other:?}"),
+        }
+
+        let spoof = Some(Sender {
+            user_id: spoofed_uid,
+            pubkey: vec![0x11; 32],
+            sig: vec![0x22; 64],
+        });
+        let point_env = Envelope {
+            v: 1,
+            r#type: MessageKind::StrokePoint,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: spoof.clone(),
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(StrokePointPayload {
+                stroke_id,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.5,
+                ts_ms: 1100,
+            })
+            .expect("payload"),
+        };
+        let out = handle_stroke_point(point_env, &mut state, host_uid).await;
+        match &out.events[..] {
+            [super::super::registry::RoomEvent::StrokePoint { sender_id, .. }] => {
+                assert_eq!(*sender_id, host_uid, "spoofed envelope sender ignored");
+            }
+            other => panic!("expected one StrokePoint, got {other:?}"),
+        }
+
+        let end_env = Envelope {
+            v: 1,
+            r#type: MessageKind::StrokeEnd,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: spoof,
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(StrokeEndPayload {
+                stroke_id,
+                ts_ms: 1200,
+            })
+            .expect("payload"),
+        };
+        let out = handle_stroke_end(end_env, &mut state, host_uid).await;
+        match &out.events[..] {
+            [super::super::registry::RoomEvent::StrokeEnd { sender_id, .. }] => {
+                assert_eq!(*sender_id, host_uid, "spoofed envelope sender ignored");
+            }
+            other => panic!("expected one StrokeEnd, got {other:?}"),
+        }
+    }
+
+    /// A BEGIN whose signed `sender` names another user, or carries
+    /// another user's key, is refused and binds nothing.
+    #[tokio::test]
+    async fn begin_with_a_spoofed_sender_is_rejected_and_binds_nothing() {
+        let room_id = Uuid::now_v7();
+        let (sk, pk) = fresh_keypair();
+        let (_, other_pk) = fresh_keypair();
+        let host_uid = Uuid::now_v7();
+        let victim_uid = Uuid::now_v7();
+        let mut state = sample_state(room_id, host_uid, pk);
+        for (claimed_uid, claimed_pk) in [(victim_uid, pk), (host_uid, other_pk)] {
+            let stroke_id = Uuid::now_v7();
+            let payload = StrokeBeginPayload {
+                stroke_id,
+                tool: locast_protocol::room::StrokeTool::Pen,
+                color: "#000000".into(),
+                width: 2.0,
+                x: 0.1,
+                y: 0.2,
+                pressure: 0.5,
+                ts_ms: 1000,
+            };
+            let sig = sign_begin(&sk, &payload);
+            let env = begin_envelope(claimed_uid, claimed_pk, sig, room_id, payload);
+            let out = handle_stroke_begin(env, &mut state, host_uid, pk, 1000).await;
+            assert!(out.events.is_empty());
+            assert_eq!(out.to_caller.len(), 1);
+            assert!(!state.drawing.pending.contains_key(&stroke_id));
+        }
     }
 
     #[tokio::test]

@@ -259,6 +259,14 @@ pub struct BroadcastItem {
     /// to the user that just joined). `None` for
     /// server-originated events.
     pub originator: Option<Uuid>,
+    /// The authenticated user_id the WS forwarder stamps on the
+    /// outgoing `Envelope::sender` (with empty `pubkey` / `sig`: it
+    /// is a server attestation, not a client signature). `Some` only
+    /// for DRAW_BEGIN / DRAW_POINT / DRAW_END, whose payloads are
+    /// forwarded verbatim and so cannot carry the author themselves.
+    /// It is always the stroke owner recorded server-side at
+    /// DRAW_BEGIN, never a client-supplied value. `None` otherwise.
+    pub sender: Option<Uuid>,
 }
 
 /// Subset of `Config` the registry needs.
@@ -476,6 +484,7 @@ impl RoomRegistry {
                         payload,
                         room_id: rid,
                         originator: None,
+                        sender: None,
                     },
                 ));
                 if matches!(event, RoomEvent::RoomClosed(_)) {
@@ -855,6 +864,7 @@ impl RoomRegistry {
             payload: serde_json::to_value(&event_payload).unwrap_or(serde_json::json!({})),
             room_id: id,
             originator: Some(user_id),
+            sender: None,
         };
         drop(state);
         self.publish(id, item);
@@ -1812,11 +1822,23 @@ fn event_to_broadcast_item(
             )
         }
     };
+    // Drawing payloads are forwarded verbatim (the DRAW_BEGIN payload
+    // is also the signed message), so the stroke owner travels as the
+    // envelope's `sender` instead. It comes from the event's
+    // `sender_id`, which the handlers take from the stroke's
+    // server-side binding.
+    let sender = match e {
+        RoomEvent::StrokeBegin { sender_id, .. }
+        | RoomEvent::StrokePoint { sender_id, .. }
+        | RoomEvent::StrokeEnd { sender_id, .. } => Some(*sender_id),
+        _ => None,
+    };
     BroadcastItem {
         kind,
         payload,
         room_id,
         originator,
+        sender,
     }
 }
 
@@ -1915,6 +1937,63 @@ mod tests {
         );
         assert_eq!(item.room_id, summary.id);
         assert_eq!(item.originator, Some(uid(2)));
+    }
+
+    /// DRAW_* broadcast items name the stroke owner in `sender`
+    /// (and as the echo-suppression `originator`); other events do not.
+    #[test]
+    fn stroke_events_name_their_owner_as_the_broadcast_sender() {
+        let room = uid(9);
+        let owner = uid(2);
+        let stroke_id = uid(7);
+        let events = [
+            RoomEvent::StrokeBegin {
+                room_id: room,
+                sender_id: owner,
+                payload: locast_protocol::room::StrokeBeginPayload {
+                    stroke_id,
+                    tool: locast_protocol::room::StrokeTool::Pen,
+                    color: "#000000".into(),
+                    width: 2.0,
+                    x: 0.1,
+                    y: 0.2,
+                    pressure: 0.5,
+                    ts_ms: 1,
+                },
+            },
+            RoomEvent::StrokePoint {
+                room_id: room,
+                sender_id: owner,
+                payload: locast_protocol::room::StrokePointPayload {
+                    stroke_id,
+                    x: 0.1,
+                    y: 0.2,
+                    pressure: 0.5,
+                    ts_ms: 2,
+                },
+            },
+            RoomEvent::StrokeEnd {
+                room_id: room,
+                sender_id: owner,
+                payload: locast_protocol::room::StrokeEndPayload {
+                    stroke_id,
+                    ts_ms: 3,
+                },
+            },
+        ];
+        for e in &events {
+            let item = event_to_broadcast_item(e, room, Some(owner));
+            assert_eq!(item.sender, Some(owner), "{:?}", item.kind);
+            assert_eq!(item.originator, Some(owner), "{:?}", item.kind);
+            assert!(
+                item.payload.get("sender").is_none() && item.payload.get("sender_id").is_none(),
+                "the payload is forwarded verbatim"
+            );
+        }
+        let closed = RoomEvent::RoomClosed(locast_protocol::room::RoomClosedPayload {
+            reason: "host_left".into(),
+        });
+        assert_eq!(event_to_broadcast_item(&closed, room, None).sender, None);
     }
 
     #[tokio::test]

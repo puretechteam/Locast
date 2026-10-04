@@ -1856,7 +1856,17 @@ async fn room_bcast_forwarder(
             r#type: item.kind,
             id: Uuid::now_v7(),
             room_id: Some(room_id),
-            sender: None,
+            // DRAW_* rebroadcasts name the stroke owner here (the
+            // server-recorded user_id, see `BroadcastItem::sender`).
+            // `pubkey` / `sig` stay empty: this is the server's
+            // attestation, not a client signature.
+            sender: item
+                .sender
+                .map(|user_id| locast_protocol::envelope::Sender {
+                    user_id,
+                    pubkey: Vec::new(),
+                    sig: Vec::new(),
+                }),
             ts_ms: now_ms(),
             seq: 0,
             payload: item.payload,

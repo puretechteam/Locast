@@ -43,7 +43,7 @@ use serde::Serialize;
 use specta::Type;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Sink for `room://state` / `room://event` push events.
@@ -1729,12 +1729,12 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokeBeginPayload>(&env)
                         {
-                            let sender_id =
-                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
-                            let ipc = StrokeBeginEvent::from((room_id, sender_id, &payload));
-                            let g = self.sink.lock().await;
-                            if let Some(s) = g.as_ref() {
-                                s.emit_stroke_begin(&ipc);
+                            if let Some(sender_id) = stroke_sender(&env) {
+                                let ipc = StrokeBeginEvent::from((room_id, sender_id, &payload));
+                                let g = self.sink.lock().await;
+                                if let Some(s) = g.as_ref() {
+                                    s.emit_stroke_begin(&ipc);
+                                }
                             }
                         }
                     }
@@ -1742,7 +1742,7 @@ impl RoomClient {
             }
             // P5-T03: a remote DRAW_POINT was accepted and
             // rebroadcast by the server. The sender_id comes
-            // from the validated envelope sender (not the
+            // from the server-stamped envelope sender (not the
             // payload). Emit `drawing://point` so the React
             // layer can append to the remote stroke.
             MessageKind::StrokePoint => {
@@ -1753,12 +1753,12 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokePointPayload>(&env)
                         {
-                            let sender_id =
-                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
-                            let ipc = StrokePointEvent::from((room_id, sender_id, &payload));
-                            let g = self.sink.lock().await;
-                            if let Some(s) = g.as_ref() {
-                                s.emit_stroke_point(&ipc);
+                            if let Some(sender_id) = stroke_sender(&env) {
+                                let ipc = StrokePointEvent::from((room_id, sender_id, &payload));
+                                let g = self.sink.lock().await;
+                                if let Some(s) = g.as_ref() {
+                                    s.emit_stroke_point(&ipc);
+                                }
                             }
                         }
                     }
@@ -1766,7 +1766,7 @@ impl RoomClient {
             }
             // P5-T03: a remote DRAW_END was accepted and
             // rebroadcast by the server. The sender_id comes
-            // from the validated envelope sender (not the
+            // from the server-stamped envelope sender (not the
             // payload). Emit `drawing://end` so the React
             // layer can finalize the remote stroke.
             MessageKind::StrokeEnd => {
@@ -1777,12 +1777,12 @@ impl RoomClient {
                         if let Ok(payload) =
                             decode_payload::<locast_protocol::room::StrokeEndPayload>(&env)
                         {
-                            let sender_id =
-                                env.sender.as_ref().map(|s| s.user_id).unwrap_or_default();
-                            let ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
-                            let g = self.sink.lock().await;
-                            if let Some(s) = g.as_ref() {
-                                s.emit_stroke_end(&ipc);
+                            if let Some(sender_id) = stroke_sender(&env) {
+                                let ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
+                                let g = self.sink.lock().await;
+                                if let Some(s) = g.as_ref() {
+                                    s.emit_stroke_end(&ipc);
+                                }
                             }
                         }
                     }
@@ -2025,6 +2025,22 @@ fn envelope<T: serde::Serialize>(kind: MessageKind, room_id: Option<Uuid>, paylo
     }
 }
 
+/// The owner of a rebroadcast DRAW_BEGIN / DRAW_POINT / DRAW_END:
+/// the server-assigned user id the server stamps on
+/// `Envelope::sender`. The drawing payloads do not carry it. A frame
+/// without a usable owner (no sender, or the nil UUID) is dropped
+/// rather than attributed to the nil user, which would break the
+/// per-owner checks that undo and clear rely on.
+fn stroke_sender(env: &Envelope) -> Option<Uuid> {
+    match env.sender.as_ref().map(|s| s.user_id) {
+        Some(id) if !id.is_nil() => Some(id),
+        _ => {
+            debug!(kind = ?env.r#type, "dropping drawing frame without a sender id");
+            None
+        }
+    }
+}
+
 fn decode_payload<T: serde::de::DeserializeOwned>(env: &Envelope) -> Result<T, RoomClientError> {
     serde_json::from_value(env.payload.clone())
         .map_err(|e| RoomClientError::Unexpected(format!("decode: {e}")))
@@ -2064,6 +2080,25 @@ mod tests {
             seq: 0,
             payload,
         }
+    }
+
+    #[test]
+    fn stroke_sender_requires_a_non_nil_server_stamped_owner() {
+        let owner = Uuid::now_v7();
+        let mut env = env_of(MessageKind::StrokePoint, serde_json::json!({}));
+        assert_eq!(stroke_sender(&env), None, "no sender: dropped");
+        env.sender = Some(locast_protocol::envelope::Sender {
+            user_id: Uuid::nil(),
+            pubkey: Vec::new(),
+            sig: Vec::new(),
+        });
+        assert_eq!(stroke_sender(&env), None, "nil sender: dropped");
+        env.sender = Some(locast_protocol::envelope::Sender {
+            user_id: owner,
+            pubkey: Vec::new(),
+            sig: Vec::new(),
+        });
+        assert_eq!(stroke_sender(&env), Some(owner));
     }
 
     fn sample_summary(host: Uuid) -> RoomSummary {

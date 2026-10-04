@@ -86,6 +86,14 @@ impl RoomEventSink for RecordingSink {
     }
 }
 
+fn sender_of(s: &Seen) -> &str {
+    match s {
+        Seen::Begin(ev) => &ev.sender_id,
+        Seen::Point(ev) => &ev.sender_id,
+        Seen::End(ev) => &ev.sender_id,
+    }
+}
+
 struct Client {
     signaling: Arc<SignalingClient>,
     room: Arc<RoomClient>,
@@ -328,6 +336,14 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
         .collect();
     assert_eq!(shape, expected_shape, "begin -> points -> end per stroke");
 
+    // Every event B saw is attributed to A's server-assigned user id,
+    // the same id A reads from `RoomClient::local_user_id` (never nil).
+    let a_id = a.room.local_user_id().await.expect("A user id").to_string();
+    assert_ne!(a_id, Uuid::nil().to_string());
+    for s in &seen {
+        assert_eq!(sender_of(s), a_id, "every event carries A's id: {s:?}");
+    }
+
     // Identity, ids and payload fidelity.
     let mut stroke_idx = 0;
     let mut point_idx = 0.0_f32;
@@ -336,11 +352,6 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
             Seen::Begin(ev) => {
                 stroke_idx = ids.iter().position(|i| *i == ev.stroke_id).expect("id");
                 point_idx = 0.0;
-                // NOTE: `ev.sender_id` is deliberately not asserted.
-                // The server's rebroadcast envelope carries only the
-                // payload (no `sender`), so the receive side currently
-                // reports the nil UUID as the originator. That is a
-                // receive-side gap outside P5-T02's send path.
                 assert_eq!(ev.tool, ["pen", "rect"][stroke_idx]);
                 assert_eq!(ev.color, "#ff5c69");
                 assert_eq!(ev.width, 3.0);
@@ -359,6 +370,100 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
     // The sender does not receive its own echo.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(a.sink.count(), 0, "server excludes the originator");
+
+    a.signaling.shutdown().await;
+    b.signaling.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_strokes_carry_their_authors_distinct_user_ids() {
+    // Two authors drawing at the same time: each stroke's events
+    // (begin, points, end) reach the other participant attributed to
+    // that stroke's author, never nil, never the receiver's own id,
+    // and never swapped between the interleaved strokes.
+    let url = spawn_server().await;
+    let (a, b) = two_in_a_room(&url).await;
+    let a_id = a.room.local_user_id().await.expect("A user id");
+    let b_id = b.room.local_user_id().await.expect("B user id");
+    assert_ne!(a_id, b_id, "distinct server-assigned ids");
+    assert!(!a_id.is_nil() && !b_id.is_nil());
+
+    // B joined as a viewer: the host grants DRAW and waits until B
+    // has seen the update.
+    let room_id: Uuid = a
+        .room
+        .state()
+        .await
+        .expect("A in a room")
+        .id
+        .parse()
+        .expect("room id");
+    a.room
+        .permission_set(room_id, b_id, locast_protocol::room::cap::DRAW, 0)
+        .await
+        .expect("grant DRAW");
+    let start = Instant::now();
+    loop {
+        let caps = b.room.state().await.and_then(|s| s.you_cap_set);
+        if caps.is_some_and(|c| c & locast_protocol::room::cap::DRAW != 0) {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "B never saw the DRAW grant"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let app_a = mock_app_for(&a);
+    let app_b = mock_app_for(&b);
+    let stroke_a = Uuid::now_v7().to_string();
+    let stroke_b = Uuid::now_v7().to_string();
+    send(&app_a, begin(&stroke_a, "pen", 0.1, 0.1))
+        .await
+        .expect("A begin");
+    send(&app_b, begin(&stroke_b, "pen", 0.9, 0.9))
+        .await
+        .expect("B begin");
+    for i in 0..4_u64 {
+        send(&app_a, point(&stroke_a, 0.2 + i as f32 * 0.1, 0.3, 2 + i))
+            .await
+            .expect("A point");
+        send(&app_b, point(&stroke_b, 0.8 - i as f32 * 0.1, 0.7, 2 + i))
+            .await
+            .expect("B point");
+    }
+    send(&app_a, end(&stroke_a, 6)).await.expect("A end");
+    send(&app_b, end(&stroke_b, 6)).await.expect("B end");
+
+    // 1 begin + 4 points + 1 end each way.
+    wait_until(
+        "both sides to see the other stroke",
+        Duration::from_secs(5),
+        || a.sink.count() == 6 && b.sink.count() == 6,
+    )
+    .await;
+
+    let seen_by_b: Vec<Seen> = b.sink.snapshot().into_iter().map(|(_, s)| s).collect();
+    let seen_by_a: Vec<Seen> = a.sink.snapshot().into_iter().map(|(_, s)| s).collect();
+    let stroke_of = |s: &Seen| match s {
+        Seen::Begin(ev) => ev.stroke_id.clone(),
+        Seen::Point(ev) => ev.stroke_id.clone(),
+        Seen::End(ev) => ev.stroke_id.clone(),
+    };
+    for s in &seen_by_b {
+        assert_eq!(stroke_of(s), stroke_a, "B only sees A's stroke");
+        assert_eq!(sender_of(s), a_id.to_string(), "B sees A as the author");
+    }
+    for s in &seen_by_a {
+        assert_eq!(stroke_of(s), stroke_b, "A only sees B's stroke");
+        assert_eq!(sender_of(s), b_id.to_string(), "A sees B as the author");
+    }
+
+    // Neither side was echoed its own stroke.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(a.sink.count(), 6, "A got no echo of its own stroke");
+    assert_eq!(b.sink.count(), 6, "B got no echo of its own stroke");
 
     a.signaling.shutdown().await;
     b.signaling.shutdown().await;

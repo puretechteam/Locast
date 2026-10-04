@@ -1821,6 +1821,199 @@ async fn a_full_rate_stroke_reaches_every_other_participant_in_order() {
     drop(harness);
 }
 
+/// `env` with a client-supplied `sender` naming `user_id`.
+fn with_claimed_sender(mut env: Envelope, user_id: Uuid, pubkey: [u8; 32]) -> Envelope {
+    env.sender = Some(Sender {
+        user_id,
+        pubkey: pubkey.to_vec(),
+        sig: vec![0x5A; 64],
+    });
+    env
+}
+
+/// The rebroadcast frame names the stroke owner as `sender.user_id`,
+/// and the stroke payload is forwarded without any identity field.
+fn assert_draw_frame_owned_by(env: &Envelope, kind: MessageKind, owner: Uuid, ctx: &str) {
+    assert_eq!(env.r#type, kind, "{ctx}: kind");
+    assert_eq!(
+        env.sender.as_ref().map(|s| s.user_id),
+        Some(owner),
+        "{ctx}: rebroadcast sender is the authenticated stroke owner"
+    );
+    for key in ["sender", "sender_id", "user_id"] {
+        assert!(
+            env.payload.get(key).is_none(),
+            "{ctx}: payload must not carry `{key}`: {}",
+            env.payload
+        );
+    }
+}
+
+/// Rebroadcast DRAW_* frames carry the authenticated owner's id, taken
+/// from the connection and the stroke binding, never from a field the
+/// client set. Spoofed senders on BEGIN are refused; on POINT / END
+/// they are ignored; another participant cannot POINT / END into the
+/// stroke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebroadcast_drawing_carries_the_authenticated_owner_and_ignores_spoofs() {
+    let harness = spawn_test_server().await;
+    let (kp_a, pk_a) = fresh_keypair();
+    let (kp_b, pk_b) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+    assert_ne!(a.user_id, b.user_id);
+
+    // The host grants B DRAW and B has seen it.
+    send_envelope(
+        &mut ws_a,
+        &permission_envelope(a.token, room_id, b.user_id, cap::DRAW),
+    )
+    .await;
+    next_of_kind(&mut ws_b, MessageKind::CapabilityUpdate, "B grant").await;
+
+    // BEGIN spoofs by B (the connection is B's): another user's id
+    // with B's key, and B's id with another user's key. Both refused.
+    let spoof_stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, a.user_id, spoof_stroke),
+    )
+    .await;
+    expect_room_error(&mut ws_b, RoomErrorCode::InvalidState, "BEGIN as A").await;
+    send_envelope(
+        &mut ws_b,
+        &with_claimed_sender(
+            draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, spoof_stroke),
+            b.user_id,
+            pk_a,
+        ),
+    )
+    .await;
+    expect_room_error(&mut ws_b, RoomErrorCode::InvalidState, "BEGIN with A's key").await;
+
+    // B's legitimate stroke. Neither spoof bound `spoof_stroke`, and
+    // the first drawing frame anyone sees is this one.
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_a, "A"), (&mut ws_c, "C")] {
+        let begin = next_draw(ws, who).await;
+        assert_eq!(
+            begin.payload["stroke_id"],
+            json!(stroke),
+            "{who}: the refused spoofs were never rebroadcast"
+        );
+        assert_draw_frame_owned_by(&begin, MessageKind::StrokeBegin, b.user_id, who);
+    }
+
+    // The host cannot POINT into B's stroke, with or without claiming
+    // to be B. Nothing is rebroadcast.
+    let a_point = |claim: Option<Uuid>| {
+        let env = room_scoped_envelope(
+            a.token,
+            MessageKind::StrokePoint,
+            room_id,
+            serde_json::to_value(StrokePointPayload {
+                stroke_id: stroke,
+                x: 0.9,
+                y: 0.9,
+                pressure: 0.5,
+                ts_ms: 2,
+            })
+            .unwrap(),
+        );
+        match claim {
+            Some(uid) => with_claimed_sender(env, uid, pk_b),
+            None => env,
+        }
+    };
+    send_envelope(&mut ws_a, &a_point(None)).await;
+    expect_room_error(&mut ws_a, RoomErrorCode::InvalidState, "A POINT into B").await;
+    send_envelope(&mut ws_a, &a_point(Some(b.user_id))).await;
+    expect_room_error(&mut ws_a, RoomErrorCode::InvalidState, "A POINT as B").await;
+
+    // B's POINT and END, each carrying a spoofed envelope sender and
+    // spoofed identity fields in the payload, are rebroadcast with B
+    // (the connection and the stroke owner) as the sender.
+    let mut point_payload = serde_json::to_value(StrokePointPayload {
+        stroke_id: stroke,
+        x: 0.3,
+        y: 0.6,
+        pressure: 0.5,
+        ts_ms: 3,
+    })
+    .unwrap();
+    point_payload["sender_id"] = json!(a.user_id);
+    point_payload["user_id"] = json!(a.user_id);
+    send_envelope(
+        &mut ws_b,
+        &with_claimed_sender(
+            room_scoped_envelope(b.token, MessageKind::StrokePoint, room_id, point_payload),
+            a.user_id,
+            pk_a,
+        ),
+    )
+    .await;
+    send_envelope(
+        &mut ws_b,
+        &with_claimed_sender(
+            room_scoped_envelope(
+                b.token,
+                MessageKind::StrokeEnd,
+                room_id,
+                serde_json::to_value(StrokeEndPayload {
+                    stroke_id: stroke,
+                    ts_ms: 4,
+                })
+                .unwrap(),
+            ),
+            c.user_id,
+            pk_a,
+        ),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_a, "A"), (&mut ws_c, "C")] {
+        let point = next_draw(ws, who).await;
+        assert_draw_frame_owned_by(&point, MessageKind::StrokePoint, b.user_id, who);
+        assert_eq!(point.payload["stroke_id"], json!(stroke), "{who}");
+        let end = next_draw(ws, who).await;
+        assert_draw_frame_owned_by(&end, MessageKind::StrokeEnd, b.user_id, who);
+        assert_eq!(end.payload["stroke_id"], json!(stroke), "{who}");
+    }
+
+    // B, the originator, is not echoed any of it.
+    for kind in [
+        MessageKind::StrokeBegin,
+        MessageKind::StrokePoint,
+        MessageKind::StrokeEnd,
+    ] {
+        assert_no_kind_within(&mut ws_b, kind, Duration::from_millis(100), "B echo").await;
+    }
+
+    // The host's own stroke is attributed to the host.
+    let host_stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_a,
+        &draw_begin_envelope(a.token, room_id, &kp_a, a.user_id, host_stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_b, "B"), (&mut ws_c, "C")] {
+        let begin = next_draw(ws, who).await;
+        assert_eq!(begin.payload["stroke_id"], json!(host_stroke), "{who}");
+        assert_draw_frame_owned_by(&begin, MessageKind::StrokeBegin, a.user_id, who);
+    }
+    drop(harness);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_privileges_in_one_room_do_not_authorize_another_room() {
     let harness = spawn_test_server().await;
