@@ -72,6 +72,57 @@ pub fn get_download_event_emitter() -> std::sync::Arc<DownloadEventEmitter> {
     })
 }
 
+/// The IPC command registry: every `#[tauri::command]` the webview may
+/// invoke. Kept in one function so `run()` and the registration contract
+/// tests (`tests/temp_files.rs`) share the exact same list. A command the
+/// frontend calls but that is missing here fails at runtime with
+/// "command not found".
+pub fn invoke_handler<R: tauri::Runtime>(
+) -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
+        commands::greet,
+        commands::import::media_import,
+        commands::quota::quota_get,
+        commands::quota::quota_set,
+        commands::scan::library_scan,
+        commands::library::library_list,
+        commands::library::library_make_permanent,
+        commands::library::library_delete,
+        commands::protocol::media_resolve_url,
+        commands::identity::identity_get,
+        commands::identity::identity_rotate,
+        commands::identity::identity_set_display_name,
+        commands::signaling::signaling_get_state,
+        commands::signaling::signaling_connect,
+        commands::signaling::signaling_disconnect,
+        commands::room::room_connect_signaling,
+        commands::room::room_create,
+        commands::room::room_join,
+        commands::room::room_leave,
+        commands::room::room_get_state,
+        commands::room::recent_rooms_list,
+        commands::room::recent_room_upsert,
+        commands::room::manifest_publish,
+        commands::room::manifest_fetch,
+        commands::room::manifest_current,
+        commands::room::room_invite_url,
+        commands::room::room_permission_set,
+        commands::room::room_chat_message,
+        commands::download::download_open,
+        commands::download::download_pause,
+        commands::download::download_resume,
+        commands::download::download_list,
+        commands::playback::playback_send,
+        commands::drawing::drawing_send,
+        // P6-T06: leave-room Keep / Delete flow.
+        commands::temp_files::get_temp_files,
+        commands::temp_files::mark_files_permanent,
+        commands::temp_files::delete_files_to_trash,
+        room::report::position_report,
+        room::report::clock_skew_probe,
+    ]
+}
+
 /// Build and run the Locast desktop client.
 ///
 /// The Tauri 2 builder is configured per `docs/ARCHITECTURE.md` section 5:
@@ -397,44 +448,7 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![
-            commands::greet,
-            commands::import::media_import,
-            commands::quota::quota_get,
-            commands::quota::quota_set,
-            commands::scan::library_scan,
-            commands::library::library_list,
-            commands::library::library_make_permanent,
-            commands::library::library_delete,
-            commands::protocol::media_resolve_url,
-            commands::identity::identity_get,
-            commands::identity::identity_rotate,
-            commands::identity::identity_set_display_name,
-            commands::signaling::signaling_get_state,
-            commands::signaling::signaling_connect,
-            commands::signaling::signaling_disconnect,
-            commands::room::room_connect_signaling,
-            commands::room::room_create,
-            commands::room::room_join,
-            commands::room::room_leave,
-            commands::room::room_get_state,
-            commands::room::recent_rooms_list,
-            commands::room::recent_room_upsert,
-            commands::room::manifest_publish,
-            commands::room::manifest_fetch,
-            commands::room::manifest_current,
-            commands::room::room_invite_url,
-            commands::room::room_permission_set,
-            commands::room::room_chat_message,
-            commands::download::download_open,
-            commands::download::download_pause,
-            commands::download::download_resume,
-            commands::download::download_list,
-            commands::playback::playback_send,
-            commands::drawing::drawing_send,
-            room::report::position_report,
-            room::report::clock_skew_probe,
-        ])
+        .invoke_handler(invoke_handler())
         .register_asynchronous_uri_scheme_protocol("locast", |ctx, request, responder| {
             // P1-T08: the `locast://` URI scheme handler. Tauri
             // hands us the request off the main thread; we
