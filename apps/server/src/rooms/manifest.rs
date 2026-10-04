@@ -114,6 +114,18 @@ pub async fn handle_manifest_publish(
         return Err(RoomError::InvalidState);
     }
 
+    // 2b. Bind the manifest to the room it is published into. The
+    //     signed `room_id` must name the envelope's room (the room
+    //     the capability gate authorized), so a manifest signed for
+    //     one room cannot be stored, cached or broadcast as another
+    //     room's manifest. Checked before anything is persisted.
+    //     The signed string must be the canonical form (what
+    //     clients produce with `Uuid::to_string`), so every
+    //     viewer sees exactly the room id the server checked.
+    if manifest.room_id != room_id.to_string() {
+        return Err(RoomError::InvalidState);
+    }
+
     // 3. Compute the next version. The room row exists
     //    (we checked `is_room_host` earlier) but the
     //    manifest may be the first one published.

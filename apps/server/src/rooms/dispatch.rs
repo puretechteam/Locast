@@ -9,9 +9,9 @@
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
-    ManifestPublishPayload, ParticipantJoinedPayload, ParticipantLeftPayload, PresencePayload,
-    RoomCreatePayload, RoomCreatedPayload, RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload,
-    RoomJoinedPayload, RoomLeavePayload, RoomStatePayload,
+    ManifestPublishPayload, ParticipantJoinedPayload, ParticipantLeftPayload, ParticipantStatus,
+    PresencePayload, RoomCreatePayload, RoomCreatedPayload, RoomErrorCode, RoomErrorPayload,
+    RoomJoinRequestPayload, RoomJoinedPayload, RoomLeavePayload, RoomStatePayload,
 };
 use uuid::Uuid;
 
@@ -26,6 +26,7 @@ use super::playback::handle_playback_cmd;
 use super::presence::handle_position_report;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
+use super::state::RoomState;
 use super::store::RoomStore;
 use super::validation::validate_display_name;
 use crate::db::Db;
@@ -174,19 +175,21 @@ pub async fn dispatch_room_message(
         }
         MessageKind::PermissionSet => {
             match handle_permission_set(envelope, registry, store, user_id, now_ms).await {
-                Ok(events) => RoomDispatchOutcome {
-                    to_caller: Vec::new(),
-                    events,
-                    close_caller: false,
-                },
+                // Already published by the handler under the room
+                // lock; handing it to the WS layer would publish it
+                // twice and out of order.
+                Ok(_published) => RoomDispatchOutcome::default(),
                 Err(e) => {
                     let mut out = RoomDispatchOutcome::default();
-                    out.to_caller.push(err_envelope(
-                        MessageKind::RoomError,
-                        RoomErrorCode::Internal,
-                        e.to_string(),
-                        now_ms,
-                    ));
+                    let message = e.to_string();
+                    // NotHost (the in-lock re-check) keeps its code;
+                    // every other failure stays Internal, as before.
+                    let code = match e {
+                        RoomError::NotHost => RoomErrorCode::NotHost,
+                        _ => RoomErrorCode::Internal,
+                    };
+                    out.to_caller
+                        .push(err_envelope(MessageKind::RoomError, code, message, now_ms));
                     out
                 }
             }
@@ -521,7 +524,51 @@ async fn handle_stroke_begin_dispatch(
         None => return default_reject("drawing target room not found"),
     };
     let mut state = handle.write().await;
+    // Re-check DRAW on the state this BEGIN will mutate: a
+    // PERMISSION_SET revoke that landed after the capability gate
+    // must stop the new stroke (architecture §11.5: revokes take
+    // effect immediately; drawing permission changes affect the
+    // next stroke). POINT / END get no in-lock DRAW re-check:
+    // §11.5 says in-progress strokes are not aborted, and they are
+    // bound to the stroke's owner. (The capability gate still
+    // applies DRAW to them, which is stricter than §11.5.)
+    if !caller_may_draw(&state, user_id) {
+        return capability_reject("DRAW capability is not held in this room");
+    }
     drawing::handle_stroke_begin(envelope, &mut state, user_id, pubkey, now_ms).await
+}
+
+/// `true` if `user_id`'s live participant record in `state` may
+/// start a stroke: a current member holding DRAW (the host holds
+/// every bit). The same rule as the capability gate, evaluated
+/// under the room lock.
+fn caller_may_draw(state: &RoomState, user_id: Uuid) -> bool {
+    state
+        .participants
+        .iter()
+        .find(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+        .is_some_and(|p| {
+            matches!(
+                p.status,
+                ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+            ) && caps::participant_can(p, caps::Scope::Drawing, caps::Action::DrawBegin)
+        })
+}
+
+/// A single-caller ROOM_ERROR(NotHost), the code the capability
+/// gate uses for a missing capability.
+fn capability_reject(message: &str) -> RoomDispatchOutcome {
+    let mut out = RoomDispatchOutcome::default();
+    out.to_caller.push(err_envelope(
+        MessageKind::RoomError,
+        RoomErrorCode::NotHost,
+        message.to_string(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0),
+    ));
+    out
 }
 
 /// P5-T02: dispatch DRAW_POINT.
@@ -1554,5 +1601,239 @@ mod tests {
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::NotJoined);
         assert!(out.events.is_empty());
+    }
+
+    // ----- Authorization re-checked at the mutation boundary -----
+
+    fn permission_envelope(room_id: Uuid, target: Uuid, add: u32) -> Envelope {
+        Envelope {
+            v: 1,
+            r#type: MessageKind::PermissionSet,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(locast_protocol::room::PermissionSetPayload {
+                target_user_id: target,
+                add_cap_set: add,
+                remove_cap_set: 0,
+            })
+            .unwrap(),
+        }
+    }
+
+    async fn live_cap_set(reg: &RoomRegistry, room_id: Uuid, user: Uuid) -> u32 {
+        let handle = reg.get_by_id(room_id).await.expect("room");
+        let st = handle.read().await;
+        st.participants
+            .iter()
+            .find(|p| p.user_id == user && p.status != ParticipantStatus::Left)
+            .expect("live record")
+            .cap_set
+    }
+
+    async fn db_cap_set(db: &crate::db::Db, room_id: Uuid, user: Uuid) -> u32 {
+        db.list_room_participants(room_id)
+            .await
+            .expect("list participants")
+            .into_iter()
+            .find(|r| r.user_id == user)
+            .expect("participant row")
+            .cap_set
+    }
+
+    /// The gate checked "host" before the room lock; a migration that
+    /// lands in between must still stop the demoted host. Calling the
+    /// handler directly after the migration reproduces that window.
+    #[tokio::test]
+    async fn permission_set_rechecks_the_host_under_the_room_lock() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let (room_id, host_uid, _host_pk, viewer_uid, _viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        let third_pk = [9u8; 32];
+        let third = db.upsert_user(&third_pk).await.expect("upsert third");
+        let code = reg
+            .get_by_id(room_id)
+            .await
+            .unwrap()
+            .read()
+            .await
+            .code
+            .clone();
+        reg.join(&s, &code, third, third_pk, "third".into(), clock.now_ms())
+            .await
+            .expect("third joins");
+
+        // Host migrates to the viewer (the old host is demoted).
+        {
+            let handle = reg.get_by_id(room_id).await.expect("room");
+            let mut st = handle.write().await;
+            assert_eq!(
+                crate::rooms::host::elect_new_host(&mut st),
+                Some(viewer_uid)
+            );
+        }
+        let before = live_cap_set(&reg, room_id, third).await;
+        let err = handle_permission_set(
+            permission_envelope(room_id, third, locast_protocol::room::cap::PLAYBACK_CONTROL),
+            &reg,
+            &s,
+            host_uid,
+            clock.now_ms(),
+        )
+        .await
+        .expect_err("demoted host must be refused");
+        assert!(matches!(err, RoomError::NotHost), "got {err:?}");
+        assert_eq!(live_cap_set(&reg, room_id, third).await, before);
+        assert_eq!(db_cap_set(&db, room_id, third).await, before);
+
+        // The current host can grant in the room they host.
+        handle_permission_set(
+            permission_envelope(room_id, third, locast_protocol::room::cap::PLAYBACK_CONTROL),
+            &reg,
+            &s,
+            viewer_uid,
+            clock.now_ms(),
+        )
+        .await
+        .expect("current host grants");
+        let after = live_cap_set(&reg, room_id, third).await;
+        assert_eq!(after, before | locast_protocol::room::cap::PLAYBACK_CONTROL);
+        assert_eq!(db_cap_set(&db, room_id, third).await, after);
+    }
+
+    /// Several grants for the same participant at once: each one's
+    /// read-modify-write runs under the room lock, so none is lost in
+    /// memory or in the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_permission_sets_do_not_lose_updates() {
+        let (reg, clock) = fresh_registry();
+        let reg = std::sync::Arc::new(reg);
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let store = std::sync::Arc::new(crate::rooms::DbRoomStore::new(db.clone()));
+        let (room_id, host_uid, _host_pk, viewer_uid, _viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+        let start = live_cap_set(&reg, room_id, viewer_uid).await;
+        let bits = [
+            locast_protocol::room::cap::PLAYBACK_CONTROL,
+            locast_protocol::room::cap::DRAW,
+            locast_protocol::room::cap::LASER,
+            locast_protocol::room::cap::MANAGE_ROOM,
+            locast_protocol::room::cap::KICK,
+            locast_protocol::room::cap::PUBLISH_MANIFEST,
+            locast_protocol::room::cap::INVITE,
+        ];
+        let now = clock.now_ms();
+        let tasks: Vec<_> = bits
+            .iter()
+            .map(|&bit| {
+                let reg = reg.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    handle_permission_set(
+                        permission_envelope(room_id, viewer_uid, bit),
+                        &reg,
+                        store.as_ref(),
+                        host_uid,
+                        now,
+                    )
+                    .await
+                    .expect("grant")
+                })
+            })
+            .collect();
+        for t in tasks {
+            t.await.expect("task");
+        }
+        let expected = bits.iter().fold(start, |acc, b| acc | b);
+        assert_eq!(live_cap_set(&reg, room_id, viewer_uid).await, expected);
+        assert_eq!(db_cap_set(&db, room_id, viewer_uid).await, expected);
+    }
+
+    fn draw_begin(room_id: Uuid, sender: Uuid, pk: [u8; 32]) -> Envelope {
+        Envelope {
+            v: 1,
+            r#type: MessageKind::StrokeBegin,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: Some(locast_protocol::envelope::Sender {
+                user_id: sender,
+                pubkey: pk.to_vec(),
+                // Not a valid signature: the capability check runs
+                // first, and a signature failure has a different
+                // error code (InvalidState).
+                sig: vec![0u8; 64],
+            }),
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(locast_protocol::room::StrokeBeginPayload {
+                stroke_id: Uuid::now_v7(),
+                tool: locast_protocol::room::StrokeTool::Pen,
+                color: "#fff".into(),
+                width: 2.0,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.5,
+                ts_ms: 0,
+            })
+            .unwrap(),
+        }
+    }
+
+    fn error_code(out: &RoomDispatchOutcome) -> RoomErrorCode {
+        assert_eq!(out.to_caller.len(), 1, "one error to the caller");
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        p.code
+    }
+
+    /// The gate checked DRAW before the room lock; a revoke that
+    /// lands in between must stop the new stroke. Calling the
+    /// dispatcher directly after the revoke reproduces that window.
+    #[tokio::test]
+    async fn draw_begin_rechecks_draw_under_the_room_lock() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, _host_uid, _host_pk, viewer_uid, viewer_pk) =
+            room_with_host_and_viewer(&reg, &db, &clock).await;
+
+        // Held: the capability check passes and the signature check
+        // is what refuses this unsigned BEGIN.
+        reg.update_participant_cap_set(
+            room_id,
+            viewer_uid,
+            locast_protocol::room::cap::CHAT | locast_protocol::room::cap::DRAW,
+            0,
+        )
+        .await
+        .unwrap();
+        let out = handle_stroke_begin_dispatch(
+            draw_begin(room_id, viewer_uid, viewer_pk),
+            &reg,
+            &clock,
+            viewer_uid,
+            viewer_pk,
+        )
+        .await;
+        assert_eq!(error_code(&out), RoomErrorCode::InvalidState);
+
+        // Revoked: refused by the capability re-check, nothing pending.
+        reg.update_participant_cap_set(room_id, viewer_uid, locast_protocol::room::cap::CHAT, 0)
+            .await
+            .unwrap();
+        let out = handle_stroke_begin_dispatch(
+            draw_begin(room_id, viewer_uid, viewer_pk),
+            &reg,
+            &clock,
+            viewer_uid,
+            viewer_pk,
+        )
+        .await;
+        assert_eq!(error_code(&out), RoomErrorCode::NotHost);
+        assert!(out.events.is_empty());
+        let handle = reg.get_by_id(room_id).await.unwrap();
+        assert!(handle.read().await.drawing.pending.is_empty());
     }
 }

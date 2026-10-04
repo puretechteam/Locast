@@ -18,7 +18,7 @@
 #![forbid(unsafe_code)]
 
 use locast_protocol::envelope::Envelope;
-use locast_protocol::room::PermissionSetPayload;
+use locast_protocol::room::{ParticipantStatus, PermissionSetPayload};
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
@@ -35,7 +35,10 @@ fn decode_payload<T: DeserializeOwned>(value: &serde_json::Value) -> Result<T, R
 ///
 /// The dispatcher has already verified the caller is the room host
 /// via `check_capability(..., Command::PermissionSet)`. This handler
-/// applies the grant/revoke and broadcasts the update.
+/// re-checks that under the room lock, applies the grant/revoke and
+/// publishes the CAPABILITY_UPDATE to the room under the same lock.
+/// The returned events are ALREADY PUBLISHED; callers must not
+/// publish them again.
 pub async fn handle_permission_set(
     envelope: Envelope,
     registry: &RoomRegistry,
@@ -58,7 +61,7 @@ async fn handle_permission_set_payload(
     registry: &RoomRegistry,
     store: &dyn RoomStore,
     caller_user_id: Uuid,
-    now_ms: i64,
+    _now_ms: i64,
 ) -> Result<Vec<RoomEvent>, RoomError> {
     let target_user_id = payload.target_user_id;
 
@@ -73,34 +76,62 @@ async fn handle_permission_set_payload(
         .await
         .ok_or(RoomError::RoomNotFound)?;
 
-    let new_cap_set = {
-        let state = handle.read().await;
-        let participant = state
-            .participants
-            .iter()
-            .find(|p| {
-                p.user_id == target_user_id
-                    && p.status != locast_protocol::room::ParticipantStatus::Left
-            })
-            .ok_or_else(|| {
-                RoomError::Internal("PERMISSION_SET: target is not a room participant".into())
-            })?;
+    // One room write lock covers the whole change: re-checking the
+    // caller's authority, reading the target's current cap_set,
+    // persisting the new value, and applying it in memory.
+    //
+    // - The capability gate's host check ran before this lock; a
+    //   host migration in between must not let a demoted host's
+    //   change through, so the host check is repeated here.
+    // - Two PERMISSION_SETs for the same target serialize on this
+    //   lock, so neither read-modify-write can lose the other's
+    //   bits, and the store sees the writes in the same order as
+    //   memory. (The store write is awaited under the lock, as
+    //   `RoomRegistry::leave` already does for its store writes.)
+    let mut state = handle.write().await;
 
-        if payload.remove_cap_set == u32::MAX {
-            payload.add_cap_set
-        } else {
-            (participant.cap_set & !payload.remove_cap_set) | payload.add_cap_set
-        }
+    // Same rule as the gate (`is_room_host` + `is_user_in_room`),
+    // evaluated on the state this change will mutate.
+    let caller_is_host = state.participants.iter().any(|p| {
+        p.user_id == caller_user_id
+            && p.is_host
+            && matches!(
+                p.status,
+                ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+            )
+    });
+    if !caller_is_host {
+        return Err(RoomError::NotHost);
+    }
+
+    let target = state
+        .participants
+        .iter_mut()
+        .find(|p| p.user_id == target_user_id && p.status != ParticipantStatus::Left)
+        .ok_or_else(|| {
+            RoomError::Internal("PERMISSION_SET: target is not a room participant".into())
+        })?;
+    let new_cap_set = if payload.remove_cap_set == u32::MAX {
+        payload.add_cap_set
+    } else {
+        (target.cap_set & !payload.remove_cap_set) | payload.add_cap_set
     };
 
     store
         .update_participant_cap_set(room_id, target_user_id, new_cap_set)
         .await
         .map_err(RoomError::Internal)?;
-
-    registry
-        .update_participant_cap_set(room_id, target_user_id, new_cap_set, now_ms)
-        .await?;
+    target.cap_set = new_cap_set;
+    let events = vec![RoomEvent::CapabilityUpdated(CapabilityUpdated {
+        target_user_id,
+        cap_set: new_cap_set,
+    })];
+    // Publish before releasing the lock so CAPABILITY_UPDATEs for
+    // the same room reach clients in the order the changes were
+    // applied (a later change cannot overtake an earlier one and
+    // leave clients with a stale cap_set). `publish` never awaits.
+    registry.publish_events(&events, |_| room_id);
+    drop(state);
 
     tracing::info!(
         host_id = %caller_user_id,
@@ -109,10 +140,7 @@ async fn handle_permission_set_payload(
         "capability updated"
     );
 
-    Ok(vec![RoomEvent::CapabilityUpdated(CapabilityUpdated {
-        target_user_id,
-        cap_set: new_cap_set,
-    })])
+    Ok(events)
 }
 
 #[cfg(test)]

@@ -1982,3 +1982,183 @@ async fn room_leave_with_a_room_id_leaves_exactly_that_room() {
     assert!(!harness.rooms.is_user_in_room(x.user_id, b.room.id).await);
     drop(harness);
 }
+
+/// A MANIFEST_PUBLISH into `publish_room` carrying a manifest validly
+/// signed by `kp` for `signed_room`.
+fn manifest_signed_for(
+    token: [u8; 32],
+    publish_room: Uuid,
+    signed_room: &str,
+    kp: &SigningKey,
+) -> Envelope {
+    let manifest = locast_manifest::sign_manifest(
+        &kp.to_bytes(),
+        &locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: signed_room.to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1,
+            host_signature: None,
+        },
+    )
+    .expect("sign manifest");
+    room_scoped_envelope(
+        token,
+        MessageKind::ManifestPublish,
+        publish_room,
+        json!({ "manifest": manifest }),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_signed_for_another_room_is_rejected_before_persistence() {
+    let harness = spawn_test_server().await;
+    let (kp_x, _) = fresh_keypair();
+    let (kp_y, _) = fresh_keypair();
+    let mut ws_x = connect(harness.addr).await;
+    let mut ws_y = connect(harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    let y = complete_handshake(&mut ws_y, &kp_y).await;
+
+    // X hosts both A and B (so the gate allows X to publish into
+    // either); Y watches B.
+    let mut rooms = Vec::new();
+    for title in ["A", "B"] {
+        send_envelope(&mut ws_x, &room_create_envelope(x.token, title, false)).await;
+        let env = next_of_kind(&mut ws_x, MessageKind::RoomCreated, "X create").await;
+        rooms.push(
+            serde_json::from_value::<RoomCreatedPayload>(env.payload)
+                .unwrap()
+                .room,
+        );
+    }
+    let (room_a, room_b) = (rooms[0].id, rooms[1].id);
+    send_envelope(&mut ws_y, &room_join_envelope(y.token, &rooms[1].code, "Y")).await;
+    next_of_kind(&mut ws_y, MessageKind::RoomJoined, "Y joins B").await;
+
+    // A manifest validly signed by B's host, but for room A, is
+    // refused in B: nothing stored, cached or broadcast.
+    send_envelope(
+        &mut ws_x,
+        &manifest_signed_for(x.token, room_b, &room_a.to_string(), &kp_x),
+    )
+    .await;
+    expect_room_error(
+        &mut ws_x,
+        RoomErrorCode::InvalidState,
+        "A's manifest into B",
+    )
+    .await;
+    // B's own id in a non-canonical spelling is refused too.
+    send_envelope(
+        &mut ws_x,
+        &manifest_signed_for(x.token, room_b, &room_b.to_string().to_uppercase(), &kp_x),
+    )
+    .await;
+    expect_room_error(&mut ws_x, RoomErrorCode::InvalidState, "uppercase room id").await;
+    assert_no_kind_within(
+        &mut ws_y,
+        MessageKind::ManifestPublished,
+        Duration::from_millis(300),
+        "Y",
+    )
+    .await;
+    assert!(harness
+        .db
+        .get_latest_room_manifest(room_b)
+        .await
+        .expect("db")
+        .is_none());
+    assert!(harness.rooms.current_manifest(room_b).await.is_none());
+
+    // The same host's manifest signed for B is accepted into B.
+    send_envelope(
+        &mut ws_x,
+        &manifest_signed_for(x.token, room_b, &room_b.to_string(), &kp_x),
+    )
+    .await;
+    let env = next_of_kind(
+        &mut ws_y,
+        MessageKind::ManifestPublished,
+        "Y gets B's manifest",
+    )
+    .await;
+    assert_eq!(env.room_id, Some(room_b));
+    assert_eq!(
+        env.payload["manifest"]["room_id"],
+        json!(room_b.to_string())
+    );
+    assert!(harness
+        .db
+        .get_latest_room_manifest(room_b)
+        .await
+        .expect("db")
+        .is_some());
+    drop(harness);
+}
+
+/// End-to-end behavior after a revoke. Over the wire the capability
+/// gate refuses the BEGIN first; the in-lock re-check for a revoke
+/// that lands between the gate and the lock is covered by
+/// `draw_begin_rechecks_draw_under_the_room_lock` (dispatch.rs).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_draw_stops_the_next_stroke() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    let change = |add: u32, remove: u32| {
+        room_scoped_envelope(
+            a.token,
+            MessageKind::PermissionSet,
+            room_id,
+            serde_json::to_value(PermissionSetPayload {
+                target_user_id: b.user_id,
+                add_cap_set: add,
+                remove_cap_set: remove,
+            })
+            .unwrap(),
+        )
+    };
+    send_envelope(&mut ws_a, &change(cap::DRAW, 0)).await;
+    next_of_kind(&mut ws_b, MessageKind::CapabilityUpdate, "B granted").await;
+    let first = Uuid::now_v7();
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, first),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_c, MessageKind::StrokeBegin, "C sees B's stroke").await;
+    assert_eq!(env.payload["stroke_id"], json!(first));
+
+    send_envelope(&mut ws_a, &change(0, cap::DRAW)).await;
+    let env = next_of_kind(&mut ws_b, MessageKind::CapabilityUpdate, "B revoked").await;
+    assert_eq!(
+        env.payload["cap_set"].as_u64().unwrap() as u32 & cap::DRAW,
+        0
+    );
+    let second = Uuid::now_v7();
+    send_envelope(
+        &mut ws_b,
+        &draw_begin_envelope(b.token, room_id, &kp_b, b.user_id, second),
+    )
+    .await;
+    expect_room_error(&mut ws_b, RoomErrorCode::NotHost, "B draws after revoke").await;
+    assert_no_kind_within(
+        &mut ws_c,
+        MessageKind::StrokeBegin,
+        Duration::from_millis(300),
+        "C",
+    )
+    .await;
+    drop(harness);
+}
