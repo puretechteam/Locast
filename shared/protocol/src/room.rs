@@ -760,6 +760,60 @@ pub struct StrokeUndoPayload {
 #[ts(export_to = "ts/index.ts")]
 pub struct StrokeClearPayload {}
 
+/// DRAW_SYNC (S -> one client): the room's authoritative drawing
+/// state as of drawing sequence `seq`.
+///
+/// Every DRAW_BEGIN / POINT / END / UNDO / CLEAR rebroadcast
+/// carries the room's drawing sequence number in `Envelope::seq`
+/// (assigned by the server in the order the room applied them).
+/// When a client's subscription drops events, the server sends
+/// this snapshot instead; the client replaces its drawing state
+/// with it and applies only DRAW_* events whose `Envelope::seq`
+/// is greater than `seq`. That reproduces exactly the server's
+/// state, whatever was dropped (including DRAW_UNDO / DRAW_CLEAR).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeSyncPayload {
+    /// The drawing sequence number this snapshot reflects: every
+    /// event with `seq <= this` is already applied in `strokes`.
+    pub seq: u64,
+    /// Every stroke on the canvas, in drawing order: committed
+    /// (ended) strokes first, oldest first, then strokes still in
+    /// progress.
+    pub strokes: Vec<StrokeSyncStroke>,
+}
+
+/// One point of a stroke in a [`StrokeSyncPayload`]: a DRAW_POINT
+/// without the (repeated) stroke id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeSyncPoint {
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    pub ts_ms: i64,
+}
+
+/// One stroke in a [`StrokeSyncPayload`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeSyncStroke {
+    pub stroke_id: Uuid,
+    /// The stroke owner recorded by the server at DRAW_BEGIN.
+    pub owner_id: Uuid,
+    /// The stroke's DRAW_BEGIN payload, or `None` when the server
+    /// no longer holds this stroke's content (its per-room budget
+    /// is spent). The stroke is still on the canvas: a client that
+    /// has it keeps its own copy.
+    pub begin: Option<StrokeBeginPayload>,
+    /// The stroke's DRAW_POINTs so far, in order (empty when
+    /// `begin` is `None`).
+    pub points: Vec<StrokeSyncPoint>,
+    /// The DRAW_END timestamp once the stroke has ended; `None`
+    /// while it is still being drawn.
+    pub end_ts_ms: Option<i64>,
+}
+
 // ===== P4-T03: POSITION_REPORT wire type =====
 //
 // docs/ARCHITECTURE.md §13.1: POSITION_REPORT is a passive,

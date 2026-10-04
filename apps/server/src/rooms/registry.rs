@@ -283,6 +283,12 @@ pub struct BroadcastItem {
     /// It is always the stroke owner recorded server-side at
     /// DRAW_BEGIN, never a client-supplied value. `None` otherwise.
     pub sender: Option<Uuid>,
+    /// The room's drawing sequence number for DRAW_BEGIN / POINT /
+    /// END / UNDO / CLEAR (assigned under the room write lock, in
+    /// publish order; travels as `Envelope::seq`), `0` for every
+    /// other kind. Lets a subscriber that fell behind tell which
+    /// drawing events a DRAW_SYNC snapshot already covers.
+    pub seq: u64,
 }
 
 /// Subset of `Config` the registry needs.
@@ -406,6 +412,24 @@ impl RoomRegistry {
         F: Fn(&RoomEvent) -> Uuid,
     {
         for event in events {
+            self.publish_event(event, &room_id_for_event, 0);
+        }
+    }
+
+    /// Publish one drawing event stamped with the room's drawing
+    /// sequence number `seq` (see [`BroadcastItem::seq`]). The
+    /// caller holds the room's write lock and took `seq` from
+    /// `StrokeBookkeeping::next_seq` under it, so the channel order
+    /// is the sequence order.
+    pub fn publish_drawing_event(&self, event: &RoomEvent, room_id: Uuid, seq: u64) {
+        self.publish_event(event, &|_: &RoomEvent| room_id, seq);
+    }
+
+    fn publish_event<F>(&self, event: &RoomEvent, room_id_for_event: &F, seq: u64)
+    where
+        F: Fn(&RoomEvent) -> Uuid,
+    {
+        {
             let originator = match event {
                 RoomEvent::ParticipantJoined(p) => Some(p.participant.user_id),
                 RoomEvent::ParticipantLeft(p) => Some(p.user_id),
@@ -456,9 +480,23 @@ impl RoomRegistry {
                 RoomEvent::ChatMessage(ChatMessage { room_id, .. }) => *room_id,
                 _ => room_id_for_event(event),
             };
-            let item = event_to_broadcast_item(event, room_id, originator);
+            let mut item = event_to_broadcast_item(event, room_id, originator);
+            item.seq = seq;
             self.publish(room_id, item);
         }
+    }
+
+    /// The room's drawing state for a DRAW_SYNC, `None` if the room
+    /// is gone. Takes the room's read lock: drawing events are
+    /// applied and published under its write lock, so the snapshot's
+    /// `seq` is exactly the last drawing event it reflects.
+    pub async fn drawing_snapshot(
+        &self,
+        room_id: Uuid,
+    ) -> Option<locast_protocol::room::StrokeSyncPayload> {
+        let handle = self.get_by_id(room_id).await?;
+        let state = handle.read().await;
+        Some(state.drawing.snapshot())
     }
 
     /// Tick the grace timer. v1 always ends the room when the
@@ -506,6 +544,7 @@ impl RoomRegistry {
                         room_id: rid,
                         originator: None,
                         sender: None,
+                        seq: 0,
                     },
                 ));
                 if matches!(event, RoomEvent::RoomClosed(_)) {
@@ -889,6 +928,7 @@ impl RoomRegistry {
             room_id: id,
             originator: Some(user_id),
             sender: None,
+            seq: 0,
         };
         drop(state);
         self.publish(id, item);
@@ -1682,7 +1722,7 @@ impl RoomRegistry {
             host_disconnect_deadline_ms: deadline,
             participants: rebuilt,
             playback: super::state::PlaybackBookkeeping::default(),
-            drawing: super::state::StrokeBookkeeping::default(),
+            drawing: super::state::StrokeBookkeeping::new(),
         };
         let handle = Arc::new(RwLock::new(state));
         {
@@ -1880,6 +1920,7 @@ fn event_to_broadcast_item(
         room_id,
         originator,
         sender,
+        seq: 0,
     }
 }
 

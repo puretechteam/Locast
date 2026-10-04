@@ -225,6 +225,8 @@ pub async fn handle_stroke_begin(
             cleared: false,
         },
     );
+    // Keep the stroke's content for DRAW_SYNC snapshots.
+    state.drawing.record_begin(user_id, &payload);
     let evt = super::registry::RoomEvent::StrokeBegin {
         room_id: envelope.room_id.unwrap_or(state.id),
         sender_id: user_id,
@@ -275,6 +277,7 @@ pub async fn handle_stroke_point(
     if binding.cleared {
         return RoomDispatchOutcome::default();
     }
+    state.drawing.record_point(&payload);
     // Attribute the point to the stroke's recorded owner (equal to
     // `user_id` after the check above); `envelope.sender` is never
     // read for POINT.
@@ -322,11 +325,13 @@ pub async fn handle_stroke_end(
     if binding.is_some_and(|b| b.cleared) {
         // Cleared while open: closed silently, never committed (so it
         // cannot be undone later) and not rebroadcast.
+        state.drawing.forget_content(&payload.stroke_id);
         return RoomDispatchOutcome::default();
     }
     // The stroke is now committed: remember its owner so DRAW_UNDO
     // can be authorized against it.
     state.drawing.commit(payload.stroke_id, owner);
+    state.drawing.record_end(&payload.stroke_id, payload.ts_ms);
     // Attribute the end to the stroke's recorded owner; `envelope.sender`
     // is never read for END.
     let evt = super::registry::RoomEvent::StrokeEnd {

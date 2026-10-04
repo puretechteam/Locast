@@ -511,6 +511,9 @@ export type StrokeBeginEvent = {
     y: number;
     pressure: number;
     ts_ms: number;
+    /** The room's drawing sequence number (`Envelope::seq`). An
+     *  event at or below the last one applied is ignored. */
+    seq?: number;
 };
 
 // P5-T03: the `drawing://point` event payload. Emitted
@@ -524,6 +527,9 @@ export type StrokePointEvent = {
     y: number;
     pressure: number;
     ts_ms: number;
+    /** The room's drawing sequence number (`Envelope::seq`). An
+     *  event at or below the last one applied is ignored. */
+    seq?: number;
 };
 
 // P5-T03: the `drawing://end` event payload. Emitted
@@ -534,6 +540,9 @@ export type StrokeEndEvent = {
     sender_id: string;
     stroke_id: string;
     ts_ms: number;
+    /** The room's drawing sequence number (`Envelope::seq`). An
+     *  event at or below the last one applied is ignored. */
+    seq?: number;
 };
 
 // P5-T03: the `drawing://undo` event payload. Emitted when the
@@ -544,6 +553,9 @@ export type StrokeUndoEvent = {
     room_id: string;
     sender_id: string;
     stroke_id: string;
+    /** The room's drawing sequence number (`Envelope::seq`). An
+     *  event at or below the last one applied is ignored. */
+    seq?: number;
 };
 
 // P5-T03: the `drawing://clear` event payload. Emitted when the
@@ -552,6 +564,47 @@ export type StrokeUndoEvent = {
 export type StrokeClearEvent = {
     room_id: string;
     sender_id: string;
+    /** The room's drawing sequence number (`Envelope::seq`). An
+     *  event at or below the last one applied is ignored. */
+    seq?: number;
+};
+
+// The `drawing://sync` event payload: the room's authoritative drawing
+// state as of drawing sequence `seq`, sent when this client's room
+// subscription dropped events. It replaces the drawing state; only
+// drawing events with a higher `seq` follow.
+export type StrokeSyncPoint = {
+    x: number;
+    y: number;
+    pressure: number;
+    ts_ms: number;
+};
+
+export type StrokeSyncBegin = {
+    tool: string;
+    color: string;
+    width: number;
+    x: number;
+    y: number;
+    pressure: number;
+    ts_ms: number;
+};
+
+export type StrokeSyncStrokeEvent = {
+    stroke_id: string;
+    owner_id: string;
+    /** `null` when the server no longer holds this stroke's content:
+     *  keep the copy already on screen, if any. */
+    begin: StrokeSyncBegin | null;
+    points: StrokeSyncPoint[];
+    /** Set once the stroke ended; `null` while it is being drawn. */
+    end_ts_ms: number | null;
+};
+
+export type StrokeSyncEvent = {
+    room_id: string;
+    seq: number;
+    strokes: StrokeSyncStrokeEvent[];
 };
 export type DownloadSessionIpc = {
   download_id: string;

@@ -225,6 +225,16 @@ pub enum MessageKind {
     // needs `cap::CLEAR_ALL`). Rebroadcast like DRAW_UNDO.
     #[serde(rename = "DRAW_CLEAR")]
     StrokeClear,
+    // DRAW_SYNC (S -> one client) carries the room's
+    // authoritative drawing state as of drawing sequence
+    // `payload.seq`. The server sends it when that client's
+    // room broadcast subscription fell behind and drawing
+    // events were dropped for it; the client replaces its
+    // drawing state with the snapshot, and only DRAW_* events
+    // with a higher `Envelope::seq` follow. Never sent by
+    // clients (the server ignores it).
+    #[serde(rename = "DRAW_SYNC")]
+    StrokeSync,
     // ----- P4-T06: NTP-style clock skew measurement -----
     // SKEW_PROBE / SKEW_REPLY is the per-connection clock
     // measurement exchange (architecture §13.3). The probe
@@ -282,6 +292,7 @@ impl MessageKind {
             MessageKind::StrokeEnd => "DRAW_END",
             MessageKind::StrokeUndo => "DRAW_UNDO",
             MessageKind::StrokeClear => "DRAW_CLEAR",
+            MessageKind::StrokeSync => "DRAW_SYNC",
             MessageKind::SkewProbe => "SKEW_PROBE",
             MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::PermissionSet => "PERMISSION_SET",

@@ -59,6 +59,10 @@ export interface DrawingLayerProps {
     roomId?: string | null;
 }
 
+/** A local stroke finished this recently may not have reached the
+ *  server yet; a DRAW_SYNC does not remove it. */
+const RECENT_LOCAL_STROKE_MS = 3000;
+
 export function DrawingLayer({
     videoRef,
     userId,
@@ -99,6 +103,23 @@ export function DrawingLayer({
             clear();
             undoTrackerRef.current.reset();
         },
+        // This client missed drawing events and the server sent its
+        // whole drawing state. Local strokes the server no longer has
+        // (undone or cleared while we were behind) leave the canvas.
+        // Kept: the stroke being drawn right now, and strokes finished
+        // in the last RECENT_LOCAL_STROKE_MS, whose events may still be
+        // on their way to the server (the snapshot can predate them,
+        // and the server never echoes our own strokes back).
+        onSync: (payload) => {
+            const onServer = new Set(payload.strokes.map((s) => s.strokeId));
+            const now = Date.now();
+            for (const s of getLocalStrokes()) {
+                const settled = s.endedAt !== 0 && now - s.endedAt >= RECENT_LOCAL_STROKE_MS;
+                if (settled && !onServer.has(s.id)) removeStroke(s.id);
+            }
+            undoTrackerRef.current.reset();
+        },
+        localStrokeIds: () => new Set(getLocalStrokes().map((s) => s.id)),
     });
 
     const [activeTool, setActiveTool] = useState<DrawingTool>("pen");

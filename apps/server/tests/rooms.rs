@@ -3438,3 +3438,97 @@ async fn nobody_but_the_host_can_grant_undo_any_or_clear_all() {
     }
     drop(r.harness);
 }
+
+/// Normal delivery: a participant that keeps up receives every
+/// drawing rebroadcast in order, each stamped with the room's drawing
+/// sequence number (contiguous from 1), and never a DRAW_SYNC.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drawing_rebroadcasts_carry_contiguous_room_sequence_numbers() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_a,
+        &draw_begin_envelope(a.token, room_id, &kp_a, a.user_id, stroke),
+    )
+    .await;
+    for i in 0..3 {
+        send_envelope(
+            &mut ws_a,
+            &room_scoped_envelope(
+                a.token,
+                MessageKind::StrokePoint,
+                room_id,
+                json!({ "stroke_id": stroke, "x": 0.1 * i as f32, "y": 0.5, "pressure": 0.5, "ts_ms": 2 + i }),
+            ),
+        )
+        .await;
+    }
+    send_envelope(
+        &mut ws_a,
+        &room_scoped_envelope(
+            a.token,
+            MessageKind::StrokeEnd,
+            room_id,
+            json!({ "stroke_id": stroke, "ts_ms": 9 }),
+        ),
+    )
+    .await;
+    send_envelope(
+        &mut ws_a,
+        &room_scoped_envelope(
+            a.token,
+            MessageKind::StrokeUndo,
+            room_id,
+            json!({ "stroke_id": stroke }),
+        ),
+    )
+    .await;
+    send_envelope(
+        &mut ws_a,
+        &room_scoped_envelope(a.token, MessageKind::StrokeClear, room_id, json!({})),
+    )
+    .await;
+
+    let expected = [
+        MessageKind::StrokeBegin,
+        MessageKind::StrokePoint,
+        MessageKind::StrokePoint,
+        MessageKind::StrokePoint,
+        MessageKind::StrokeEnd,
+        MessageKind::StrokeUndo,
+        MessageKind::StrokeClear,
+    ];
+    let mut seen = Vec::new();
+    while seen.len() < expected.len() {
+        let env = next_envelope(&mut ws_b).await;
+        assert_ne!(
+            env.r#type,
+            MessageKind::StrokeSync,
+            "no snapshot when keeping up"
+        );
+        if env.r#type.is_drawing() {
+            assert_eq!(env.room_id, Some(room_id));
+            seen.push((env.r#type, env.seq));
+        }
+    }
+    // The room's numbering starts from a clock-based epoch; within
+    // the room it is contiguous.
+    let first = seen[0].1;
+    assert_eq!(
+        seen,
+        expected.iter().cloned().zip(first..).collect::<Vec<_>>(),
+        "every drawing event, in order, numbered contiguously"
+    );
+    drop(harness);
+}

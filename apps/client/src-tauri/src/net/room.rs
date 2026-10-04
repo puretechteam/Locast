@@ -96,6 +96,8 @@ pub trait RoomEventSink: Send + Sync {
     /// P5-T03: emit `drawing://clear` when a DRAW_CLEAR is accepted
     /// and rebroadcast by the server (actor included).
     fn emit_stroke_clear(&self, _ev: &StrokeClearEvent) {}
+    /// Emit `drawing://sync` when the server sends a DRAW_SYNC.
+    fn emit_stroke_sync(&self, _ev: &StrokeSyncEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -113,6 +115,7 @@ impl RoomEventSink for NoopEventSink {
     fn emit_stroke_end(&self, _ev: &StrokeEndEvent) {}
     fn emit_stroke_undo(&self, _ev: &StrokeUndoEvent) {}
     fn emit_stroke_clear(&self, _ev: &StrokeClearEvent) {}
+    fn emit_stroke_sync(&self, _ev: &StrokeSyncEvent) {}
 }
 
 /// A Tauri-backed sink. Wraps a `tauri::AppHandle` and
@@ -170,6 +173,9 @@ mod tauri_sink {
         }
         fn emit_stroke_clear(&self, ev: &StrokeClearEvent) {
             let _ = self.handle.emit(STROKE_CLEAR_EVENT, ev.clone());
+        }
+        fn emit_stroke_sync(&self, ev: &StrokeSyncEvent) {
+            let _ = self.handle.emit(STROKE_SYNC_EVENT, ev.clone());
         }
     }
 }
@@ -453,6 +459,10 @@ pub const STROKE_UNDO_EVENT: &str = "drawing://undo";
 /// and rebroadcast by the server (to the actor too).
 pub const STROKE_CLEAR_EVENT: &str = "drawing://clear";
 
+/// Tauri event name emitted when the server sends a DRAW_SYNC: the
+/// room's authoritative drawing state, replacing the webview's.
+pub const STROKE_SYNC_EVENT: &str = "drawing://sync";
+
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
 /// the same field names; the wire field `action`
@@ -615,6 +625,10 @@ pub struct StrokeBeginEvent {
     pub y: f32,
     pub pressure: f32,
     pub ts_ms: i64,
+    /// The room's drawing sequence number (`Envelope::seq`). The
+    /// webview ignores a drawing event at or below the last one it
+    /// applied (a duplicate, or already covered by a DRAW_SYNC).
+    pub seq: u64,
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)> for StrokeBeginEvent {
@@ -635,6 +649,7 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokeBeginPayload)> for StrokeBe
             y: payload.y,
             pressure: payload.pressure,
             ts_ms: payload.ts_ms,
+            seq: 0,
         }
     }
 }
@@ -651,6 +666,10 @@ pub struct StrokePointEvent {
     pub y: f32,
     pub pressure: f32,
     pub ts_ms: i64,
+    /// The room's drawing sequence number (`Envelope::seq`). The
+    /// webview ignores a drawing event at or below the last one it
+    /// applied (a duplicate, or already covered by a DRAW_SYNC).
+    pub seq: u64,
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokePointPayload)> for StrokePointEvent {
@@ -665,6 +684,7 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokePointPayload)> for StrokePo
             y: payload.y,
             pressure: payload.pressure,
             ts_ms: payload.ts_ms,
+            seq: 0,
         }
     }
 }
@@ -678,6 +698,10 @@ pub struct StrokeEndEvent {
     pub sender_id: String,
     pub stroke_id: String,
     pub ts_ms: i64,
+    /// The room's drawing sequence number (`Envelope::seq`). The
+    /// webview ignores a drawing event at or below the last one it
+    /// applied (a duplicate, or already covered by a DRAW_SYNC).
+    pub seq: u64,
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)> for StrokeEndEvent {
@@ -689,6 +713,7 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)> for StrokeEndE
             sender_id: sender_id.to_string(),
             stroke_id: payload.stroke_id.to_string(),
             ts_ms: payload.ts_ms,
+            seq: 0,
         }
     }
 }
@@ -701,6 +726,10 @@ pub struct StrokeUndoEvent {
     pub room_id: String,
     pub sender_id: String,
     pub stroke_id: String,
+    /// The room's drawing sequence number (`Envelope::seq`). The
+    /// webview ignores a drawing event at or below the last one it
+    /// applied (a duplicate, or already covered by a DRAW_SYNC).
+    pub seq: u64,
 }
 
 impl From<(Uuid, Uuid, &locast_protocol::room::StrokeUndoPayload)> for StrokeUndoEvent {
@@ -711,6 +740,92 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokeUndoPayload)> for StrokeUnd
             room_id: room_id.to_string(),
             sender_id: sender_id.to_string(),
             stroke_id: payload.stroke_id.to_string(),
+            seq: 0,
+        }
+    }
+}
+
+/// One point of a stroke in a [`StrokeSyncEvent`].
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeSyncPoint {
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    pub ts_ms: i64,
+}
+
+/// A stroke's DRAW_BEGIN fields in a [`StrokeSyncEvent`].
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeSyncBegin {
+    pub tool: String,
+    pub color: String,
+    pub width: f32,
+    pub x: f32,
+    pub y: f32,
+    pub pressure: f32,
+    pub ts_ms: i64,
+}
+
+/// One stroke in a [`StrokeSyncEvent`].
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeSyncStrokeEvent {
+    pub stroke_id: String,
+    pub owner_id: String,
+    /// `None` when the server no longer holds this stroke's content;
+    /// the stroke is still on the canvas and a webview that has it
+    /// keeps its own copy.
+    pub begin: Option<StrokeSyncBegin>,
+    pub points: Vec<StrokeSyncPoint>,
+    /// Set once the stroke has ended; `None` while in progress.
+    pub end_ts_ms: Option<i64>,
+}
+
+/// Emitted as `drawing://sync` for a DRAW_SYNC: the room's whole
+/// drawing state as of drawing sequence `seq`, in drawing order.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeSyncEvent {
+    pub room_id: String,
+    pub seq: u64,
+    pub strokes: Vec<StrokeSyncStrokeEvent>,
+}
+
+impl From<(Uuid, &locast_protocol::room::StrokeSyncPayload)> for StrokeSyncEvent {
+    fn from((room_id, payload): (Uuid, &locast_protocol::room::StrokeSyncPayload)) -> Self {
+        let strokes = payload
+            .strokes
+            .iter()
+            .map(|st| StrokeSyncStrokeEvent {
+                stroke_id: st.stroke_id.to_string(),
+                owner_id: st.owner_id.to_string(),
+                begin: st.begin.as_ref().map(|b| StrokeSyncBegin {
+                    tool: serde_json::to_value(b.tool)
+                        .ok()
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "pen".to_string()),
+                    color: b.color.clone(),
+                    width: b.width,
+                    x: b.x,
+                    y: b.y,
+                    pressure: b.pressure,
+                    ts_ms: b.ts_ms,
+                }),
+                points: st
+                    .points
+                    .iter()
+                    .map(|p| StrokeSyncPoint {
+                        x: p.x,
+                        y: p.y,
+                        pressure: p.pressure,
+                        ts_ms: p.ts_ms,
+                    })
+                    .collect(),
+                end_ts_ms: st.end_ts_ms,
+            })
+            .collect();
+        Self {
+            room_id: room_id.to_string(),
+            seq: payload.seq,
+            strokes,
         }
     }
 }
@@ -722,6 +837,10 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokeUndoPayload)> for StrokeUnd
 pub struct StrokeClearEvent {
     pub room_id: String,
     pub sender_id: String,
+    /// The room's drawing sequence number (`Envelope::seq`). The
+    /// webview ignores a drawing event at or below the last one it
+    /// applied (a duplicate, or already covered by a DRAW_SYNC).
+    pub seq: u64,
 }
 
 impl From<(Uuid, Uuid)> for StrokeClearEvent {
@@ -729,6 +848,7 @@ impl From<(Uuid, Uuid)> for StrokeClearEvent {
         Self {
             room_id: room_id.to_string(),
             sender_id: sender_id.to_string(),
+            seq: 0,
         }
     }
 }
@@ -1794,7 +1914,9 @@ impl RoomClient {
                             decode_payload::<locast_protocol::room::StrokeBeginPayload>(&env)
                         {
                             if let Some(sender_id) = stroke_sender(&env) {
-                                let ipc = StrokeBeginEvent::from((room_id, sender_id, &payload));
+                                let mut ipc =
+                                    StrokeBeginEvent::from((room_id, sender_id, &payload));
+                                ipc.seq = env.seq;
                                 let g = self.sink.lock().await;
                                 if let Some(s) = g.as_ref() {
                                     s.emit_stroke_begin(&ipc);
@@ -1818,7 +1940,9 @@ impl RoomClient {
                             decode_payload::<locast_protocol::room::StrokePointPayload>(&env)
                         {
                             if let Some(sender_id) = stroke_sender(&env) {
-                                let ipc = StrokePointEvent::from((room_id, sender_id, &payload));
+                                let mut ipc =
+                                    StrokePointEvent::from((room_id, sender_id, &payload));
+                                ipc.seq = env.seq;
                                 let g = self.sink.lock().await;
                                 if let Some(s) = g.as_ref() {
                                     s.emit_stroke_point(&ipc);
@@ -1842,7 +1966,8 @@ impl RoomClient {
                             decode_payload::<locast_protocol::room::StrokeEndPayload>(&env)
                         {
                             if let Some(sender_id) = stroke_sender(&env) {
-                                let ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
+                                let mut ipc = StrokeEndEvent::from((room_id, sender_id, &payload));
+                                ipc.seq = env.seq;
                                 let g = self.sink.lock().await;
                                 if let Some(s) = g.as_ref() {
                                     s.emit_stroke_end(&ipc);
@@ -1864,7 +1989,8 @@ impl RoomClient {
                             decode_payload::<locast_protocol::room::StrokeUndoPayload>(&env)
                         {
                             if let Some(sender_id) = stroke_sender(&env) {
-                                let ipc = StrokeUndoEvent::from((room_id, sender_id, &payload));
+                                let mut ipc = StrokeUndoEvent::from((room_id, sender_id, &payload));
+                                ipc.seq = env.seq;
                                 let g = self.sink.lock().await;
                                 if let Some(s) = g.as_ref() {
                                     s.emit_stroke_undo(&ipc);
@@ -1880,10 +2006,30 @@ impl RoomClient {
                     let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
                     if current_room.as_deref() == Some(room_id.to_string().as_str()) {
                         if let Some(sender_id) = stroke_sender(&env) {
-                            let ipc = StrokeClearEvent::from((room_id, sender_id));
+                            let mut ipc = StrokeClearEvent::from((room_id, sender_id));
+                            ipc.seq = env.seq;
                             let g = self.sink.lock().await;
                             if let Some(s) = g.as_ref() {
                                 s.emit_stroke_clear(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
+            // The server's drawing snapshot after this client's room
+            // subscription dropped events: hand it to the webview,
+            // which replaces its drawing state with it.
+            MessageKind::StrokeSync => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    if current_room.as_deref() == Some(room_id.to_string().as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::StrokeSyncPayload>(&env)
+                        {
+                            let ipc = StrokeSyncEvent::from((room_id, &payload));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_stroke_sync(&ipc);
                             }
                         }
                     }
@@ -3122,5 +3268,99 @@ mod tests {
             .await
             .expect_err("no anchor must reject");
         assert!(matches!(err, super::ManifestAcceptError::NoTrustAnchor));
+    }
+
+    /// Captures the drawing events the room client emits.
+    #[derive(Default)]
+    struct DrawingSink {
+        undos: std::sync::Mutex<Vec<StrokeUndoEvent>>,
+        syncs: std::sync::Mutex<Vec<StrokeSyncEvent>>,
+    }
+    impl RoomEventSink for DrawingSink {
+        fn emit_state(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_event(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_state_cleared(&self) {}
+        fn emit_stroke_undo(&self, ev: &StrokeUndoEvent) {
+            self.undos.lock().unwrap().push(ev.clone());
+        }
+        fn emit_stroke_sync(&self, ev: &StrokeSyncEvent) {
+            self.syncs.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn drawing_events_carry_seq_and_draw_sync_reaches_the_webview() {
+        let rc = fresh_room_client().await;
+        let summary = sample_summary(Uuid::from_bytes([1u8; 16]));
+        let room = summary.id;
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(summary));
+        let sink = Arc::new(DrawingSink::default());
+        rc.install_event_sink(sink.clone()).await;
+        let actor = Uuid::now_v7();
+        let stroke = Uuid::now_v7();
+
+        let mut undo = env_of(
+            MessageKind::StrokeUndo,
+            serde_json::json!({ "stroke_id": stroke }),
+        );
+        undo.room_id = Some(room);
+        undo.seq = 7;
+        undo.sender = Some(locast_protocol::envelope::Sender {
+            user_id: actor,
+            pubkey: Vec::new(),
+            sig: Vec::new(),
+        });
+        rc.handle_inbound(undo).await;
+        let undos = sink.undos.lock().unwrap().clone();
+        assert_eq!(undos.len(), 1);
+        assert_eq!(
+            undos[0].seq, 7,
+            "the server's drawing seq reaches the webview"
+        );
+
+        let snapshot = locast_protocol::room::StrokeSyncPayload {
+            seq: 9,
+            strokes: vec![locast_protocol::room::StrokeSyncStroke {
+                stroke_id: stroke,
+                owner_id: actor,
+                begin: Some(locast_protocol::room::StrokeBeginPayload {
+                    stroke_id: stroke,
+                    tool: locast_protocol::room::StrokeTool::Pen,
+                    color: "#123456".into(),
+                    width: 3.0,
+                    x: 0.1,
+                    y: 0.2,
+                    pressure: 0.5,
+                    ts_ms: 1,
+                }),
+                points: vec![locast_protocol::room::StrokeSyncPoint {
+                    x: 0.3,
+                    y: 0.4,
+                    pressure: 0.5,
+                    ts_ms: 2,
+                }],
+                end_ts_ms: Some(3),
+            }],
+        };
+        let mut sync = env_of(
+            MessageKind::StrokeSync,
+            serde_json::to_value(&snapshot).unwrap(),
+        );
+        sync.room_id = Some(room);
+        rc.handle_inbound(sync.clone()).await;
+        // A snapshot for another room is not this room's state.
+        sync.room_id = Some(Uuid::now_v7());
+        rc.handle_inbound(sync).await;
+
+        let syncs = sink.syncs.lock().unwrap().clone();
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].room_id, room.to_string());
+        assert_eq!(syncs[0].seq, 9);
+        let st = &syncs[0].strokes[0];
+        assert_eq!(st.stroke_id, stroke.to_string());
+        assert_eq!(st.owner_id, actor.to_string());
+        assert_eq!(st.begin.as_ref().unwrap().tool, "pen");
+        assert_eq!(st.points.len(), 1);
+        assert_eq!(st.end_ts_ms, Some(3));
     }
 }

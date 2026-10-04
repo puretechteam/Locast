@@ -38,6 +38,39 @@ pub struct PendingStroke {
 /// DRAW_CLEAR still removes it from every screen.
 pub const MAX_COMMITTED_STROKES: usize = 5_000;
 
+/// Most DRAW_POINTs whose content the server keeps per room for
+/// DRAW_SYNC snapshots (about 1 MB in memory, a few MB as JSON).
+/// When a new point would
+/// exceed it, the content of the OLDEST committed strokes is
+/// dropped first; if only strokes in progress remain, the new
+/// point's stroke stops being kept. A stroke whose content was
+/// dropped is still on every screen and still undoable; a DRAW_SYNC
+/// lists it without content and a client that has it keeps its
+/// copy.
+pub const MAX_RETAINED_POINTS: usize = 50_000;
+
+/// Most DRAW_POINTs kept for one stroke (the protocol's per-stroke
+/// limit, architecture §15.8).
+pub const MAX_RETAINED_POINTS_PER_STROKE: usize = 10_000;
+
+/// Longest DRAW_BEGIN `color` whose stroke content is kept (CSS
+/// colors are short). A stroke with a longer color is still relayed
+/// and committed as before; it is only listed without content in a
+/// DRAW_SYNC, so a client cannot make the server hold large strings.
+pub const MAX_RETAINED_COLOR_BYTES: usize = 64;
+
+/// The content of one stroke, kept for DRAW_SYNC.
+#[derive(Debug, Clone)]
+struct StrokeContent {
+    owner: Uuid,
+    begin: locast_protocol::room::StrokeBeginPayload,
+    points: Vec<locast_protocol::room::StrokeSyncPoint>,
+    end_ts_ms: Option<i64>,
+    /// Content dropped (budget or per-stroke limit): the stroke is
+    /// listed in a snapshot without content from then on.
+    dropped: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct StrokeBookkeeping {
     /// Live strokes keyed by `stroke_id`. The map is
@@ -56,6 +89,20 @@ pub struct StrokeBookkeeping {
     committed: HashMap<Uuid, Uuid>,
     /// Commit order of `committed`, oldest first, for the cap.
     committed_order: VecDeque<Uuid>,
+    /// The room's drawing sequence: the number of drawing events
+    /// (BEGIN / POINT / END / UNDO / CLEAR) published so far. Each
+    /// published event carries the value it advanced this to.
+    seq: u64,
+    /// Content of every stroke on the canvas (pending, not cleared,
+    /// and committed), for DRAW_SYNC.
+    content: HashMap<Uuid, StrokeContent>,
+    /// Points currently held in `content` (bounded by
+    /// [`MAX_RETAINED_POINTS`]).
+    retained_points: usize,
+    /// Committed strokes in commit order, for evicting the oldest
+    /// content first in amortized O(1). May hold ids whose content
+    /// is already gone; those are skipped.
+    evict_order: VecDeque<Uuid>,
 }
 
 impl StrokeBookkeeping {
@@ -73,7 +120,195 @@ impl StrokeBookkeeping {
                 forgotten.push(old);
             }
         }
+        // A forgotten stroke stays on screens but is no longer
+        // tracked; drop its content too.
+        for old in &forgotten {
+            self.forget_content(old);
+        }
         forgotten
+    }
+
+    /// Bookkeeping for a room created or restored now. The drawing
+    /// sequence starts from the wall clock (ms x 1000) rather than 0,
+    /// so a room restored after a server restart never numbers its
+    /// events below what clients already applied (they ignore events
+    /// at or below their last applied seq). The values stay below
+    /// 2^53, exact in JavaScript.
+    pub fn new() -> Self {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            seq: now_ms.saturating_mul(1000),
+            ..Self::default()
+        }
+    }
+
+    /// Advance the room's drawing sequence and return the new
+    /// value. Called once per published drawing event, under the
+    /// room write lock, in publish order.
+    pub fn next_seq(&mut self) -> u64 {
+        self.seq += 1;
+        self.seq
+    }
+
+    /// The last drawing sequence number published.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Keep the content of a stroke DRAW_BEGIN just opened.
+    pub fn record_begin(&mut self, owner: Uuid, begin: &locast_protocol::room::StrokeBeginPayload) {
+        self.forget_content(&begin.stroke_id);
+        let oversized = begin.color.len() > MAX_RETAINED_COLOR_BYTES;
+        let mut kept = begin.clone();
+        if oversized {
+            kept.color = String::new();
+        }
+        self.content.insert(
+            begin.stroke_id,
+            StrokeContent {
+                owner,
+                begin: kept,
+                points: Vec::new(),
+                end_ts_ms: None,
+                dropped: oversized,
+            },
+        );
+    }
+
+    /// Keep one accepted DRAW_POINT, within the budgets.
+    pub fn record_point(&mut self, point: &locast_protocol::room::StrokePointPayload) {
+        let Some(c) = self.content.get(&point.stroke_id) else {
+            return;
+        };
+        if c.dropped {
+            return;
+        }
+        if c.points.len() >= MAX_RETAINED_POINTS_PER_STROKE {
+            self.drop_content(&point.stroke_id);
+            self.mark_dropped(point.stroke_id);
+            return;
+        }
+        // Make room: oldest committed strokes' content goes first.
+        while self.retained_points >= MAX_RETAINED_POINTS {
+            let mut victim = None;
+            while let Some(id) = self.evict_order.pop_front() {
+                let holds_points = self.committed.contains_key(&id)
+                    && self
+                        .content
+                        .get(&id)
+                        .is_some_and(|c| !c.dropped && !c.points.is_empty());
+                if holds_points {
+                    victim = Some(id);
+                    break;
+                }
+            }
+            match victim {
+                Some(id) => {
+                    self.drop_content(&id);
+                    self.mark_dropped(id);
+                }
+                None => {
+                    // Only strokes in progress hold content: stop
+                    // keeping this one.
+                    self.drop_content(&point.stroke_id);
+                    self.mark_dropped(point.stroke_id);
+                    return;
+                }
+            }
+        }
+        if let Some(c) = self.content.get_mut(&point.stroke_id) {
+            c.points.push(locast_protocol::room::StrokeSyncPoint {
+                x: point.x,
+                y: point.y,
+                pressure: point.pressure,
+                ts_ms: point.ts_ms,
+            });
+            self.retained_points += 1;
+        }
+    }
+
+    /// Record a committed stroke's DRAW_END timestamp.
+    pub fn record_end(&mut self, stroke_id: &Uuid, ts_ms: i64) {
+        if let Some(c) = self.content.get_mut(stroke_id) {
+            c.end_ts_ms = Some(ts_ms);
+            self.evict_order.push_back(*stroke_id);
+        }
+        // Keep the queue from collecting stale ids (undone /
+        // forgotten strokes) without bound.
+        if self.evict_order.len() > 2 * MAX_COMMITTED_STROKES {
+            let committed = &self.committed;
+            self.evict_order.retain(|id| committed.contains_key(id));
+        }
+    }
+
+    /// Forget a stroke's content entirely (undone, cleared,
+    /// cleared-while-open, forgotten).
+    pub fn forget_content(&mut self, stroke_id: &Uuid) {
+        if let Some(c) = self.content.remove(stroke_id) {
+            self.retained_points -= c.points.len();
+        }
+    }
+
+    /// Free a stroke's points but keep its entry (marked dropped).
+    fn drop_content(&mut self, stroke_id: &Uuid) {
+        if let Some(c) = self.content.get_mut(stroke_id) {
+            self.retained_points -= c.points.len();
+            c.points = Vec::new();
+        }
+    }
+
+    fn mark_dropped(&mut self, stroke_id: Uuid) {
+        if let Some(c) = self.content.get_mut(&stroke_id) {
+            c.dropped = true;
+        }
+    }
+
+    /// The room's drawing state as of [`Self::seq`], for DRAW_SYNC:
+    /// committed strokes in commit order, then strokes in progress
+    /// (not cleared) in the order they began.
+    pub fn snapshot(&self) -> locast_protocol::room::StrokeSyncPayload {
+        use locast_protocol::room::StrokeSyncStroke;
+        let entry = |id: &Uuid, owner: Uuid| -> StrokeSyncStroke {
+            match self.content.get(id) {
+                Some(c) if !c.dropped => StrokeSyncStroke {
+                    stroke_id: *id,
+                    owner_id: c.owner,
+                    begin: Some(c.begin.clone()),
+                    points: c.points.clone(),
+                    end_ts_ms: c.end_ts_ms,
+                },
+                // Content dropped: list the stroke without it (whether
+                // it has ended is still known).
+                other => StrokeSyncStroke {
+                    stroke_id: *id,
+                    owner_id: owner,
+                    begin: None,
+                    points: Vec::new(),
+                    end_ts_ms: other.and_then(|c| c.end_ts_ms),
+                },
+            }
+        };
+        let mut strokes: Vec<StrokeSyncStroke> = self
+            .committed_order
+            .iter()
+            .filter_map(|id| self.committed.get(id).map(|owner| entry(id, *owner)))
+            .collect();
+        let mut open: Vec<(&Uuid, &PendingStroke)> =
+            self.pending.iter().filter(|(_, p)| !p.cleared).collect();
+        open.sort_by(|a, b| a.1.started_ms.cmp(&b.1.started_ms).then(a.0.cmp(b.0)));
+        strokes.extend(open.into_iter().map(|(id, p)| entry(id, p.sender_id)));
+        locast_protocol::room::StrokeSyncPayload {
+            seq: self.seq,
+            strokes,
+        }
+    }
+
+    /// Points currently retained for DRAW_SYNC (tests / metrics).
+    pub fn retained_points(&self) -> usize {
+        self.retained_points
     }
 
     /// The owner of a committed stroke, `None` if it is unknown,
@@ -86,6 +321,7 @@ impl StrokeBookkeeping {
     pub fn remove_committed(&mut self, stroke_id: &Uuid) -> bool {
         if self.committed.remove(stroke_id).is_some() {
             self.committed_order.retain(|id| id != stroke_id);
+            self.forget_content(stroke_id);
             true
         } else {
             false
@@ -102,6 +338,10 @@ impl StrokeBookkeeping {
         for stroke in self.pending.values_mut() {
             stroke.cleared = true;
         }
+        // Nothing is on the canvas any more.
+        self.content.clear();
+        self.retained_points = 0;
+        self.evict_order.clear();
         n
     }
 
@@ -247,7 +487,7 @@ impl RoomState {
             host_disconnect_deadline_ms: None,
             participants: vec![host],
             playback: PlaybackBookkeeping::default(),
-            drawing: StrokeBookkeeping::default(),
+            drawing: StrokeBookkeeping::new(),
         }
     }
 

@@ -545,7 +545,7 @@ async fn handle_stroke_begin_dispatch(
         return capability_reject("DRAW capability is not held in this room");
     }
     let mut out = drawing::handle_stroke_begin(envelope, &mut state, user_id, pubkey, now_ms).await;
-    publish_drawing_events_locked(registry, room_id, &mut out);
+    publish_drawing_events_locked(registry, &mut state, room_id, &mut out);
     out
 }
 
@@ -561,13 +561,20 @@ async fn handle_stroke_begin_dispatch(
 /// BEGIN of the stroke it removes). Publishing under the lock makes
 /// the broadcast order equal the server's apply order, the same
 /// approach PERMISSION_SET uses. `publish_events` never awaits.
+///
+/// Each event also takes the room's next drawing sequence number
+/// here, under the same lock, so a DRAW_SYNC snapshot (taken under
+/// the read lock) knows exactly which events it already contains.
 fn publish_drawing_events_locked(
     registry: &RoomRegistry,
+    state: &mut RoomState,
     room_id: Uuid,
     out: &mut RoomDispatchOutcome,
 ) {
-    let events = std::mem::take(&mut out.events);
-    registry.publish_events(&events, |_| room_id);
+    for event in std::mem::take(&mut out.events) {
+        let seq = state.drawing.next_seq();
+        registry.publish_drawing_event(&event, room_id, seq);
+    }
 }
 
 /// `true` if `user_id`'s live participant record in `state` may
@@ -623,7 +630,7 @@ async fn handle_stroke_point_dispatch(
     };
     let mut state = handle.write().await;
     let mut out = drawing::handle_stroke_point(envelope, &mut state, user_id).await;
-    publish_drawing_events_locked(registry, room_id, &mut out);
+    publish_drawing_events_locked(registry, &mut state, room_id, &mut out);
     out
 }
 
@@ -647,7 +654,7 @@ async fn handle_stroke_end_dispatch(
     };
     let mut state = handle.write().await;
     let mut out = drawing::handle_stroke_end(envelope, &mut state, user_id).await;
-    publish_drawing_events_locked(registry, room_id, &mut out);
+    publish_drawing_events_locked(registry, &mut state, room_id, &mut out);
     out
 }
 
@@ -672,7 +679,7 @@ async fn handle_stroke_undo_dispatch(
     };
     let mut state = handle.write().await;
     let mut out = drawing::handle_stroke_undo(envelope, &mut state, user_id).await;
-    publish_drawing_events_locked(registry, room_id, &mut out);
+    publish_drawing_events_locked(registry, &mut state, room_id, &mut out);
     out
 }
 
@@ -695,7 +702,7 @@ async fn handle_stroke_clear_dispatch(
     };
     let mut state = handle.write().await;
     let mut out = drawing::handle_stroke_clear(&mut state, user_id).await;
-    publish_drawing_events_locked(registry, room_id, &mut out);
+    publish_drawing_events_locked(registry, &mut state, room_id, &mut out);
     out
 }
 
@@ -2156,5 +2163,683 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(reg.current_manifest(room_id).await.is_none());
+    }
+
+    // ----- Drawing recovery: dropped room events -> DRAW_SYNC -----
+
+    use crate::rooms::feed::{FeedItem, RoomFeed};
+    use crate::rooms::registry::BroadcastItem;
+    use locast_protocol::room::{
+        StrokeBeginPayload, StrokeEndPayload, StrokePointPayload, StrokeSyncPayload, StrokeTool,
+        StrokeUndoPayload,
+    };
+
+    /// A room hosted by the Ed25519 identity derived from `seed`.
+    async fn drawing_room(
+        reg: &RoomRegistry,
+        db: &crate::db::Db,
+        clock: &MockClock,
+        seed: [u8; 32],
+    ) -> (Uuid, Uuid, [u8; 32]) {
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let pk = locast_crypto::ed25519::public_key_from_seed(&seed);
+        let host = db.upsert_user(&pk).await.expect("upsert host");
+        let (room, _) = reg
+            .create(&s, "D".into(), host, pk, true, clock.now_ms())
+            .await
+            .expect("create");
+        (room.id, host, pk)
+    }
+
+    /// Drives the real dispatcher as one authenticated host.
+    struct Drawer<'a> {
+        reg: &'a RoomRegistry,
+        db: &'a crate::db::Db,
+        clock: &'a MockClock,
+        relay: &'a SignalRelay,
+        room: Uuid,
+        user: Uuid,
+        pk: [u8; 32],
+        seed: [u8; 32],
+    }
+
+    impl Drawer<'_> {
+        async fn send(&self, kind: MessageKind, payload: serde_json::Value, signed: bool) {
+            let s = crate::rooms::DbRoomStore::new(self.db.clone());
+            let sender = signed.then(|| {
+                let begin: StrokeBeginPayload = serde_json::from_value(payload.clone()).unwrap();
+                let bytes = locast_crypto::drawing_signed_bytes(&begin).unwrap();
+                let sig = locast_crypto::ed25519::sign(&self.seed, &bytes);
+                locast_protocol::envelope::Sender {
+                    user_id: self.user,
+                    pubkey: self.pk.to_vec(),
+                    sig: sig.to_vec(),
+                }
+            });
+            let env = Envelope {
+                v: 1,
+                r#type: kind,
+                id: Uuid::now_v7(),
+                room_id: Some(self.room),
+                sender,
+                ts_ms: 0,
+                seq: 0,
+                payload,
+            };
+            let out = dispatch_room_message(
+                env,
+                &ctx(self.reg, &s, self.db, self.clock, self.relay),
+                self.user,
+                self.pk,
+            )
+            .await;
+            assert!(
+                out.to_caller.is_empty(),
+                "drawing refused: {:?}",
+                out.to_caller
+            );
+        }
+
+        /// A whole stroke: BEGIN, `points` POINTs, END.
+        async fn stroke(&self, id: Uuid, points: usize) {
+            self.begin(id).await;
+            for i in 0..points {
+                self.point(id, i).await;
+            }
+            self.end(id).await;
+        }
+
+        async fn begin(&self, id: Uuid) {
+            let p = StrokeBeginPayload {
+                stroke_id: id,
+                tool: StrokeTool::Pen,
+                color: "#fff".into(),
+                width: 2.0,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.5,
+                ts_ms: 1,
+            };
+            self.send(
+                MessageKind::StrokeBegin,
+                serde_json::to_value(p).unwrap(),
+                true,
+            )
+            .await;
+        }
+
+        async fn point(&self, id: Uuid, i: usize) {
+            let p = StrokePointPayload {
+                stroke_id: id,
+                x: (i % 1000) as f32 / 1000.0,
+                y: 0.25,
+                pressure: 0.5,
+                ts_ms: 2 + i as i64,
+            };
+            self.send(
+                MessageKind::StrokePoint,
+                serde_json::to_value(p).unwrap(),
+                false,
+            )
+            .await;
+        }
+
+        async fn end(&self, id: Uuid) {
+            let p = StrokeEndPayload {
+                stroke_id: id,
+                ts_ms: 99_999,
+            };
+            self.send(
+                MessageKind::StrokeEnd,
+                serde_json::to_value(p).unwrap(),
+                false,
+            )
+            .await;
+        }
+
+        async fn undo(&self, id: Uuid) {
+            let p = StrokeUndoPayload { stroke_id: id };
+            self.send(
+                MessageKind::StrokeUndo,
+                serde_json::to_value(p).unwrap(),
+                false,
+            )
+            .await;
+        }
+
+        async fn clear(&self) {
+            self.send(MessageKind::StrokeClear, serde_json::json!({}), false)
+                .await;
+        }
+    }
+
+    /// The client-side drawing model, with the client's rules: a
+    /// DRAW_SYNC replaces the state; a DRAW_* whose seq is not above
+    /// the last applied one is ignored; BEGIN of a known id is ignored.
+    #[derive(Default, Debug)]
+    struct Canvas {
+        /// (stroke id, point xs, ended), in drawing order.
+        strokes: Vec<(Uuid, Vec<f32>, bool)>,
+        last_seq: u64,
+        syncs: usize,
+        delivered: Vec<(MessageKind, u64)>,
+    }
+
+    impl Canvas {
+        fn apply_sync(&mut self, snap: &StrokeSyncPayload) {
+            self.syncs += 1;
+            let old = std::mem::take(&mut self.strokes);
+            for s in &snap.strokes {
+                match &s.begin {
+                    Some(_) => self.strokes.push((
+                        s.stroke_id,
+                        s.points.iter().map(|p| p.x).collect(),
+                        s.end_ts_ms.is_some(),
+                    )),
+                    // Content no longer held by the server: keep ours.
+                    None => {
+                        if let Some(mine) = old.iter().find(|o| o.0 == s.stroke_id) {
+                            self.strokes.push(mine.clone());
+                        }
+                    }
+                }
+            }
+            self.last_seq = self.last_seq.max(snap.seq);
+        }
+
+        fn apply_item(&mut self, item: &BroadcastItem) {
+            self.delivered.push((item.kind.clone(), item.seq));
+            if item.seq == 0 {
+                return;
+            }
+            if item.seq <= self.last_seq {
+                return; // duplicate / already covered
+            }
+            self.last_seq = item.seq;
+            let id = |v: &serde_json::Value| -> Uuid {
+                serde_json::from_value(v["stroke_id"].clone()).unwrap()
+            };
+            match item.kind {
+                MessageKind::StrokeBegin => {
+                    let sid = id(&item.payload);
+                    if !self.strokes.iter().any(|s| s.0 == sid) {
+                        self.strokes.push((sid, Vec::new(), false));
+                    }
+                }
+                MessageKind::StrokePoint => {
+                    let sid = id(&item.payload);
+                    if let Some(s) = self.strokes.iter_mut().find(|s| s.0 == sid && !s.2) {
+                        s.1.push(item.payload["x"].as_f64().unwrap() as f32);
+                    }
+                }
+                MessageKind::StrokeEnd => {
+                    let sid = id(&item.payload);
+                    if let Some(s) = self.strokes.iter_mut().find(|s| s.0 == sid) {
+                        s.2 = true;
+                    }
+                }
+                MessageKind::StrokeUndo => {
+                    let sid = id(&item.payload);
+                    self.strokes.retain(|s| s.0 != sid);
+                }
+                MessageKind::StrokeClear => self.strokes.clear(),
+                _ => {}
+            }
+        }
+
+        /// Drain everything currently available from `feed`.
+        async fn drain(&mut self, feed: &mut RoomFeed, reg: &RoomRegistry) {
+            self.drain_idle(feed, reg, std::time::Duration::from_millis(20))
+                .await;
+        }
+
+        /// Drain until `feed` produces nothing for `idle`.
+        async fn drain_idle(
+            &mut self,
+            feed: &mut RoomFeed,
+            reg: &RoomRegistry,
+            idle: std::time::Duration,
+        ) {
+            while let Ok(item) = tokio::time::timeout(idle, feed.next(reg)).await {
+                match item {
+                    FeedItem::Event(item) => self.apply_item(&item),
+                    FeedItem::DrawSync(snap) => self.apply_sync(&snap),
+                    FeedItem::Closed => break,
+                }
+            }
+        }
+
+        fn saw(&self, kind: MessageKind) -> bool {
+            self.delivered.iter().any(|(k, _)| *k == kind)
+        }
+    }
+
+    /// A feed without the production snapshot rate limit.
+    fn test_feed(room: Uuid, rx: tokio::sync::broadcast::Receiver<BroadcastItem>) -> RoomFeed {
+        RoomFeed::with_min_sync_interval(room, rx, std::time::Duration::ZERO)
+    }
+
+    /// The room's authoritative drawing state, in the model's shape.
+    async fn authoritative(reg: &RoomRegistry, room: Uuid) -> Vec<(Uuid, Vec<f32>, bool)> {
+        let snap = reg.drawing_snapshot(room).await.expect("room");
+        snap.strokes
+            .iter()
+            .map(|s| {
+                (
+                    s.stroke_id,
+                    s.points.iter().map(|p| p.x).collect(),
+                    s.end_ts_ms.is_some(),
+                )
+            })
+            .collect()
+    }
+
+    /// More than the room channel's 256 slots, so a subscriber that
+    /// has not read anything is guaranteed to lag.
+    const OVERFLOW: usize = 300;
+
+    #[tokio::test]
+    async fn lagging_subscriber_recovers_from_a_dropped_undo() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [31u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut slow = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut fast = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut fast_canvas = Canvas::default();
+
+        let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        d.stroke(a, 3).await;
+        d.stroke(b, 2).await;
+        d.undo(b).await;
+        fast_canvas.drain(&mut fast, &reg).await;
+        // Enough traffic after the undo to push it off the slow ring;
+        // the fast subscriber keeps up while it is published.
+        d.begin(c).await;
+        for i in 0..OVERFLOW {
+            d.point(c, i).await;
+            if i % 100 == 99 {
+                fast_canvas.drain(&mut fast, &reg).await;
+            }
+        }
+        d.end(c).await;
+        fast_canvas.drain(&mut fast, &reg).await;
+
+        let mut slow_canvas = Canvas::default();
+        slow_canvas.drain(&mut slow, &reg).await;
+
+        let truth = authoritative(&reg, room).await;
+        assert_eq!(truth.iter().map(|s| s.0).collect::<Vec<_>>(), vec![a, c]);
+        assert_eq!(truth[1].1.len(), OVERFLOW);
+        // The slow subscriber really lost the undo, recovered by
+        // snapshot, and ends exactly on the room's state.
+        assert!(
+            !slow_canvas.saw(MessageKind::StrokeUndo),
+            "undo was dropped"
+        );
+        assert_eq!(slow_canvas.syncs, 1);
+        assert_eq!(slow_canvas.strokes, truth);
+        // Nothing older than the snapshot was replayed to it.
+        let floor = slow_canvas.last_seq;
+        assert!(slow_canvas
+            .delivered
+            .iter()
+            .all(|(_, seq)| *seq == 0 || *seq > floor || floor == 0));
+        // The fast subscriber was never behind: no snapshot, every
+        // event in sequence, same state.
+        assert_eq!(fast_canvas.syncs, 0);
+        let seqs: Vec<u64> = fast_canvas.delivered.iter().map(|d| d.1).collect();
+        let first = seqs[0];
+        assert_eq!(
+            seqs,
+            (first..first + seqs.len() as u64).collect::<Vec<_>>(),
+            "contiguous seqs"
+        );
+        assert_eq!(fast_canvas.strokes, truth);
+    }
+
+    #[tokio::test]
+    async fn lagging_subscriber_recovers_from_a_dropped_clear() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [32u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut slow = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut slow_canvas = Canvas::default();
+
+        // The slow client is up to date before the clear...
+        let (a, b, e) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        d.stroke(a, 4).await;
+        d.stroke(b, 4).await;
+        slow_canvas.drain(&mut slow, &reg).await;
+        assert_eq!(slow_canvas.strokes.len(), 2);
+        // ...then misses it.
+        d.clear().await;
+        d.stroke(e, OVERFLOW).await;
+        slow_canvas.drain(&mut slow, &reg).await;
+
+        let truth = authoritative(&reg, room).await;
+        assert_eq!(truth.iter().map(|s| s.0).collect::<Vec<_>>(), vec![e]);
+        assert!(
+            !slow_canvas.saw(MessageKind::StrokeClear),
+            "clear was dropped"
+        );
+        assert_eq!(slow_canvas.syncs, 1);
+        assert_eq!(
+            slow_canvas.strokes, truth,
+            "A and B are gone after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_lag_and_live_events_after_a_sync_converge() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [33u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut slow = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut canvas = Canvas::default();
+
+        // Several kinds of events lost in one lag: strokes, an undo,
+        // a clear, more strokes, and a stroke still in progress.
+        let ids: Vec<Uuid> = (0..6).map(|_| Uuid::now_v7()).collect();
+        d.stroke(ids[0], 5).await;
+        d.stroke(ids[1], 5).await;
+        d.undo(ids[0]).await;
+        d.clear().await;
+        d.stroke(ids[2], OVERFLOW).await;
+        d.begin(ids[3]).await;
+        d.point(ids[3], 7).await;
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 1);
+        assert_eq!(canvas.strokes, authoritative(&reg, room).await);
+        // The in-progress stroke continues live after the snapshot.
+        d.point(ids[3], 8).await;
+        d.end(ids[3]).await;
+        d.undo(ids[2]).await;
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 1, "no lag, no snapshot");
+        assert_eq!(canvas.strokes, authoritative(&reg, room).await);
+        // A second lag.
+        d.stroke(ids[4], OVERFLOW).await;
+        d.undo(ids[3]).await;
+        d.stroke(ids[5], 1).await;
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 2);
+        let truth = authoritative(&reg, room).await;
+        assert_eq!(
+            truth.iter().map(|s| s.0).collect::<Vec<_>>(),
+            vec![ids[4], ids[5]]
+        );
+        assert_eq!(canvas.strokes, truth);
+    }
+
+    #[tokio::test]
+    async fn replayed_and_duplicate_events_are_harmless() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [34u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut rx = reg.subscribe(room).await.unwrap();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        d.stroke(a, 3).await;
+        d.stroke(b, 3).await;
+        d.undo(a).await;
+        let mut items = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            items.push(item);
+        }
+        let mut canvas = Canvas::default();
+        for item in &items {
+            canvas.apply_item(item);
+        }
+        let truth = authoritative(&reg, room).await;
+        assert_eq!(canvas.strokes, truth);
+        // Every event delivered twice, and a stale snapshot-covered
+        // replay after a sync: nothing changes.
+        for item in &items {
+            canvas.apply_item(item);
+        }
+        assert_eq!(canvas.strokes, truth);
+        canvas.apply_sync(&reg.drawing_snapshot(room).await.unwrap());
+        for item in &items {
+            canvas.apply_item(item);
+        }
+        assert_eq!(canvas.strokes, truth);
+        assert_eq!(truth.iter().map(|s| s.0).collect::<Vec<_>>(), vec![b]);
+    }
+
+    #[tokio::test]
+    async fn drawing_recovery_stays_inside_the_room() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let (s1, s2) = ([35u8; 32], [36u8; 32]);
+        let (r1, u1, pk1) = drawing_room(&reg, &db, &clock, s1).await;
+        let (r2, u2, pk2) = drawing_room(&reg, &db, &clock, s2).await;
+        let d1 = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room: r1,
+            user: u1,
+            pk: pk1,
+            seed: s1,
+        };
+        let d2 = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room: r2,
+            user: u2,
+            pk: pk2,
+            seed: s2,
+        };
+        let mut slow1 = test_feed(r1, reg.subscribe(r1).await.unwrap());
+        let mut fast2 = test_feed(r2, reg.subscribe(r2).await.unwrap());
+        let (x, y, z) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        d2.stroke(y, 2).await;
+        d1.stroke(x, OVERFLOW).await;
+        d2.clear().await;
+        d2.stroke(z, 2).await;
+
+        let mut c1 = Canvas::default();
+        c1.drain(&mut slow1, &reg).await;
+        assert_eq!(c1.syncs, 1);
+        assert_eq!(c1.strokes, authoritative(&reg, r1).await);
+        assert_eq!(c1.strokes.iter().map(|s| s.0).collect::<Vec<_>>(), vec![x]);
+        let mut c2 = Canvas::default();
+        c2.drain(&mut fast2, &reg).await;
+        assert_eq!(c2.syncs, 0);
+        assert_eq!(c2.strokes.iter().map(|s| s.0).collect::<Vec<_>>(), vec![z]);
+        // Each room numbers its own drawing events: room 2's are
+        // contiguous, untouched by room 1's 300.
+        let seqs: Vec<u64> = c2.delivered.iter().map(|d| d.1).collect();
+        assert_eq!(seqs.len(), 9);
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
+    }
+
+    #[tokio::test]
+    async fn retained_drawing_content_is_bounded() {
+        use crate::rooms::state::MAX_RETAINED_POINTS;
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [37u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        // Strokes totalling more than the budget.
+        let per = 5_000;
+        let n = MAX_RETAINED_POINTS / per + 2;
+        let ids: Vec<Uuid> = (0..n).map(|_| Uuid::now_v7()).collect();
+        for id in &ids {
+            d.stroke(*id, per).await;
+        }
+        let handle = reg.get_by_id(room).await.unwrap();
+        let retained = handle.read().await.drawing.retained_points();
+        assert!(retained <= MAX_RETAINED_POINTS, "retained {retained}");
+        let snap = reg.drawing_snapshot(room).await.unwrap();
+        // Every stroke is still listed; the oldest lost their content,
+        // the newest kept it.
+        assert_eq!(snap.strokes.len(), n);
+        assert!(snap.strokes[0].begin.is_none());
+        assert_eq!(snap.strokes[n - 1].points.len(), per);
+    }
+
+    /// A subscriber that keeps lagging gets at most one snapshot per
+    /// interval, and the delayed snapshot still converges.
+    #[tokio::test]
+    async fn snapshots_are_rate_limited_and_still_converge() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [38u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let interval = std::time::Duration::from_millis(300);
+        let mut slow =
+            RoomFeed::with_min_sync_interval(room, reg.subscribe(room).await.unwrap(), interval);
+        let mut canvas = Canvas::default();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        d.stroke(a, OVERFLOW).await;
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 1);
+        let first_sync = std::time::Instant::now();
+        d.undo(a).await;
+        d.stroke(b, OVERFLOW).await;
+        canvas
+            .drain_idle(&mut slow, &reg, std::time::Duration::from_secs(2))
+            .await;
+        assert_eq!(canvas.syncs, 2, "one more snapshot, not one per overflow");
+        assert!(first_sync.elapsed() >= std::time::Duration::from_millis(250));
+        assert_eq!(canvas.strokes, authoritative(&reg, room).await);
+    }
+
+    /// A DRAW_BEGIN with an oversized color is relayed and committed
+    /// as before, but the server does not keep its content.
+    #[tokio::test]
+    async fn oversized_color_is_not_retained() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [39u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let id = Uuid::now_v7();
+        let begin = StrokeBeginPayload {
+            stroke_id: id,
+            tool: StrokeTool::Pen,
+            color: "x".repeat(10_000),
+            width: 2.0,
+            x: 0.5,
+            y: 0.5,
+            pressure: 0.5,
+            ts_ms: 1,
+        };
+        d.send(
+            MessageKind::StrokeBegin,
+            serde_json::to_value(begin).unwrap(),
+            true,
+        )
+        .await;
+        d.point(id, 1).await;
+        d.end(id).await;
+        let snap = reg.drawing_snapshot(room).await.unwrap();
+        assert_eq!(snap.strokes.len(), 1, "still on the canvas");
+        assert!(snap.strokes[0].begin.is_none(), "content not kept");
+        assert_eq!(snap.strokes[0].end_ts_ms, Some(99_999));
+        let handle = reg.get_by_id(room).await.unwrap();
+        assert_eq!(handle.read().await.drawing.retained_points(), 0);
+    }
+
+    /// A room's drawing sequence starts from the wall clock, so a room
+    /// restored after a server restart numbers its events above what
+    /// clients already applied.
+    #[tokio::test]
+    async fn drawing_sequence_starts_from_the_clock() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            * 1000;
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let (room, _, _) = drawing_room(&reg, &db, &clock, [40u8; 32]).await;
+        let seq = reg.drawing_snapshot(room).await.unwrap().seq;
+        assert!(seq >= before, "seq {seq} below the clock base {before}");
+        assert!(seq < (1u64 << 53), "exact in JavaScript");
     }
 }

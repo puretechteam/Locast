@@ -1796,7 +1796,10 @@ async fn room_bcast_forwarder(
     cancel: Arc<tokio::sync::Notify>,
     self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>>,
 ) {
-    let mut subscribed: RoomSubscription = None;
+    // The current room subscription. `RoomFeed` turns a dropped
+    // run of broadcast items into a DRAW_SYNC snapshot so the
+    // client's drawing state recovers (see `rooms::feed`).
+    let mut feed: Option<crate::rooms::feed::RoomFeed> = None;
     loop {
         // Wait for a new subscription from the connection loop
         // (checked first, so a room change always wins over
@@ -1809,22 +1812,47 @@ async fn room_bcast_forwarder(
             new = sub_rx.recv() => match new {
                 Some(s) => {
                     // Replacing drops the old Receiver.
-                    subscribed = s;
+                    feed = s.map(|(rid, rx)| crate::rooms::feed::RoomFeed::new(rid, rx));
                     continue;
                 }
                 // Connection loop is gone.
                 None => return,
             },
-            res = async {
-                match subscribed.as_mut() {
-                    Some((rid, rx)) => rx.recv().await.map(|item| (*rid, item)),
+            next = async {
+                match feed.as_mut() {
+                    Some(f) => (f.room_id(), f.next(&state.rooms).await),
                     None => std::future::pending().await,
                 }
-            } => match res {
-                Ok(pair) => pair,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    subscribed = None;
+            } => match next {
+                (rid, crate::rooms::feed::FeedItem::Event(item)) => (rid, item),
+                (rid, crate::rooms::feed::FeedItem::DrawSync(snapshot)) => {
+                    // Only to a current member of that room, like
+                    // every other room item.
+                    let self_uid = *self_user_id.lock().await;
+                    let member = match self_uid {
+                        Some(uid) => state.rooms.is_user_in_room(uid, rid).await,
+                        None => false,
+                    };
+                    if member {
+                        let env = Envelope {
+                            v: 1,
+                            r#type: MessageKind::StrokeSync,
+                            id: Uuid::now_v7(),
+                            room_id: Some(rid),
+                            sender: None,
+                            ts_ms: now_ms(),
+                            seq: snapshot.seq,
+                            payload: serde_json::to_value(&snapshot)
+                                .unwrap_or(serde_json::json!({})),
+                        };
+                        if outbound_tx.send(env).is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                (_, crate::rooms::feed::FeedItem::Closed) => {
+                    feed = None;
                     continue;
                 }
             },
@@ -1868,7 +1896,8 @@ async fn room_bcast_forwarder(
                     sig: Vec::new(),
                 }),
             ts_ms: now_ms(),
-            seq: 0,
+            // The room's drawing sequence number for DRAW_*, else 0.
+            seq: item.seq,
             payload: item.payload,
         };
         if outbound_tx.send(env).is_err() {

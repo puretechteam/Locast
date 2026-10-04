@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { Stroke, StrokePoint, StrokeTool } from "../drawing/types";
+import type { RemoteStrokeSyncPayload } from "../services/drawingRemote";
 
 export type { Stroke, StrokePoint, StrokeTool };
 
@@ -52,6 +53,23 @@ interface DrawingStoreState {
      *  no-op if the store does not hold it. */
     removeStroke: (strokeId: string) => void;
 
+    /** Highest drawing sequence number applied in this room (0 until
+     *  the first sequenced event or DRAW_SYNC). */
+    lastSeq: number;
+
+    /** Admit a drawing event by its sequence number: `false` (ignore
+     *  it) when `seq` is not above the last one applied, i.e. a
+     *  duplicate or an event a DRAW_SYNC already covers. `0` /
+     *  missing means unsequenced and is always admitted. */
+    acceptSeq: (seq: number | undefined) => boolean;
+
+    /** Replace the remote drawing state with a DRAW_SYNC snapshot.
+     *  Strokes in `localIds` (drawn on this client, which the server
+     *  never echoes back) are left to the local canvas. A stroke the
+     *  server no longer holds content for keeps the copy already in
+     *  the store, if any. */
+    applySnapshot: (snapshot: RemoteStrokeSyncPayload, localIds: ReadonlySet<string>) => void;
+
     getActiveStroke: (strokeId: string) => RemoteStroke | undefined;
 
     getCompletedStrokes: () => readonly RemoteStroke[];
@@ -63,6 +81,7 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => ({
     roomId: null,
     activeStrokes: new Map(),
     completedStrokes: [],
+    lastSeq: 0,
 
     setRoomId: (roomId) => {
         if (roomId !== get().roomId) {
@@ -70,11 +89,72 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => ({
                 roomId,
                 activeStrokes: new Map(),
                 completedStrokes: [],
+                lastSeq: 0,
             });
         }
     },
 
+    acceptSeq: (seq) => {
+        if (seq === undefined || seq === 0) return true;
+        if (seq <= get().lastSeq) return false;
+        set({ lastSeq: seq });
+        return true;
+    },
+
+    applySnapshot: (snapshot, localIds) => {
+        set((state) => {
+            const previous = new Map<string, RemoteStroke>();
+            for (const s of state.completedStrokes) previous.set(s.id, s);
+            for (const s of state.activeStrokes.values()) previous.set(s.id, s);
+            const wasActive = (id: string) => state.activeStrokes.has(id);
+            const activeStrokes = new Map<string, RemoteStroke>();
+            const completedStrokes: RemoteStroke[] = [];
+            for (const s of snapshot.strokes) {
+                if (localIds.has(s.strokeId)) continue;
+                let stroke: RemoteStroke | undefined;
+                if (s.begin === null) {
+                    stroke = previous.get(s.strokeId);
+                } else {
+                    stroke = {
+                        id: s.strokeId,
+                        userId: s.ownerId,
+                        tool: s.begin.tool,
+                        color: s.begin.color,
+                        width: s.begin.width,
+                        points: [
+                            { x: s.begin.x, y: s.begin.y, pressure: s.begin.pressure, ts: s.begin.tsMs },
+                            ...s.points,
+                        ],
+                        startedAt: s.begin.tsMs,
+                        endedAt: s.endTsMs ?? 0,
+                    };
+                }
+                if (stroke === undefined) continue;
+                // Still being drawn: an open stroke from the snapshot,
+                // or (content gone) our own copy that was still open.
+                const open =
+                    s.endTsMs === null && (s.begin !== null || wasActive(s.strokeId));
+                if (open) {
+                    activeStrokes.set(stroke.id, stroke);
+                } else {
+                    completedStrokes.push(stroke);
+                }
+            }
+            return {
+                activeStrokes,
+                completedStrokes,
+                lastSeq: Math.max(state.lastSeq, snapshot.seq),
+            };
+        });
+    },
+
     beginStroke: ({ strokeId, userId, tool, color, width, x, y, pressure, tsMs }) => {
+        // A repeated BEGIN for a stroke already held is a duplicate:
+        // replacing it would throw its points away.
+        const held = get();
+        if (held.activeStrokes.has(strokeId) || held.completedStrokes.some((s) => s.id === strokeId)) {
+            return;
+        }
         const stroke: RemoteStroke = {
             id: strokeId,
             userId,
