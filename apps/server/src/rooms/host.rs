@@ -82,7 +82,10 @@ pub(super) fn elect_new_host(state: &mut RoomState) -> Option<Uuid> {
                 | locast_protocol::room::cap::KICK
                 | locast_protocol::room::cap::PUBLISH_MANIFEST
                 | locast_protocol::room::cap::INVITE
-                | locast_protocol::room::cap::CHAT;
+                | locast_protocol::room::cap::CHAT
+                | locast_protocol::room::cap::UNDO_OWN
+                | locast_protocol::room::cap::UNDO_ANY
+                | locast_protocol::room::cap::CLEAR_ALL;
         } else if p.is_host && p.user_id != new_host {
             p.is_host = false;
             p.cap_set = locast_protocol::room::cap::CHAT;

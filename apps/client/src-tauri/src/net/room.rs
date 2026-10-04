@@ -88,6 +88,14 @@ pub trait RoomEventSink: Send + Sync {
     /// P5-T03: emit `drawing://end` when a remote
     /// DRAW_END is accepted and rebroadcast by the server.
     fn emit_stroke_end(&self, _ev: &StrokeEndEvent) {}
+    /// P5-T03: emit `drawing://undo` when a DRAW_UNDO is accepted
+    /// and rebroadcast by the server. Delivered to every
+    /// participant, the actor included: the stroke is removed from
+    /// the canvas only on this event.
+    fn emit_stroke_undo(&self, _ev: &StrokeUndoEvent) {}
+    /// P5-T03: emit `drawing://clear` when a DRAW_CLEAR is accepted
+    /// and rebroadcast by the server (actor included).
+    fn emit_stroke_clear(&self, _ev: &StrokeClearEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -103,6 +111,8 @@ impl RoomEventSink for NoopEventSink {
     fn emit_stroke_begin(&self, _ev: &StrokeBeginEvent) {}
     fn emit_stroke_point(&self, _ev: &StrokePointEvent) {}
     fn emit_stroke_end(&self, _ev: &StrokeEndEvent) {}
+    fn emit_stroke_undo(&self, _ev: &StrokeUndoEvent) {}
+    fn emit_stroke_clear(&self, _ev: &StrokeClearEvent) {}
 }
 
 /// A Tauri-backed sink. Wraps a `tauri::AppHandle` and
@@ -154,6 +164,12 @@ mod tauri_sink {
         }
         fn emit_stroke_end(&self, ev: &StrokeEndEvent) {
             let _ = self.handle.emit(STROKE_END_EVENT, ev.clone());
+        }
+        fn emit_stroke_undo(&self, ev: &StrokeUndoEvent) {
+            let _ = self.handle.emit(STROKE_UNDO_EVENT, ev.clone());
+        }
+        fn emit_stroke_clear(&self, ev: &StrokeClearEvent) {
+            let _ = self.handle.emit(STROKE_CLEAR_EVENT, ev.clone());
         }
     }
 }
@@ -429,6 +445,14 @@ pub const PENDING_OUTBOUND_CAP: usize = 256;
 /// DRAW_END is accepted and rebroadcast by the server.
 pub const STROKE_END_EVENT: &str = "drawing://end";
 
+/// P5-T03: Tauri event name emitted when a DRAW_UNDO is accepted
+/// and rebroadcast by the server (to the actor too).
+pub const STROKE_UNDO_EVENT: &str = "drawing://undo";
+
+/// P5-T03: Tauri event name emitted when a DRAW_CLEAR is accepted
+/// and rebroadcast by the server (to the actor too).
+pub const STROKE_CLEAR_EVENT: &str = "drawing://clear";
+
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
 /// the same field names; the wire field `action`
@@ -665,6 +689,46 @@ impl From<(Uuid, Uuid, &locast_protocol::room::StrokeEndPayload)> for StrokeEndE
             sender_id: sender_id.to_string(),
             stroke_id: payload.stroke_id.to_string(),
             ts_ms: payload.ts_ms,
+        }
+    }
+}
+
+/// P5-T03: IPC-safe undo event payload. Emitted as `drawing://undo`
+/// when a DRAW_UNDO is accepted. `sender_id` is the server-stamped
+/// actor (the connection that issued the undo), not the stroke owner.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeUndoEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub stroke_id: String,
+}
+
+impl From<(Uuid, Uuid, &locast_protocol::room::StrokeUndoPayload)> for StrokeUndoEvent {
+    fn from(
+        (room_id, sender_id, payload): (Uuid, Uuid, &locast_protocol::room::StrokeUndoPayload),
+    ) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
+            stroke_id: payload.stroke_id.to_string(),
+        }
+    }
+}
+
+/// P5-T03: IPC-safe clear event payload. Emitted as `drawing://clear`
+/// when a DRAW_CLEAR is accepted. `sender_id` is the server-stamped
+/// actor.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct StrokeClearEvent {
+    pub room_id: String,
+    pub sender_id: String,
+}
+
+impl From<(Uuid, Uuid)> for StrokeClearEvent {
+    fn from((room_id, sender_id): (Uuid, Uuid)) -> Self {
+        Self {
+            room_id: room_id.to_string(),
+            sender_id: sender_id.to_string(),
         }
     }
 }
@@ -1788,6 +1852,43 @@ impl RoomClient {
                     }
                 }
             }
+            // P5-T03: a DRAW_UNDO was accepted by the server. It is
+            // delivered to every participant, the local user
+            // included: the stroke leaves the canvas only on this
+            // event. `sender_id` is the server-stamped actor.
+            MessageKind::StrokeUndo => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    if current_room.as_deref() == Some(room_id.to_string().as_str()) {
+                        if let Ok(payload) =
+                            decode_payload::<locast_protocol::room::StrokeUndoPayload>(&env)
+                        {
+                            if let Some(sender_id) = stroke_sender(&env) {
+                                let ipc = StrokeUndoEvent::from((room_id, sender_id, &payload));
+                                let g = self.sink.lock().await;
+                                if let Some(s) = g.as_ref() {
+                                    s.emit_stroke_undo(&ipc);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // P5-T03: a DRAW_CLEAR was accepted (actor included).
+            MessageKind::StrokeClear => {
+                if let Some(room_id) = env.room_id {
+                    let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                    if current_room.as_deref() == Some(room_id.to_string().as_str()) {
+                        if let Some(sender_id) = stroke_sender(&env) {
+                            let ipc = StrokeClearEvent::from((room_id, sender_id));
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_stroke_clear(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
             // P6-T02: a participant's cap_set was updated
             // by the host. If the target is the local user,
             // update `you_cap_set`. Otherwise update the
@@ -2025,12 +2126,12 @@ fn envelope<T: serde::Serialize>(kind: MessageKind, room_id: Option<Uuid>, paylo
     }
 }
 
-/// The owner of a rebroadcast DRAW_BEGIN / DRAW_POINT / DRAW_END:
-/// the server-assigned user id the server stamps on
-/// `Envelope::sender`. The drawing payloads do not carry it. A frame
-/// without a usable owner (no sender, or the nil UUID) is dropped
-/// rather than attributed to the nil user, which would break the
-/// per-owner checks that undo and clear rely on.
+/// The owner of a rebroadcast DRAW_BEGIN / DRAW_POINT / DRAW_END, or
+/// the actor of a DRAW_UNDO / DRAW_CLEAR: the server-assigned user id
+/// the server stamps on `Envelope::sender`. The drawing payloads do not
+/// carry it. A frame without a usable id (no sender, or the nil UUID)
+/// is dropped rather than attributed to the nil user, which would
+/// break the per-owner checks that undo and clear rely on.
 fn stroke_sender(env: &Envelope) -> Option<Uuid> {
     match env.sender.as_ref().map(|s| s.user_id) {
         Some(id) if !id.is_nil() => Some(id),
@@ -2099,6 +2200,29 @@ mod tests {
             sig: Vec::new(),
         });
         assert_eq!(stroke_sender(&env), Some(owner));
+    }
+
+    #[test]
+    fn undo_and_clear_events_carry_the_server_stamped_actor_not_the_payload() {
+        let room = Uuid::now_v7();
+        let actor = Uuid::now_v7();
+        let stroke = Uuid::now_v7();
+        let undo = StrokeUndoEvent::from((
+            room,
+            actor,
+            &locast_protocol::room::StrokeUndoPayload { stroke_id: stroke },
+        ));
+        assert_eq!(undo.room_id, room.to_string());
+        assert_eq!(undo.sender_id, actor.to_string());
+        assert_eq!(undo.stroke_id, stroke.to_string());
+        let clear = StrokeClearEvent::from((room, actor));
+        assert_eq!(clear.room_id, room.to_string());
+        assert_eq!(clear.sender_id, actor.to_string());
+        // The wire payload has no identity field to read.
+        let wire =
+            serde_json::to_value(locast_protocol::room::StrokeUndoPayload { stroke_id: stroke })
+                .unwrap();
+        assert_eq!(wire, serde_json::json!({ "stroke_id": stroke }));
     }
 
     fn sample_summary(host: Uuid) -> RoomSummary {

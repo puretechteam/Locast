@@ -25,7 +25,8 @@ pub enum Action {
     DrawBegin,
     DrawPoint,
     DrawEnd,
-    UndoStroke,
+    UndoOwnStroke,
+    UndoAnyStroke,
     ClearAll,
     SendChat,
     ManageRoom,
@@ -43,8 +44,9 @@ impl Scope {
             (Scope::Drawing, Action::DrawBegin) => cap_bits::DRAW,
             (Scope::Drawing, Action::DrawPoint) => cap_bits::DRAW,
             (Scope::Drawing, Action::DrawEnd) => cap_bits::DRAW,
-            (Scope::Drawing, Action::UndoStroke) => cap_bits::DRAW,
-            (Scope::Drawing, Action::ClearAll) => cap_bits::DRAW,
+            (Scope::Drawing, Action::UndoOwnStroke) => cap_bits::UNDO_OWN,
+            (Scope::Drawing, Action::UndoAnyStroke) => cap_bits::UNDO_ANY,
+            (Scope::Drawing, Action::ClearAll) => cap_bits::CLEAR_ALL,
             (Scope::Chat, Action::SendChat) => cap_bits::CHAT,
             (Scope::Room, Action::ManageRoom) => cap_bits::MANAGE_ROOM,
             (Scope::Room, Action::Kick) => cap_bits::KICK,
@@ -111,7 +113,7 @@ mod tests {
         assert!(can(p, Scope::Drawing, Action::DrawBegin));
         assert!(can(p, Scope::Drawing, Action::DrawPoint));
         assert!(can(p, Scope::Drawing, Action::DrawEnd));
-        assert!(can(p, Scope::Drawing, Action::UndoStroke));
+        assert!(can(p, Scope::Drawing, Action::UndoOwnStroke));
         assert!(can(p, Scope::Drawing, Action::ClearAll));
         assert!(can(p, Scope::Chat, Action::SendChat));
         assert!(can(p, Scope::Room, Action::ManageRoom));

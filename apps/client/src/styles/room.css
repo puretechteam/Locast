@@ -662,6 +662,35 @@ code {
     cursor: pointer;
 }
 
+/* P5-T03: undo / clear-all actions. */
+.drawing-toolbar__actions {
+    display: flex;
+    gap: 0.35rem;
+}
+
+.drawing-toolbar__action {
+    flex: 1 1 auto;
+    padding: 0.3rem 0.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.8);
+    font-size: 0.75rem;
+    cursor: pointer;
+}
+
+.drawing-toolbar__action:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.3);
+    color: #fff;
+}
+
+.drawing-toolbar__action--confirm {
+    background: rgba(255, 92, 105, 0.25);
+    border-color: #ff5c69;
+    color: #ff5c69;
+}
+
 /* P4-T04: drift indicator. The indicator is hidden by
  * default (component returns null when |smoothed| <=
  * 2 s); the rules below only apply when the element is

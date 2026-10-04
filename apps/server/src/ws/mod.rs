@@ -1894,6 +1894,8 @@ fn routes_to_room_dispatch(kind: &MessageKind) -> bool {
                 | MessageKind::StrokeBegin
                 | MessageKind::StrokePoint
                 | MessageKind::StrokeEnd
+                | MessageKind::StrokeUndo
+                | MessageKind::StrokeClear
                 | MessageKind::PermissionSet
         )
 }

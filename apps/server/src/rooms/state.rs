@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use locast_protocol::room::{Participant, ParticipantSelf, ParticipantStatus, RoomSummary};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
 /// P5-T02: per-stroke binding for the drawing protocol.
@@ -22,7 +22,21 @@ pub struct PendingStroke {
     pub sender_id: Uuid,
     pub sender_pubkey: [u8; 32],
     pub started_ms: i64,
+    /// P5-T03: a DRAW_CLEAR was accepted while this stroke was
+    /// still open. The drawer's remaining DRAW_POINT / DRAW_END
+    /// are accepted (so the drawer is not answered with a
+    /// ROOM_ERROR) but are neither rebroadcast nor committed, so
+    /// the cleared stroke cannot reappear on other screens or be
+    /// undone later.
+    pub cleared: bool,
 }
+
+/// Most committed (ended, visible) strokes the server remembers
+/// per room. When a new stroke would exceed it the OLDEST
+/// remembered stroke is forgotten: it stays on every screen but
+/// can no longer be undone (DRAW_UNDO for it is a no-op).
+/// DRAW_CLEAR still removes it from every screen.
+pub const MAX_COMMITTED_STROKES: usize = 5_000;
 
 #[derive(Debug, Default)]
 pub struct StrokeBookkeeping {
@@ -34,6 +48,67 @@ pub struct StrokeBookkeeping {
     /// timeout is a future task — P5-T02 only
     /// accumulates the bookkeeping).
     pub pending: HashMap<Uuid, PendingStroke>,
+    /// P5-T03: committed (ended) strokes still visible in the
+    /// room, `stroke_id -> owner user_id`. This is what DRAW_UNDO
+    /// is authorized against. It is per room (it lives in this
+    /// room's `RoomState`), bounded by [`MAX_COMMITTED_STROKES`],
+    /// emptied by DRAW_CLEAR, and dropped with the room.
+    committed: HashMap<Uuid, Uuid>,
+    /// Commit order of `committed`, oldest first, for the cap.
+    committed_order: VecDeque<Uuid>,
+}
+
+impl StrokeBookkeeping {
+    /// Record `stroke_id` as a committed stroke owned by `owner`.
+    /// Returns the ids forgotten to stay within the cap (oldest
+    /// first; normally empty).
+    pub fn commit(&mut self, stroke_id: Uuid, owner: Uuid) -> Vec<Uuid> {
+        if self.committed.insert(stroke_id, owner).is_none() {
+            self.committed_order.push_back(stroke_id);
+        }
+        let mut forgotten = Vec::new();
+        while self.committed_order.len() > MAX_COMMITTED_STROKES {
+            if let Some(old) = self.committed_order.pop_front() {
+                self.committed.remove(&old);
+                forgotten.push(old);
+            }
+        }
+        forgotten
+    }
+
+    /// The owner of a committed stroke, `None` if it is unknown,
+    /// still in progress, already removed, cleared or forgotten.
+    pub fn owner_of(&self, stroke_id: &Uuid) -> Option<Uuid> {
+        self.committed.get(stroke_id).copied()
+    }
+
+    /// Remove one committed stroke. `true` if it was present.
+    pub fn remove_committed(&mut self, stroke_id: &Uuid) -> bool {
+        if self.committed.remove(stroke_id).is_some() {
+            self.committed_order.retain(|id| id != stroke_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// DRAW_CLEAR: forget every committed stroke and mark every
+    /// in-progress stroke as cleared. Returns how many committed
+    /// strokes were forgotten.
+    pub fn clear_all(&mut self) -> usize {
+        let n = self.committed.len();
+        self.committed.clear();
+        self.committed_order.clear();
+        for stroke in self.pending.values_mut() {
+            stroke.cleared = true;
+        }
+        n
+    }
+
+    /// Number of remembered committed strokes.
+    pub fn committed_len(&self) -> usize {
+        self.committed.len()
+    }
 }
 
 /// The mutable per-room state. Lives behind a
@@ -254,5 +329,103 @@ impl ParticipantRecord {
             last_seen_ms: self.last_seen_ms,
             is_host: self.is_host,
         }
+    }
+}
+
+#[cfg(test)]
+mod stroke_record_tests {
+    use super::*;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn commit_remembers_the_owner_and_remove_forgets_it() {
+        let mut d = StrokeBookkeeping::default();
+        assert!(d.commit(id(1), id(100)).is_empty());
+        assert_eq!(d.owner_of(&id(1)), Some(id(100)));
+        assert_eq!(d.committed_len(), 1);
+        assert!(d.remove_committed(&id(1)));
+        assert_eq!(d.owner_of(&id(1)), None);
+        // Removing again (a replayed undo) is harmless.
+        assert!(!d.remove_committed(&id(1)));
+        assert_eq!(d.committed_len(), 0);
+    }
+
+    #[test]
+    fn a_pending_stroke_is_not_a_committed_stroke() {
+        let mut d = StrokeBookkeeping::default();
+        d.pending.insert(
+            id(7),
+            PendingStroke {
+                sender_id: id(100),
+                sender_pubkey: [0; 32],
+                started_ms: 0,
+                cleared: false,
+            },
+        );
+        assert_eq!(
+            d.owner_of(&id(7)),
+            None,
+            "in-progress strokes are not undoable"
+        );
+    }
+
+    #[test]
+    fn the_record_is_bounded_and_forgets_the_oldest_first() {
+        let mut d = StrokeBookkeeping::default();
+        for n in 0..MAX_COMMITTED_STROKES as u128 {
+            assert!(d.commit(id(n + 1), id(100)).is_empty());
+        }
+        assert_eq!(d.committed_len(), MAX_COMMITTED_STROKES);
+        let forgotten = d.commit(id(1_000_000), id(101));
+        assert_eq!(forgotten, vec![id(1)], "the oldest stroke is forgotten");
+        assert_eq!(d.committed_len(), MAX_COMMITTED_STROKES);
+        assert_eq!(d.owner_of(&id(1)), None);
+        assert_eq!(d.owner_of(&id(2)), Some(id(100)));
+        assert_eq!(d.owner_of(&id(1_000_000)), Some(id(101)));
+        // An undone stroke frees its slot: no eviction on the next commit.
+        assert!(d.remove_committed(&id(2)));
+        assert!(d.commit(id(1_000_001), id(101)).is_empty());
+        assert_eq!(d.committed_len(), MAX_COMMITTED_STROKES);
+    }
+
+    #[test]
+    fn clear_all_empties_the_record_and_marks_open_strokes_cleared() {
+        let mut d = StrokeBookkeeping::default();
+        d.commit(id(1), id(100));
+        d.commit(id(2), id(101));
+        d.pending.insert(
+            id(3),
+            PendingStroke {
+                sender_id: id(100),
+                sender_pubkey: [0; 32],
+                started_ms: 0,
+                cleared: false,
+            },
+        );
+        assert_eq!(d.clear_all(), 2);
+        assert_eq!(d.committed_len(), 0);
+        assert_eq!(d.owner_of(&id(1)), None);
+        assert!(d.pending.get(&id(3)).expect("still pending").cleared);
+        // A second clear is harmless.
+        assert_eq!(d.clear_all(), 0);
+    }
+
+    #[test]
+    fn a_new_room_state_starts_with_an_empty_record() {
+        let state = RoomState::new(
+            id(1),
+            "AAAAAA".into(),
+            "T".into(),
+            id(2),
+            [1; 32],
+            true,
+            0,
+            0,
+        );
+        assert_eq!(state.drawing.committed_len(), 0);
+        assert!(state.drawing.pending.is_empty());
     }
 }

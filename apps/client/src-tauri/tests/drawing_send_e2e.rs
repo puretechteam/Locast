@@ -28,7 +28,8 @@ use locast_client_lib::commands::drawing::{
 use locast_client_lib::identity::keystore::{IdentityKeyring, IdentityService, MockKeyring};
 use locast_client_lib::net::config::SignalingConfig;
 use locast_client_lib::net::room::{
-    RoomClient, RoomEventSink, RoomSummaryIpc, StrokeBeginEvent, StrokeEndEvent, StrokePointEvent,
+    RoomClient, RoomEventSink, RoomSummaryIpc, StrokeBeginEvent, StrokeClearEvent, StrokeEndEvent,
+    StrokePointEvent, StrokeUndoEvent,
 };
 use locast_client_lib::net::signaling::SignalingClient;
 use locast_client_lib::net::state::ConnPhase;
@@ -46,6 +47,8 @@ enum Seen {
     Begin(StrokeBeginEvent),
     Point(StrokePointEvent),
     End(StrokeEndEvent),
+    Undo(StrokeUndoEvent),
+    Clear(StrokeClearEvent),
 }
 
 #[derive(Default)]
@@ -59,6 +62,26 @@ impl RecordingSink {
     }
     fn count(&self) -> usize {
         self.events.lock().expect("sink lock").len()
+    }
+    /// The undo events seen so far, in arrival order.
+    fn undos(&self) -> Vec<(Instant, StrokeUndoEvent)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|(t, s)| match s {
+                Seen::Undo(ev) => Some((t, ev)),
+                _ => None,
+            })
+            .collect()
+    }
+    /// The clear events seen so far, in arrival order.
+    fn clears(&self) -> Vec<(Instant, StrokeClearEvent)> {
+        self.snapshot()
+            .into_iter()
+            .filter_map(|(t, s)| match s {
+                Seen::Clear(ev) => Some((t, ev)),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -84,6 +107,18 @@ impl RoomEventSink for RecordingSink {
             .expect("sink lock")
             .push((Instant::now(), Seen::End(ev.clone())));
     }
+    fn emit_stroke_undo(&self, ev: &StrokeUndoEvent) {
+        self.events
+            .lock()
+            .expect("sink lock")
+            .push((Instant::now(), Seen::Undo(ev.clone())));
+    }
+    fn emit_stroke_clear(&self, ev: &StrokeClearEvent) {
+        self.events
+            .lock()
+            .expect("sink lock")
+            .push((Instant::now(), Seen::Clear(ev.clone())));
+    }
 }
 
 fn sender_of(s: &Seen) -> &str {
@@ -91,6 +126,8 @@ fn sender_of(s: &Seen) -> &str {
         Seen::Begin(ev) => &ev.sender_id,
         Seen::Point(ev) => &ev.sender_id,
         Seen::End(ev) => &ev.sender_id,
+        Seen::Undo(ev) => &ev.sender_id,
+        Seen::Clear(ev) => &ev.sender_id,
     }
 }
 
@@ -249,6 +286,20 @@ async fn two_in_a_room(url: &str) -> (Client, Client) {
         .room_join(summary.code.clone(), "B".into())
         .await
         .expect("join");
+    // `room_join` can return before the inbound loop has stored the
+    // server-assigned user id, so wait for both ids before a test reads
+    // them (under load the id was briefly `None`).
+    let start = Instant::now();
+    loop {
+        if a.room.local_user_id().await.is_some() && b.room.local_user_id().await.is_some() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "both clients learn their server-assigned user ids"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     (a, b)
 }
 
@@ -302,7 +353,11 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
         let res = send(&app, begin(&id, tool, 0.10, 0.20))
             .await
             .expect("begin accepted by the command");
-        assert_eq!(res.stroke_id, id, "command echoes the canonical id");
+        assert_eq!(
+            res.stroke_id.as_deref(),
+            Some(id.as_str()),
+            "command echoes the canonical id"
+        );
         for i in 0..n_points {
             let seq = 2 + i;
             send(&app, point(&id, 0.2 + i as f32 * 0.05, 0.5, seq))
@@ -332,6 +387,8 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
             Seen::Begin(_) => 'B',
             Seen::Point(_) => 'P',
             Seen::End(_) => 'E',
+            Seen::Undo(_) => 'U',
+            Seen::Clear(_) => 'X',
         })
         .collect();
     assert_eq!(shape, expected_shape, "begin -> points -> end per stroke");
@@ -364,6 +421,7 @@ async fn drawing_send_delivers_a_stroke_to_the_other_participant_in_order() {
                 point_idx += 1.0;
             }
             Seen::End(ev) => assert_eq!(ev.stroke_id, ids[stroke_idx]),
+            Seen::Undo(_) | Seen::Clear(_) => panic!("no undo or clear was sent"),
         }
     }
 
@@ -450,6 +508,8 @@ async fn remote_strokes_carry_their_authors_distinct_user_ids() {
         Seen::Begin(ev) => ev.stroke_id.clone(),
         Seen::Point(ev) => ev.stroke_id.clone(),
         Seen::End(ev) => ev.stroke_id.clone(),
+        Seen::Undo(ev) => ev.stroke_id.clone(),
+        Seen::Clear(_) => String::new(),
     };
     for s in &seen_by_b {
         assert_eq!(stroke_of(s), stroke_a, "B only sees A's stroke");
@@ -723,4 +783,390 @@ async fn drawing_send_outside_a_room_fails_cleanly() {
     let err = send(&app, begin(&id, "pen", 0.1, 0.1)).await;
     assert!(err.is_err(), "no room -> Err, not a panic");
     a.signaling.shutdown().await;
+}
+
+// ---------------------------------------------------------------
+// P5-T03: undo + clear_all through the production send path
+// ---------------------------------------------------------------
+
+fn undo(stroke_id: &str) -> DrawingSendInput {
+    DrawingSendInput::Undo {
+        stroke_id: stroke_id.to_string(),
+    }
+}
+
+fn clear() -> DrawingSendInput {
+    DrawingSendInput::Clear {}
+}
+
+async fn room_id_of(c: &Client) -> Uuid {
+    c.room
+        .state()
+        .await
+        .expect("in a room")
+        .id
+        .parse()
+        .expect("room id")
+}
+
+/// The host grants `bits` (on top of what the target holds) and waits
+/// until the target's own room client has applied the update.
+async fn grant(host: &Client, target: &Client, bits: u32) {
+    let room_id = room_id_of(host).await;
+    let target_id = target.room.local_user_id().await.expect("target id");
+    host.room
+        .permission_set(room_id, target_id, bits, 0)
+        .await
+        .expect("permission_set");
+    let start = Instant::now();
+    loop {
+        let caps = target.room.state().await.and_then(|s| s.you_cap_set);
+        if caps.is_some_and(|c| c & bits == bits) {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "target never saw the grant {bits:#x}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Draw a complete stroke (begin, two points, end) through the command.
+async fn draw(app: &App<'_>, stroke_id: &str) {
+    send(app, begin(stroke_id, "pen", 0.1, 0.1))
+        .await
+        .expect("begin");
+    send(app, point(stroke_id, 0.2, 0.2, 2))
+        .await
+        .expect("point");
+    send(app, point(stroke_id, 0.3, 0.3, 3))
+        .await
+        .expect("point");
+    send(app, end(stroke_id, 4)).await.expect("end");
+}
+
+/// No new events (of any kind) reach `c` beyond `expected` for a while.
+async fn assert_event_count_stays(c: &Client, expected: usize, what: &str) {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(c.sink.count(), expected, "{what}");
+}
+
+/// Host + two more participants in one room, all with the DRAW + own
+/// undo capabilities an Editor holds.
+async fn three_in_a_room(url: &str) -> (Client, Client, Client) {
+    let a = connect_client(url).await;
+    let b = connect_client(url).await;
+    let c = connect_client(url).await;
+    let summary = a
+        .room
+        .room_create("Draw".into(), false)
+        .await
+        .expect("create");
+    b.room
+        .room_join(summary.code.clone(), "B".into())
+        .await
+        .expect("join b");
+    c.room
+        .room_join(summary.code.clone(), "C".into())
+        .await
+        .expect("join c");
+    (a, b, c)
+}
+
+/// Acceptance A + G: own undo. B (DRAW + UNDO_OWN) draws and undoes its
+/// own stroke; the undo reaches A (remote) and B (the actor, echoed)
+/// attributed to B, well inside the latency budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_undo_reaches_both_clients_with_the_actor_attributed() {
+    let url = spawn_server().await;
+    let (a, b) = two_in_a_room(&url).await;
+    let b_id = b.room.local_user_id().await.expect("b id").to_string();
+    grant(
+        &a,
+        &b,
+        locast_protocol::room::cap::DRAW | locast_protocol::room::cap::UNDO_OWN,
+    )
+    .await;
+    let app_b = mock_app_for(&b);
+    let id = Uuid::now_v7().to_string();
+    draw(&app_b, &id).await;
+    wait_until("A to see the stroke", Duration::from_secs(5), || {
+        a.sink.count() == 4
+    })
+    .await;
+
+    let t0 = Instant::now();
+    let res = send(&app_b, undo(&id)).await.expect("undo accepted");
+    assert_eq!(res.stroke_id.as_deref(), Some(id.as_str()));
+    wait_until("A and B to see the undo", Duration::from_secs(5), || {
+        a.sink.undos().len() == 1 && b.sink.undos().len() == 1
+    })
+    .await;
+    for (who, c) in [("A", &a), ("B", &b)] {
+        let (at, ev) = c.sink.undos().remove(0);
+        let ms = at.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+        println!("undo reached {who} {ms:.2} ms after the command returned");
+        assert!(ms < 1000.0, "{who}: undo latency {ms:.2} ms");
+        assert_eq!(ev.stroke_id, id, "{who}");
+        assert_eq!(ev.sender_id, b_id, "{who}: the actor is B (server-stamped)");
+        assert_eq!(ev.room_id, room_id_of(&a).await.to_string(), "{who}");
+    }
+    // A duplicate undo is harmless: no second event, nobody evicted.
+    send(&app_b, undo(&id))
+        .await
+        .expect("duplicate undo accepted");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.sink.undos().len(), 1);
+    assert_eq!(b.sink.undos().len(), 1);
+    assert!(a.room.state().await.is_some() && b.room.state().await.is_some());
+
+    a.signaling.shutdown().await;
+    b.signaling.shutdown().await;
+}
+
+/// Acceptance B + F: undo-any. A draws; B without undo_any is refused
+/// (nothing changes, B is not evicted); after the host grants undo_any,
+/// B undoes A's stroke and both clients see it removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_another_users_stroke_needs_undo_any_and_refusal_changes_nothing() {
+    let url = spawn_server().await;
+    let (a, b) = two_in_a_room(&url).await;
+    let a_id = a.room.local_user_id().await.expect("a id").to_string();
+    let b_id = b.room.local_user_id().await.expect("b id").to_string();
+    grant(
+        &a,
+        &b,
+        locast_protocol::room::cap::DRAW | locast_protocol::room::cap::UNDO_OWN,
+    )
+    .await;
+    let app_a = mock_app_for(&a);
+    let app_b = mock_app_for(&b);
+    let id = Uuid::now_v7().to_string();
+    draw(&app_a, &id).await;
+    wait_until("B to see A's stroke", Duration::from_secs(5), || {
+        b.sink.count() == 4
+    })
+    .await;
+
+    // B holds undo_own only: the command queues the envelope, the server
+    // refuses it silently. Nothing is broadcast, B stays in the room.
+    send(&app_b, undo(&id)).await.expect("queued");
+    assert_event_count_stays(&a, 0, "A saw nothing").await;
+    assert_event_count_stays(&b, 4, "B saw nothing new").await;
+    assert!(b.room.state().await.is_some(), "B was not evicted");
+
+    // Granted: the stroke is still there to undo.
+    grant(&a, &b, locast_protocol::room::cap::UNDO_ANY).await;
+    send(&app_b, undo(&id)).await.expect("undo");
+    wait_until("A and B to see the undo", Duration::from_secs(5), || {
+        a.sink.undos().len() == 1 && b.sink.undos().len() == 1
+    })
+    .await;
+    for c in [&a, &b] {
+        let ev = &c.sink.undos()[0].1;
+        assert_eq!(ev.stroke_id, id);
+        assert_eq!(ev.sender_id, b_id, "B is the actor, A was the owner");
+        assert_ne!(ev.sender_id, a_id);
+    }
+
+    a.signaling.shutdown().await;
+    b.signaling.shutdown().await;
+}
+
+/// Acceptance C + D: ownership, unknown ids, duplicates and a stroke of
+/// another room.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_own_is_limited_to_own_strokes_and_odd_ids_are_safe_no_ops() {
+    let url = spawn_server().await;
+    let (a, b, c) = three_in_a_room(&url).await;
+    let caps = locast_protocol::room::cap::DRAW | locast_protocol::room::cap::UNDO_OWN;
+    grant(&a, &b, caps).await;
+    grant(&a, &c, caps).await;
+    let app_a = mock_app_for(&a);
+    let app_b = mock_app_for(&b);
+    let app_c = mock_app_for(&c);
+
+    let sb = Uuid::now_v7().to_string();
+    let sc = Uuid::now_v7().to_string();
+    draw(&app_b, &sb).await;
+    wait_until("A and C to see B's stroke", Duration::from_secs(5), || {
+        a.sink.count() == 4 && c.sink.count() == 4
+    })
+    .await;
+    draw(&app_c, &sc).await;
+    wait_until("A and B to see C's stroke", Duration::from_secs(5), || {
+        a.sink.count() == 8 && b.sink.count() == 4
+    })
+    .await;
+
+    // C holds only undo_own and tries B's stroke: refused, nothing moves.
+    send(&app_c, undo(&sb)).await.expect("queued");
+    // Unknown id, and the same stroke twice.
+    send(&app_a, undo(&Uuid::now_v7().to_string()))
+        .await
+        .expect("queued");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (who, cl) in [("A", &a), ("B", &b), ("C", &c)] {
+        assert!(cl.sink.undos().is_empty(), "{who}: nothing was undone");
+        assert!(cl.room.state().await.is_some(), "{who}: not evicted");
+    }
+
+    // A stroke of ANOTHER room: D hosts its own room and draws there.
+    let d = connect_client(&url).await;
+    d.room
+        .room_create("Other".into(), false)
+        .await
+        .expect("d room");
+    let app_d = mock_app_for(&d);
+    let sd = Uuid::now_v7().to_string();
+    draw(&app_d, &sd).await;
+    // A (host of room 1, every bit) names D's stroke: unknown in room 1.
+    send(&app_a, undo(&sd)).await.expect("queued");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(d.sink.undos().is_empty(), "D's stroke is untouched");
+    assert!(a.sink.undos().is_empty() && b.sink.undos().is_empty());
+    // ... D can still undo it in its own room.
+    send(&app_d, undo(&sd)).await.expect("d undo");
+    wait_until("D to see its own undo", Duration::from_secs(5), || {
+        d.sink.undos().len() == 1
+    })
+    .await;
+    assert!(a.sink.undos().is_empty(), "room 1 never hears about room 2");
+
+    // Everyone can undo their own, exactly once.
+    send(&app_b, undo(&sb)).await.expect("b undo");
+    wait_until("all three to see B's undo", Duration::from_secs(5), || {
+        a.sink.undos().len() == 1 && b.sink.undos().len() == 1 && c.sink.undos().len() == 1
+    })
+    .await;
+    send(&app_c, undo(&sc)).await.expect("c undo");
+    wait_until("all three to see C's undo", Duration::from_secs(5), || {
+        a.sink.undos().len() == 2 && b.sink.undos().len() == 2 && c.sink.undos().len() == 2
+    })
+    .await;
+    send(&app_b, undo(&sb)).await.expect("replay");
+    send(&app_c, undo(&sc)).await.expect("replay");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.sink.undos().len(), 2, "replays are no-ops");
+
+    for cl in [&a, &b, &c, &d] {
+        cl.signaling.shutdown().await;
+    }
+}
+
+/// Acceptance E + F + G: clear_all. Unauthorized clear changes nothing;
+/// an authorized one reaches every client (the actor included) quickly,
+/// and a later undo of a cleared stroke is a no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_all_needs_the_capability_and_reaches_every_client() {
+    let url = spawn_server().await;
+    let (a, b, c) = three_in_a_room(&url).await;
+    let caps = locast_protocol::room::cap::DRAW | locast_protocol::room::cap::UNDO_OWN;
+    grant(&a, &b, caps).await;
+    grant(&a, &c, caps).await;
+    let app_a = mock_app_for(&a);
+    let app_b = mock_app_for(&b);
+    let app_c = mock_app_for(&c);
+    let a_id = a.room.local_user_id().await.expect("a id").to_string();
+
+    let s1 = Uuid::now_v7().to_string();
+    let s2 = Uuid::now_v7().to_string();
+    let s3 = Uuid::now_v7().to_string();
+    draw(&app_a, &s1).await;
+    wait_until("B and C to see s1", Duration::from_secs(5), || {
+        b.sink.count() == 4 && c.sink.count() == 4
+    })
+    .await;
+    draw(&app_b, &s2).await;
+    wait_until("A and C to see s2", Duration::from_secs(5), || {
+        a.sink.count() == 4 && c.sink.count() == 8
+    })
+    .await;
+    draw(&app_c, &s3).await;
+    wait_until("A and B to see s3", Duration::from_secs(5), || {
+        a.sink.count() == 8 && b.sink.count() == 8
+    })
+    .await;
+
+    // B and C hold no clear_all: refused, nothing changes anywhere.
+    send(&app_b, clear()).await.expect("queued");
+    send(&app_c, clear()).await.expect("queued");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (who, cl) in [("A", &a), ("B", &b), ("C", &c)] {
+        assert!(cl.sink.clears().is_empty(), "{who}: no clear");
+        assert!(cl.room.state().await.is_some(), "{who}: not evicted");
+    }
+    // The room still holds the strokes: an authorized undo works.
+    send(&app_a, undo(&s2)).await.expect("undo");
+    wait_until(
+        "everyone to see the undo of s2",
+        Duration::from_secs(5),
+        || a.sink.undos().len() == 1 && b.sink.undos().len() == 1 && c.sink.undos().len() == 1,
+    )
+    .await;
+
+    // The host clears (the host holds clear_all implicitly).
+    let t0 = Instant::now();
+    let res = send(&app_a, clear()).await.expect("clear");
+    assert_eq!(res.stroke_id, None, "a clear concerns no single stroke");
+    wait_until(
+        "every client to see the clear",
+        Duration::from_secs(5),
+        || a.sink.clears().len() == 1 && b.sink.clears().len() == 1 && c.sink.clears().len() == 1,
+    )
+    .await;
+    for (who, cl) in [("A (actor)", &a), ("B", &b), ("C", &c)] {
+        let (at, ev) = cl.sink.clears().remove(0);
+        let ms = at.saturating_duration_since(t0).as_secs_f64() * 1000.0;
+        println!("clear reached {who} {ms:.2} ms after the command returned");
+        assert!(ms < 1000.0, "{who}: clear latency {ms:.2} ms");
+        assert_eq!(ev.sender_id, a_id, "{who}: attributed to the actor");
+    }
+
+    // Cleared strokes are gone server-side too: undoing them is a no-op.
+    for s in [&s1, &s3] {
+        send(&app_a, undo(s)).await.expect("queued");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.sink.undos().len(), 1, "no undo of a cleared stroke");
+    assert_eq!(b.sink.undos().len(), 1);
+
+    // A viewer holding clear_all (granted) can clear too.
+    grant(&a, &b, locast_protocol::room::cap::CLEAR_ALL).await;
+    send(&app_b, clear()).await.expect("b clear");
+    wait_until("a second clear everywhere", Duration::from_secs(5), || {
+        a.sink.clears().len() == 2 && b.sink.clears().len() == 2 && c.sink.clears().len() == 2
+    })
+    .await;
+    let b_id = b.room.local_user_id().await.expect("b id").to_string();
+    assert_eq!(c.sink.clears()[1].1.sender_id, b_id);
+
+    for cl in [&a, &b, &c] {
+        cl.signaling.shutdown().await;
+    }
+}
+
+/// The new send actions reject a malformed id before anything is sent
+/// (an unsolicited server error would evict the user).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_undo_ids_are_rejected_before_anything_is_sent() {
+    let url = spawn_server().await;
+    let (a, b) = two_in_a_room(&url).await;
+    let app = mock_app_for(&a);
+    let good = Uuid::now_v7().to_string();
+    for bad in ["", "nope", &good.to_uppercase(), &good.replace('-', "")] {
+        assert!(send(&app, undo(bad)).await.is_err(), "undo {bad:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(b.sink.count(), 0);
+    assert!(a.room.state().await.is_some());
+    // Outside a room both actions fail cleanly.
+    let lone = connect_client(&url).await;
+    let app = mock_app_for(&lone);
+    assert!(send(&app, undo(&good)).await.is_err());
+    assert!(send(&app, clear()).await.is_err());
+    for cl in [&a, &b, &lone] {
+        cl.signaling.shutdown().await;
+    }
 }

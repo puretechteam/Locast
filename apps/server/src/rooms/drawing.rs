@@ -54,6 +54,39 @@
 //! - Stroke abandonment: the pending map is wiped on
 //!   `RoomState::new` (room teardown); individual stroke
 //!   GC is a future task.
+//!
+//! P5-T03 adds DRAW_UNDO and DRAW_CLEAR:
+//!
+//! - Committed strokes. DRAW_END moves a stroke from the
+//!   pending map into the room's committed record
+//!   (`stroke_id -> owner user_id`, bounded by
+//!   `MAX_COMMITTED_STROKES`, oldest forgotten first). DRAW_UNDO
+//!   is authorized against THAT record, looked up in the room
+//!   the envelope names.
+//! - DRAW_UNDO carries only a stroke id. The actor is the
+//!   authenticated connection; the owner is the stored one.
+//!   Owner == actor needs UNDO_OWN (or UNDO_ANY), anyone else's
+//!   stroke needs UNDO_ANY. The capability is re-checked under
+//!   the room lock. A stroke that is unknown, still in progress,
+//!   already undone, cleared or forgotten is an idempotent
+//!   no-op (nothing is mutated or broadcast, and no ROOM_ERROR
+//!   is sent: the room client treats every unsolicited
+//!   ROOM_ERROR as the end of the room, and these are expected
+//!   races). A refusal (missing capability, or another user's
+//!   stroke with only UNDO_OWN) is likewise silent and logged:
+//!   the real client gates its UI on the same bits, so a
+//!   refusal only happens after a revoke race.
+//! - DRAW_CLEAR needs CLEAR_ALL (re-checked under the lock),
+//!   empties the committed record and marks every in-progress
+//!   stroke `cleared`: the drawer's remaining POINT / END are
+//!   accepted silently (no ROOM_ERROR) but not rebroadcast or
+//!   committed, so a cleared stroke cannot reappear.
+//! - Accepted undo / clear events are rebroadcast to EVERY
+//!   participant, the actor included, with the authenticated
+//!   actor as `Envelope::sender`. The dispatcher publishes them
+//!   (and all other drawing events) while still holding the
+//!   room lock, so every client sees them in the order the
+//!   server applied them.
 
 #![forbid(unsafe_code)]
 
@@ -63,8 +96,11 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
 
 use locast_protocol::envelope::{Envelope, MessageKind, Sender};
-use locast_protocol::room::{StrokeBeginPayload, StrokeEndPayload, StrokePointPayload};
+use locast_protocol::room::{
+    ParticipantStatus, StrokeBeginPayload, StrokeEndPayload, StrokePointPayload, StrokeUndoPayload,
+};
 
+use super::caps::{participant_can, Action, Scope};
 use super::dispatch::RoomDispatchOutcome;
 use super::state::RoomState;
 use super::validation::validate_unit_range;
@@ -166,7 +202,14 @@ pub async fn handle_stroke_begin(
     }
     // Reject a second BEGIN for the same stroke id (a
     // replay or a collision).
-    if state.drawing.pending.contains_key(&payload.stroke_id) {
+    //
+    // Also refuse an id that is already a committed stroke:
+    // otherwise another participant could re-BEGIN and END a
+    // stroke id the room already holds and overwrite its recorded
+    // owner (and so become allowed to undo it as "their own").
+    if state.drawing.pending.contains_key(&payload.stroke_id)
+        || state.drawing.owner_of(&payload.stroke_id).is_some()
+    {
         return err_outcome(
             &envelope,
             reason(DrawingError::StrokeIdMismatch).to_string(),
@@ -179,6 +222,7 @@ pub async fn handle_stroke_begin(
             sender_id: user_id,
             sender_pubkey: pubkey,
             started_ms: now_ms,
+            cleared: false,
         },
     );
     let evt = super::registry::RoomEvent::StrokeBegin {
@@ -225,6 +269,12 @@ pub async fn handle_stroke_point(
             reason(DrawingError::StrokeIdMismatch).to_string(),
         );
     }
+    // A DRAW_CLEAR landed while this stroke was open: accept the
+    // point (so the drawer is not answered with a ROOM_ERROR) but do
+    // not rebroadcast it, or the cleared stroke would reappear.
+    if binding.cleared {
+        return RoomDispatchOutcome::default();
+    }
     // Attribute the point to the stroke's recorded owner (equal to
     // `user_id` after the check above); `envelope.sender` is never
     // read for POINT.
@@ -268,7 +318,15 @@ pub async fn handle_stroke_end(
             return err_outcome(&envelope, reason(DrawingError::UnknownStroke).to_string());
         }
     };
-    state.drawing.pending.remove(&payload.stroke_id);
+    let binding = state.drawing.pending.remove(&payload.stroke_id);
+    if binding.is_some_and(|b| b.cleared) {
+        // Cleared while open: closed silently, never committed (so it
+        // cannot be undone later) and not rebroadcast.
+        return RoomDispatchOutcome::default();
+    }
+    // The stroke is now committed: remember its owner so DRAW_UNDO
+    // can be authorized against it.
+    state.drawing.commit(payload.stroke_id, owner);
     // Attribute the end to the stroke's recorded owner; `envelope.sender`
     // is never read for END.
     let evt = super::registry::RoomEvent::StrokeEnd {
@@ -279,6 +337,99 @@ pub async fn handle_stroke_end(
     RoomDispatchOutcome {
         to_caller: Vec::new(),
         events: vec![evt],
+        close_caller: false,
+    }
+}
+
+/// `true` if `user_id` has a live participant record in `state`
+/// (connected or reconnecting) that may perform `action`.
+fn actor_can(state: &RoomState, user_id: Uuid, action: Action) -> bool {
+    state
+        .participants
+        .iter()
+        .find(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+        .is_some_and(|p| {
+            matches!(
+                p.status,
+                ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+            ) && participant_can(p, Scope::Drawing, action)
+        })
+}
+
+/// P5-T03: validate DRAW_UNDO.
+///
+/// `user_id` is the authenticated connection (never read from the
+/// envelope or payload). The stroke is looked up only in `state`,
+/// the room the envelope names. See the module docs for the no-op
+/// and refusal rules.
+pub async fn handle_stroke_undo(
+    envelope: Envelope,
+    state: &mut RoomState,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let payload: StrokeUndoPayload = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(p) => p,
+        Err(e) => return err_outcome(&envelope, format!("bad DRAW_UNDO payload: {e}")),
+    };
+    let Some(owner) = state.drawing.owner_of(&payload.stroke_id) else {
+        // Unknown, in progress, already undone, cleared, forgotten, or
+        // a stroke of another room: idempotent no-op.
+        tracing::debug!(
+            room_id = %state.id,
+            user_id = %user_id,
+            stroke_id = %payload.stroke_id,
+            "DRAW_UNDO for a stroke the room does not hold; ignored"
+        );
+        return RoomDispatchOutcome::default();
+    };
+    let allowed = if owner == user_id {
+        actor_can(state, user_id, Action::UndoOwnStroke)
+            || actor_can(state, user_id, Action::UndoAnyStroke)
+    } else {
+        actor_can(state, user_id, Action::UndoAnyStroke)
+    };
+    if !allowed {
+        tracing::debug!(
+            room_id = %state.id,
+            user_id = %user_id,
+            stroke_id = %payload.stroke_id,
+            own_stroke = owner == user_id,
+            "DRAW_UNDO refused: capability not held; room state unchanged"
+        );
+        return RoomDispatchOutcome::default();
+    }
+    state.drawing.remove_committed(&payload.stroke_id);
+    RoomDispatchOutcome {
+        to_caller: Vec::new(),
+        events: vec![super::registry::RoomEvent::StrokeUndo {
+            room_id: state.id,
+            actor_id: user_id,
+            payload,
+        }],
+        close_caller: false,
+    }
+}
+
+/// P5-T03: validate DRAW_CLEAR. Requires CLEAR_ALL (re-checked here
+/// under the room lock); a caller without it is refused silently and
+/// the room is not touched.
+pub async fn handle_stroke_clear(state: &mut RoomState, user_id: Uuid) -> RoomDispatchOutcome {
+    if !actor_can(state, user_id, Action::ClearAll) {
+        tracing::debug!(
+            room_id = %state.id,
+            user_id = %user_id,
+            "DRAW_CLEAR refused: capability not held; room state unchanged"
+        );
+        return RoomDispatchOutcome::default();
+    }
+    let cleared = state.drawing.clear_all();
+    tracing::debug!(room_id = %state.id, cleared, "DRAW_CLEAR applied");
+    RoomDispatchOutcome {
+        to_caller: Vec::new(),
+        events: vec![super::registry::RoomEvent::StrokeClear {
+            room_id: state.id,
+            actor_id: user_id,
+        }],
         close_caller: false,
     }
 }
@@ -721,5 +872,437 @@ mod tests {
         assert_eq!(out.events.len(), 1);
         assert!(out.to_caller.is_empty());
         assert!(!state.drawing.pending.contains_key(&stroke_id));
+    }
+
+    // ------------------------------------------------------------
+    // P5-T03: DRAW_UNDO / DRAW_CLEAR
+    // ------------------------------------------------------------
+
+    use super::super::registry::RoomEvent;
+    use super::super::state::ParticipantRecord;
+    use locast_protocol::room::cap;
+
+    struct Room {
+        state: RoomState,
+        host: Uuid,
+        host_sk: SigningKey,
+        host_pk: [u8; 32],
+    }
+
+    fn room() -> Room {
+        let (host_sk, host_pk) = fresh_keypair();
+        let host = Uuid::now_v7();
+        Room {
+            state: sample_state(Uuid::now_v7(), host, host_pk),
+            host,
+            host_sk,
+            host_pk,
+        }
+    }
+
+    fn add_member(state: &mut RoomState, caps: u32) -> Uuid {
+        let uid = Uuid::now_v7();
+        state.participants.push(ParticipantRecord {
+            user_id: uid,
+            pubkey: [9; 32],
+            display_name: "m".into(),
+            joined_ms: 0,
+            status: ParticipantStatus::Connected,
+            last_seen_ms: 0,
+            is_host: false,
+            cap_set: caps,
+        });
+        uid
+    }
+
+    fn set_caps(state: &mut RoomState, uid: Uuid, caps: u32) {
+        state
+            .participants
+            .iter_mut()
+            .find(|p| p.user_id == uid)
+            .expect("member")
+            .cap_set = caps;
+    }
+
+    fn begin_payload(stroke_id: Uuid) -> StrokeBeginPayload {
+        StrokeBeginPayload {
+            stroke_id,
+            tool: locast_protocol::room::StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 2.0,
+            x: 0.1,
+            y: 0.2,
+            pressure: 0.5,
+            ts_ms: 1000,
+        }
+    }
+
+    fn plain(kind: MessageKind, room_id: Uuid, payload: serde_json::Value) -> Envelope {
+        Envelope {
+            v: 1,
+            r#type: kind,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload,
+        }
+    }
+
+    /// Draw one complete stroke as the host (BEGIN then END).
+    async fn host_stroke(r: &mut Room) -> Uuid {
+        let stroke_id = Uuid::now_v7();
+        let payload = begin_payload(stroke_id);
+        let sig = sign_begin(&r.host_sk, &payload);
+        let env = begin_envelope(r.host, r.host_pk, sig, r.state.id, payload);
+        let out = handle_stroke_begin(env, &mut r.state, r.host, r.host_pk, 1).await;
+        assert_eq!(out.events.len(), 1);
+        end_stroke(&mut r.state, r.host, stroke_id).await;
+        stroke_id
+    }
+
+    async fn end_stroke(state: &mut RoomState, uid: Uuid, stroke_id: Uuid) -> RoomDispatchOutcome {
+        let env = plain(
+            MessageKind::StrokeEnd,
+            state.id,
+            serde_json::to_value(StrokeEndPayload {
+                stroke_id,
+                ts_ms: 2,
+            })
+            .unwrap(),
+        );
+        handle_stroke_end(env, state, uid).await
+    }
+
+    fn undo_env(room_id: Uuid, stroke_id: Uuid) -> Envelope {
+        plain(
+            MessageKind::StrokeUndo,
+            room_id,
+            serde_json::to_value(StrokeUndoPayload { stroke_id }).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn ended_strokes_are_recorded_with_their_owner_and_pending_ones_are_not() {
+        let mut r = room();
+        let stroke_id = Uuid::now_v7();
+        let payload = begin_payload(stroke_id);
+        let sig = sign_begin(&r.host_sk, &payload);
+        let env = begin_envelope(r.host, r.host_pk, sig, r.state.id, payload);
+        handle_stroke_begin(env, &mut r.state, r.host, r.host_pk, 1).await;
+        assert_eq!(
+            r.state.drawing.owner_of(&stroke_id),
+            None,
+            "still in progress"
+        );
+        end_stroke(&mut r.state, r.host, stroke_id).await;
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(r.host));
+        assert!(!r.state.drawing.pending.contains_key(&stroke_id));
+    }
+
+    #[tokio::test]
+    async fn own_undo_needs_undo_own_and_removes_the_stroke_with_the_actor_stamped() {
+        let mut r = room();
+        let member = add_member(&mut r.state, cap::CHAT | cap::DRAW);
+        // The member draws a stroke (BEGIN needs a real signature).
+        let (sk, pk) = fresh_keypair();
+        let stroke_id = Uuid::now_v7();
+        let payload = begin_payload(stroke_id);
+        let sig = sign_begin(&sk, &payload);
+        let env = begin_envelope(member, pk, sig, r.state.id, payload);
+        handle_stroke_begin(env, &mut r.state, member, pk, 1).await;
+        end_stroke(&mut r.state, member, stroke_id).await;
+
+        // No undo bit: refused, state unchanged.
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, member).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(member));
+
+        // undo_own: allowed; the event names the AUTHENTICATED actor.
+        set_caps(&mut r.state, member, cap::CHAT | cap::DRAW | cap::UNDO_OWN);
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, member).await;
+        match &out.events[..] {
+            [RoomEvent::StrokeUndo {
+                room_id,
+                actor_id,
+                payload,
+            }] => {
+                assert_eq!(*room_id, r.state.id);
+                assert_eq!(*actor_id, member);
+                assert_eq!(payload.stroke_id, stroke_id);
+            }
+            other => panic!("expected one StrokeUndo, got {other:?}"),
+        }
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), None);
+
+        // A replayed undo is a harmless no-op.
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, member).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+    }
+
+    #[tokio::test]
+    async fn undoing_another_users_stroke_needs_undo_any() {
+        let mut r = room();
+        let stroke_id = host_stroke(&mut r).await;
+        let other = add_member(&mut r.state, cap::CHAT | cap::UNDO_OWN);
+        // undo_own is not enough for someone else's stroke.
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, other).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert_eq!(
+            r.state.drawing.owner_of(&stroke_id),
+            Some(r.host),
+            "unchanged"
+        );
+        // clear_all is not enough either.
+        set_caps(&mut r.state, other, cap::CHAT | cap::CLEAR_ALL);
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, other).await;
+        assert!(out.events.is_empty());
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(r.host));
+        // undo_any is.
+        set_caps(&mut r.state, other, cap::CHAT | cap::UNDO_ANY);
+        let out = handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, other).await;
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), None);
+    }
+
+    #[tokio::test]
+    async fn undo_any_alone_may_also_undo_the_actors_own_stroke() {
+        let mut r = room();
+        let stroke_id = host_stroke(&mut r).await;
+        // Hand the host's stroke to a member by recording it directly.
+        let member = add_member(&mut r.state, cap::CHAT | cap::UNDO_ANY);
+        let mine = Uuid::now_v7();
+        r.state.drawing.commit(mine, member);
+        let out = handle_stroke_undo(undo_env(r.state.id, mine), &mut r.state, member).await;
+        assert_eq!(out.events.len(), 1);
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(r.host));
+    }
+
+    #[tokio::test]
+    async fn unknown_in_progress_and_removed_strokes_are_silent_no_ops() {
+        let mut r = room();
+        // Unknown id.
+        let out =
+            handle_stroke_undo(undo_env(r.state.id, Uuid::now_v7()), &mut r.state, r.host).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        // In progress.
+        let open = Uuid::now_v7();
+        let payload = begin_payload(open);
+        let sig = sign_begin(&r.host_sk, &payload);
+        let env = begin_envelope(r.host, r.host_pk, sig, r.state.id, payload);
+        handle_stroke_begin(env, &mut r.state, r.host, r.host_pk, 1).await;
+        let out = handle_stroke_undo(undo_env(r.state.id, open), &mut r.state, r.host).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert!(
+            r.state.drawing.pending.contains_key(&open),
+            "pending untouched"
+        );
+        // After END it can be undone, exactly once.
+        end_stroke(&mut r.state, r.host, open).await;
+        assert_eq!(
+            handle_stroke_undo(undo_env(r.state.id, open), &mut r.state, r.host)
+                .await
+                .events
+                .len(),
+            1
+        );
+        assert!(
+            handle_stroke_undo(undo_env(r.state.id, open), &mut r.state, r.host)
+                .await
+                .events
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_only_sees_strokes_of_the_room_it_is_dispatched_in() {
+        let mut room_a = room();
+        let mut room_b = room();
+        let stroke_in_a = host_stroke(&mut room_a).await;
+        // Same user id, same stroke id, but room B's state: nothing there.
+        let out = handle_stroke_undo(
+            undo_env(room_b.state.id, stroke_in_a),
+            &mut room_b.state,
+            room_b.host,
+        )
+        .await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert_eq!(
+            room_a.state.drawing.owner_of(&stroke_in_a),
+            Some(room_a.host)
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_payload_identity_fields_are_ignored() {
+        let mut r = room();
+        let stroke_id = host_stroke(&mut r).await;
+        let member = add_member(&mut r.state, cap::CHAT | cap::UNDO_OWN);
+        let spoof = plain(
+            MessageKind::StrokeUndo,
+            r.state.id,
+            serde_json::json!({
+                "stroke_id": stroke_id,
+                "user_id": r.host,
+                "owner": member,
+                "actor_id": r.host,
+            }),
+        );
+        // `member` is the connection; claiming to be the host or the
+        // owner in the payload changes nothing: still refused.
+        let out = handle_stroke_undo(spoof, &mut r.state, member).await;
+        assert!(out.events.is_empty());
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(r.host));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_undo_payload_is_an_error_not_a_panic() {
+        let mut r = room();
+        let env = plain(MessageKind::StrokeUndo, r.state.id, serde_json::json!({}));
+        let out = handle_stroke_undo(env, &mut r.state, r.host).await;
+        assert!(out.events.is_empty());
+        assert_eq!(out.to_caller.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn begin_cannot_take_over_a_committed_stroke_id() {
+        let mut r = room();
+        let victim_stroke = host_stroke(&mut r).await;
+        let (sk, pk) = fresh_keypair();
+        let attacker = add_member(&mut r.state, cap::CHAT | cap::DRAW | cap::UNDO_OWN);
+        let payload = begin_payload(victim_stroke);
+        let sig = sign_begin(&sk, &payload);
+        let env = begin_envelope(attacker, pk, sig, r.state.id, payload);
+        let out = handle_stroke_begin(env, &mut r.state, attacker, pk, 5).await;
+        assert!(out.events.is_empty());
+        assert_eq!(
+            out.to_caller.len(),
+            1,
+            "re-BEGIN of a committed id is refused"
+        );
+        assert_eq!(r.state.drawing.owner_of(&victim_stroke), Some(r.host));
+        // So the attacker cannot undo it as "their own".
+        let out =
+            handle_stroke_undo(undo_env(r.state.id, victim_stroke), &mut r.state, attacker).await;
+        assert!(out.events.is_empty());
+        assert_eq!(r.state.drawing.owner_of(&victim_stroke), Some(r.host));
+    }
+
+    #[tokio::test]
+    async fn clear_requires_clear_all_and_never_mutates_without_it() {
+        let mut r = room();
+        let s1 = host_stroke(&mut r).await;
+        let s2 = host_stroke(&mut r).await;
+        let member = add_member(
+            &mut r.state,
+            cap::CHAT | cap::DRAW | cap::UNDO_ANY | cap::UNDO_OWN,
+        );
+        let out = handle_stroke_clear(&mut r.state, member).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert_eq!(r.state.drawing.committed_len(), 2, "state intact");
+
+        set_caps(&mut r.state, member, cap::CHAT | cap::CLEAR_ALL);
+        let out = handle_stroke_clear(&mut r.state, member).await;
+        match &out.events[..] {
+            [RoomEvent::StrokeClear { room_id, actor_id }] => {
+                assert_eq!(*room_id, r.state.id);
+                assert_eq!(*actor_id, member);
+            }
+            other => panic!("expected one StrokeClear, got {other:?}"),
+        }
+        assert_eq!(r.state.drawing.committed_len(), 0);
+        // A later undo of a cleared stroke is a harmless no-op.
+        for s in [s1, s2] {
+            let out = handle_stroke_undo(undo_env(r.state.id, s), &mut r.state, r.host).await;
+            assert!(out.events.is_empty() && out.to_caller.is_empty());
+        }
+        // Replayed clear is idempotent (still broadcast, nothing to remove).
+        assert_eq!(
+            handle_stroke_clear(&mut r.state, r.host).await.events.len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stroke_open_during_clear_never_reappears_and_does_not_error() {
+        let mut r = room();
+        let open = Uuid::now_v7();
+        let payload = begin_payload(open);
+        let sig = sign_begin(&r.host_sk, &payload);
+        let env = begin_envelope(r.host, r.host_pk, sig, r.state.id, payload);
+        handle_stroke_begin(env, &mut r.state, r.host, r.host_pk, 1).await;
+        assert_eq!(
+            handle_stroke_clear(&mut r.state, r.host).await.events.len(),
+            1
+        );
+
+        // The drawer's remaining POINT and END are accepted silently:
+        // no error (which would evict the drawer's client), no
+        // rebroadcast, nothing committed.
+        let point = plain(
+            MessageKind::StrokePoint,
+            r.state.id,
+            serde_json::to_value(StrokePointPayload {
+                stroke_id: open,
+                x: 0.5,
+                y: 0.5,
+                pressure: 0.5,
+                ts_ms: 3,
+            })
+            .unwrap(),
+        );
+        let out = handle_stroke_point(point, &mut r.state, r.host).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        let out = end_stroke(&mut r.state, r.host, open).await;
+        assert!(out.events.is_empty() && out.to_caller.is_empty());
+        assert!(!r.state.drawing.pending.contains_key(&open));
+        assert_eq!(r.state.drawing.owner_of(&open), None, "not undoable");
+        assert_eq!(r.state.drawing.committed_len(), 0);
+        // A stroke begun AFTER the clear is normal again.
+        let after = host_stroke(&mut r).await;
+        assert_eq!(r.state.drawing.owner_of(&after), Some(r.host));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_or_departed_actor_is_refused_under_the_lock() {
+        let mut r = room();
+        let stroke_id = host_stroke(&mut r).await;
+        let member = add_member(&mut r.state, cap::CHAT | cap::UNDO_ANY | cap::CLEAR_ALL);
+        // Revoked between the gate and the lock.
+        set_caps(&mut r.state, member, cap::CHAT);
+        assert!(
+            handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, member)
+                .await
+                .events
+                .is_empty()
+        );
+        assert!(handle_stroke_clear(&mut r.state, member)
+            .await
+            .events
+            .is_empty());
+        // Left the room: capabilities no longer count.
+        set_caps(
+            &mut r.state,
+            member,
+            cap::CHAT | cap::UNDO_ANY | cap::CLEAR_ALL,
+        );
+        r.state
+            .participants
+            .iter_mut()
+            .find(|p| p.user_id == member)
+            .unwrap()
+            .status = ParticipantStatus::Left;
+        assert!(
+            handle_stroke_undo(undo_env(r.state.id, stroke_id), &mut r.state, member)
+                .await
+                .events
+                .is_empty()
+        );
+        assert!(handle_stroke_clear(&mut r.state, member)
+            .await
+            .events
+            .is_empty());
+        assert_eq!(r.state.drawing.owner_of(&stroke_id), Some(r.host));
     }
 }

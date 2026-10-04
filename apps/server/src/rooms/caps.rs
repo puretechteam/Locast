@@ -60,7 +60,8 @@ pub enum Action {
     DrawBegin,
     DrawPoint,
     DrawEnd,
-    UndoStroke,
+    UndoOwnStroke,
+    UndoAnyStroke,
     ClearAll,
     SendChat,
     ManageRoom,
@@ -78,8 +79,9 @@ impl Scope {
             (Scope::Drawing, Action::DrawBegin) => cap_bits::DRAW,
             (Scope::Drawing, Action::DrawPoint) => cap_bits::DRAW,
             (Scope::Drawing, Action::DrawEnd) => cap_bits::DRAW,
-            (Scope::Drawing, Action::UndoStroke) => cap_bits::DRAW,
-            (Scope::Drawing, Action::ClearAll) => cap_bits::DRAW,
+            (Scope::Drawing, Action::UndoOwnStroke) => cap_bits::UNDO_OWN,
+            (Scope::Drawing, Action::UndoAnyStroke) => cap_bits::UNDO_ANY,
+            (Scope::Drawing, Action::ClearAll) => cap_bits::CLEAR_ALL,
             (Scope::Chat, Action::SendChat) => cap_bits::CHAT,
             (Scope::Room, Action::ManageRoom) => cap_bits::MANAGE_ROOM,
             (Scope::Room, Action::Kick) => cap_bits::KICK,
@@ -213,6 +215,17 @@ pub enum Command {
     /// level (any stroke begin a non-member could not
     /// have started is rejected).
     Draw,
+    /// P5-T03: DRAW_UNDO. The caller must be a member of the
+    /// room named in `envelope.room_id` and hold UNDO_OWN or
+    /// UNDO_ANY there (the host holds both). Which one is
+    /// needed for a given stroke depends on the stroke's owner,
+    /// which only the per-type handler can look up (under the
+    /// room lock); the gate only turns away callers who hold
+    /// neither.
+    DrawUndo,
+    /// P5-T03: DRAW_CLEAR. Member of the named room holding
+    /// CLEAR_ALL (the host holds it).
+    DrawClear,
     /// P6-T02: host-only PERMISSION_SET envelope. The
     /// capability check is two-fold:
     ///
@@ -316,6 +329,36 @@ pub async fn check_capability(
                 .to_scope_action()
                 .expect("capability-gated command has a scope/action");
             if can(registry, user_id, rid, scope, action).await {
+                Ok(())
+            } else {
+                Err(CapsError::NotHost)
+            }
+        }
+        Command::DrawUndo => {
+            if can(
+                registry,
+                user_id,
+                rid,
+                Scope::Drawing,
+                Action::UndoOwnStroke,
+            )
+            .await
+                || can(
+                    registry,
+                    user_id,
+                    rid,
+                    Scope::Drawing,
+                    Action::UndoAnyStroke,
+                )
+                .await
+            {
+                Ok(())
+            } else {
+                Err(CapsError::NotHost)
+            }
+        }
+        Command::DrawClear => {
+            if can(registry, user_id, rid, Scope::Drawing, Action::ClearAll).await {
                 Ok(())
             } else {
                 Err(CapsError::NotHost)
@@ -458,7 +501,16 @@ mod tests {
         assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawBegin).await);
         assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawPoint).await);
         assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::DrawEnd).await);
-        assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::UndoStroke).await);
+        assert!(
+            can(
+                &reg,
+                host_uid,
+                room_id,
+                Scope::Drawing,
+                Action::UndoOwnStroke
+            )
+            .await
+        );
         assert!(can(&reg, host_uid, room_id, Scope::Drawing, Action::ClearAll).await);
         assert!(can(&reg, host_uid, room_id, Scope::Chat, Action::SendChat).await);
         assert!(can(&reg, host_uid, room_id, Scope::Room, Action::ManageRoom).await);
@@ -474,6 +526,84 @@ mod tests {
             .await
         );
         assert!(can(&reg, host_uid, room_id, Scope::Manifest, Action::Invite).await);
+    }
+
+    #[tokio::test]
+    async fn undo_and_clear_have_their_own_capability_bits() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, host_uid) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let viewer = uid(2);
+        let draw = |a| can(&reg, viewer, room_id, Scope::Drawing, a);
+        // DRAW alone grants none of undo / clear.
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::DRAW, clock.now_ms())
+            .await
+            .unwrap();
+        assert!(draw(Action::DrawBegin).await);
+        assert!(!draw(Action::UndoOwnStroke).await);
+        assert!(!draw(Action::UndoAnyStroke).await);
+        assert!(!draw(Action::ClearAll).await);
+        // Each bit grants exactly its own action.
+        for (bit, own, any, clear) in [
+            (cap_bits::UNDO_OWN, true, false, false),
+            (cap_bits::UNDO_ANY, false, true, false),
+            (cap_bits::CLEAR_ALL, false, false, true),
+        ] {
+            reg.update_participant_cap_set(room_id, viewer, bit, clock.now_ms())
+                .await
+                .unwrap();
+            assert_eq!(draw(Action::UndoOwnStroke).await, own, "{bit:#x} undo_own");
+            assert_eq!(draw(Action::UndoAnyStroke).await, any, "{bit:#x} undo_any");
+            assert_eq!(draw(Action::ClearAll).await, clear, "{bit:#x} clear_all");
+            assert!(!draw(Action::DrawBegin).await, "{bit:#x} is not DRAW");
+        }
+        // The host's stored set carries all three bits (the client mirror
+        // reads them to enable its undo / clear controls).
+        let handle = reg.get_by_id(room_id).await.unwrap();
+        let host_caps = handle
+            .read()
+            .await
+            .participants
+            .iter()
+            .find(|p| p.user_id == host_uid)
+            .unwrap()
+            .cap_set;
+        let all = cap_bits::UNDO_OWN | cap_bits::UNDO_ANY | cap_bits::CLEAR_ALL;
+        assert_eq!(host_caps & all, all);
+    }
+
+    #[tokio::test]
+    async fn the_gate_admits_undo_with_either_undo_bit_and_clear_with_clear_all() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, host_uid) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let viewer = uid(2);
+        let gate = |cmd| check_capability(&reg, viewer, Some(room_id), cmd);
+        assert!(gate(Command::DrawUndo).await.is_err());
+        assert!(gate(Command::DrawClear).await.is_err());
+        for bit in [cap_bits::UNDO_OWN, cap_bits::UNDO_ANY] {
+            reg.update_participant_cap_set(room_id, viewer, bit, clock.now_ms())
+                .await
+                .unwrap();
+            assert!(gate(Command::DrawUndo).await.is_ok(), "{bit:#x}");
+            assert!(gate(Command::DrawClear).await.is_err(), "{bit:#x}");
+        }
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::CLEAR_ALL, clock.now_ms())
+            .await
+            .unwrap();
+        assert!(gate(Command::DrawUndo).await.is_err());
+        assert!(gate(Command::DrawClear).await.is_ok());
+        // The host passes both; a non-member and a wrong room fail both.
+        let host_gate = |cmd| check_capability(&reg, host_uid, Some(room_id), cmd);
+        assert!(host_gate(Command::DrawUndo).await.is_ok());
+        assert!(host_gate(Command::DrawClear).await.is_ok());
+        for cmd in [Command::DrawUndo, Command::DrawClear] {
+            assert!(check_capability(&reg, uid(99), Some(room_id), cmd)
+                .await
+                .is_err());
+            assert!(check_capability(&reg, host_uid, Some(Uuid::now_v7()), cmd)
+                .await
+                .is_err());
+            assert!(check_capability(&reg, host_uid, None, cmd).await.is_err());
+        }
     }
 
     #[tokio::test]
@@ -494,7 +624,7 @@ mod tests {
         assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
         assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawPoint).await);
         assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::DrawEnd).await);
-        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::UndoStroke).await);
+        assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::UndoOwnStroke).await);
         assert!(!can(&reg, viewer, room_id, Scope::Drawing, Action::ClearAll).await);
         assert!(can(&reg, viewer, room_id, Scope::Chat, Action::SendChat).await);
         assert!(!can(&reg, viewer, room_id, Scope::Room, Action::ManageRoom).await);

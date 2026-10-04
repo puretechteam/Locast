@@ -9,6 +9,10 @@ export const CAP = {
     PUBLISH_MANIFEST: 0x20,
     INVITE: 0x40,
     CHAT: 0x80,
+    MEDIA: 0x100,
+    UNDO_OWN: 0x200,
+    UNDO_ANY: 0x400,
+    CLEAR_ALL: 0x800,
 } as const;
 
 export type Cap = (typeof CAP)[keyof typeof CAP];

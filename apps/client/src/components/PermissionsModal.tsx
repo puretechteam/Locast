@@ -9,8 +9,11 @@ type Preset = "viewer" | "editor" | "co-host";
 
 const PRESET_CAPS: Record<Preset, Cap[]> = {
     viewer: [],
-    editor: [CAP.PLAYBACK_CONTROL, CAP.DRAW, CAP.LASER, CAP.CHAT],
-    "co-host": [CAP.PLAYBACK_CONTROL, CAP.DRAW, CAP.LASER, CAP.MANAGE_ROOM, CAP.KICK, CAP.PUBLISH_MANIFEST, CAP.INVITE, CAP.CHAT],
+    // P5-T03: an Editor can undo their own strokes and a Co-host can also
+    // clear the canvas (architecture 14.7). UNDO_ANY is not part of any
+    // preset; it needs the per-user capability editor.
+    editor: [CAP.PLAYBACK_CONTROL, CAP.DRAW, CAP.LASER, CAP.CHAT, CAP.UNDO_OWN],
+    "co-host": [CAP.PLAYBACK_CONTROL, CAP.DRAW, CAP.LASER, CAP.MANAGE_ROOM, CAP.KICK, CAP.PUBLISH_MANIFEST, CAP.INVITE, CAP.CHAT, CAP.UNDO_OWN, CAP.CLEAR_ALL],
 };
 
 function presetToCaps(preset: Preset): number {

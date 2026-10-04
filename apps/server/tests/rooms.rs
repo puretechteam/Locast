@@ -24,7 +24,7 @@ use locast_protocol::envelope::Sender;
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
     cap, PermissionSetPayload, PlaybackAcceptedEvent, PlaybackAction, PlaybackCommandPayload,
-    StrokeBeginPayload, StrokeEndPayload, StrokePointPayload, StrokeTool,
+    StrokeBeginPayload, StrokeEndPayload, StrokePointPayload, StrokeTool, StrokeUndoPayload,
 };
 use locast_protocol::room::{
     HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
@@ -2564,4 +2564,877 @@ async fn manifest_must_be_signed_by_the_authenticated_host() {
         1
     );
     drop(harness);
+}
+
+// ---------------------------------------------------------------------------
+// P5-T03: DRAW_UNDO / DRAW_CLEAR over the real WebSocket path.
+// ---------------------------------------------------------------------------
+
+fn draw_undo_envelope(token: [u8; 32], room_id: Uuid, stroke_id: Uuid) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::StrokeUndo,
+        room_id,
+        serde_json::to_value(StrokeUndoPayload { stroke_id }).unwrap(),
+    )
+}
+
+fn draw_clear_envelope(token: [u8; 32], room_id: Uuid) -> Envelope {
+    room_scoped_envelope(token, MessageKind::StrokeClear, room_id, json!({}))
+}
+
+fn draw_end_envelope(token: [u8; 32], room_id: Uuid, stroke_id: Uuid) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::StrokeEnd,
+        room_id,
+        serde_json::to_value(StrokeEndPayload {
+            stroke_id,
+            ts_ms: 9,
+        })
+        .unwrap(),
+    )
+}
+
+fn draw_point_envelope(token: [u8; 32], room_id: Uuid, stroke_id: Uuid) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::StrokePoint,
+        room_id,
+        serde_json::to_value(StrokePointPayload {
+            stroke_id,
+            x: 0.4,
+            y: 0.4,
+            pressure: 0.5,
+            ts_ms: 5,
+        })
+        .unwrap(),
+    )
+}
+
+/// Three participants with the `playback_room` shape plus the sockets
+/// and identities the undo / clear tests need.
+struct DrawRoom {
+    harness: TestHarness,
+    room_id: Uuid,
+    ws_a: Ws,
+    ws_b: Ws,
+    ws_c: Ws,
+    a: AuthedClient,
+    b: AuthedClient,
+    c: AuthedClient,
+    kp_a: SigningKey,
+    kp_b: SigningKey,
+    kp_c: SigningKey,
+}
+
+async fn draw_room() -> DrawRoom {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+    DrawRoom {
+        harness,
+        room_id,
+        ws_a,
+        ws_b,
+        ws_c,
+        a,
+        b,
+        c,
+        kp_a,
+        kp_b,
+        kp_c,
+    }
+}
+
+/// The host sets `target`'s capability bits to exactly `add` on top of
+/// the default (a PERMISSION_SET add) and waits until `target_ws`
+/// has seen the resulting CAPABILITY_UPDATE.
+async fn grant(
+    host_ws: &mut Ws,
+    host: &AuthedClient,
+    room_id: Uuid,
+    target_ws: &mut Ws,
+    target: &AuthedClient,
+    add: u32,
+) {
+    send_envelope(
+        host_ws,
+        &permission_envelope(host.token, room_id, target.user_id, add),
+    )
+    .await;
+    loop {
+        let env = next_of_kind(target_ws, MessageKind::CapabilityUpdate, "grant seen").await;
+        let bits = env.payload["cap_set"].as_u64().expect("cap_set") as u32;
+        if env.payload["target_user_id"] == json!(target.user_id) && bits & add == add {
+            return;
+        }
+    }
+}
+
+/// Drain the drawing frames of one stroke (BEGIN, END) from a receiver.
+async fn expect_stroke(ws: &mut Ws, stroke: Uuid, owner: Uuid, ctx: &str) {
+    for kind in [MessageKind::StrokeBegin, MessageKind::StrokeEnd] {
+        let env = next_of_kind(ws, kind.clone(), ctx).await;
+        assert_eq!(env.payload["stroke_id"], json!(stroke), "{ctx} {kind:?}");
+        assert_eq!(env.sender.as_ref().map(|s| s.user_id), Some(owner), "{ctx}");
+    }
+}
+
+/// Send BEGIN + END as `who` (who must hold DRAW).
+async fn commit_stroke(ws: &mut Ws, who: &AuthedClient, kp: &SigningKey, room_id: Uuid) -> Uuid {
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        ws,
+        &draw_begin_envelope(who.token, room_id, kp, who.user_id, stroke),
+    )
+    .await;
+    send_envelope(ws, &draw_end_envelope(who.token, room_id, stroke)).await;
+    stroke
+}
+
+/// No DRAW_UNDO / DRAW_CLEAR / ROOM_ERROR reaches `ws` within `window`.
+async fn assert_quiet(ws: &mut Ws, window: Duration, ctx: &str) {
+    for kind in [
+        MessageKind::StrokeUndo,
+        MessageKind::StrokeClear,
+        MessageKind::RoomError,
+    ] {
+        assert_no_kind_within(ws, kind, window, ctx).await;
+    }
+}
+
+fn assert_undo_frame(env: &Envelope, room_id: Uuid, stroke: Uuid, actor: Uuid, ctx: &str) {
+    assert_eq!(env.r#type, MessageKind::StrokeUndo, "{ctx}");
+    assert_eq!(env.room_id, Some(room_id), "{ctx}");
+    assert_eq!(
+        env.sender.as_ref().map(|s| s.user_id),
+        Some(actor),
+        "{ctx}: the sender is the authenticated actor"
+    );
+    assert_eq!(
+        env.payload,
+        json!({ "stroke_id": stroke }),
+        "{ctx}: payload is the stroke id only"
+    );
+}
+
+/// A: own undo. B (DRAW + UNDO_OWN) draws and undoes its own stroke;
+/// A, B (the actor) and C all receive the undo, in apply order, with B
+/// stamped as the actor; a duplicate undo is a silent no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn own_undo_reaches_every_participant_including_the_actor() {
+    let mut r = draw_room().await;
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::DRAW | cap::UNDO_OWN,
+    )
+    .await;
+
+    // BEGIN, END and UNDO sent back to back: every client sees them in
+    // exactly that order (no undo overtaking its stroke).
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        &mut r.ws_b,
+        &draw_begin_envelope(r.b.token, r.room_id, &r.kp_b, r.b.user_id, stroke),
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_b,
+        &draw_end_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    let t0 = std::time::Instant::now();
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_c, "C")] {
+        let seq = [
+            next_draw_any(ws, who).await,
+            next_draw_any(ws, who).await,
+            next_draw_any(ws, who).await,
+        ];
+        let kinds: Vec<_> = seq.iter().map(|e| e.r#type.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                MessageKind::StrokeBegin,
+                MessageKind::StrokeEnd,
+                MessageKind::StrokeUndo
+            ],
+            "{who}: apply order"
+        );
+        assert_undo_frame(&seq[2], r.room_id, stroke, r.b.user_id, who);
+        println!(
+            "DRAW_UNDO reached {who} {:.2} ms after the send",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(t0.elapsed() < Duration::from_millis(1000), "{who}: latency");
+    }
+    // The actor gets the authoritative event too (it removes its own
+    // stroke only when it arrives).
+    let echo = next_of_kind(&mut r.ws_b, MessageKind::StrokeUndo, "B echo").await;
+    assert_undo_frame(&echo, r.room_id, stroke, r.b.user_id, "B (actor)");
+    println!(
+        "DRAW_UNDO echoed to the actor {:.2} ms after the send",
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Duplicate / replayed undo: nothing happens, nobody is told, nobody
+    // is evicted (no ROOM_ERROR).
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    drop(r.harness);
+}
+
+/// The actor in the DRAW_UNDO frame is the authenticated connection:
+/// a spoofed envelope sender and spoofed payload identity fields are
+/// ignored, for undo and for clear.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_and_clear_actor_is_the_connection_not_a_claimed_identity() {
+    let mut r = draw_room().await;
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::DRAW | cap::UNDO_OWN | cap::CLEAR_ALL,
+    )
+    .await;
+    let stroke = commit_stroke(&mut r.ws_b, &r.b, &r.kp_b, r.room_id).await;
+    expect_stroke(&mut r.ws_a, stroke, r.b.user_id, "A").await;
+
+    let mut payload = serde_json::to_value(StrokeUndoPayload { stroke_id: stroke }).unwrap();
+    payload["user_id"] = json!(r.a.user_id);
+    payload["owner"] = json!(r.a.user_id);
+    payload["sender_id"] = json!(r.a.user_id);
+    let undo = with_claimed_sender(
+        room_scoped_envelope(r.b.token, MessageKind::StrokeUndo, r.room_id, payload),
+        r.a.user_id,
+        [7; 32],
+    );
+    send_envelope(&mut r.ws_b, &undo).await;
+    let seen = next_of_kind(&mut r.ws_a, MessageKind::StrokeUndo, "A").await;
+    assert_undo_frame(
+        &seen,
+        r.room_id,
+        stroke,
+        r.b.user_id,
+        "A sees B, not the claimed A",
+    );
+
+    let clear = with_claimed_sender(
+        room_scoped_envelope(
+            r.b.token,
+            MessageKind::StrokeClear,
+            r.room_id,
+            json!({ "user_id": r.a.user_id, "actor": r.a.user_id }),
+        ),
+        r.c.user_id,
+        [7; 32],
+    );
+    send_envelope(&mut r.ws_b, &clear).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeClear, who).await;
+        assert_eq!(env.room_id, Some(r.room_id), "{who}");
+        assert_eq!(
+            env.sender.as_ref().map(|s| s.user_id),
+            Some(r.b.user_id),
+            "{who}: the clear is attributed to the connection"
+        );
+        assert_eq!(env.payload, json!({}), "{who}: empty payload");
+    }
+    drop(r.harness);
+}
+
+/// B: undo-any. A draws; B (DRAW + UNDO_OWN only) is refused with room
+/// state unchanged and no ROOM_ERROR; after the host grants UNDO_ANY,
+/// B's undo of A's stroke reaches everyone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undoing_someone_elses_stroke_needs_undo_any() {
+    let mut r = draw_room().await;
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::DRAW | cap::UNDO_OWN,
+    )
+    .await;
+
+    // The host draws; B and C see it.
+    let stroke = commit_stroke(&mut r.ws_a, &r.a, &r.kp_a, r.room_id).await;
+    expect_stroke(&mut r.ws_b, stroke, r.a.user_id, "B").await;
+    expect_stroke(&mut r.ws_c, stroke, r.a.user_id, "C").await;
+
+    // B (undo_own only) and C (no undo bit at all) are refused silently.
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_c,
+        &draw_undo_envelope(r.c.token, r.room_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+
+    // Grant UNDO_ANY: the very same stroke is still there to undo, so
+    // the refusals changed nothing.
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::UNDO_ANY,
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, stroke, r.b.user_id, who);
+    }
+    drop(r.harness);
+}
+
+/// C: ownership. Two editors with UNDO_OWN each undo only their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn undo_own_cannot_undo_another_users_stroke() {
+    let mut r = draw_room().await;
+    for (ws, who) in [(&mut r.ws_b, &r.b), (&mut r.ws_c, &r.c)] {
+        grant(
+            &mut r.ws_a,
+            &r.a,
+            r.room_id,
+            ws,
+            who,
+            cap::DRAW | cap::UNDO_OWN,
+        )
+        .await;
+    }
+    let sb = commit_stroke(&mut r.ws_b, &r.b, &r.kp_b, r.room_id).await;
+    expect_stroke(&mut r.ws_a, sb, r.b.user_id, "A").await;
+    expect_stroke(&mut r.ws_c, sb, r.b.user_id, "C").await;
+    let sc = commit_stroke(&mut r.ws_c, &r.c, &r.kp_c, r.room_id).await;
+    expect_stroke(&mut r.ws_a, sc, r.c.user_id, "A").await;
+    expect_stroke(&mut r.ws_b, sc, r.c.user_id, "B").await;
+
+    // B tries to undo C's stroke: refused, nothing broadcast.
+    send_envelope(&mut r.ws_b, &draw_undo_envelope(r.b.token, r.room_id, sc)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    // C's stroke is intact: C can still undo it, and B can undo its own.
+    send_envelope(&mut r.ws_c, &draw_undo_envelope(r.c.token, r.room_id, sc)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, sc, r.c.user_id, who);
+    }
+    send_envelope(&mut r.ws_b, &draw_undo_envelope(r.b.token, r.room_id, sb)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, sb, r.b.user_id, who);
+    }
+    drop(r.harness);
+}
+
+/// D: unknown ids, in-progress strokes and strokes of another room are
+/// safe no-ops that corrupt nothing and send no ROOM_ERROR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_in_progress_and_other_room_strokes_cannot_be_undone() {
+    let mut r = draw_room().await;
+
+    // A second, unrelated room hosted by X, with a committed stroke.
+    let (kp_x, _) = fresh_keypair();
+    let mut ws_x = connect(r.harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    send_envelope(&mut ws_x, &room_create_envelope(x.token, "Other", false)).await;
+    let other_room = serde_json::from_value::<RoomCreatedPayload>(
+        next_of_kind(&mut ws_x, MessageKind::RoomCreated, "X create")
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room
+    .id;
+    assert_ne!(other_room, r.room_id);
+    let other_stroke = commit_stroke(&mut ws_x, &x, &kp_x, other_room).await;
+
+    // The host of THIS room (holds undo_any here) cannot reach it, by
+    // naming either room.
+    send_envelope(
+        &mut r.ws_a,
+        &draw_undo_envelope(r.a.token, r.room_id, other_stroke),
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_a,
+        &draw_undo_envelope(r.a.token, other_room, other_stroke),
+    )
+    .await;
+    // A stroke id nobody ever drew.
+    send_envelope(
+        &mut r.ws_a,
+        &draw_undo_envelope(r.a.token, r.room_id, Uuid::now_v7()),
+    )
+    .await;
+    // A stroke still being drawn (BEGIN without END).
+    let open = Uuid::now_v7();
+    send_envelope(
+        &mut r.ws_b,
+        &draw_begin_envelope(r.b.token, r.room_id, &r.kp_b, r.b.user_id, open),
+    )
+    .await;
+    // B has no DRAW yet: refused with a ROOM_ERROR as before. Grant, retry.
+    expect_room_error(&mut r.ws_b, RoomErrorCode::NotHost, "B drew without DRAW").await;
+    grant(&mut r.ws_a, &r.a, r.room_id, &mut r.ws_b, &r.b, cap::DRAW).await;
+    send_envelope(
+        &mut r.ws_b,
+        &draw_begin_envelope(r.b.token, r.room_id, &r.kp_b, r.b.user_id, open),
+    )
+    .await;
+    next_of_kind(
+        &mut r.ws_a,
+        MessageKind::StrokeBegin,
+        "A sees the open stroke",
+    )
+    .await;
+    send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, open)).await;
+
+    for (ws, who) in [
+        (&mut r.ws_a, "A"),
+        (&mut r.ws_b, "B"),
+        (&mut r.ws_c, "C"),
+        (&mut ws_x, "X"),
+    ] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+
+    // Nothing was corrupted: X's stroke is still undoable in its own
+    // room, and the open stroke can still be ended and then undone.
+    send_envelope(
+        &mut ws_x,
+        &draw_undo_envelope(x.token, other_room, other_stroke),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_x, MessageKind::StrokeUndo, "X own undo").await;
+    assert_undo_frame(&env, other_room, other_stroke, x.user_id, "X");
+    send_envelope(&mut r.ws_b, &draw_end_envelope(r.b.token, r.room_id, open)).await;
+    next_of_kind(&mut r.ws_a, MessageKind::StrokeEnd, "A sees the end").await;
+    send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, open)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, open, r.a.user_id, who);
+    }
+    drop(r.harness);
+}
+
+/// E + F: clear_all. Several users, several strokes; an unauthorized
+/// clear changes nothing; an authorized one wipes the room for everyone
+/// and a later undo of a cleared stroke is a harmless no-op.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_all_wipes_the_canvas_for_everyone_and_needs_clear_all() {
+    let mut r = draw_room().await;
+    for (ws, who) in [(&mut r.ws_b, &r.b), (&mut r.ws_c, &r.c)] {
+        grant(
+            &mut r.ws_a,
+            &r.a,
+            r.room_id,
+            ws,
+            who,
+            cap::DRAW | cap::UNDO_OWN,
+        )
+        .await;
+    }
+    // Strokes are drawn one after the other and drained by the others,
+    // so the frames each client sees have one defined order.
+    let s1 = commit_stroke(&mut r.ws_a, &r.a, &r.kp_a, r.room_id).await;
+    expect_stroke(&mut r.ws_b, s1, r.a.user_id, "B").await;
+    expect_stroke(&mut r.ws_c, s1, r.a.user_id, "C").await;
+    let s2 = commit_stroke(&mut r.ws_b, &r.b, &r.kp_b, r.room_id).await;
+    expect_stroke(&mut r.ws_a, s2, r.b.user_id, "A").await;
+    expect_stroke(&mut r.ws_c, s2, r.b.user_id, "C").await;
+    let s3 = commit_stroke(&mut r.ws_c, &r.c, &r.kp_c, r.room_id).await;
+    expect_stroke(&mut r.ws_a, s3, r.c.user_id, "A").await;
+    expect_stroke(&mut r.ws_b, s3, r.c.user_id, "B").await;
+
+    // B and C hold no clear_all: refused, state intact.
+    send_envelope(&mut r.ws_b, &draw_clear_envelope(r.b.token, r.room_id)).await;
+    send_envelope(&mut r.ws_c, &draw_clear_envelope(r.c.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    // ... intact: the host can still undo one of the strokes.
+    send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, s2)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, s2, r.a.user_id, who);
+    }
+
+    // Grant clear_all to B; B clears.
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::CLEAR_ALL,
+    )
+    .await;
+    let t0 = std::time::Instant::now();
+    send_envelope(&mut r.ws_b, &draw_clear_envelope(r.b.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeClear, who).await;
+        assert_eq!(env.room_id, Some(r.room_id), "{who}");
+        assert_eq!(
+            env.sender.as_ref().map(|s| s.user_id),
+            Some(r.b.user_id),
+            "{who}"
+        );
+        println!(
+            "DRAW_CLEAR reached {who} {:.2} ms after the send",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        assert!(t0.elapsed() < Duration::from_millis(1000), "{who}: latency");
+    }
+
+    // The cleared strokes are gone from the server: undo is a no-op for
+    // all of them (even for the host, who holds every bit).
+    for s in [s1, s2, s3] {
+        send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, s)).await;
+    }
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    // A fresh stroke after the clear works normally.
+    let fresh = commit_stroke(&mut r.ws_a, &r.a, &r.kp_a, r.room_id).await;
+    expect_stroke(&mut r.ws_c, fresh, r.a.user_id, "C").await;
+    send_envelope(
+        &mut r.ws_a,
+        &draw_undo_envelope(r.a.token, r.room_id, fresh),
+    )
+    .await;
+    let env = next_of_kind(&mut r.ws_c, MessageKind::StrokeUndo, "C").await;
+    assert_undo_frame(&env, r.room_id, fresh, r.a.user_id, "C");
+    drop(r.harness);
+}
+
+/// A stroke still being drawn when the clear lands does not reappear:
+/// its remaining POINT / END are accepted without an error and are not
+/// rebroadcast, and it cannot be undone afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stroke_in_progress_during_clear_does_not_reappear() {
+    let mut r = draw_room().await;
+    grant(&mut r.ws_a, &r.a, r.room_id, &mut r.ws_c, &r.c, cap::DRAW).await;
+    let open = Uuid::now_v7();
+    send_envelope(
+        &mut r.ws_c,
+        &draw_begin_envelope(r.c.token, r.room_id, &r.kp_c, r.c.user_id, open),
+    )
+    .await;
+    next_of_kind(&mut r.ws_b, MessageKind::StrokeBegin, "B sees the begin").await;
+
+    send_envelope(&mut r.ws_a, &draw_clear_envelope(r.a.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        next_of_kind(ws, MessageKind::StrokeClear, who).await;
+    }
+
+    // C keeps drawing and lifts the pen.
+    send_envelope(
+        &mut r.ws_c,
+        &draw_point_envelope(r.c.token, r.room_id, open),
+    )
+    .await;
+    send_envelope(&mut r.ws_c, &draw_end_envelope(r.c.token, r.room_id, open)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B")] {
+        assert_no_kind_within(
+            ws,
+            MessageKind::StrokePoint,
+            Duration::from_millis(300),
+            who,
+        )
+        .await;
+        assert_no_kind_within(ws, MessageKind::StrokeEnd, Duration::from_millis(100), who).await;
+    }
+    // C got no error (a ROOM_ERROR would evict its client) ...
+    assert_no_kind_within(
+        &mut r.ws_c,
+        MessageKind::RoomError,
+        Duration::from_millis(300),
+        "C",
+    )
+    .await;
+    // ... and the cleared stroke is not undoable.
+    send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, open)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    drop(r.harness);
+}
+
+/// Undo / clear are room-scoped: the host of another room (every
+/// capability THERE) cannot clear or undo in a room it is not in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_from_a_non_member_of_the_room_does_nothing() {
+    let mut r = draw_room().await;
+    let (kp_x, _) = fresh_keypair();
+    let mut ws_x = connect(r.harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    // X hosts its own room (holds clear_all THERE), but is not in A's.
+    send_envelope(&mut ws_x, &room_create_envelope(x.token, "X", false)).await;
+    next_of_kind(&mut ws_x, MessageKind::RoomCreated, "X create").await;
+    let s = commit_stroke(&mut r.ws_a, &r.a, &r.kp_a, r.room_id).await;
+    expect_stroke(&mut r.ws_b, s, r.a.user_id, "B").await;
+
+    send_envelope(&mut ws_x, &draw_clear_envelope(x.token, r.room_id)).await;
+    send_envelope(&mut ws_x, &draw_undo_envelope(x.token, r.room_id, s)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    // The stroke survived: the host can undo it.
+    send_envelope(&mut r.ws_a, &draw_undo_envelope(r.a.token, r.room_id, s)).await;
+    let env = next_of_kind(&mut r.ws_b, MessageKind::StrokeUndo, "B").await;
+    assert_undo_frame(&env, r.room_id, s, r.a.user_id, "B");
+    drop(r.harness);
+}
+
+/// A revoked UNDO_OWN stops the next undo (revokes take effect
+/// immediately; the server re-checks under the room lock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_undo_own_stops_the_next_undo() {
+    let mut r = draw_room().await;
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::DRAW | cap::UNDO_OWN,
+    )
+    .await;
+    let stroke = commit_stroke(&mut r.ws_b, &r.b, &r.kp_b, r.room_id).await;
+    expect_stroke(&mut r.ws_a, stroke, r.b.user_id, "A").await;
+    send_envelope(
+        &mut r.ws_a,
+        &room_scoped_envelope(
+            r.a.token,
+            MessageKind::PermissionSet,
+            r.room_id,
+            serde_json::to_value(PermissionSetPayload {
+                target_user_id: r.b.user_id,
+                add_cap_set: 0,
+                remove_cap_set: cap::UNDO_OWN,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+    loop {
+        let env = next_of_kind(&mut r.ws_b, MessageKind::CapabilityUpdate, "B revoke").await;
+        if env.payload["cap_set"].as_u64().unwrap() as u32 & cap::UNDO_OWN == 0 {
+            break;
+        }
+    }
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+    drop(r.harness);
+}
+
+/// Read until the next DRAW_* frame (including undo / clear) arrives.
+async fn next_draw_any(ws: &mut Ws, ctx: &str) -> Envelope {
+    loop {
+        let bytes = tokio::time::timeout(Duration::from_secs(10), read_binary(ws))
+            .await
+            .unwrap_or_else(|_| panic!("{ctx}: no drawing frame within 10 s"))
+            .unwrap_or_else(|| panic!("{ctx}: connection closed waiting for a drawing frame"));
+        let env = decode(&bytes);
+        if env.r#type.is_drawing() {
+            return env;
+        }
+    }
+}
+
+/// Cap bits of `user` as the server holds them.
+async fn server_caps(r: &DrawRoom, user: Uuid) -> u32 {
+    let handle = r.harness.rooms.get_by_id(r.room_id).await.expect("room");
+    let state = handle.read().await;
+    state
+        .participants
+        .iter()
+        .find(|p| p.user_id == user)
+        .expect("participant")
+        .cap_set
+}
+
+/// PERMISSION_SET is host-only: nobody else can give themselves or
+/// anyone else UNDO_ANY / CLEAR_ALL, whatever else they hold (viewer,
+/// editor, or a co-host-style bundle without those bits). The refusals
+/// change nothing, so undo / clear from them still do nothing, and the
+/// strokes are still there for the host to undo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nobody_but_the_host_can_grant_undo_any_or_clear_all() {
+    let mut r = draw_room().await;
+    let escalation = cap::UNDO_ANY | cap::CLEAR_ALL;
+    let stroke = commit_stroke(&mut r.ws_a, &r.a, &r.kp_a, r.room_id).await;
+    expect_stroke(&mut r.ws_b, stroke, r.a.user_id, "B").await;
+    expect_stroke(&mut r.ws_c, stroke, r.a.user_id, "C").await;
+    let b_before = server_caps(&r, r.b.user_id).await;
+    let c_before = server_caps(&r, r.c.user_id).await;
+
+    // Attempts by a plain viewer (C) and then by an editor (B), aimed at
+    // themselves and at each other, including a "replace everything"
+    // remove mask.
+    let attempts = |token: [u8; 32], targets: [Uuid; 2]| {
+        let mut v = Vec::new();
+        for t in targets {
+            v.push(permission_envelope(token, r.room_id, t, escalation));
+            v.push(room_scoped_envelope(
+                token,
+                MessageKind::PermissionSet,
+                r.room_id,
+                serde_json::to_value(PermissionSetPayload {
+                    target_user_id: t,
+                    add_cap_set: cap::UNDO_ANY,
+                    remove_cap_set: u32::MAX,
+                })
+                .unwrap(),
+            ));
+        }
+        v
+    };
+    for env in attempts(r.c.token, [r.c.user_id, r.b.user_id]) {
+        send_envelope(&mut r.ws_c, &env).await;
+        expect_room_error(&mut r.ws_c, RoomErrorCode::NotHost, "viewer PERMISSION_SET").await;
+    }
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_b,
+        &r.b,
+        cap::DRAW | cap::UNDO_OWN,
+    )
+    .await;
+    let b_before = b_before | cap::DRAW | cap::UNDO_OWN;
+    for env in attempts(r.b.token, [r.b.user_id, r.c.user_id]) {
+        send_envelope(&mut r.ws_b, &env).await;
+        expect_room_error(&mut r.ws_b, RoomErrorCode::NotHost, "editor PERMISSION_SET").await;
+    }
+
+    // A co-host-style bundle (everything except the two bits in question)
+    // does not make PERMISSION_SET available either.
+    let cohost_without = cap::PLAYBACK_CONTROL
+        | cap::DRAW
+        | cap::LASER
+        | cap::MANAGE_ROOM
+        | cap::KICK
+        | cap::PUBLISH_MANIFEST
+        | cap::INVITE
+        | cap::CHAT
+        | cap::UNDO_OWN;
+    grant(
+        &mut r.ws_a,
+        &r.a,
+        r.room_id,
+        &mut r.ws_c,
+        &r.c,
+        cohost_without,
+    )
+    .await;
+    let c_before = c_before | cohost_without;
+    for env in attempts(r.c.token, [r.c.user_id, r.b.user_id]) {
+        send_envelope(&mut r.ws_c, &env).await;
+        expect_room_error(
+            &mut r.ws_c,
+            RoomErrorCode::NotHost,
+            "co-host PERMISSION_SET",
+        )
+        .await;
+    }
+
+    // Nothing changed on the server and nobody was told of a change.
+    assert_eq!(server_caps(&r, r.b.user_id).await, b_before, "B's caps");
+    assert_eq!(server_caps(&r, r.c.user_id).await, c_before, "C's caps");
+    for user in [r.b.user_id, r.c.user_id] {
+        assert_eq!(server_caps(&r, user).await & escalation, 0, "no escalation");
+    }
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        loop {
+            // Drain the legitimate grants; any update carrying the
+            // escalation bits is a failure.
+            let bytes = tokio::time::timeout(Duration::from_millis(300), read_binary(ws)).await;
+            let Ok(Some(bytes)) = bytes else { break };
+            let env = decode(&bytes);
+            if env.r#type == MessageKind::CapabilityUpdate {
+                let bits = env.payload["cap_set"].as_u64().unwrap() as u32;
+                assert_eq!(bits & escalation, 0, "{who}: escalated CAPABILITY_UPDATE");
+            }
+        }
+    }
+
+    // The users still cannot undo someone else's stroke or clear.
+    send_envelope(
+        &mut r.ws_b,
+        &draw_undo_envelope(r.b.token, r.room_id, stroke),
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_c,
+        &draw_undo_envelope(r.c.token, r.room_id, stroke),
+    )
+    .await;
+    send_envelope(&mut r.ws_b, &draw_clear_envelope(r.b.token, r.room_id)).await;
+    send_envelope(&mut r.ws_c, &draw_clear_envelope(r.c.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        assert_quiet(ws, Duration::from_millis(300), who).await;
+    }
+
+    // State intact: the host can still undo the stroke.
+    send_envelope(
+        &mut r.ws_a,
+        &draw_undo_envelope(r.a.token, r.room_id, stroke),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::StrokeUndo, who).await;
+        assert_undo_frame(&env, r.room_id, stroke, r.a.user_id, who);
+    }
+    drop(r.harness);
 }

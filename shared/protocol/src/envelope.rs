@@ -213,6 +213,18 @@ pub enum MessageKind {
     // here; future tasks handle them).
     #[serde(rename = "DRAW_END")]
     StrokeEnd,
+    // ----- P5-T03: undo / clear -----
+    // DRAW_UNDO removes one committed stroke (payload: the
+    // stroke id only). Own strokes need `cap::UNDO_OWN`, other
+    // participants' strokes `cap::UNDO_ANY`. The server
+    // rebroadcasts it to every participant, the actor included,
+    // with the authenticated actor as `Envelope::sender`.
+    #[serde(rename = "DRAW_UNDO")]
+    StrokeUndo,
+    // DRAW_CLEAR wipes every stroke in the room (empty payload;
+    // needs `cap::CLEAR_ALL`). Rebroadcast like DRAW_UNDO.
+    #[serde(rename = "DRAW_CLEAR")]
+    StrokeClear,
     // ----- P4-T06: NTP-style clock skew measurement -----
     // SKEW_PROBE / SKEW_REPLY is the per-connection clock
     // measurement exchange (architecture §13.3). The probe
@@ -268,6 +280,8 @@ impl MessageKind {
             MessageKind::StrokeBegin => "DRAW_BEGIN",
             MessageKind::StrokePoint => "DRAW_POINT",
             MessageKind::StrokeEnd => "DRAW_END",
+            MessageKind::StrokeUndo => "DRAW_UNDO",
+            MessageKind::StrokeClear => "DRAW_CLEAR",
             MessageKind::SkewProbe => "SKEW_PROBE",
             MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::PermissionSet => "PERMISSION_SET",
@@ -347,14 +361,19 @@ impl MessageKind {
     }
 
     /// `true` for any of the P5-T02 drawing envelope kinds
-    /// (DRAW_BEGIN / DRAW_POINT / DRAW_END). Routed through
+    /// (DRAW_BEGIN / DRAW_POINT / DRAW_END, plus the P5-T03
+    /// DRAW_UNDO / DRAW_CLEAR). Routed through
     /// the same WS-layer bearer check + per-room dispatch
     /// path as POSITION_REPORT; the per-type handler then
     /// performs the per-stroke signature / binding checks.
     pub fn is_drawing(&self) -> bool {
         matches!(
             self,
-            MessageKind::StrokeBegin | MessageKind::StrokePoint | MessageKind::StrokeEnd
+            MessageKind::StrokeBegin
+                | MessageKind::StrokePoint
+                | MessageKind::StrokeEnd
+                | MessageKind::StrokeUndo
+                | MessageKind::StrokeClear
         )
     }
 
@@ -428,6 +447,21 @@ mod tests {
         let s = r#"{"v":1,"type":"FOOBAR","id":"00000000-0000-0000-0000-000000000000","room_id":null,"sender":null,"ts_ms":1,"seq":1,"payload":{}}"#;
         let env: Envelope = serde_json::from_str(s).expect("decode unknown");
         assert!(matches!(env.r#type, MessageKind::Other(ref t) if t == "FOOBAR"));
+    }
+
+    #[test]
+    fn undo_and_clear_are_drawing_kinds_with_stable_wire_names() {
+        for (kind, wire) in [
+            (MessageKind::StrokeUndo, "DRAW_UNDO"),
+            (MessageKind::StrokeClear, "DRAW_CLEAR"),
+        ] {
+            assert!(kind.is_drawing(), "{wire} routes as a drawing message");
+            assert_eq!(kind.as_str(), wire);
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: MessageKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind);
+        }
     }
 
     #[test]

@@ -36,6 +36,7 @@ import type { RefObject } from "react";
 import type { Stroke, StrokePoint, StrokeTool } from "../drawing/types";
 import { newStrokeId, newStroke } from "../drawing/types";
 import { renderStrokes } from "../drawing/strokeRenderer";
+import type { UndoCandidate } from "../drawing/undoPolicy";
 import type { RemoteStroke } from "../stores/useDrawingStore";
 
 /** Configuration for the default pen style. The
@@ -64,6 +65,12 @@ export interface DrawingCanvasHandle {
     endStroke: (endedAt?: number) => void;
     clear: () => void;
     undo: () => void;
+    /** P5-T03: drop one local stroke by id (the server confirmed its
+     *  undo). A no-op if this client does not hold it. */
+    removeStroke: (strokeId: string) => void;
+    /** P5-T03: the local strokes, oldest first, read synchronously
+     *  (not subject to render batching). */
+    getLocalStrokes: () => readonly UndoCandidate[];
     setStrokeStyle: (style: { color?: string; width?: number; tool?: StrokeTool }) => void;
     getActiveStroke: () => Stroke | null;
 }
@@ -322,6 +329,17 @@ export function useDrawingCanvas(
         setStrokes(strokesRef.current);
     }, []);
 
+    const removeStroke = useCallback((strokeId: string): void => {
+        if (!strokesRef.current.some((s) => s.id === strokeId)) return;
+        if (activeRef.current?.id === strokeId) activeRef.current = null;
+        strokesRef.current = strokesRef.current.filter((s) => s.id !== strokeId);
+        setStrokes(strokesRef.current);
+    }, []);
+
+    const getLocalStrokes = useCallback((): readonly UndoCandidate[] => {
+        return strokesRef.current;
+    }, []);
+
     const setStrokeStyle = useCallback(
         (next: { color?: string; width?: number; tool?: StrokeTool }): void => {
             if (next.color !== undefined) {
@@ -386,6 +404,7 @@ export function useDrawingCanvas(
             endStroke: (endedAt?: number) => endStroke(endedAt),
             clear: () => clear(),
             undo: () => undo(),
+            removeStroke: (strokeId: string) => removeStroke(strokeId),
             setStrokeStyle: (next: { color?: string; width?: number; tool?: StrokeTool }) =>
                 setStrokeStyle(next),
         };
@@ -400,6 +419,7 @@ export function useDrawingCanvas(
         endStroke,
         clear,
         undo,
+        removeStroke,
         setStrokeStyle,
     ]);
 
@@ -411,6 +431,8 @@ export function useDrawingCanvas(
         endStroke,
         clear,
         undo,
+        removeStroke,
+        getLocalStrokes,
         setStrokeStyle,
         getActiveStroke,
     };

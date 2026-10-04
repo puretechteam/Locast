@@ -1,5 +1,8 @@
 //! P5-T02: Tauri command for the DRAW_BEGIN / DRAW_POINT /
-//! DRAW_END wire protocol.
+//! DRAW_END wire protocol. P5-T03 adds the `undo` and `clear`
+//! actions (DRAW_UNDO / DRAW_CLEAR) to the same command so they
+//! travel through the same single ordered send queue as the stroke
+//! they follow.
 //!
 //! Mirrors `apps/client/src-tauri/src/commands/playback.rs`
 //! (P4-T02). The React layer's `services/drawing.ts` calls
@@ -79,12 +82,22 @@ pub enum DrawingSendInput {
         ts_ms: i64,
         client_seq: u64,
     },
+    /// P5-T03: ask the server to remove one committed stroke. Only the
+    /// stroke id travels; the server looks up the owner and checks
+    /// `undo_own` / `undo_any` itself. The stroke leaves the local
+    /// canvas when the server's DRAW_UNDO event comes back.
+    Undo { stroke_id: String },
+    /// P5-T03: ask the server to wipe every stroke in the room
+    /// (needs `clear_all`). The canvas clears when the server's
+    /// DRAW_CLEAR event comes back.
+    Clear {},
 }
 
 #[derive(Debug, Clone, Serialize, Type)]
 pub struct DrawingSendResult {
     pub envelope_id: String,
-    pub stroke_id: String,
+    /// The stroke the envelope concerns; `None` for `Clear`.
+    pub stroke_id: Option<String>,
 }
 
 fn err<S: Into<String>>(s: S) -> AppError {
@@ -129,6 +142,9 @@ fn unit_ok(n: f32) -> bool {
 ///   `width` finite and `> 0`.
 /// - POINT: `x`, `y`, `pressure` finite and in `[0, 1]`.
 /// - END: nothing beyond the stroke id.
+/// - UNDO: the stroke id. CLEAR: nothing. (The server never answers
+///   a refused undo / clear with ROOM_ERROR, but the id must still be
+///   canonical so it matches the one the local store holds.)
 ///
 /// Also checks the stroke id, the tool name and the colour cap.
 pub fn validate_input(input: &DrawingSendInput) -> Result<(), AppError> {
@@ -170,9 +186,10 @@ pub fn validate_input(input: &DrawingSendInput) -> Result<(), AppError> {
                 return Err(err("point coordinates and pressure must be within [0, 1]"));
             }
         }
-        DrawingSendInput::End { stroke_id, .. } => {
+        DrawingSendInput::End { stroke_id, .. } | DrawingSendInput::Undo { stroke_id } => {
             parse_stroke_id(stroke_id)?;
         }
+        DrawingSendInput::Clear {} => {}
     }
     Ok(())
 }
@@ -242,6 +259,18 @@ pub async fn send_drawing(
         uuid::Uuid::parse_str(&summary.id).map_err(|e| err(format!("bad cached room id: {e}")))?;
 
     let (kind, stroke_id_str, ts_ms, client_seq) = match &input {
+        DrawingSendInput::Undo { stroke_id } => (
+            locast_protocol::envelope::MessageKind::StrokeUndo,
+            Some(stroke_id.clone()),
+            now_ms(),
+            0,
+        ),
+        DrawingSendInput::Clear {} => (
+            locast_protocol::envelope::MessageKind::StrokeClear,
+            None,
+            now_ms(),
+            0,
+        ),
         DrawingSendInput::Begin {
             stroke_id,
             ts_ms,
@@ -249,7 +278,7 @@ pub async fn send_drawing(
             ..
         } => (
             locast_protocol::envelope::MessageKind::StrokeBegin,
-            stroke_id.clone(),
+            Some(stroke_id.clone()),
             *ts_ms,
             *client_seq,
         ),
@@ -260,7 +289,7 @@ pub async fn send_drawing(
             ..
         } => (
             locast_protocol::envelope::MessageKind::StrokePoint,
-            stroke_id.clone(),
+            Some(stroke_id.clone()),
             *ts_ms,
             *client_seq,
         ),
@@ -270,12 +299,12 @@ pub async fn send_drawing(
             client_seq,
         } => (
             locast_protocol::envelope::MessageKind::StrokeEnd,
-            stroke_id.clone(),
+            Some(stroke_id.clone()),
             *ts_ms,
             *client_seq,
         ),
     };
-    let stroke_id = parse_stroke_id(&stroke_id_str)?;
+    let stroke_id = stroke_id_str.as_deref().map(parse_stroke_id).transpose()?;
 
     // Build the typed payload + (for Begin) the signed
     // sender.
@@ -308,7 +337,7 @@ pub async fn send_drawing(
                 .await
                 .ok_or_else(|| err("no server-assigned user id (not in a room)"))?;
             let begin_payload = locast_protocol::room::StrokeBeginPayload {
-                stroke_id,
+                stroke_id: stroke_id.ok_or_else(|| err("missing stroke id"))?,
                 tool,
                 color: color.clone(),
                 width: *width,
@@ -335,7 +364,7 @@ pub async fn send_drawing(
         }
         DrawingSendInput::Point { x, y, pressure, .. } => {
             let point_payload = locast_protocol::room::StrokePointPayload {
-                stroke_id,
+                stroke_id: stroke_id.ok_or_else(|| err("missing stroke id"))?,
                 x: *x,
                 y: *y,
                 pressure: *pressure,
@@ -348,13 +377,31 @@ pub async fn send_drawing(
             )
         }
         DrawingSendInput::End { .. } => {
-            let end_payload = locast_protocol::room::StrokeEndPayload { stroke_id, ts_ms };
+            let end_payload = locast_protocol::room::StrokeEndPayload {
+                stroke_id: stroke_id.ok_or_else(|| err("missing stroke id"))?,
+                ts_ms,
+            };
             (
                 serde_json::to_value(&end_payload)
                     .map_err(|e| err(format!("serialize end payload: {e}")))?,
                 None,
             )
         }
+        DrawingSendInput::Undo { .. } => {
+            let undo_payload = locast_protocol::room::StrokeUndoPayload {
+                stroke_id: stroke_id.ok_or_else(|| err("missing stroke id"))?,
+            };
+            (
+                serde_json::to_value(&undo_payload)
+                    .map_err(|e| err(format!("serialize undo payload: {e}")))?,
+                None,
+            )
+        }
+        DrawingSendInput::Clear {} => (
+            serde_json::to_value(locast_protocol::room::StrokeClearPayload {})
+                .map_err(|e| err(format!("serialize clear payload: {e}")))?,
+            None,
+        ),
     };
 
     let envelope_id = uuid::Uuid::now_v7();
@@ -376,6 +423,81 @@ pub async fn send_drawing(
 
     Ok(DrawingSendResult {
         envelope_id: env.id.to_string(),
-        stroke_id: stroke_id.to_string(),
+        stroke_id: stroke_id.map(|id| id.to_string()),
     })
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn canonical() -> String {
+        uuid::Uuid::now_v7().to_string()
+    }
+
+    #[test]
+    fn undo_requires_a_canonical_stroke_id() {
+        let good = canonical();
+        assert!(validate_input(&DrawingSendInput::Undo {
+            stroke_id: good.clone()
+        })
+        .is_ok());
+        for bad in [
+            String::new(),
+            "not-a-uuid".to_string(),
+            good.to_uppercase(),
+            good.replace('-', ""),
+            format!("{{{good}}}"),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        ] {
+            assert!(
+                validate_input(&DrawingSendInput::Undo {
+                    stroke_id: bad.clone()
+                })
+                .is_err(),
+                "undo with {bad:?} must be rejected before anything is sent"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_carries_nothing_to_validate() {
+        assert!(validate_input(&DrawingSendInput::Clear {}).is_ok());
+    }
+
+    #[test]
+    fn undo_and_clear_deserialize_from_the_typescript_shape() {
+        let id = canonical();
+        let undo: DrawingSendInput =
+            serde_json::from_value(serde_json::json!({ "action": "undo", "stroke_id": id }))
+                .expect("undo");
+        assert!(matches!(undo, DrawingSendInput::Undo { stroke_id } if stroke_id == id));
+        let clear: DrawingSendInput =
+            serde_json::from_value(serde_json::json!({ "action": "clear" })).expect("clear");
+        assert!(matches!(clear, DrawingSendInput::Clear {}));
+        // An undo without a stroke id is not an undo.
+        assert!(serde_json::from_value::<DrawingSendInput>(
+            serde_json::json!({ "action": "undo" })
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_result_reports_no_stroke_for_a_clear() {
+        let res = DrawingSendResult {
+            envelope_id: canonical(),
+            stroke_id: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&res).unwrap()["stroke_id"],
+            serde_json::Value::Null
+        );
+    }
 }

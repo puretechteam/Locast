@@ -163,6 +163,22 @@ pub enum RoomEvent {
         sender_id: Uuid,
         payload: locast_protocol::room::StrokeEndPayload,
     },
+    /// P5-T03: an accepted DRAW_UNDO. Broadcast to EVERY
+    /// participant, the actor included (no echo suppression):
+    /// the actor removes the stroke from its own canvas only
+    /// when it receives this authoritative event, so a refused
+    /// undo can never leave the actor's screen diverged.
+    /// `actor_id` is the authenticated connection's user id; it
+    /// travels as `Envelope::sender`, never in the payload.
+    StrokeUndo {
+        room_id: Uuid,
+        actor_id: Uuid,
+        payload: locast_protocol::room::StrokeUndoPayload,
+    },
+    /// P5-T03: an accepted DRAW_CLEAR. Broadcast to every
+    /// participant, the actor included, with `actor_id` as
+    /// `Envelope::sender`.
+    StrokeClear { room_id: Uuid, actor_id: Uuid },
     /// P6-T02: the host has granted or revoked capabilities
     /// for a participant. Broadcast to all room participants.
     CapabilityUpdated(CapabilityUpdated),
@@ -413,6 +429,9 @@ impl RoomRegistry {
                 RoomEvent::StrokeBegin { sender_id, .. } => Some(*sender_id),
                 RoomEvent::StrokePoint { sender_id, .. } => Some(*sender_id),
                 RoomEvent::StrokeEnd { sender_id, .. } => Some(*sender_id),
+                // P5-T03: undo / clear reach everyone, the actor
+                // included (see `RoomEvent::StrokeUndo`).
+                RoomEvent::StrokeUndo { .. } | RoomEvent::StrokeClear { .. } => None,
                 // P6-T02: capability update is server-broadcast
                 // from the host's PERMISSION_SET. The host SHOULD
                 // receive the update so it can confirm the change.
@@ -432,6 +451,8 @@ impl RoomRegistry {
                 RoomEvent::StrokeBegin { room_id, .. } => *room_id,
                 RoomEvent::StrokePoint { room_id, .. } => *room_id,
                 RoomEvent::StrokeEnd { room_id, .. } => *room_id,
+                RoomEvent::StrokeUndo { room_id, .. } => *room_id,
+                RoomEvent::StrokeClear { room_id, .. } => *room_id,
                 RoomEvent::ChatMessage(ChatMessage { room_id, .. }) => *room_id,
                 _ => room_id_for_event(event),
             };
@@ -733,7 +754,10 @@ impl RoomRegistry {
             | cap::KICK
             | cap::PUBLISH_MANIFEST
             | cap::INVITE
-            | cap::CHAT;
+            | cap::CHAT
+            | cap::UNDO_OWN
+            | cap::UNDO_ANY
+            | cap::CLEAR_ALL;
         // Persist the room row first.
         store
             .insert_room(
@@ -1625,7 +1649,10 @@ impl RoomRegistry {
                 | cap::KICK
                 | cap::PUBLISH_MANIFEST
                 | cap::INVITE
-                | cap::CHAT;
+                | cap::CHAT
+                | cap::UNDO_OWN
+                | cap::UNDO_ANY
+                | cap::CLEAR_ALL;
             let status = if deadline.is_some() {
                 ParticipantStatus::Reconnecting
             } else {
@@ -1795,6 +1822,16 @@ fn event_to_broadcast_item(
             locast_protocol::envelope::MessageKind::StrokeEnd,
             serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
         ),
+        // P5-T03: DRAW_UNDO carries only the stroke id; DRAW_CLEAR
+        // an empty object. The actor travels as the envelope sender.
+        RoomEvent::StrokeUndo { payload, .. } => (
+            locast_protocol::envelope::MessageKind::StrokeUndo,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
+        ),
+        RoomEvent::StrokeClear { .. } => (
+            locast_protocol::envelope::MessageKind::StrokeClear,
+            serde_json::json!({}),
+        ),
         // P6-T02: rebroadcast the capability update as a
         // CAPABILITY_UPDATE envelope carrying the new cap_set.
         RoomEvent::CapabilityUpdated(evt) => {
@@ -1831,6 +1868,10 @@ fn event_to_broadcast_item(
         RoomEvent::StrokeBegin { sender_id, .. }
         | RoomEvent::StrokePoint { sender_id, .. }
         | RoomEvent::StrokeEnd { sender_id, .. } => Some(*sender_id),
+        // The authenticated actor of an undo / clear.
+        RoomEvent::StrokeUndo { actor_id, .. } | RoomEvent::StrokeClear { actor_id, .. } => {
+            Some(*actor_id)
+        }
         _ => None,
     };
     BroadcastItem {
@@ -1937,6 +1978,60 @@ mod tests {
         );
         assert_eq!(item.room_id, summary.id);
         assert_eq!(item.originator, Some(uid(2)));
+    }
+
+    /// P5-T03: undo / clear reach everyone including the actor (no
+    /// echo suppression) and name the authenticated actor as the
+    /// envelope sender, never in the payload.
+    #[test]
+    fn undo_and_clear_events_reach_the_actor_and_name_the_actor_as_sender() {
+        let actor = uid(2);
+        let stroke_id = uid(7);
+        let r = RoomRegistry::new(cfg());
+        let mut rx_probe = None;
+        // `publish_events` computes the originator; check it through a
+        // real subscription so the test covers that path too.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        rt.block_on(async {
+            let (summary, _) = r
+                .create(&store(), "R".into(), actor, keypair(2), true, 1_000)
+                .await
+                .expect("create");
+            let mut rx = r.subscribe(summary.id).await.expect("subscribe");
+            let undo = RoomEvent::StrokeUndo {
+                room_id: summary.id,
+                actor_id: actor,
+                payload: locast_protocol::room::StrokeUndoPayload { stroke_id },
+            };
+            let clear = RoomEvent::StrokeClear {
+                room_id: summary.id,
+                actor_id: actor,
+            };
+            r.publish_events(&[undo, clear], |_| summary.id);
+            let a = rx.try_recv().expect("undo item");
+            let b = rx.try_recv().expect("clear item");
+            rx_probe = Some((a, b));
+        });
+        let (undo_item, clear_item) = rx_probe.expect("items");
+        assert_eq!(undo_item.originator, None, "the actor is not suppressed");
+        assert_eq!(clear_item.originator, None, "the actor is not suppressed");
+        assert_eq!(undo_item.sender, Some(actor));
+        assert_eq!(clear_item.sender, Some(actor));
+        assert_eq!(
+            undo_item.kind,
+            locast_protocol::envelope::MessageKind::StrokeUndo
+        );
+        assert_eq!(
+            clear_item.kind,
+            locast_protocol::envelope::MessageKind::StrokeClear
+        );
+        assert_eq!(
+            undo_item.payload,
+            serde_json::json!({ "stroke_id": stroke_id })
+        );
+        assert_eq!(clear_item.payload, serde_json::json!({}));
     }
 
     /// DRAW_* broadcast items name the stroke owner in `sender`
@@ -2071,6 +2166,41 @@ mod tests {
             RoomEvent::RoomClosed(p) if p.reason == "host_left"
         )));
         assert!(r.get_by_code(&code).await.is_none());
+    }
+
+    /// P5-T03: the per-room stroke record lives in the room's state, so
+    /// ending the room frees it, and a new room starts empty.
+    #[tokio::test]
+    async fn the_stroke_record_is_dropped_with_the_room() {
+        let r = RoomRegistry::new(cfg());
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create");
+        let handle = r.get_by_id(summary.id).await.expect("room");
+        handle.write().await.drawing.commit(uid(7), uid(1));
+        assert_eq!(handle.read().await.drawing.committed_len(), 1);
+        let weak = Arc::downgrade(&handle);
+        drop(handle);
+
+        // Host leaves with migration off: the room ends and is removed.
+        r.leave(&store(), uid(1), true, 2_000)
+            .await
+            .expect("leave host");
+        assert!(r.get_by_id(summary.id).await.is_none());
+        assert!(
+            weak.upgrade().is_none(),
+            "the room state, and its stroke record, was freed"
+        );
+
+        // A new room does not inherit anything.
+        let (other, _) = r
+            .create(&store(), "Y".into(), uid(3), keypair(3), false, 3_000)
+            .await
+            .expect("create");
+        let fresh = r.get_by_id(other.id).await.expect("room");
+        assert_eq!(fresh.read().await.drawing.committed_len(), 0);
+        assert_eq!(fresh.read().await.drawing.owner_of(&uid(7)), None);
     }
 
     #[tokio::test]

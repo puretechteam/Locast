@@ -247,7 +247,8 @@ export const commands = {
 
 // P5-T02: typed shape for `drawing_send`. Mirrors the
 // Rust `DrawingSendInput` enum (Begin / Point / End
-// variants discriminated by `action`).
+// variants discriminated by `action`). P5-T03 adds `undo`
+// (one stroke id) and `clear` (no fields).
 export type DrawingSendInput =
   | {
       action: "begin";
@@ -275,11 +276,19 @@ export type DrawingSendInput =
       stroke_id: string;
       ts_ms: number;
       client_seq: number;
+    }
+  | {
+      action: "undo";
+      stroke_id: string;
+    }
+  | {
+      action: "clear";
     };
 
 export interface DrawingSendResult {
   envelope_id: string;
-  stroke_id: string;
+  // `null` for a `clear` (it concerns no single stroke).
+  stroke_id: string | null;
 }
 
 /* Types */
@@ -526,6 +535,24 @@ export type StrokeEndEvent = {
     stroke_id: string;
     ts_ms: number;
 };
+
+// P5-T03: the `drawing://undo` event payload. Emitted when the
+// server accepts a DRAW_UNDO, to EVERY participant including the
+// actor. `sender_id` is the server-stamped actor (who undid), not
+// the stroke's owner.
+export type StrokeUndoEvent = {
+    room_id: string;
+    sender_id: string;
+    stroke_id: string;
+};
+
+// P5-T03: the `drawing://clear` event payload. Emitted when the
+// server accepts a DRAW_CLEAR, to every participant including the
+// actor. `sender_id` is the server-stamped actor.
+export type StrokeClearEvent = {
+    room_id: string;
+    sender_id: string;
+};
 export type DownloadSessionIpc = {
   download_id: string;
   media_id: string;
@@ -671,6 +698,16 @@ export const events = {
   strokeEnd: <EventListener<StrokeEndEvent>>((h) =>
     __listenAs__("drawing://end", h)
   ),
+  // P5-T03: DRAW_UNDO accepted by the server (actor included).
+  // Removes the named stroke from the canvas.
+  strokeUndo: <EventListener<StrokeUndoEvent>>((h) =>
+    __listenAs__("drawing://undo", h)
+  ),
+  // P5-T03: DRAW_CLEAR accepted by the server (actor included).
+  // Wipes every stroke.
+  strokeClear: <EventListener<StrokeClearEvent>>((h) =>
+    __listenAs__("drawing://clear", h)
+  ),
   // P6-T03: inbound CHAT_MESSAGE from a remote participant.
   // Emitted when a chat message is accepted and rebroadcast
   // by the server. The sender_id is the server-authoritative
@@ -690,4 +727,6 @@ export const positionReportChanged = events.positionReport;
 export const strokeBeginChanged = events.strokeBegin;
 export const strokePointChanged = events.strokePoint;
 export const strokeEndChanged = events.strokeEnd;
+export const strokeUndoChanged = events.strokeUndo;
+export const strokeClearChanged = events.strokeClear;
 export const chatMessageChanged = events.chatMessage;

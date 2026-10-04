@@ -1,14 +1,24 @@
 import { useEffect, useRef } from "react";
 import { listenEvent } from "../services/_eventTransport";
-import type { StrokeBeginEvent, StrokePointEvent, StrokeEndEvent } from "../bindings/index";
+import type {
+    StrokeBeginEvent,
+    StrokePointEvent,
+    StrokeEndEvent,
+    StrokeUndoEvent,
+    StrokeClearEvent,
+} from "../bindings/index";
 import type { StrokeTool } from "../drawing/types";
 import {
     fromStrokeBeginEvent,
     fromStrokePointEvent,
     fromStrokeEndEvent,
+    fromStrokeUndoEvent,
+    fromStrokeClearEvent,
     type RemoteStrokeBeginPayload,
     type RemoteStrokePointPayload,
     type RemoteStrokeEndPayload,
+    type RemoteStrokeUndoPayload,
+    type RemoteStrokeClearPayload,
 } from "../services/drawingRemote";
 import { useDrawingStore } from "../stores/useDrawingStore";
 
@@ -16,6 +26,13 @@ interface DrawingEventHandlers {
     onBegin?: (payload: RemoteStrokeBeginPayload) => void;
     onPoint?: (payload: RemoteStrokePointPayload) => void;
     onEnd?: (payload: RemoteStrokeEndPayload) => void;
+    /** P5-T03: called AFTER the remote store dropped the stroke, for
+     *  every accepted undo (the local user's own included). The owner
+     *  of the local canvas uses it to drop the stroke it holds. */
+    onUndo?: (payload: RemoteStrokeUndoPayload) => void;
+    /** P5-T03: called AFTER the remote store was emptied, for every
+     *  accepted clear (the local user's own included). */
+    onClear?: (payload: RemoteStrokeClearPayload) => void;
 }
 
 export function useDrawingEventBridge(handlers: DrawingEventHandlers = {}): void {
@@ -73,6 +90,24 @@ export function useDrawingEventBridge(handlers: DrawingEventHandlers = {}): void
                 handlersRef.current.onEnd?.(payload);
             };
 
+            const onUndo = (ev: StrokeUndoEvent) => {
+                if (cancelled) return;
+                const currentRoomId = useDrawingStore.getState().roomId;
+                const payload = fromStrokeUndoEvent(ev);
+                if (payload.roomId !== currentRoomId) return;
+                useDrawingStore.getState().removeStroke(payload.strokeId);
+                handlersRef.current.onUndo?.(payload);
+            };
+
+            const onClear = (ev: StrokeClearEvent) => {
+                if (cancelled) return;
+                const currentRoomId = useDrawingStore.getState().roomId;
+                const payload = fromStrokeClearEvent(ev);
+                if (payload.roomId !== currentRoomId) return;
+                useDrawingStore.getState().clearRoom();
+                handlersRef.current.onClear?.(payload);
+            };
+
             try {
                 const u1 = await listenEvent<StrokeBeginEvent>("drawing://begin", onBegin);
                 if (cancelled) { u1(); return; }
@@ -85,6 +120,14 @@ export function useDrawingEventBridge(handlers: DrawingEventHandlers = {}): void
                 const u3 = await listenEvent<StrokeEndEvent>("drawing://end", onEnd);
                 if (cancelled) { u3(); return; }
                 unsubs.push(u3);
+
+                const u4 = await listenEvent<StrokeUndoEvent>("drawing://undo", onUndo);
+                if (cancelled) { u4(); return; }
+                unsubs.push(u4);
+
+                const u5 = await listenEvent<StrokeClearEvent>("drawing://clear", onClear);
+                if (cancelled) { u5(); return; }
+                unsubs.push(u5);
 
                 if (typeof window !== "undefined") {
                     (window as unknown as { __locast_drawing_subscribed?: boolean }).__locast_drawing_subscribed = true;
@@ -131,6 +174,7 @@ export function useDrawingEventBridge(handlers: DrawingEventHandlers = {}): void
                     strokeId: string;
                     tsMs: number;
                 }) => void;
+                removeStroke: (strokeId: string) => void;
             };
         };
         w.__locastDrawingStore = {
@@ -140,6 +184,7 @@ export function useDrawingEventBridge(handlers: DrawingEventHandlers = {}): void
             beginStroke: (opts) => useDrawingStore.getState().beginStroke(opts),
             appendPoint: (opts) => useDrawingStore.getState().appendPoint(opts),
             endStroke: (opts) => useDrawingStore.getState().endStroke(opts),
+            removeStroke: (strokeId) => useDrawingStore.getState().removeStroke(strokeId),
         };
         return () => {
             if (w.__locastDrawingStore) delete w.__locastDrawingStore;

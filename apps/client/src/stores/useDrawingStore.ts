@@ -48,6 +48,10 @@ interface DrawingStoreState {
 
     clearRoom: () => void;
 
+    /** P5-T03: remove one stroke (in progress or finished) by id. A
+     *  no-op if the store does not hold it. */
+    removeStroke: (strokeId: string) => void;
+
     getActiveStroke: (strokeId: string) => RemoteStroke | undefined;
 
     getCompletedStrokes: () => readonly RemoteStroke[];
@@ -119,6 +123,20 @@ export const useDrawingStore = create<DrawingStoreState>((set, get) => ({
         set({
             activeStrokes: new Map(),
             completedStrokes: [],
+        });
+    },
+
+    removeStroke: (strokeId) => {
+        set((state) => {
+            const inActive = state.activeStrokes.has(strokeId);
+            const inCompleted = state.completedStrokes.some((s) => s.id === strokeId);
+            if (!inActive && !inCompleted) return state;
+            const activeStrokes = new Map(state.activeStrokes);
+            activeStrokes.delete(strokeId);
+            return {
+                activeStrokes,
+                completedStrokes: state.completedStrokes.filter((s) => s.id !== strokeId),
+            };
         });
     },
 

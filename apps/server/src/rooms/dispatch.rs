@@ -92,6 +92,8 @@ pub async fn dispatch_room_message(
         MessageKind::StrokeBegin => Some(Command::Draw),
         MessageKind::StrokePoint => Some(Command::Draw),
         MessageKind::StrokeEnd => Some(Command::Draw),
+        MessageKind::StrokeUndo => Some(Command::DrawUndo),
+        MessageKind::StrokeClear => Some(Command::DrawClear),
         MessageKind::PermissionSet => Some(Command::PermissionSet),
         MessageKind::ChatMessage => Some(Command::ChatMessage),
         _ => None,
@@ -105,6 +107,11 @@ pub async fn dispatch_room_message(
             // the caller as a ROOM_ERROR. P5-T02's drawing
             // commands also surface as ROOM_ERROR so a
             // forged envelope gets an explicit denial.
+            // P5-T03's DRAW_UNDO / DRAW_CLEAR are deliberately NOT in
+            // that list: a refusal is dropped and logged, because the
+            // room client treats every unsolicited ROOM_ERROR as the
+            // end of the room and a revoke race on an undo / clear
+            // button must not evict the user.
             if matches!(
                 cmd,
                 Command::PublishManifest
@@ -173,6 +180,8 @@ pub async fn dispatch_room_message(
         MessageKind::StrokeEnd => {
             handle_stroke_end_dispatch(envelope, registry, clock, user_id).await
         }
+        MessageKind::StrokeUndo => handle_stroke_undo_dispatch(envelope, registry, user_id).await,
+        MessageKind::StrokeClear => handle_stroke_clear_dispatch(envelope, registry, user_id).await,
         MessageKind::PermissionSet => {
             match handle_permission_set(envelope, registry, store, user_id, now_ms).await {
                 // Already published by the handler under the room
@@ -535,7 +544,30 @@ async fn handle_stroke_begin_dispatch(
     if !caller_may_draw(&state, user_id) {
         return capability_reject("DRAW capability is not held in this room");
     }
-    drawing::handle_stroke_begin(envelope, &mut state, user_id, pubkey, now_ms).await
+    let mut out = drawing::handle_stroke_begin(envelope, &mut state, user_id, pubkey, now_ms).await;
+    publish_drawing_events_locked(registry, room_id, &mut out);
+    out
+}
+
+/// Publish the drawing events in `out` NOW, while the caller still
+/// holds the room's write lock, and leave `out.events` empty so the
+/// WS layer does not publish them a second time.
+///
+/// Drawing events change what the room contains (strokes appear,
+/// are undone, are cleared). If they were published after the lock
+/// is released, two connections could apply A-then-B on the server
+/// but publish B-then-A, and clients would converge on a different
+/// canvas than the server holds (for example an undo overtaking the
+/// BEGIN of the stroke it removes). Publishing under the lock makes
+/// the broadcast order equal the server's apply order, the same
+/// approach PERMISSION_SET uses. `publish_events` never awaits.
+fn publish_drawing_events_locked(
+    registry: &RoomRegistry,
+    room_id: Uuid,
+    out: &mut RoomDispatchOutcome,
+) {
+    let events = std::mem::take(&mut out.events);
+    registry.publish_events(&events, |_| room_id);
 }
 
 /// `true` if `user_id`'s live participant record in `state` may
@@ -590,7 +622,9 @@ async fn handle_stroke_point_dispatch(
         None => return default_reject("drawing target room not found"),
     };
     let mut state = handle.write().await;
-    drawing::handle_stroke_point(envelope, &mut state, user_id).await
+    let mut out = drawing::handle_stroke_point(envelope, &mut state, user_id).await;
+    publish_drawing_events_locked(registry, room_id, &mut out);
+    out
 }
 
 /// P5-T02: dispatch DRAW_END.
@@ -612,7 +646,57 @@ async fn handle_stroke_end_dispatch(
         None => return default_reject("drawing target room not found"),
     };
     let mut state = handle.write().await;
-    drawing::handle_stroke_end(envelope, &mut state, user_id).await
+    let mut out = drawing::handle_stroke_end(envelope, &mut state, user_id).await;
+    publish_drawing_events_locked(registry, room_id, &mut out);
+    out
+}
+
+/// P5-T03: dispatch DRAW_UNDO. The stroke is looked up only in the
+/// room the envelope names; the actor is the authenticated
+/// connection.
+async fn handle_stroke_undo_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let room_id = match envelope.room_id {
+        Some(r) => r,
+        None => return default_reject("DRAW_UNDO requires envelope.room_id"),
+    };
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return default_reject("drawing sender is not in the named room");
+    }
+    let handle = match registry.get_by_id(room_id).await {
+        Some(h) => h,
+        None => return default_reject("drawing target room not found"),
+    };
+    let mut state = handle.write().await;
+    let mut out = drawing::handle_stroke_undo(envelope, &mut state, user_id).await;
+    publish_drawing_events_locked(registry, room_id, &mut out);
+    out
+}
+
+/// P5-T03: dispatch DRAW_CLEAR.
+async fn handle_stroke_clear_dispatch(
+    envelope: Envelope,
+    registry: &RoomRegistry,
+    user_id: Uuid,
+) -> RoomDispatchOutcome {
+    let room_id = match envelope.room_id {
+        Some(r) => r,
+        None => return default_reject("DRAW_CLEAR requires envelope.room_id"),
+    };
+    if !registry.is_user_in_room(user_id, room_id).await {
+        return default_reject("drawing sender is not in the named room");
+    }
+    let handle = match registry.get_by_id(room_id).await {
+        Some(h) => h,
+        None => return default_reject("drawing target room not found"),
+    };
+    let mut state = handle.write().await;
+    let mut out = drawing::handle_stroke_clear(&mut state, user_id).await;
+    publish_drawing_events_locked(registry, room_id, &mut out);
+    out
 }
 
 fn default_reject(message: &str) -> RoomDispatchOutcome {

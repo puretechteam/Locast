@@ -33,6 +33,14 @@ pub mod cap {
     pub const INVITE: u32 = 0x40;
     pub const CHAT: u32 = 0x80;
     pub const MEDIA: u32 = 0x100;
+    /// P5-T03: undo a stroke the caller drew (architecture 14.2
+    /// `drawing.undo_own`).
+    pub const UNDO_OWN: u32 = 0x200;
+    /// P5-T03: undo any participant's stroke (`drawing.undo_any`).
+    /// Implies the right to undo the caller's own strokes.
+    pub const UNDO_ANY: u32 = 0x400;
+    /// P5-T03: wipe every stroke in the room (`drawing.clear_all`).
+    pub const CLEAR_ALL: u32 = 0x800;
 }
 
 /// ROOM_CREATE (C -> S). The creator chooses the migration
@@ -722,6 +730,36 @@ pub struct StrokeEndPayload {
     pub ts_ms: i64,
 }
 
+/// DRAW_UNDO (C -> S, S -> all). P5-T03.
+///
+/// Names ONE committed (ended) stroke to remove from the room.
+/// The client sends only the stroke id; the server looks the
+/// stroke up in the record of the room named by
+/// `Envelope::room_id`, compares the stored owner with the
+/// authenticated connection, and requires `cap::UNDO_OWN` (own
+/// stroke) or `cap::UNDO_ANY` (anyone's). On success the server
+/// rebroadcasts this payload to EVERY participant, the actor
+/// included, with the authenticated actor as `Envelope::sender`
+/// (the payload carries no identity field, and any identity
+/// field a client adds is ignored).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeUndoPayload {
+    /// Stroke id from the corresponding DRAW_BEGIN.
+    pub stroke_id: Uuid,
+}
+
+/// DRAW_CLEAR (C -> S, S -> all). P5-T03.
+///
+/// Wipes every stroke in the room. Requires `cap::CLEAR_ALL`.
+/// The payload is empty: the room comes from `Envelope::room_id`
+/// and the actor is the authenticated connection, stamped on the
+/// rebroadcast as `Envelope::sender` (to every participant, the
+/// actor included).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[ts(export_to = "ts/index.ts")]
+pub struct StrokeClearPayload {}
+
 // ===== P4-T03: POSITION_REPORT wire type =====
 //
 // docs/ARCHITECTURE.md §13.1: POSITION_REPORT is a passive,
@@ -893,6 +931,52 @@ pub struct SkewSample {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn capability_bits_are_distinct_single_bits() {
+        let all = [
+            cap::PLAYBACK_CONTROL,
+            cap::DRAW,
+            cap::LASER,
+            cap::MANAGE_ROOM,
+            cap::KICK,
+            cap::PUBLISH_MANIFEST,
+            cap::INVITE,
+            cap::CHAT,
+            cap::MEDIA,
+            cap::UNDO_OWN,
+            cap::UNDO_ANY,
+            cap::CLEAR_ALL,
+        ];
+        let mut seen = 0u32;
+        for bit in all {
+            assert_eq!(bit.count_ones(), 1, "{bit:#x} is a single bit");
+            assert_eq!(seen & bit, 0, "{bit:#x} is not reused");
+            seen |= bit;
+        }
+        assert_eq!(cap::UNDO_OWN, 0x200);
+        assert_eq!(cap::UNDO_ANY, 0x400);
+        assert_eq!(cap::CLEAR_ALL, 0x800);
+    }
+
+    #[test]
+    fn undo_and_clear_payloads_have_the_documented_wire_shape() {
+        let id = Uuid::now_v7();
+        let undo = serde_json::to_value(StrokeUndoPayload { stroke_id: id }).unwrap();
+        assert_eq!(undo, json!({ "stroke_id": id }));
+        // Unknown (identity) fields a client adds are ignored on decode.
+        let spoofed: StrokeUndoPayload = serde_json::from_value(
+            json!({ "stroke_id": id, "user_id": Uuid::nil(), "owner": Uuid::nil() }),
+        )
+        .unwrap();
+        assert_eq!(spoofed.stroke_id, id);
+        assert_eq!(
+            serde_json::to_value(StrokeClearPayload {}).unwrap(),
+            json!({})
+        );
+        let _: StrokeClearPayload =
+            serde_json::from_value(json!({ "user_id": Uuid::nil() })).unwrap();
+    }
 
     #[test]
     fn room_create_serde_roundtrip() {

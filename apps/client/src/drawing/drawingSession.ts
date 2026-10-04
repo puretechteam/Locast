@@ -1,7 +1,8 @@
 // P5-T02: the network half of local drawing.
 //
 // `DrawingSession` turns local stroke activity into the
-// DRAW_BEGIN / DRAW_POINT / DRAW_END `drawing_send` calls.
+// DRAW_BEGIN / DRAW_POINT / DRAW_END `drawing_send` calls
+// (and, P5-T03, the DRAW_UNDO / DRAW_CLEAR ones).
 // It is deliberately free of React, Tauri and DOM imports
 // (the transport is injected) so the Node smoke test
 // `drawingSession.smoke.ts` can drive the exact production
@@ -49,6 +50,14 @@
 //    bounded to `MAX_QUEUED_POINTS`: when full, the OLDEST
 //    queued point is dropped (last-point-wins). BEGIN and END
 //    are never dropped and order is preserved.
+//
+// 6. Undo and clear (P5-T03). `undoStroke` / `clearAll` go
+//    through the SAME ordered queue, so an undo of the stroke
+//    that was just drawn is sent after that stroke's DRAW_END
+//    (the server only undoes ended strokes). They change
+//    nothing locally: the stroke leaves the canvas when the
+//    server's DRAW_UNDO event comes back (to the actor too), so
+//    a refused undo can never diverge the actor's screen.
 
 import type { DrawingSendInput, DrawingSendResult } from "../bindings/index";
 import { MAX_DRAW_POINT_HZ } from "./constants.ts";
@@ -291,6 +300,32 @@ export class DrawingSession {
         this.activeStrokeId = null;
         this.pendingPoint = null;
         this.cancelScheduledFrame();
+    }
+
+    /**
+     * Ask the server to remove one committed stroke (DRAW_UNDO).
+     * Queued behind everything already sent, so it follows the
+     * stroke's own DRAW_END. Resolves when the send completes;
+     * rejects (after `onError` ran) if it fails or times out. The
+     * canvas is NOT touched here: the stroke is removed when the
+     * server's undo event arrives.
+     */
+    public undoStroke(strokeId: string): Promise<void> {
+        return this.enqueue(
+            { id: strokeId, failed: false },
+            { action: "undo", stroke_id: strokeId },
+        ).then(() => undefined);
+    }
+
+    /**
+     * Ask the server to wipe every stroke in the room
+     * (DRAW_CLEAR). Same queueing and "canvas changes only on the
+     * server's event" rules as `undoStroke`.
+     */
+    public clearAll(): Promise<void> {
+        return this.enqueue({ id: "clear", failed: false }, { action: "clear" }).then(
+            () => undefined,
+        );
     }
 
     /** Resolves once every send queued so far has settled. */

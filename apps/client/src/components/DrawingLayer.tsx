@@ -16,6 +16,12 @@
 // P5-T03: also subscribes to remote drawing events
 // (DRAW_BEGIN/POINT/END rebroadcast) and renders them
 // on the same canvas.
+// P5-T03 (undo / clear): Ctrl+Z and the toolbar's Undo send a
+// DRAW_UNDO for the user's newest finished stroke when they hold
+// UNDO_OWN / UNDO_ANY; the server's DRAW_UNDO / DRAW_CLEAR events
+// (delivered to the actor too) are what remove strokes from the
+// canvas. Without the capability Ctrl+Z only drops the newest
+// stroke from this client's own canvas, as before.
 // P5-T04: laser pointer overlay integrated here.
 // P5-T06: drawing toolbar and keyboard shortcuts.
 
@@ -30,6 +36,7 @@ import type { DrawingTool, DrawingMode } from "../hooks/useKeyboardScope";
 import type { StrokeTool } from "../drawing/types";
 import { DrawingService } from "../services/drawing";
 import { PointerStrokePipeline } from "../drawing/pointerPipeline";
+import { planUndo, UndoTracker } from "../drawing/undoPolicy";
 import type { PointerSample } from "../drawing/pointerPipeline";
 import { LaserPointer } from "./LaserPointer";
 import { DrawingToolbar } from "./DrawingToolbar";
@@ -60,7 +67,6 @@ export function DrawingLayer({
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
     useDrawingRoomSync(roomId ?? null);
-    useDrawingEventBridge({});
 
     const remoteStrokes = useDrawingStore((s) => s.getAllStrokes());
 
@@ -69,8 +75,31 @@ export function DrawingLayer({
         appendPoint,
         endStroke,
         undo,
+        clear,
+        removeStroke,
+        getLocalStrokes,
         setStrokeStyle,
     } = useDrawingCanvas(canvasRef, videoRef, userId, remoteStrokes);
+
+    // Undo requests already on their way to the server (or given up on
+    // after a silent refusal), so a second Ctrl+Z targets the next
+    // stroke instead of the same one.
+    const undoTrackerRef = useRef<UndoTracker>(new UndoTracker());
+
+    // P5-T03: the server's undo / clear events (the actor's own
+    // included) are what take strokes off the canvas. The bridge has
+    // already updated the remote store; drop them from the local
+    // canvas as well.
+    useDrawingEventBridge({
+        onUndo: (payload) => {
+            removeStroke(payload.strokeId);
+            undoTrackerRef.current.confirmed(payload.strokeId);
+        },
+        onClear: () => {
+            clear();
+            undoTrackerRef.current.reset();
+        },
+    });
 
     const [activeTool, setActiveTool] = useState<DrawingTool>("pen");
     const [strokeColor, setStrokeColor] = useState("#e6e6e6");
@@ -78,9 +107,56 @@ export function DrawingLayer({
 
     const youCapSet = useCapabilityStore((s) => s.youCapSet);
     const canDraw = youCapSet !== null && (youCapSet & CAP.DRAW) !== 0;
+    // UI gating only: the server decides what is allowed.
+    const canUndoOwn =
+        youCapSet !== null && (youCapSet & (CAP.UNDO_OWN | CAP.UNDO_ANY)) !== 0;
+    const canClearAll = youCapSet !== null && (youCapSet & CAP.CLEAR_ALL) !== 0;
+
+    // P5-T02: the production send path. One DrawingService
+    // per room (a new roomId gives a fresh instance, so no
+    // stroke id or queued send leaks across rooms).
+    const service = useMemo(() => new DrawingService(), [roomId]);
+    useEffect(() => {
+        // A new room (service) starts with a clean slate; unmount stops
+        // the timers.
+        const tracker = new UndoTracker();
+        undoTrackerRef.current = tracker;
+        return () => tracker.reset();
+    }, [service]);
+
+    const canUndoOwnRef = useRef(canUndoOwn);
+    canUndoOwnRef.current = canUndoOwn;
+
+    // Ctrl+Z / the Undo button. With UNDO_OWN / UNDO_ANY: ask the
+    // server to undo the newest finished local stroke (it disappears
+    // when the server's event arrives). Without: drop the newest
+    // stroke from this canvas only, as before P5-T03.
+    const handleUndo = useCallback(() => {
+        const plan = planUndo({
+            canUndoOwn: canUndoOwnRef.current,
+            strokes: getLocalStrokes(),
+            pending: undoTrackerRef.current.pending,
+            gaveUp: undoTrackerRef.current.gaveUp,
+        });
+        if (plan.kind === "local") {
+            undo();
+            return;
+        }
+        if (plan.kind !== "remote") return;
+        const tracker = undoTrackerRef.current;
+        tracker.markSent(plan.strokeId);
+        service.undoStroke(plan.strokeId).catch(() => {
+            // Already reported through the session's onError; allow a retry.
+            tracker.sendFailed(plan.strokeId);
+        });
+    }, [getLocalStrokes, undo, service]);
+
+    const handleClearAll = useCallback(() => {
+        service.clearAll().catch(() => undefined);
+    }, [service]);
 
     const keyboard = useKeyboardScope({
-        onUndo: undo,
+        onUndo: handleUndo,
         canDraw,
     });
 
@@ -144,13 +220,9 @@ export function DrawingLayer({
 
     const isDrawing = keyboard.drawingMode !== "none";
 
-    // P5-T02: the production send path. One DrawingService
-    // per room (a new roomId gives a fresh instance, so no
-    // stroke id or queued send leaks across rooms). The
-    // pipeline couples the local hook (store + renderer)
+    // The pipeline couples the local hook (store + renderer)
     // with the service so the local stroke id is the wire
     // stroke id.
-    const service = useMemo(() => new DrawingService(), [roomId]);
     const canDrawRef = useRef(canDraw);
     canDrawRef.current = canDraw;
     const pipeline = useMemo(
@@ -277,6 +349,10 @@ export function DrawingLayer({
                 onColorChange={handleColorChange}
                 onStrokeWidthChange={handleStrokeWidthChange}
                 onClose={handleToolbarClose}
+                canUndo={canUndoOwn}
+                canClearAll={canClearAll}
+                onUndo={handleUndo}
+                onClearAll={handleClearAll}
             />
         </>
     );

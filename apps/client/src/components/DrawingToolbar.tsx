@@ -4,12 +4,15 @@
 // - Tool buttons: pen, eraser, arrow, rect, circle, text
 // - Color picker
 // - Stroke width
+// - Undo / Clear all (P5-T03; shown only when the local user holds
+//   the matching capability, which is a convenience: the server
+//   decides)
 // - Close button
 //
 // The toolbar is toggled by the `d` key and positioned
 // in the top-right corner of the player stage.
 
-import { useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { DrawingTool } from "../hooks/useKeyboardScope";
 
 export interface DrawingToolbarProps {
@@ -21,7 +24,16 @@ export interface DrawingToolbarProps {
     onColorChange: (color: string) => void;
     onStrokeWidthChange: (width: number) => void;
     onClose: () => void;
+    /** The local user may undo their own strokes (UNDO_OWN / UNDO_ANY). */
+    canUndo?: boolean;
+    /** The local user may clear the whole canvas (CLEAR_ALL). */
+    canClearAll?: boolean;
+    onUndo?: () => void;
+    onClearAll?: () => void;
 }
+
+/** How long "Clear all" waits for its confirming second click. */
+const CLEAR_CONFIRM_MS = 3000;
 
 interface ToolDef {
     id: DrawingTool;
@@ -58,7 +70,27 @@ export function DrawingToolbar({
     onColorChange,
     onStrokeWidthChange,
     onClose,
+    canUndo = false,
+    canClearAll = false,
+    onUndo,
+    onClearAll,
 }: DrawingToolbarProps): React.ReactNode {
+    // Clearing wipes the canvas for EVERYONE, so it takes two clicks.
+    const [confirmingClear, setConfirmingClear] = useState(false);
+    useEffect(() => {
+        if (!confirmingClear) return undefined;
+        const t = setTimeout(() => setConfirmingClear(false), CLEAR_CONFIRM_MS);
+        return () => clearTimeout(t);
+    }, [confirmingClear]);
+    const handleClearClick = useCallback(() => {
+        if (!confirmingClear) {
+            setConfirmingClear(true);
+            return;
+        }
+        setConfirmingClear(false);
+        onClearAll?.();
+    }, [confirmingClear, onClearAll]);
+
     const handleToolClick = useCallback(
         (tool: DrawingTool) => {
             onToolSelect(tool);
@@ -152,6 +184,31 @@ export function DrawingToolbar({
                     data-testid="drawing-toolbar-width-slider"
                 />
             </div>
+
+            {(canUndo || canClearAll) && (
+                <div className="drawing-toolbar__actions" role="group" aria-label="Canvas actions">
+                    {canUndo && (
+                        <button
+                            className="drawing-toolbar__action"
+                            onClick={onUndo}
+                            title="Undo your last stroke (Ctrl+Z)"
+                            data-testid="drawing-toolbar-undo"
+                        >
+                            Undo
+                        </button>
+                    )}
+                    {canClearAll && (
+                        <button
+                            className={`drawing-toolbar__action${confirmingClear ? " drawing-toolbar__action--confirm" : ""}`}
+                            onClick={handleClearClick}
+                            title="Remove every stroke for everyone"
+                            data-testid="drawing-toolbar-clear-all"
+                        >
+                            {confirmingClear ? "Confirm clear" : "Clear all"}
+                        </button>
+                    )}
+                </div>
+            )}
         </div>
     );
 }

@@ -20,7 +20,11 @@
 //       pointer handlers;
 //   (f) a transport that never settles cannot wedge the
 //       queue: the send times out, DRAW_END still goes out,
-//       and queued DRAW_POINTs stay bounded.
+//       and queued DRAW_POINTs stay bounded;
+//   (g) P5-T03: undo / clear go through the same ordered
+//       queue (an undo follows its stroke's DRAW_END), never
+//       touch the local canvas, and a failing one is
+//       reported without wedging the queue.
 
 import { DrawingSession, MAX_QUEUED_POINTS } from "./drawingSession.ts";
 import type { DrawingSendFn } from "./drawingSession.ts";
@@ -110,7 +114,10 @@ function makeRig(opts: {
         } finally {
             inFlight -= 1;
         }
-        return { envelope_id: `env-${calls.length}`, stroke_id: input.stroke_id };
+        return {
+            envelope_id: `env-${calls.length}`,
+            stroke_id: "stroke_id" in input ? input.stroke_id : null,
+        };
     };
     let frameCb: (() => void) | null = null;
     const errors: unknown[] = [];
@@ -210,7 +217,8 @@ async function main(): Promise<void> {
         check("local store id is a canonical UUID", localId !== undefined && isCanonicalStrokeId(localId));
         check(
             "every wire envelope carries the local stroke id",
-            r.calls.length > 0 && r.calls.every((c) => c.stroke_id === localId),
+            r.calls.length > 0 &&
+                r.calls.every((c) => "stroke_id" in c && c.stroke_id === localId),
         );
     }
 
@@ -242,7 +250,7 @@ async function main(): Promise<void> {
             kinds.join(","),
         );
         check("only one drawing_send in flight at a time", r.maxInFlight() === 1, String(r.maxInFlight()));
-        const seqs = r.calls.map((c) => c.client_seq);
+        const seqs = r.calls.map((c) => ("client_seq" in c ? c.client_seq : 0));
         check(
             "client_seq is strictly increasing starting at 1",
             seqs[0] === 1 && seqs.every((s, i) => i === 0 || s > (seqs[i - 1] ?? 0)),
@@ -652,6 +660,89 @@ async function main(): Promise<void> {
             r.calls.map((c) => c.action).join(","),
         );
         check("hung BEGIN: no unhandled rejection", unhandled.length === 0);
+    }
+
+    // ---------------------------------------------------------
+    // (g) undo + clear (P5-T03)
+    // ---------------------------------------------------------
+    process.stdout.write("(g) undo / clear through the ordered queue\n");
+    {
+        // A slow transport: the undo is requested while the stroke's
+        // own sends are still in flight. It must go out after END.
+        const r = makeRig({ sendDelayMs: 5 });
+        r.pipeline.down(STYLE, { x: 0.1, y: 0.1, pressure: 0.5, ts: 1 });
+        r.pipeline.up({ x: 0.2, y: 0.2, pressure: 0.5, ts: 2 });
+        const id = r.local.ids[0];
+        check("a stroke was drawn", id !== undefined);
+        const localEventsBefore = r.local.events.slice();
+        const undone = r.session.undoStroke(id ?? "");
+        const cleared = r.session.clearAll();
+        await Promise.all([undone, cleared]);
+        const kinds = r.calls.map((c) => c.action);
+        check(
+            "begin, point, end, undo, clear in order",
+            kinds.join(",") === "begin,point,end,undo,clear" ||
+                kinds.join(",") === "begin,end,undo,clear",
+            kinds.join(","),
+        );
+        const undo = r.calls.find((c) => c.action === "undo");
+        check(
+            "undo carries the local stroke id and nothing else",
+            undo !== undefined &&
+                undo.action === "undo" &&
+                undo.stroke_id === id &&
+                Object.keys(undo).sort().join(",") === "action,stroke_id",
+        );
+        const clr = r.calls.find((c) => c.action === "clear");
+        check(
+            "clear carries no fields",
+            clr !== undefined && Object.keys(clr).join(",") === "action",
+        );
+        check("still one send in flight at a time", r.maxInFlight() === 1, String(r.maxInFlight()));
+        check(
+            "undo and clear do not touch the local canvas",
+            r.local.events.join(",") === localEventsBefore.join(","),
+            r.local.events.join(","),
+        );
+        check("no error was reported", r.errors.length === 0);
+    }
+    {
+        // A failing undo rejects to its caller, is reported through
+        // onError, and does not wedge the queue.
+        let failNext = true;
+        const r = makeRig({
+            send: async (input) => {
+                if (input.action === "undo" && failNext) {
+                    failNext = false;
+                    throw new Error("boom");
+                }
+            },
+        });
+        let rejected = false;
+        await r.session.undoStroke(newStrokeId()).catch(() => {
+            rejected = true;
+        });
+        check("a failed undo rejects to the caller", rejected);
+        check("a failed undo is reported through onError", r.errors.length === 1);
+        await r.session.clearAll();
+        check(
+            "a later clear still goes out",
+            r.calls.map((c) => c.action).join(",") === "undo,clear",
+            r.calls.map((c) => c.action).join(","),
+        );
+        check("no unhandled rejection from undo / clear", unhandled.length === 0);
+    }
+    {
+        // An undo for a stroke the session never drew is just a send:
+        // the SERVER decides (and answers a no-op silently).
+        const r = makeRig();
+        const foreign = newStrokeId();
+        await r.session.undoStroke(foreign);
+        const first = r.calls[0];
+        check(
+            "an undo of any canonical id is sent as-is",
+            first !== undefined && first.action === "undo" && first.stroke_id === foreign,
+        );
     }
 
     if (failures > 0) {
