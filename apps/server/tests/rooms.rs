@@ -1707,6 +1707,120 @@ async fn chat_permission_and_drawing_messages_reach_their_handlers() {
     drop(harness);
 }
 
+/// Read until the next DRAW_BEGIN / DRAW_POINT / DRAW_END arrives,
+/// skipping room chatter. Unlike `next_of_kind` this exposes the
+/// arrival ORDER across the three drawing kinds.
+async fn next_draw(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    ctx: &str,
+) -> Envelope {
+    loop {
+        let bytes = tokio::time::timeout(Duration::from_secs(10), read_binary(ws))
+            .await
+            .unwrap_or_else(|_| panic!("{ctx}: no drawing frame within 10 s"))
+            .unwrap_or_else(|| panic!("{ctx}: connection closed waiting for a drawing frame"));
+        let env = decode(&bytes);
+        if matches!(
+            env.r#type,
+            MessageKind::StrokeBegin | MessageKind::StrokePoint | MessageKind::StrokeEnd
+        ) {
+            return env;
+        }
+    }
+}
+
+/// P5-T02: a full-rate stroke (DRAW_BEGIN, 120 DRAW_POINT, DRAW_END)
+/// from a participant holding DRAW reaches every other participant,
+/// complete and in the order it was sent, and is not echoed back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_rate_stroke_reaches_every_other_participant_in_order() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let room_id = playback_room(&mut ws_a, &mut ws_b, &mut ws_c, &a, &b, &c).await;
+
+    // The host holds every capability, DRAW included.
+    let stroke = Uuid::now_v7();
+    send_envelope(
+        &mut ws_a,
+        &draw_begin_envelope(a.token, room_id, &kp_a, a.user_id, stroke),
+    )
+    .await;
+    const POINTS: u32 = 120;
+    for i in 0..POINTS {
+        send_envelope(
+            &mut ws_a,
+            &room_scoped_envelope(
+                a.token,
+                MessageKind::StrokePoint,
+                room_id,
+                serde_json::to_value(StrokePointPayload {
+                    stroke_id: stroke,
+                    x: i as f32 / POINTS as f32,
+                    y: 0.5,
+                    pressure: 0.5,
+                    ts_ms: i as i64,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+    }
+    send_envelope(
+        &mut ws_a,
+        &room_scoped_envelope(
+            a.token,
+            MessageKind::StrokeEnd,
+            room_id,
+            serde_json::to_value(StrokeEndPayload {
+                stroke_id: stroke,
+                ts_ms: 999,
+            })
+            .unwrap(),
+        ),
+    )
+    .await;
+
+    for (ws, who) in [(&mut ws_b, "B"), (&mut ws_c, "C")] {
+        let begin = next_draw(ws, who).await;
+        assert_eq!(begin.r#type, MessageKind::StrokeBegin, "{who}: first frame");
+        assert_eq!(begin.payload["stroke_id"], json!(stroke), "{who}");
+        for i in 0..POINTS {
+            let env = next_draw(ws, who).await;
+            assert_eq!(env.r#type, MessageKind::StrokePoint, "{who}: point {i}");
+            assert_eq!(env.room_id, Some(room_id), "{who}: point {i}");
+            assert_eq!(env.payload["stroke_id"], json!(stroke), "{who}: point {i}");
+            let x = env.payload["x"].as_f64().expect("x");
+            assert!(
+                (x - f64::from(i as f32 / POINTS as f32)).abs() < 1e-6,
+                "{who}: point {i} out of order, x = {x}"
+            );
+        }
+        let end = next_draw(ws, who).await;
+        assert_eq!(end.r#type, MessageKind::StrokeEnd, "{who}: last frame");
+        assert_eq!(end.payload["stroke_id"], json!(stroke), "{who}");
+    }
+
+    // The originator never sees its own stroke come back.
+    for kind in [
+        MessageKind::StrokeBegin,
+        MessageKind::StrokePoint,
+        MessageKind::StrokeEnd,
+    ] {
+        assert_no_kind_within(&mut ws_a, kind, Duration::from_millis(100), "A echo").await;
+    }
+    drop(harness);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_privileges_in_one_room_do_not_authorize_another_room() {
     let harness = spawn_test_server().await;

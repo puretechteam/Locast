@@ -5,9 +5,12 @@
 // Vite-only).
 
 /** P5-T02: maximum DRAW_POINT messages per second per
- *  local user. Architecture §15.8 hard cap. The
- *  React-side coalescer's natural ceiling is the
- *  display refresh rate (typically 60 Hz via
- *  `requestAnimationFrame`); the 120 Hz budget is
- *  therefore never exceeded. */
-export const MAX_DRAW_POINT_HZ = 120;
+ *  local user. Architecture §15.8 allows at most 120 Hz;
+ *  the client uses 80 Hz because the server rate-limits
+ *  each connection to 100 msg/s sustained, and a higher
+ *  point rate plus BEGIN/END/presence traffic could
+ *  exhaust that budget during a long stroke. The
+ *  React-side coalescer's natural ceiling is the display
+ *  refresh rate (typically 60 Hz via
+ *  `requestAnimationFrame`). */
+export const MAX_DRAW_POINT_HZ = 80;

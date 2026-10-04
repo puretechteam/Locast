@@ -25,13 +25,13 @@ process.stdout.write("drawing coalescing smoke\n");
 // ----- Constant sanity -----
 process.stdout.write("constants\n");
 check(
-    "MAX_DRAW_POINT_HZ is 120",
-    MAX_DRAW_POINT_HZ === 120,
+    "MAX_DRAW_POINT_HZ is 80 (below the server's 100 msg/s limit)",
+    MAX_DRAW_POINT_HZ === 80,
 );
 const MIN_INTERVAL_MS = 1000 / MAX_DRAW_POINT_HZ;
 check(
-    "1000/MAX_DRAW_POINT_HZ is approximately 8.33",
-    Math.abs(MIN_INTERVAL_MS - 1000 / 120) < 1e-6,
+    "1000/MAX_DRAW_POINT_HZ is 12.5 ms",
+    Math.abs(MIN_INTERVAL_MS - 12.5) < 1e-6,
 );
 
 // ----- Pure coalescing simulation -----
@@ -75,7 +75,7 @@ process.stdout.write("last-point-wins coalescing\n");
 // Scenario A: 200 pointermoves in 1 s.
 // A real pointer event is delivered roughly every 5 ms;
 // the coalescer keeps the LAST pending point and only
-// emits when the 8.33 ms minimum interval has elapsed.
+// emits when the 12.5 ms minimum interval has elapsed.
 {
     const s = newSim(0);
     s.lastFlushMs = -100;
@@ -85,8 +85,8 @@ process.stdout.write("last-point-wins coalescing\n");
         tick(s, now);
     }
     check(
-        "200 events at 5 ms intervals -> <=120 flushes",
-        s.flushed <= 120,
+        "200 events at 5 ms intervals -> <=80 flushes",
+        s.flushed <= MAX_DRAW_POINT_HZ,
     );
     check(
         "200 events at 5 ms intervals -> at least 50 flushes",
@@ -111,7 +111,7 @@ process.stdout.write("last-point-wins coalescing\n");
 }
 
 // Scenario C: rapid burst (100 events in 50 ms)
-// -> at most ceil(50 / 8.33) = 6 flushes.
+// -> at most ceil(50 / 12.5) = 4 flushes.
 {
     const s = newSim(0);
     for (let i = 0; i < 100; i++) {
@@ -121,8 +121,8 @@ process.stdout.write("last-point-wins coalescing\n");
         tick(s, now);
     }
     check(
-        "100 events in 50 ms -> <=7 flushes",
-        s.flushed <= 7,
+        "100 events in 50 ms -> <=5 flushes",
+        s.flushed <= 5,
     );
     check(
         "100 events in 50 ms -> at least 4 flushes (interval honored)",

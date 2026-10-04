@@ -16,6 +16,7 @@
     "smoke:geometry": "node --experimental-strip-types --no-warnings src/drawing/geometry.smoke.ts",
     "smoke:stroke-renderer": "node --experimental-strip-types --no-warnings src/drawing/strokeRenderer.smoke.ts",
     "smoke:drawing": "node --experimental-strip-types --no-warnings src/drawing/coalescing.smoke.ts",
+    "smoke:drawing-session": "node --experimental-strip-types --no-warnings src/drawing/drawingSession.smoke.ts",
     "test:e2e": "playwright test --config=tests/playwright/playwright.config.ts",
     "test:perf": "playwright test --config=tests/perf/playwright.config.ts",
     "perf:flag": "node tests/perf/flag-long-tasks.mjs",

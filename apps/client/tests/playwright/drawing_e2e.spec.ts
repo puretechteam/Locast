@@ -5,17 +5,18 @@
 //    within 50 ms."
 //
 // The Vite harness cannot load a real <video> for
-// pointer input, so the test drives the drawing
-// service directly through the IPC seam
-// (`__locastDrawing`) that the React layer's
-// `DrawingService` exposes. The seam tracks the
-// in-flight stroke id, pending network point, and
-// monotonic seq so the Playwright test can assert
-// (a) the wire-level shape of the DRAW_BEGIN /
-// DRAW_POINT / DRAW_END envelope stream the React
-// layer hands to the Rust IPC, and (b) the
-// last-point-wins coalescing produces <=120
-// DRAW_POINT messages for a 200-event burst.
+// pointer input, so the test imports the production
+// `DrawingService` (services/drawing.ts) and drives it
+// directly; the Tauri invoke shim records every
+// `drawing_send` call. The test asserts (a) the
+// wire-level shape of the DRAW_BEGIN / DRAW_POINT /
+// DRAW_END stream the React layer hands to the Rust IPC,
+// and (b) the last-point-wins coalescing produces <=120
+// DRAW_POINT messages for a 200-event burst. The same
+// logic is covered without a browser by
+// `pnpm -C apps/client smoke:drawing-session`, and the
+// Rust half by `cargo test -p locast-client --test
+// drawing_send_e2e`.
 
 import { test, expect, injectLocastShim } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
@@ -301,8 +302,8 @@ test("200 DRAW_POINT calls in 1 second produce <=120 outbound DRAW_POINT envelop
     // The acceptance test is "200 points in 1 s produce
     // <=120 DRAW_POINT messages". We assert the upper
     // bound; the lower bound is the service's natural
-    // rAF cadence (60 Hz) plus the 8.33 ms interval
-    // cap, which on a fast machine can yield 60-120.
+    // rAF cadence (60 Hz) plus the 12.5 ms interval
+    // cap, which on a fast machine can yield 50-80.
     expect(pointEnvelopes.length).toBeGreaterThanOrEqual(50);
 
     // Every envelope's stroke_id is the one we began.

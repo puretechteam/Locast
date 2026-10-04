@@ -3,8 +3,8 @@
 // Shapes mirror `docs/ARCHITECTURE.md` §15.4 wire format
 // (normalized [0..1] float coordinates, per stroke:
 // tool, color, width, point ring). They are deliberately
-// kept network-friendly: a future P5-T02 transport can
-// serialize these straight to JSON without conversion.
+// kept network-friendly: the P5-T02 transport serializes
+// these straight to the wire without conversion.
 //
 // This module is pure (no React, no DOM); it can be
 // imported by the smoke test, the renderer, the hook,
@@ -96,20 +96,62 @@ export function newStroke(opts: {
     };
 }
 
-/** Generate a UUID v7-ish id without depending on the
- *  `crypto` global so the smoke test can run in plain
- *  Node without `--experimental-global-crypto`. The id
- *  shape matches the wire format (`xxxxxxxx-xxxx-7xxx
- *  -xxxx-xxxxxxxxxxxx`) but the random suffix is a
- *  simple `Math.random` fallback; the transport layer
- *  will replace this with a real UUID v7 when P5-T02
- *  ships. Deterministic-where-possible for the smoke
- *  test means the canvas accepts any non-empty unique
- *  string. */
-export function makeStrokeId(prefix: string): string {
-    const rnd = Math.floor(Math.random() * 0xffffffff)
-        .toString(16)
-        .padStart(8, "0");
-    const ts = Date.now().toString(16).padStart(12, "0");
-    return `${prefix}-${ts}-7${rnd.slice(0, 3)}-${rnd.slice(3, 7)}`;
+/** Fill `n` bytes from the platform CSPRNG, falling back
+ *  to `Math.random` when `crypto.getRandomValues` is not
+ *  available (very old webviews). Ids are not security
+ *  tokens (the server binds them to the signed sender), so
+ *  the fallback only needs to avoid collisions. */
+function randomBytes(n: number): Uint8Array {
+    const out = new Uint8Array(n);
+    const c = (
+        globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }
+    ).crypto;
+    if (c !== undefined && typeof c.getRandomValues === "function") {
+        c.getRandomValues(out);
+        return out;
+    }
+    for (let i = 0; i < n; i++) {
+        out[i] = Math.floor(Math.random() * 256);
+    }
+    return out;
+}
+
+/** Generate a stroke id: a canonical (lowercase,
+ *  hyphenated) UUID v7 per architecture section 15.4. This
+ *  is the ONE id scheme for strokes: the same string is the
+ *  local store/renderer id and the `stroke_id` on the wire
+ *  (`drawing_send` parses it with `Uuid::parse_str` and the
+ *  server deserializes it as a `Uuid`).
+ *
+ *  Layout: 48-bit big-endian unix-ms timestamp, version
+ *  nibble 7, 12 random bits, variant 10, 62 random bits. */
+export function newStrokeId(nowMs: number = Date.now()): string {
+    const b = randomBytes(16);
+    // Timestamps are far below 2^48, so the arithmetic
+    // below is exact in a double.
+    let ts = Math.max(0, Math.floor(nowMs));
+    for (let i = 5; i >= 0; i--) {
+        b[i] = ts % 256;
+        ts = Math.floor(ts / 256);
+    }
+    b[6] = ((b[6] ?? 0) & 0x0f) | 0x70;
+    b[8] = ((b[8] ?? 0) & 0x3f) | 0x80;
+    let hex = "";
+    for (const byte of b) {
+        hex += byte.toString(16).padStart(2, "0");
+    }
+    return (
+        `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-` +
+        `${hex.slice(16, 20)}-${hex.slice(20, 32)}`
+    );
+}
+
+const CANONICAL_UUID =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** `true` when `id` is a canonical lowercase hyphenated
+ *  RFC 4122 UUID, i.e. exactly the shape the Rust
+ *  `drawing_send` command accepts and echoes back. */
+export function isCanonicalStrokeId(id: string): boolean {
+    return CANONICAL_UUID.test(id);
 }

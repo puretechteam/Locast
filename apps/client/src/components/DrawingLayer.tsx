@@ -5,8 +5,11 @@
 //
 // - Owns the canvas DOM element via a ref the parent
 //   hook (`useDrawingCanvas`) drives.
-// - Pointer event handling is managed by P5-T06 when
-//   drawing mode is active.
+// - Pointer events (active in drawing mode) are fed through
+//   `PointerStrokePipeline`, which drives both the local
+//   stroke (hook) and the P5-T02 network send
+//   (`DrawingService`: DRAW_BEGIN / DRAW_POINT / DRAW_END
+//   via the `drawing_send` Tauri command).
 // - Reads `data-testid` selectors that the Playwright
 //   suite uses to verify presence, intrinsic-size, and
 //   resize behavior.
@@ -16,7 +19,7 @@
 // P5-T04: laser pointer overlay integrated here.
 // P5-T06: drawing toolbar and keyboard shortcuts.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
 import { useDrawingCanvas } from "../hooks/useDrawingCanvas";
 import { useDrawingEventBridge, useDrawingRoomSync } from "../hooks/useDrawingEventBridge";
@@ -25,6 +28,9 @@ import { useCapabilityStore, CAP } from "../stores/useCapabilityStore";
 import { useKeyboardScope } from "../hooks/useKeyboardScope";
 import type { DrawingTool, DrawingMode } from "../hooks/useKeyboardScope";
 import type { StrokeTool } from "../drawing/types";
+import { DrawingService } from "../services/drawing";
+import { PointerStrokePipeline } from "../drawing/pointerPipeline";
+import type { PointerSample } from "../drawing/pointerPipeline";
 import { LaserPointer } from "./LaserPointer";
 import { DrawingToolbar } from "./DrawingToolbar";
 
@@ -138,49 +144,107 @@ export function DrawingLayer({
 
     const isDrawing = keyboard.drawingMode !== "none";
 
-    const handlePointerDown = useCallback(
-        (e: React.PointerEvent<HTMLCanvasElement>) => {
-            if (!isDrawing) return;
+    // P5-T02: the production send path. One DrawingService
+    // per room (a new roomId gives a fresh instance, so no
+    // stroke id or queued send leaks across rooms). The
+    // pipeline couples the local hook (store + renderer)
+    // with the service so the local stroke id is the wire
+    // stroke id.
+    const service = useMemo(() => new DrawingService(), [roomId]);
+    const canDrawRef = useRef(canDraw);
+    canDrawRef.current = canDraw;
+    const pipeline = useMemo(
+        () =>
+            new PointerStrokePipeline(
+                { beginStroke, appendPoint, endStroke },
+                service,
+                { canSend: () => canDrawRef.current },
+            ),
+        [beginStroke, appendPoint, endStroke, service],
+    );
+
+    // Never leave a stroke dangling: leaving the room /
+    // unmounting the layer / switching rooms closes the
+    // active stroke (flushes the last point, sends
+    // DRAW_END).
+    useEffect(() => {
+        return () => {
+            pipeline.finish();
+            void service.dispose();
+        };
+    }, [pipeline, service]);
+
+    // Losing the DRAW capability mid-stroke closes the stroke
+    // locally and stops sending: the server refuses every
+    // DRAW_* from a user without DRAW with a ROOM_ERROR, and
+    // the room client treats an unsolicited ROOM_ERROR as the
+    // end of the room.
+    useEffect(() => {
+        if (!canDraw) pipeline.finish({ sendEnd: false });
+    }, [canDraw, pipeline]);
+
+    // Leaving drawing mode (toolbar close, Escape, laser)
+    // ends any stroke in progress.
+    useEffect(() => {
+        if (!isDrawing) pipeline.finish();
+    }, [isDrawing, pipeline]);
+
+    const sampleFrom = useCallback(
+        (e: React.PointerEvent<HTMLCanvasElement>): PointerSample | null => {
             const canvas = canvasRef.current;
-            if (!canvas) return;
+            if (!canvas) return null;
             const rect = canvas.getBoundingClientRect();
             const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
             const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-            beginStroke({
-                tool: keyboard.drawingMode as StrokeTool,
-                color: strokeColor,
-                width: strokeWidth,
-            });
-            appendPoint({ x, y, pressure: e.pressure || 0, ts: Date.now() });
+            return { x, y, pressure: e.pressure || 0, ts: Date.now(), pointerId: e.pointerId };
         },
-        [isDrawing, beginStroke, appendPoint, keyboard.drawingMode, strokeColor, strokeWidth],
+        [],
+    );
+
+    const handlePointerDown = useCallback(
+        (e: React.PointerEvent<HTMLCanvasElement>) => {
+            if (!isDrawing) return;
+            const sample = sampleFrom(e);
+            if (sample === null) return;
+            pipeline.down(
+                {
+                    tool: keyboard.drawingMode as StrokeTool,
+                    color: strokeColor,
+                    width: strokeWidth,
+                },
+                sample,
+            );
+        },
+        [isDrawing, sampleFrom, pipeline, keyboard.drawingMode, strokeColor, strokeWidth],
     );
 
     const handlePointerMove = useCallback(
         (e: React.PointerEvent<HTMLCanvasElement>) => {
             if (!isDrawing) return;
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const rect = canvas.getBoundingClientRect();
-            const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-            appendPoint({ x, y, pressure: e.pressure || 0, ts: Date.now() });
+            const sample = sampleFrom(e);
+            if (sample === null) return;
+            pipeline.move(sample);
         },
-        [isDrawing, appendPoint],
+        [isDrawing, sampleFrom, pipeline],
     );
 
     const handlePointerUp = useCallback(
         (e: React.PointerEvent<HTMLCanvasElement>) => {
             if (!isDrawing) return;
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const rect = canvas.getBoundingClientRect();
-            const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-            appendPoint({ x, y, pressure: e.pressure || 0, ts: Date.now() });
-            endStroke();
+            const sample = sampleFrom(e);
+            if (sample === null) return;
+            pipeline.up(sample);
         },
-        [isDrawing, appendPoint, endStroke],
+        [isDrawing, sampleFrom, pipeline],
+    );
+
+    // pointercancel (touch palm rejection, OS gesture) and
+    // leaving the canvas end the stroke where it is.
+    const handlePointerCancel = useCallback(
+        (e: React.PointerEvent<HTMLCanvasElement>) => {
+            pipeline.cancel({ x: 0, y: 0, pressure: 0, ts: 0, pointerId: e.pointerId });
+        },
+        [pipeline],
     );
 
     return (
@@ -194,6 +258,7 @@ export function DrawingLayer({
                 onPointerDown={handlePointerDown}
                 onPointerMove={handlePointerMove}
                 onPointerUp={handlePointerUp}
+                onPointerCancel={handlePointerCancel}
                 onPointerLeave={handlePointerUp}
             />
             {/* P5-T04/P5-T06: laser pointer overlay */}

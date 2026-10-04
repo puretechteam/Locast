@@ -23,18 +23,18 @@
 //    matches the pattern established by P4-T05's
 //    `__locastDrift`).
 //
-// The hook does NOT install pointer event listeners on
-// the canvas: P5-T01 ships the canvas with
-// `pointer-events: none` so the native `<video controls>`
-// overlay remains usable. Future tasks (a drawing mode
-// toggle) will switch the canvas to `pointer-events:
-// auto` and call into the hook's imperative API from a
-// new pointer-pipeline handler.
+// The hook does NOT install pointer event listeners: the
+// canvas owner (`DrawingLayer`) routes pointer events
+// through `PointerStrokePipeline` (drawing/pointerPipeline.ts),
+// which calls this hook's imperative API for the local stroke
+// and `DrawingService` for the network stroke. The canvas
+// has `pointer-events: none` outside drawing mode so the
+// native `<video controls>` overlay stays usable.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { Stroke, StrokePoint, StrokeTool } from "../drawing/types";
-import { makeStrokeId, newStroke } from "../drawing/types";
+import { newStrokeId, newStroke } from "../drawing/types";
 import { renderStrokes } from "../drawing/strokeRenderer";
 import type { RemoteStroke } from "../stores/useDrawingStore";
 
@@ -248,17 +248,18 @@ export function useDrawingCanvas(
     }, [strokes, remoteStrokes, intrinsicSize]);
 
     /**
-     * Public imperative API. The future drawing toolbar
-     * calls these from `onPointerDown` / `onPointerMove`
-     * / `onPointerUp` handlers once the canvas has
-     * `pointer-events: auto`; P5-T01's test seam uses
-     * them directly.
+     * Public imperative API. `PointerStrokePipeline` calls
+     * these from the canvas pointer handlers while drawing
+     * mode is active; P5-T01's test seam uses them directly.
      */
     const beginStroke = useCallback((opts?: Partial<BeginStrokeOpts>): string => {
         const tool = opts?.tool ?? styleRef.current.tool;
         const color = opts?.color ?? styleRef.current.color;
         const width = opts?.width ?? styleRef.current.width;
-        const id = makeStrokeId("stroke");
+        // The same id goes on the wire (see
+        // `drawing/pointerPipeline.ts`), so a remote echo,
+        // dedup, or a later undo can correlate strokes.
+        const id = newStrokeId();
         const stroke = newStroke({
             id,
             userId: opts?.userId ?? userIdRef.current,
