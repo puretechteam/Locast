@@ -43,10 +43,12 @@
 //! ## Error contract
 //!
 //! - The caller-facing error shape is `ROOM_ERROR` with one
-//!   of: `InvalidState` (bad payload / verify failed),
-//!   `NotHost` (capability gate; emitted by the dispatch
-//!   layer, not this function), `NotJoined` (not in a room),
-//!   `Internal` (DB write failed).
+//!   of: `InvalidState` (bad payload, verify failed, signed
+//!   room id is not the envelope's room, or the signer is not
+//!   the authenticated publisher), `NotHost` (the capability
+//!   gate, or this function's re-check under the room lock),
+//!   `RoomClosed` (the room has ended),
+//!   `NotJoined` (not in a room), `Internal` (DB write failed).
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
@@ -56,13 +58,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use locast_manifest::MediaManifest;
 use locast_protocol::envelope::MessageKind;
 use locast_protocol::room::{
-    ManifestPublishPayload, ManifestPublishedPayload, RoomErrorCode, RoomErrorPayload,
+    ManifestPublishPayload, ManifestPublishedPayload, ParticipantStatus, RoomErrorCode,
+    RoomErrorPayload,
 };
 use uuid::Uuid;
 
 use super::caps;
 use super::error::RoomError;
 use super::registry::{CachedManifest, RoomEvent, RoomRegistry};
+use super::state::RoomLifecycle;
 use crate::db::Db;
 use crate::time::Clock;
 
@@ -77,19 +81,38 @@ use crate::time::Clock;
 /// 3. INSERTs a fresh `room_manifests` row with
 ///    `version = max(existing) + 1`.
 /// 4. Updates the registry's in-memory manifest cache.
-/// 5. Returns the [`RoomEvent::ManifestPublished`] to be
-///    published to the room's broadcast channel.
+/// 5. Publishes the [`RoomEvent::ManifestPublished`] to the
+///    room's broadcast channel and returns it.
 ///
-/// The function does NOT directly send anything on the
-/// WS — it returns a [`RoomEvent`] and the dispatch
-/// layer is responsible for the broadcast. This keeps
-/// the registry free of transport types.
+/// `user_id` and `pubkey` are the server-authenticated
+/// session identity (challenge-verified at AUTH and re-checked
+/// against the bearer on every message), never fields from the
+/// envelope.
+///
+/// Signer binding: the manifest's `host_signature.public_key`
+/// must decode to exactly `pubkey`, and `pubkey` must be the
+/// pubkey on the room's CURRENT host record. A manifest that
+/// verifies but was signed by any other key is refused: the
+/// signature then proves the authenticated host signed it
+/// (architecture §21.3: the pubkey is the canonical user
+/// identifier; §21.5: host authority is checked against the
+/// room's host).
+///
+/// Atomicity: steps 3-5 (host re-check, version decision,
+/// persistence, cache update, broadcast) run under ONE room
+/// write lock, so a host change cannot slip between the
+/// authorization and the write, and concurrent publishes for a
+/// room get consecutive versions, the cache always holds the
+/// highest one, and broadcasts go out in version order. The
+/// returned event is ALREADY PUBLISHED; callers must not
+/// publish it again.
 pub async fn handle_manifest_publish(
     envelope: &locast_protocol::envelope::Envelope,
     registry: &RoomRegistry,
     db: &Db,
     clock: &dyn Clock,
     user_id: Uuid,
+    pubkey: [u8; 32],
 ) -> Result<RoomEvent, RoomError> {
     // 1. Decode the payload. The dispatch layer strips the
     //    `bearer` field; we deserialize the cleaned value
@@ -126,9 +149,51 @@ pub async fn handle_manifest_publish(
         return Err(RoomError::InvalidState);
     }
 
-    // 3. Compute the next version. The room row exists
-    //    (we checked `is_room_host` earlier) but the
-    //    manifest may be the first one published.
+    // 2c. Bind the signer to the authenticated publisher: the key
+    //     that signed (already verified above) must be the
+    //     session's authenticated pubkey, compared as raw 32-byte
+    //     Ed25519 keys (so base64 spelling cannot matter).
+    if signer_public_key(&manifest)? != pubkey {
+        return Err(RoomError::InvalidState);
+    }
+
+    // 3. Take the room write lock and re-check, on the state the
+    //    publish is ordered against, that the authenticated
+    //    publisher is the room's current host (same rule as the
+    //    capability gate: live host record, Connected or
+    //    Reconnecting) and that the host record carries the
+    //    session pubkey (so signer == authenticated user ==
+    //    current host). The lock is held to the end of step 5;
+    //    host migration and other publishes take the same lock.
+    //    (Awaiting the DB under the room lock follows
+    //    `RoomRegistry::leave`.)
+    let handle = registry
+        .get_by_id(room_id)
+        .await
+        .ok_or(RoomError::NotJoined)?;
+    let state = handle.write().await;
+    // An ended room (e.g. the host's grace window expired) takes
+    // no further manifests, even from a host record that still
+    // reads Reconnecting until the room is removed.
+    if state.state == RoomLifecycle::Ended {
+        return Err(RoomError::RoomClosed);
+    }
+    let is_current_host = state.participants.iter().any(|p| {
+        p.user_id == user_id
+            && p.is_host
+            && p.pubkey == pubkey
+            && matches!(
+                p.status,
+                ParticipantStatus::Connected | ParticipantStatus::Reconnecting
+            )
+    });
+    if !is_current_host {
+        return Err(RoomError::NotHost);
+    }
+
+    // Compute the next version. The room row exists (the host
+    // record above proves the room is live) but the manifest may
+    // be the first one published.
     let now = clock.now_ms();
     let (version, manifest_hash) = compute_version_and_hash(&manifest, db, room_id).await?;
 
@@ -162,13 +227,31 @@ pub async fn handle_manifest_publish(
         )
         .await;
 
-    // 6. Build the event.
-    Ok(RoomEvent::ManifestPublished {
+    // 6. Publish while still holding the room lock, so
+    //    MANIFEST_PUBLISHED broadcasts leave in version order.
+    //    `publish` never awaits.
+    let event = RoomEvent::ManifestPublished {
         room_id,
         manifest,
         version,
         published_at_ms: now,
-    })
+    };
+    registry.publish_events(std::slice::from_ref(&event), |_| room_id);
+    drop(state);
+    Ok(event)
+}
+
+/// The raw Ed25519 public key that signed `manifest`. Only called
+/// after `verify_manifest` succeeded, so a missing or malformed
+/// key here is still treated as an invalid manifest.
+fn signer_public_key(manifest: &MediaManifest) -> Result<[u8; 32], RoomError> {
+    let sig = manifest
+        .host_signature
+        .as_ref()
+        .ok_or(RoomError::InvalidState)?;
+    let bytes = locast_crypto::ed25519::from_base64(&sig.public_key)
+        .map_err(|_| RoomError::InvalidState)?;
+    bytes.try_into().map_err(|_| RoomError::InvalidState)
 }
 
 /// Handle a `MANIFEST_REQUEST` from a room member. Returns

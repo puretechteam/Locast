@@ -2162,3 +2162,99 @@ async fn revoking_draw_stops_the_next_stroke() {
     .await;
     drop(harness);
 }
+
+/// A MANIFEST_PUBLISH whose manifest is validly signed by `signer`
+/// (for the right room), regardless of who sends it.
+fn manifest_signed_by(token: [u8; 32], room_id: Uuid, signer: &SigningKey) -> Envelope {
+    let manifest = locast_manifest::sign_manifest(
+        &signer.to_bytes(),
+        &locast_manifest::MediaManifest {
+            manifest_version: 1,
+            room_id: room_id.to_string(),
+            media: vec![],
+            subtitles: vec![],
+            created_at: 1,
+            host_signature: None,
+        },
+    )
+    .expect("sign manifest");
+    room_scoped_envelope(
+        token,
+        MessageKind::ManifestPublish,
+        room_id,
+        json!({ "manifest": manifest }),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manifest_must_be_signed_by_the_authenticated_host() {
+    let harness = spawn_test_server().await;
+    let (kp_h, _) = fresh_keypair();
+    let (kp_v, _) = fresh_keypair();
+    let (kp_other, _) = fresh_keypair();
+    let mut ws_h = connect(harness.addr).await;
+    let mut ws_v = connect(harness.addr).await;
+    let h = complete_handshake(&mut ws_h, &kp_h).await;
+    let v = complete_handshake(&mut ws_v, &kp_v).await;
+    send_envelope(&mut ws_h, &room_create_envelope(h.token, "M", false)).await;
+    let room = serde_json::from_value::<RoomCreatedPayload>(
+        next_of_kind(&mut ws_h, MessageKind::RoomCreated, "create")
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room;
+    send_envelope(&mut ws_v, &room_join_envelope(v.token, &room.code, "V")).await;
+    next_of_kind(&mut ws_v, MessageKind::RoomJoined, "join").await;
+
+    // The authenticated host presents manifests that verify but were
+    // signed by someone else: an unrelated key, and the viewer's key.
+    for (signer, ctx) in [(&kp_other, "unrelated key"), (&kp_v, "viewer's key")] {
+        send_envelope(&mut ws_h, &manifest_signed_by(h.token, room.id, signer)).await;
+        expect_room_error(&mut ws_h, RoomErrorCode::InvalidState, ctx).await;
+    }
+    // Nothing persisted, cached or broadcast.
+    assert!(harness
+        .db
+        .get_latest_room_manifest(room.id)
+        .await
+        .expect("db")
+        .is_none());
+    assert!(harness.rooms.current_manifest(room.id).await.is_none());
+    assert_no_kind_within(
+        &mut ws_v,
+        MessageKind::ManifestPublished,
+        Duration::from_millis(300),
+        "viewer",
+    )
+    .await;
+
+    // Signed with the host's own authenticated key: accepted as v1.
+    send_envelope(&mut ws_h, &manifest_signed_by(h.token, room.id, &kp_h)).await;
+    let env = next_of_kind(&mut ws_v, MessageKind::ManifestPublished, "viewer gets it").await;
+    assert_eq!(env.payload["version"], 1);
+    // Exactly once: the handler publishes it, the WS layer does not.
+    assert_no_kind_within(
+        &mut ws_v,
+        MessageKind::ManifestPublished,
+        Duration::from_millis(300),
+        "single broadcast",
+    )
+    .await;
+    assert_eq!(
+        env.payload["manifest"]["host_signature"]["public_key"],
+        json!(locast_crypto::ed25519::to_base64(
+            &kp_h.verifying_key().to_bytes()
+        ))
+    );
+    assert_eq!(
+        harness
+            .rooms
+            .current_manifest(room.id)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    drop(harness);
+}

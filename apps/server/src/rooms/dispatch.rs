@@ -150,7 +150,7 @@ pub async fn dispatch_room_message(
         }
         MessageKind::Presence => handle_presence(registry, user_id, now_ms).await,
         MessageKind::ManifestPublish => {
-            handle_manifest_publish_dispatch(envelope, registry, db, clock, user_id).await
+            handle_manifest_publish_dispatch(envelope, registry, db, clock, user_id, pubkey).await
         }
         MessageKind::ManifestRequest => {
             handle_manifest_fetch_dispatch(envelope, registry, user_id, now_ms).await
@@ -384,29 +384,29 @@ async fn handle_presence(
     RoomDispatchOutcome::default()
 }
 
-/// P3-T03: the manifest publish dispatch. Decodes the
-/// payload, runs `handle_manifest_publish`, and turns the
-/// resulting `RoomEvent::ManifestPublished` into a
-/// `RoomDispatchOutcome` with the event in the `events`
-/// list (so the WS layer broadcasts it to every other
-/// participant).
+/// P3-T03: the manifest publish dispatch. Runs
+/// `handle_manifest_publish` with the session's authenticated
+/// `user_id` + `pubkey`. The handler publishes the
+/// `RoomEvent::ManifestPublished` itself, under the room lock, so
+/// it is NOT added to `events` (the WS layer would publish it a
+/// second time, out of order).
 async fn handle_manifest_publish_dispatch(
     envelope: Envelope,
     registry: &RoomRegistry,
     db: &Db,
     clock: &dyn Clock,
     user_id: Uuid,
+    pubkey: [u8; 32],
 ) -> RoomDispatchOutcome {
     let mut out = RoomDispatchOutcome::default();
-    match handle_manifest_publish(&envelope, registry, db, clock, user_id).await {
-        Ok(event) => {
-            out.events.push(event);
-        }
+    match handle_manifest_publish(&envelope, registry, db, clock, user_id, pubkey).await {
+        Ok(_published) => {}
         Err(e) => {
             let code: RoomErrorCode = match e {
                 RoomError::NotHost => RoomErrorCode::NotHost,
                 RoomError::NotJoined => RoomErrorCode::NotJoined,
                 RoomError::InvalidState => RoomErrorCode::InvalidState,
+                RoomError::RoomClosed => RoomErrorCode::RoomClosed,
                 _ => RoomErrorCode::Internal,
             };
             out.to_caller.push(err_envelope(
@@ -1010,20 +1010,18 @@ mod tests {
         // before `insert_room_manifest` (the row's FK
         // references it). The bearer-auth path does this
         // in production; the test does it by hand.
-        let host_user_id = db.upsert_user(&pubkey()).await.expect("upsert user");
+        // The host's identity is a real Ed25519 keypair: the server
+        // requires the manifest's signer to be the authenticated
+        // host's pubkey, so the session pubkey must be the one the
+        // signing seed derives.
+        let seed: [u8; 32] = pubkey();
+        let host_pk = locast_crypto::ed25519::public_key_from_seed(&seed);
+        let host_user_id = db.upsert_user(&host_pk).await.expect("upsert user");
         // Create a room as host (becomes host).
         let (room, _self_view) = reg
-            .create(&s, "T".into(), host_user_id, pubkey(), true, clock.now_ms())
+            .create(&s, "T".into(), host_user_id, host_pk, true, clock.now_ms())
             .await
             .expect("create");
-        // Sign a manifest with the host's keypair-derived
-        // seed, then publish. The server runs
-        // `locast_manifest::verify_manifest` on the
-        // supplied bytes; the test must therefore use a
-        // keypair the server can also derive the pubkey
-        // for. We use pubkey() = [7u8; 32]; we use the
-        // matching seed.
-        let seed: [u8; 32] = pubkey();
         let manifest = locast_manifest::MediaManifest {
             manifest_version: 1,
             room_id: room.id.to_string(),
@@ -1046,13 +1044,14 @@ mod tests {
             })
             .unwrap(),
         };
-        let _publish_out = dispatch_room_message(
+        let publish_out = dispatch_room_message(
             env,
             &ctx(&reg, &s, &db, &clock, &relay),
             host_user_id,
-            pubkey(),
+            host_pk,
         )
         .await;
+        assert!(publish_out.to_caller.is_empty(), "publish accepted");
         // Now fetch.
         let env = Envelope {
             v: 1,
@@ -1071,7 +1070,7 @@ mod tests {
             env,
             &ctx(&reg, &s, &db, &clock, &relay),
             host_user_id,
-            pubkey(),
+            host_pk,
         )
         .await;
         assert_eq!(out.to_caller.len(), 1);
@@ -1835,5 +1834,243 @@ mod tests {
         assert!(out.events.is_empty());
         let handle = reg.get_by_id(room_id).await.unwrap();
         assert!(handle.read().await.drawing.pending.is_empty());
+    }
+
+    // ----- MANIFEST_PUBLISH: host re-check and ordering under the room lock -----
+
+    /// A room whose host and viewer have real Ed25519 identities
+    /// (seeds 21 / 22), persisted so manifests can be inserted.
+    async fn manifest_room(
+        reg: &RoomRegistry,
+        db: &crate::db::Db,
+        clock: &MockClock,
+    ) -> (Uuid, (Uuid, [u8; 32], [u8; 32]), (Uuid, [u8; 32], [u8; 32])) {
+        let s = crate::rooms::DbRoomStore::new(db.clone());
+        let host_seed = [21u8; 32];
+        let viewer_seed = [22u8; 32];
+        let host_pk = locast_crypto::ed25519::public_key_from_seed(&host_seed);
+        let viewer_pk = locast_crypto::ed25519::public_key_from_seed(&viewer_seed);
+        let host = db.upsert_user(&host_pk).await.expect("upsert host");
+        let viewer = db.upsert_user(&viewer_pk).await.expect("upsert viewer");
+        let (room, _) = reg
+            .create(&s, "M".into(), host, host_pk, true, clock.now_ms())
+            .await
+            .expect("create");
+        reg.join(
+            &s,
+            &room.code,
+            viewer,
+            viewer_pk,
+            "viewer".into(),
+            clock.now_ms(),
+        )
+        .await
+        .expect("join");
+        (
+            room.id,
+            (host, host_pk, host_seed),
+            (viewer, viewer_pk, viewer_seed),
+        )
+    }
+
+    fn publish_envelope(room_id: Uuid, seed: &[u8; 32], created_at: i64) -> Envelope {
+        let manifest = locast_manifest::sign_manifest(
+            seed,
+            &locast_manifest::MediaManifest {
+                manifest_version: 1,
+                room_id: room_id.to_string(),
+                media: vec![],
+                subtitles: vec![],
+                created_at,
+                host_signature: None,
+            },
+        )
+        .expect("sign");
+        Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestPublish,
+            id: Uuid::now_v7(),
+            room_id: Some(room_id),
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(locast_protocol::room::ManifestPublishPayload {
+                manifest,
+            })
+            .unwrap(),
+        }
+    }
+
+    /// The gate checked "host" before the room lock; a migration that
+    /// lands in between must stop the old host's publish. Calling the
+    /// handler directly after the migration reproduces that window.
+    #[tokio::test]
+    async fn manifest_publish_rechecks_the_host_under_the_room_lock() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, (host, host_pk, host_seed), (viewer, viewer_pk, viewer_seed)) =
+            manifest_room(&reg, &db, &clock).await;
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+        {
+            let handle = reg.get_by_id(room_id).await.expect("room");
+            let mut st = handle.write().await;
+            assert_eq!(crate::rooms::host::elect_new_host(&mut st), Some(viewer));
+        }
+
+        // The demoted host's own, correctly signed manifest is refused.
+        let err = crate::rooms::handle_manifest_publish(
+            &publish_envelope(room_id, &host_seed, 1),
+            &reg,
+            &db,
+            &clock,
+            host,
+            host_pk,
+        )
+        .await
+        .expect_err("demoted host must be refused");
+        assert!(matches!(err, RoomError::NotHost), "got {err:?}");
+        assert!(db
+            .get_latest_room_manifest(room_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reg.current_manifest(room_id).await.is_none());
+        assert!(rx.try_recv().is_err(), "nothing broadcast");
+
+        // The new host publishes version 1.
+        crate::rooms::handle_manifest_publish(
+            &publish_envelope(room_id, &viewer_seed, 2),
+            &reg,
+            &db,
+            &clock,
+            viewer,
+            viewer_pk,
+        )
+        .await
+        .expect("current host publishes");
+        assert_eq!(reg.current_manifest(room_id).await.unwrap().version, 1);
+        assert_eq!(
+            rx.try_recv().expect("broadcast").kind,
+            MessageKind::ManifestPublished
+        );
+    }
+
+    /// The signer must be the authenticated publisher: the host
+    /// presenting a manifest validly signed by another key is
+    /// refused before anything is written.
+    #[tokio::test]
+    async fn manifest_signed_by_another_key_is_refused() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, (host, host_pk, _host_seed), (_viewer, _viewer_pk, viewer_seed)) =
+            manifest_room(&reg, &db, &clock).await;
+        let err = crate::rooms::handle_manifest_publish(
+            &publish_envelope(room_id, &viewer_seed, 1),
+            &reg,
+            &db,
+            &clock,
+            host,
+            host_pk,
+        )
+        .await
+        .expect_err("foreign signer must be refused");
+        assert!(matches!(err, RoomError::InvalidState), "got {err:?}");
+        assert!(db
+            .get_latest_room_manifest(room_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reg.current_manifest(room_id).await.is_none());
+    }
+
+    /// Concurrent publishes for one room serialize on the room lock:
+    /// every one succeeds with a distinct consecutive version, the
+    /// cache ends on the highest, and broadcasts leave in version
+    /// order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_manifest_publishes_get_ordered_versions() {
+        let (reg, clock) = fresh_registry();
+        let reg = std::sync::Arc::new(reg);
+        let clock = std::sync::Arc::new(clock);
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, (host, host_pk, host_seed), _) = manifest_room(&reg, &db, &clock).await;
+        let mut rx = reg.subscribe(room_id).await.expect("room channel");
+        const N: i64 = 8;
+        let tasks: Vec<_> = (0..N)
+            .map(|i| {
+                let (reg, clock, db) = (reg.clone(), clock.clone(), db.clone());
+                tokio::spawn(async move {
+                    crate::rooms::handle_manifest_publish(
+                        &publish_envelope(room_id, &host_seed, i),
+                        &reg,
+                        &db,
+                        clock.as_ref(),
+                        host,
+                        host_pk,
+                    )
+                    .await
+                })
+            })
+            .collect();
+        let mut versions = Vec::new();
+        for t in tasks {
+            match t.await.expect("task").expect("publish") {
+                RoomEvent::ManifestPublished { version, .. } => versions.push(version),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            (1..=N).collect::<Vec<_>>(),
+            "consecutive versions"
+        );
+        assert_eq!(reg.current_manifest(room_id).await.unwrap().version, N);
+        assert_eq!(
+            db.get_latest_room_manifest(room_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            N
+        );
+        let mut broadcast = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            broadcast.push(item.payload["version"].as_i64().expect("version"));
+        }
+        assert_eq!(
+            broadcast,
+            (1..=N).collect::<Vec<_>>(),
+            "broadcast in version order"
+        );
+    }
+
+    /// A room that has ended takes no manifest, even from its host.
+    #[tokio::test]
+    async fn manifest_publish_into_an_ended_room_is_refused() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, (host, host_pk, host_seed), _) = manifest_room(&reg, &db, &clock).await;
+        {
+            let handle = reg.get_by_id(room_id).await.expect("room");
+            handle.write().await.state = crate::rooms::RoomLifecycle::Ended;
+        }
+        let err = crate::rooms::handle_manifest_publish(
+            &publish_envelope(room_id, &host_seed, 1),
+            &reg,
+            &db,
+            &clock,
+            host,
+            host_pk,
+        )
+        .await
+        .expect_err("ended room");
+        assert!(matches!(err, RoomError::RoomClosed), "got {err:?}");
+        assert!(db
+            .get_latest_room_manifest(room_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(reg.current_manifest(room_id).await.is_none());
     }
 }
