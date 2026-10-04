@@ -52,6 +52,9 @@ export type RoomSummaryIpc = {
     host_disconnected: boolean;
     host_disconnect_deadline_ms: number | null;
     you_cap_set?: number;
+    /** The local user's server-assigned id (P5-T04: the
+     *  production source of RoomPage's `localUserId`). */
+    you_user_id?: string | null;
 };
 
 export type PlaybackStateEvent = {
@@ -102,6 +105,18 @@ export type StrokeEndEvent = {
     ts_ms: number;
 };
 
+export type LaserMoveEvent = {
+    room_id: string;
+    sender_id: string;
+    x: number;
+    y: number;
+};
+
+export type LaserOffEvent = {
+    room_id: string;
+    sender_id: string;
+};
+
 export type ChatMessage = {
     room_id: string;
     sender_id: string;
@@ -122,19 +137,26 @@ type LocastApi = {
     emitStrokePoint: (p: StrokePointEvent) => Promise<void>;
     emitStrokeEnd: (p: StrokeEndEvent) => Promise<void>;
     emitChatMessage: (p: ChatMessage) => Promise<void>;
+    /** P5-T04: drive the `laser://move` / `laser://off` events. */
+    emitLaserMove: (p: LaserMoveEvent) => Promise<void>;
+    emitLaserOff: (p: LaserOffEvent) => Promise<void>;
     /** P4-T05: wait for download/playback event bridge to subscribe. */
     waitForBridge: () => Promise<void>;
     /** P5-T03: wait for the drawing event bridge to subscribe. */
     waitForDrawingBridge: () => Promise<void>;
     /** P6-T03: wait for the chat event bridge to subscribe. */
     waitForChatBridge: () => Promise<void>;
+    /** P5-T04: wait for the laser transport to subscribe. */
+    waitForLaserBridge: () => Promise<void>;
     /** P4-T05: read all Tauri invoke() calls recorded
      *  by the shim since the last reset. Tests assert
      *  on this to verify that the local-only sync
      *  branch does NOT emit a `playback_send` and the
      *  host-authoritative branch DOES. */
     readInvokeLog: () => Promise<
-        Array<{ name: string; args: unknown }>
+        /** `t` (performance.now() at the call) is recorded for
+         *  `laser_send` only. */
+        Array<{ name: string; args: unknown; t?: number }>
     >;
     /** P4-T05: clear the invoke log. Tests call this at
      *  the start of each scenario. */
@@ -370,6 +392,16 @@ const SHIM_SOURCE = `
                         stroke_id: stroke_id,
                     });
                 }
+            // P5-T04: record the laser send IPC so the laser
+            // transport spec can count LASER_MOVE / LASER_OFF
+            // sends and their timing. The Rust side returns a
+            // synthetic envelope id.
+            if (name === "laser_send") {
+                w.__locast_invoke_log.push({ name: name, args: args, t: performance.now() });
+                return Promise.resolve({
+                    envelope_id: "envelope-" + (w.__locast_invoke_log.length),
+                });
+            }
             // P6-T06: download_open marks a temp file as permanent
             // (changes state to "complete").
             if (name === "download_open") {
@@ -493,6 +525,16 @@ const SHIM_SOURCE = `
                     mod.__emit("chat://message", payload);
                 });
             },
+            emitLaserMove: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("laser://move", payload);
+                });
+            },
+            emitLaserOff: function(payload) {
+                return import("/tests/playwright/shim/tauriShim.ts").then(function(mod) {
+                    mod.__emit("laser://off", payload);
+                });
+            },
         };
         w.__locast = api;
     })();
@@ -595,6 +637,24 @@ export const test = base.extend<{ locast: LocastApi }>({
                     return w.__locast.emitChatMessage(payload);
                 }, p);
             },
+            emitLaserMove: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitLaserMove: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitLaserMove(payload);
+                }, p);
+            },
+            emitLaserOff: async (p) => {
+                await page.evaluate((payload) => {
+                    const w = window as unknown as { __locast?: { emitLaserOff: (p: unknown) => Promise<void> } };
+                    if (!w.__locast) {
+                        throw new Error("__locast not present on window");
+                    }
+                    return w.__locast.emitLaserOff(payload);
+                }, p);
+            },
             waitForBridge: async () => {
                 await page.waitForFunction(
                     () => (window as { __locast_subscribed?: boolean }).__locast_subscribed === true,
@@ -616,12 +676,20 @@ export const test = base.extend<{ locast: LocastApi }>({
                     { timeout: 5000 },
                 );
             },
+            waitForLaserBridge: async () => {
+                await page.waitForFunction(
+                    () => (window as { __locast_laser_subscribed?: boolean }).__locast_laser_subscribed === true,
+                    undefined,
+                    { timeout: 5000 },
+                );
+            },
             readInvokeLog: async () => {
                 return await page.evaluate(() => {
                     const w = window as unknown as {
                         __locast_invoke_log?: Array<{
                             name: string;
                             args: unknown;
+                            t?: number;
                         }>;
                     };
                     return w.__locast_invoke_log ?? [];

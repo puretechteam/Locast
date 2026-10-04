@@ -27,6 +27,17 @@ pub use crate::ws::TokenBucket;
 /// the spec; future work may tune it.
 pub const DEFAULT_RETRY_AFTER_MS: i64 = 1_000;
 
+/// P5-T04: sustained LASER_MOVE / LASER_OFF frames per second a
+/// connection may relay. The client sends at most 60 Hz
+/// (architecture §16.3); capping the laser at 60 % of the default
+/// 100 msg/s connection budget keeps a full-rate laser from
+/// starving the connection's other traffic.
+pub const LASER_MSGS_PER_SEC: u32 = 60;
+
+/// P5-T04: laser burst capacity (one second at the sustained rate),
+/// so scheduler jitter in a 60 Hz sender is not dropped.
+pub const LASER_MSG_BURST: u32 = 60;
+
 /// A single rate-limit hit. Returned by
 /// [`PerConnLimiter::on_frame`] when the connection
 /// exceeded either the msg/s or the bytes/s bucket. The
@@ -68,6 +79,9 @@ pub struct PerConnLimiter {
     pub msg: TokenBucket,
     /// Bytes-per-second bucket.
     pub bytes: TokenBucket,
+    /// P5-T04: laser frames, debited in ADDITION to `msg` and
+    /// `bytes` (a laser frame is still an ordinary frame).
+    pub laser: TokenBucket,
     /// The msg/s capacity. Kept so the hit payload can
     /// report the configured limit without an extra
     /// plumbing parameter.
@@ -88,6 +102,7 @@ impl PerConnLimiter {
         Self {
             msg: TokenBucket::new_with(msg_burst, msg_per_sec),
             bytes: TokenBucket::new_with(bytes_burst, bytes_per_sec),
+            laser: TokenBucket::new_with(LASER_MSG_BURST, LASER_MSGS_PER_SEC),
             msg_limit: msg_per_sec,
             bytes_limit: bytes_per_sec,
         }
@@ -151,6 +166,15 @@ impl PerConnLimiter {
         }
     }
 
+    /// P5-T04: debit one laser frame. `false` means the connection
+    /// is over its laser rate: the caller drops the frame silently
+    /// (no RATE_LIMIT, no throttle, no disconnect), because a lost
+    /// laser position is superseded by the next one and the
+    /// connection's other traffic must keep flowing.
+    pub fn check_laser(&mut self) -> bool {
+        self.laser.try_consume()
+    }
+
     /// Reset both buckets to full. Used on a successful
     /// AUTH so a fresh authed user gets a clean rate
     /// budget regardless of any pre-auth frames the
@@ -164,6 +188,7 @@ impl PerConnLimiter {
     ) {
         self.msg = TokenBucket::new_with(msg_burst, msg_per_sec);
         self.bytes = TokenBucket::new_with(bytes_burst, bytes_per_sec);
+        self.laser = TokenBucket::new_with(LASER_MSG_BURST, LASER_MSGS_PER_SEC);
         self.msg_limit = msg_per_sec;
         self.bytes_limit = bytes_per_sec;
     }
@@ -234,6 +259,67 @@ mod tests {
         }
         let hit = l.on_frame(0).expect_err("burst exhausted");
         assert_eq!(hit.limit, 10);
+    }
+
+    /// A sender at exactly the sustained rate is never refused, however
+    /// long it runs (fractional refills are kept, not rounded away).
+    #[test]
+    fn a_sender_at_exactly_the_sustained_rate_is_never_refused() {
+        let t0 = 1_000_000;
+        let mut tb = TokenBucket::new_at(LASER_MSG_BURST, LASER_MSGS_PER_SEC, t0);
+        // 60 Hz for 60 s with integer-ms gaps (16 / 17 / 17 ms), frame
+        // k at floor(k * 1000 / 60).
+        for k in 0..3_600i64 {
+            assert!(
+                tb.try_consume_n_at(1, t0 + k * 1_000 / 60),
+                "frame {k} of an exact 60 Hz sender refused"
+            );
+        }
+        // The same holds for the general bucket at its own rate.
+        let mut tb = TokenBucket::new_at(200, 100, t0);
+        for k in 0..6_000i64 {
+            assert!(tb.try_consume_n_at(1, t0 + k * 10), "frame {k} refused");
+        }
+    }
+
+    /// Faster than the sustained rate: only the burst plus the refill
+    /// gets through.
+    #[test]
+    fn a_sender_over_the_sustained_rate_is_capped_at_burst_plus_refill() {
+        let t0 = 5_000;
+        let mut tb = TokenBucket::new_at(LASER_MSG_BURST, LASER_MSGS_PER_SEC, t0);
+        // 200 Hz for 10 s: 60 burst + 60/s * 10 s = 660 (the frame at
+        // t = 10 s itself excluded).
+        let accepted = (0..2_000i64)
+            .filter(|k| tb.try_consume_n_at(1, t0 + k * 5))
+            .count();
+        assert!(
+            (659..=661).contains(&accepted),
+            "accepted {accepted}, expected about 660"
+        );
+        // A clock step backwards credits nothing.
+        let mut tb = TokenBucket::new_at(1, 1, t0);
+        assert!(tb.try_consume_n_at(1, t0));
+        assert!(!tb.try_consume_n_at(1, t0 - 10_000));
+        assert!(!tb.try_consume_n_at(1, t0 + 999));
+        assert!(tb.try_consume_n_at(1, t0 + 1_000));
+        // Large byte refills do not overflow.
+        let mut tb = TokenBucket::new_at(2_000_000, 1_000_000, 0);
+        assert!(tb.try_consume_n_at(2_000_000, 0));
+        assert!(tb.try_consume_n_at(2_000_000, i64::MAX / 2));
+    }
+
+    #[test]
+    fn laser_bucket_is_separate_and_capped_at_its_burst() {
+        let mut l = PerConnLimiter::new(1_000, 1_000, 1_000_000, 2_000_000);
+        for _ in 0..LASER_MSG_BURST {
+            assert!(l.check_laser());
+        }
+        assert!(!l.check_laser(), "laser burst exhausted");
+        // The general buckets are untouched by laser debits.
+        assert!(l.on_frame(10).is_ok());
+        l.reset(1_000, 1_000, 1_000_000, 2_000_000);
+        assert!(l.check_laser(), "reset refills the laser bucket");
     }
 
     #[test]

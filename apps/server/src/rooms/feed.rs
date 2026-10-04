@@ -23,9 +23,11 @@
 //! the first item received after the lag is a drawing event numbered
 //! at most one past what the client already has (delivered or
 //! covered by a snapshot), no drawing event the client lacks was
-//! lost and no snapshot is sent. Otherwise (including when the first
-//! item is not a drawing event, so a lost trailing DRAW_UNDO cannot
-//! go unnoticed) a snapshot is sent before that item.
+//! lost and no snapshot is sent. If the first item is not a drawing
+//! event, the room's current drawing sequence decides: past what the
+//! client has means a drawing event (maybe a trailing DRAW_UNDO) was
+//! lost; otherwise only non-drawing items (e.g. transient lasers)
+//! were. On a loss, a snapshot is sent before that item.
 
 #![forbid(unsafe_code)]
 
@@ -124,7 +126,7 @@ impl RoomFeed {
                 }
                 // The room is gone; its channel closes next.
             }
-            let item = match self.held.take() {
+            let mut item = match self.held.take() {
                 Some(item) => item,
                 None => match self.rx.recv().await {
                     Ok(item) => item,
@@ -141,11 +143,29 @@ impl RoomFeed {
                 },
             };
             if self.lagged {
-                self.lagged = false;
                 let have = self.draw_floor.max(self.last_seen);
-                // Contiguous drawing numbers: anything lost was older
-                // than `item`, so it is covered iff `item.seq <= have + 1`.
-                if item.seq == 0 || item.seq > have + 1 {
+                let lost_drawing = if item.seq == 0 {
+                    // A non-drawing item (e.g. a laser) revealed the
+                    // lag. A drawing event was lost only if the room
+                    // has published one the client lacks: numbers are
+                    // contiguous and in publish order, so that is
+                    // exactly "the room's drawing sequence is past
+                    // `have`". (Without this check, transient laser
+                    // traffic would turn every lag into a snapshot.)
+                    // Park the item first so a cancelled await loses
+                    // nothing; `lagged` stays set until decided.
+                    self.held = Some(item);
+                    let current = rooms.drawing_seq(self.room_id).await;
+                    item = self.held.take().expect("parked above");
+                    current.is_some_and(|seq| seq > have)
+                } else {
+                    // Contiguous drawing numbers: anything lost was
+                    // older than `item`, so it is covered iff
+                    // `item.seq <= have + 1`.
+                    item.seq > have + 1
+                };
+                self.lagged = false;
+                if lost_drawing {
                     self.sync_pending = true;
                     self.held = Some(item);
                     continue;

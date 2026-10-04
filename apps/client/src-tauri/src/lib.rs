@@ -114,6 +114,8 @@ pub fn invoke_handler<R: tauri::Runtime>(
         commands::download::download_list,
         commands::playback::playback_send,
         commands::drawing::drawing_send,
+        // P5-T04: laser pointer transport.
+        commands::laser::laser_send,
         // P6-T06: leave-room Keep / Delete flow.
         commands::temp_files::get_temp_files,
         commands::temp_files::mark_files_permanent,

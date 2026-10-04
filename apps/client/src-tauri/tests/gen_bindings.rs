@@ -112,6 +112,7 @@ mod inner {
                 commands::room::recent_room_upsert,
                 commands::playback::playback_send,
                 commands::drawing::drawing_send,
+                commands::laser::laser_send,
             ])
             .events(collect_events![])
             // BigInt-style integer types (i64, u64, etc.) appear

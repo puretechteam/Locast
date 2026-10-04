@@ -98,6 +98,12 @@ pub trait RoomEventSink: Send + Sync {
     fn emit_stroke_clear(&self, _ev: &StrokeClearEvent) {}
     /// Emit `drawing://sync` when the server sends a DRAW_SYNC.
     fn emit_stroke_sync(&self, _ev: &StrokeSyncEvent) {}
+    /// P5-T04: emit `laser://move` when the server relays another
+    /// participant's LASER_MOVE.
+    fn emit_laser_move(&self, _ev: &LaserMoveEvent) {}
+    /// P5-T04: emit `laser://off` when the server relays another
+    /// participant's LASER_OFF.
+    fn emit_laser_off(&self, _ev: &LaserOffEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -176,6 +182,12 @@ mod tauri_sink {
         }
         fn emit_stroke_sync(&self, ev: &StrokeSyncEvent) {
             let _ = self.handle.emit(STROKE_SYNC_EVENT, ev.clone());
+        }
+        fn emit_laser_move(&self, ev: &LaserMoveEvent) {
+            let _ = self.handle.emit(LASER_MOVE_EVENT, ev.clone());
+        }
+        fn emit_laser_off(&self, ev: &LaserOffEvent) {
+            let _ = self.handle.emit(LASER_OFF_EVENT, ev.clone());
         }
     }
 }
@@ -462,6 +474,14 @@ pub const STROKE_CLEAR_EVENT: &str = "drawing://clear";
 /// Tauri event name emitted when the server sends a DRAW_SYNC: the
 /// room's authoritative drawing state, replacing the webview's.
 pub const STROKE_SYNC_EVENT: &str = "drawing://sync";
+
+/// P5-T04: Tauri event name emitted when the server relays another
+/// participant's LASER_MOVE.
+pub const LASER_MOVE_EVENT: &str = "laser://move";
+
+/// P5-T04: Tauri event name emitted when the server relays another
+/// participant's LASER_OFF.
+pub const LASER_OFF_EVENT: &str = "laser://off";
 
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
@@ -851,6 +871,28 @@ impl From<(Uuid, Uuid)> for StrokeClearEvent {
             seq: 0,
         }
     }
+}
+
+/// P5-T04: IPC-safe laser position event payload. Emitted as
+/// `laser://move` when the server relays another participant's
+/// LASER_MOVE. `sender_id` is the server-stamped sender (the
+/// payload carries no identity). Unsequenced: each move supersedes
+/// the previous one.
+#[derive(Serialize, Type, Clone, Debug)]
+pub struct LaserMoveEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// P5-T04: IPC-safe laser release event payload. Emitted as
+/// `laser://off` when the server relays another participant's
+/// LASER_OFF; the webview fades that sender's trail out.
+#[derive(Serialize, Type, Clone, Debug)]
+pub struct LaserOffEvent {
+    pub room_id: String,
+    pub sender_id: String,
 }
 
 /// Default timeout for a single request-reply round trip.
@@ -1648,6 +1690,27 @@ impl RoomClient {
         }
     }
 
+    /// P5-T04: the room and server-stamped sender of a relayed
+    /// LASER_MOVE / LASER_OFF, or `None` when the frame must be
+    /// dropped: it names no room or a room other than the one this
+    /// client is in, it has no usable server-stamped sender (see
+    /// [`stroke_sender`]; the payload is never consulted), or the
+    /// sender is the local user (the server never echoes a laser
+    /// back to its sender; this is a defensive second check).
+    async fn laser_origin(&self, env: &Envelope) -> Option<(Uuid, Uuid)> {
+        let room_id = env.room_id?;
+        let current_room = self.state.lock().await.as_ref().map(|s| s.id.clone());
+        if current_room.as_deref() != Some(room_id.to_string().as_str()) {
+            return None;
+        }
+        let sender_id = stroke_sender(env)?;
+        if *self.local_user_id.lock().await == Some(sender_id) {
+            debug!("dropping an echo of the local user's own laser");
+            return None;
+        }
+        Some((room_id, sender_id))
+    }
+
     /// Single inbound-envelope handler. Split out so it
     /// is straightforward to unit test in isolation
     /// (without the surrounding `mpsc::Receiver`).
@@ -2035,6 +2098,46 @@ impl RoomClient {
                     }
                 }
             }
+            // P5-T04: another participant's laser moved. The server
+            // relays it to everyone but the sender, stamped with the
+            // authenticated sender; the payload has no identity.
+            MessageKind::LaserMove => {
+                if let Some((room_id, sender_id)) = self.laser_origin(&env).await {
+                    if let Ok(payload) =
+                        decode_payload::<locast_protocol::room::LaserMovePayload>(&env)
+                    {
+                        if laser_unit_ok(payload.x) && laser_unit_ok(payload.y) {
+                            let ipc = LaserMoveEvent {
+                                room_id: room_id.to_string(),
+                                sender_id: sender_id.to_string(),
+                                x: payload.x,
+                                y: payload.y,
+                            };
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_laser_move(&ipc);
+                            }
+                        } else {
+                            debug!("dropping LASER_MOVE with out-of-range coordinates");
+                        }
+                    }
+                }
+            }
+            // P5-T04: another participant released its laser.
+            MessageKind::LaserOff => {
+                if let Some((room_id, sender_id)) = self.laser_origin(&env).await {
+                    if decode_payload::<locast_protocol::room::LaserOffPayload>(&env).is_ok() {
+                        let ipc = LaserOffEvent {
+                            room_id: room_id.to_string(),
+                            sender_id: sender_id.to_string(),
+                        };
+                        let g = self.sink.lock().await;
+                        if let Some(s) = g.as_ref() {
+                            s.emit_laser_off(&ipc);
+                        }
+                    }
+                }
+            }
             // P6-T02: a participant's cap_set was updated
             // by the host. If the target is the local user,
             // update `you_cap_set`. Otherwise update the
@@ -2288,6 +2391,13 @@ fn stroke_sender(env: &Envelope) -> Option<Uuid> {
     }
 }
 
+/// P5-T04: a relayed laser coordinate must be finite and within
+/// `[0, 1]`. The server checks this too; the client re-checks
+/// rather than trusting the relay.
+fn laser_unit_ok(n: f32) -> bool {
+    n.is_finite() && (0.0..=1.0).contains(&n)
+}
+
 fn decode_payload<T: serde::de::DeserializeOwned>(env: &Envelope) -> Result<T, RoomClientError> {
     serde_json::from_value(env.payload.clone())
         .map_err(|e| RoomClientError::Unexpected(format!("decode: {e}")))
@@ -2346,6 +2456,199 @@ mod tests {
             sig: Vec::new(),
         });
         assert_eq!(stroke_sender(&env), Some(owner));
+    }
+
+    /// P5-T04: records the laser events `handle_inbound` emits.
+    #[derive(Default)]
+    struct LaserSink {
+        moves: std::sync::Mutex<Vec<LaserMoveEvent>>,
+        offs: std::sync::Mutex<Vec<LaserOffEvent>>,
+    }
+    impl RoomEventSink for LaserSink {
+        fn emit_state(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_event(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_state_cleared(&self) {}
+        fn emit_laser_move(&self, ev: &LaserMoveEvent) {
+            self.moves.lock().unwrap().push(ev.clone());
+        }
+        fn emit_laser_off(&self, ev: &LaserOffEvent) {
+            self.offs.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    /// A room client in a room (returned id) as user `me`, with a
+    /// [`LaserSink`] installed.
+    async fn laser_client(me: Uuid) -> (RoomClient, Uuid, Arc<LaserSink>) {
+        let rc = fresh_room_client().await;
+        let summary = RoomSummaryIpc::from(sample_summary(Uuid::now_v7()));
+        let room_id = Uuid::parse_str(&summary.id).unwrap();
+        *rc.state.lock().await = Some(summary);
+        *rc.local_user_id.lock().await = Some(me);
+        let sink = Arc::new(LaserSink::default());
+        rc.install_event_sink(sink.clone()).await;
+        (rc, room_id, sink)
+    }
+
+    fn laser_env(
+        kind: MessageKind,
+        room_id: Uuid,
+        sender: Option<Uuid>,
+        payload: serde_json::Value,
+    ) -> Envelope {
+        let mut env = env_of(kind, payload);
+        env.room_id = Some(room_id);
+        env.sender = sender.map(|user_id| locast_protocol::envelope::Sender {
+            user_id,
+            pubkey: Vec::new(),
+            sig: Vec::new(),
+        });
+        env
+    }
+
+    #[tokio::test]
+    async fn laser_move_takes_the_sender_from_the_envelope_not_the_payload() {
+        let me = Uuid::now_v7();
+        let remote = Uuid::now_v7();
+        let spoofed = Uuid::now_v7();
+        let (rc, room_id, sink) = laser_client(me).await;
+        // A hostile payload naming someone else (or us) is ignored:
+        // only the server-stamped `Envelope::sender` counts.
+        rc.handle_inbound(laser_env(
+            MessageKind::LaserMove,
+            room_id,
+            Some(remote),
+            serde_json::json!({ "x": 0.25, "y": 0.75, "user_id": spoofed, "sender_id": me }),
+        ))
+        .await;
+        let moves = sink.moves.lock().unwrap().clone();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].sender_id, remote.to_string());
+        assert_eq!(moves[0].room_id, room_id.to_string());
+        assert_eq!((moves[0].x, moves[0].y), (0.25, 0.75));
+
+        rc.handle_inbound(laser_env(
+            MessageKind::LaserOff,
+            room_id,
+            Some(remote),
+            serde_json::json!({ "user_id": spoofed }),
+        ))
+        .await;
+        let offs = sink.offs.lock().unwrap().clone();
+        assert_eq!(offs.len(), 1);
+        assert_eq!(offs[0].sender_id, remote.to_string());
+        assert_eq!(offs[0].room_id, room_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn laser_without_a_usable_sender_is_dropped() {
+        let (rc, room_id, sink) = laser_client(Uuid::now_v7()).await;
+        for kind in [MessageKind::LaserMove, MessageKind::LaserOff] {
+            for sender in [None, Some(Uuid::nil())] {
+                rc.handle_inbound(laser_env(
+                    kind.clone(),
+                    room_id,
+                    sender,
+                    serde_json::json!({ "x": 0.5, "y": 0.5, "user_id": Uuid::now_v7() }),
+                ))
+                .await;
+            }
+        }
+        assert!(sink.moves.lock().unwrap().is_empty());
+        assert!(sink.offs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn laser_for_another_room_or_no_room_is_dropped() {
+        let (rc, _room_id, sink) = laser_client(Uuid::now_v7()).await;
+        let remote = Uuid::now_v7();
+        for kind in [MessageKind::LaserMove, MessageKind::LaserOff] {
+            rc.handle_inbound(laser_env(
+                kind.clone(),
+                Uuid::now_v7(),
+                Some(remote),
+                serde_json::json!({ "x": 0.5, "y": 0.5 }),
+            ))
+            .await;
+            let mut no_room = laser_env(
+                kind,
+                Uuid::now_v7(),
+                Some(remote),
+                serde_json::json!({ "x": 0.5, "y": 0.5 }),
+            );
+            no_room.room_id = None;
+            rc.handle_inbound(no_room).await;
+        }
+        assert!(sink.moves.lock().unwrap().is_empty());
+        assert!(sink.offs.lock().unwrap().is_empty());
+
+        // Not in any room at all.
+        *rc.state.lock().await = None;
+        rc.handle_inbound(laser_env(
+            MessageKind::LaserMove,
+            Uuid::now_v7(),
+            Some(remote),
+            serde_json::json!({ "x": 0.5, "y": 0.5 }),
+        ))
+        .await;
+        assert!(sink.moves.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn laser_echo_of_the_local_user_is_dropped() {
+        let me = Uuid::now_v7();
+        let (rc, room_id, sink) = laser_client(me).await;
+        for kind in [MessageKind::LaserMove, MessageKind::LaserOff] {
+            rc.handle_inbound(laser_env(
+                kind,
+                room_id,
+                Some(me),
+                serde_json::json!({ "x": 0.5, "y": 0.5 }),
+            ))
+            .await;
+        }
+        assert!(sink.moves.lock().unwrap().is_empty());
+        assert!(sink.offs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn laser_move_with_bad_coordinates_is_dropped() {
+        let (rc, room_id, sink) = laser_client(Uuid::now_v7()).await;
+        let remote = Uuid::now_v7();
+        for payload in [
+            serde_json::json!({ "x": -0.1, "y": 0.5 }),
+            serde_json::json!({ "x": 0.5, "y": 1.5 }),
+            // JSON has no NaN / infinity; a huge value overflows f32
+            // to infinity or fails to decode, either way dropped.
+            serde_json::json!({ "x": 1e300, "y": 0.5 }),
+            serde_json::json!({ "x": "0.5", "y": 0.5 }),
+            serde_json::json!({ "y": 0.5 }),
+        ] {
+            rc.handle_inbound(laser_env(
+                MessageKind::LaserMove,
+                room_id,
+                Some(remote),
+                payload,
+            ))
+            .await;
+        }
+        assert!(sink.moves.lock().unwrap().is_empty());
+        // The edges of the frame are valid.
+        rc.handle_inbound(laser_env(
+            MessageKind::LaserMove,
+            room_id,
+            Some(remote),
+            serde_json::json!({ "x": 0.0, "y": 1.0 }),
+        ))
+        .await;
+        assert_eq!(sink.moves.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn laser_unit_range_rejects_non_finite_values() {
+        assert!(laser_unit_ok(0.0) && laser_unit_ok(1.0) && laser_unit_ok(0.5));
+        for bad in [-0.0001, 1.0001, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!laser_unit_ok(bad), "{bad} must be rejected");
+        }
     }
 
     #[test]

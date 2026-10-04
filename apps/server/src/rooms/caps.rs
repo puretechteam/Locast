@@ -63,6 +63,8 @@ pub enum Action {
     UndoOwnStroke,
     UndoAnyStroke,
     ClearAll,
+    /// P5-T04: LASER_MOVE / LASER_OFF.
+    PointLaser,
     SendChat,
     ManageRoom,
     Kick,
@@ -82,6 +84,7 @@ impl Scope {
             (Scope::Drawing, Action::UndoOwnStroke) => cap_bits::UNDO_OWN,
             (Scope::Drawing, Action::UndoAnyStroke) => cap_bits::UNDO_ANY,
             (Scope::Drawing, Action::ClearAll) => cap_bits::CLEAR_ALL,
+            (Scope::Drawing, Action::PointLaser) => cap_bits::LASER,
             (Scope::Chat, Action::SendChat) => cap_bits::CHAT,
             (Scope::Room, Action::ManageRoom) => cap_bits::MANAGE_ROOM,
             (Scope::Room, Action::Kick) => cap_bits::KICK,
@@ -226,6 +229,12 @@ pub enum Command {
     /// P5-T03: DRAW_CLEAR. Member of the named room holding
     /// CLEAR_ALL (the host holds it).
     DrawClear,
+    /// P5-T04: LASER_MOVE / LASER_OFF. Member of the room named
+    /// in `envelope.room_id` holding LASER (the host holds it).
+    /// Refusals are dropped silently by the dispatcher: the
+    /// laser is best-effort presence, and a ROOM_ERROR would end
+    /// the room on the client during a revoke race.
+    Laser,
     /// P6-T02: host-only PERMISSION_SET envelope. The
     /// capability check is two-fold:
     ///
@@ -254,6 +263,7 @@ impl Command {
             Command::Draw => Some((Scope::Drawing, Action::DrawBegin)),
             Command::PublishManifest => Some((Scope::Manifest, Action::PublishManifest)),
             Command::ChatMessage => Some((Scope::Chat, Action::SendChat)),
+            Command::Laser => Some((Scope::Drawing, Action::PointLaser)),
             // PermissionSet is checked via is_room_host directly in check_capability;
             // it does not use can() since can() is read-only.
             Command::PermissionSet => None,
@@ -324,7 +334,7 @@ pub async fn check_capability(
         }
         // Capability-bit gated (host, or a participant the host
         // granted the bit to).
-        Command::PlaybackControl | Command::Draw | Command::ChatMessage => {
+        Command::PlaybackControl | Command::Draw | Command::ChatMessage | Command::Laser => {
             let (scope, action) = command
                 .to_scope_action()
                 .expect("capability-gated command has a scope/action");
@@ -947,5 +957,48 @@ mod tests {
             .await
             .expect("grant again");
         assert!(can(&reg, viewer, room_id, Scope::Drawing, Action::DrawBegin).await);
+    }
+
+    #[tokio::test]
+    async fn laser_needs_the_laser_bit_in_the_named_room() {
+        let (reg, clock) = fresh_registry();
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let viewer = uid(2);
+        assert!(
+            check_capability(&reg, uid(1), Some(room_id), Command::Laser)
+                .await
+                .is_ok(),
+            "the host may point the laser"
+        );
+        assert!(matches!(
+            check_capability(&reg, viewer, Some(room_id), Command::Laser).await,
+            Err(CapsError::NotHost)
+        ));
+        // DRAW alone does not grant the laser.
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::DRAW, clock.now_ms())
+            .await
+            .expect("grant DRAW");
+        assert!(
+            check_capability(&reg, viewer, Some(room_id), Command::Laser)
+                .await
+                .is_err()
+        );
+        reg.update_participant_cap_set(room_id, viewer, cap_bits::LASER, clock.now_ms())
+            .await
+            .expect("grant LASER");
+        assert!(
+            check_capability(&reg, viewer, Some(room_id), Command::Laser)
+                .await
+                .is_ok()
+        );
+        // Room-scoped: no room, or a room the caller is not in, is refused.
+        assert!(matches!(
+            check_capability(&reg, viewer, None, Command::Laser).await,
+            Err(CapsError::NotMember)
+        ));
+        assert!(matches!(
+            check_capability(&reg, viewer, Some(Uuid::now_v7()), Command::Laser).await,
+            Err(CapsError::NotMember)
+        ));
     }
 }

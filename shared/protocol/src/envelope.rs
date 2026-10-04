@@ -235,6 +235,19 @@ pub enum MessageKind {
     // clients (the server ignores it).
     #[serde(rename = "DRAW_SYNC")]
     StrokeSync,
+    // ----- P5-T04: laser pointer -----
+    // LASER_MOVE / LASER_OFF are the transient laser pointer
+    // (architecture §16, §18.4.8). Unsigned and unsequenced:
+    // the server attributes them to the authenticated
+    // connection (needs `cap::LASER`), relays them to every
+    // other room participant with that user as
+    // `Envelope::sender`, and keeps no state. They are never
+    // replayed and are not part of DRAW_SYNC; a lost
+    // LASER_MOVE is superseded by the next one.
+    #[serde(rename = "LASER_MOVE")]
+    LaserMove,
+    #[serde(rename = "LASER_OFF")]
+    LaserOff,
     // ----- P4-T06: NTP-style clock skew measurement -----
     // SKEW_PROBE / SKEW_REPLY is the per-connection clock
     // measurement exchange (architecture §13.3). The probe
@@ -293,6 +306,8 @@ impl MessageKind {
             MessageKind::StrokeUndo => "DRAW_UNDO",
             MessageKind::StrokeClear => "DRAW_CLEAR",
             MessageKind::StrokeSync => "DRAW_SYNC",
+            MessageKind::LaserMove => "LASER_MOVE",
+            MessageKind::LaserOff => "LASER_OFF",
             MessageKind::SkewProbe => "SKEW_PROBE",
             MessageKind::SkewReply => "SKEW_REPLY",
             MessageKind::PermissionSet => "PERMISSION_SET",
@@ -388,6 +403,13 @@ impl MessageKind {
         )
     }
 
+    /// `true` for the P5-T04 laser pointer kinds (LASER_MOVE /
+    /// LASER_OFF). Kept separate from `is_drawing`: lasers are
+    /// unsequenced and stateless on the server.
+    pub fn is_laser(&self) -> bool {
+        matches!(self, MessageKind::LaserMove | MessageKind::LaserOff)
+    }
+
     /// `true` for the P6-T02 host-only PERMISSION_SET envelope.
     pub fn is_permission_set(&self) -> bool {
         matches!(self, MessageKind::PermissionSet)
@@ -473,6 +495,24 @@ mod tests {
             let back: MessageKind = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(back, kind);
         }
+    }
+
+    #[test]
+    fn laser_kinds_have_stable_wire_names_and_are_not_drawing() {
+        for (kind, wire) in [
+            (MessageKind::LaserMove, "LASER_MOVE"),
+            (MessageKind::LaserOff, "LASER_OFF"),
+        ] {
+            assert!(kind.is_laser(), "{wire} routes as a laser message");
+            assert!(!kind.is_drawing(), "{wire} is not a sequenced drawing kind");
+            assert_eq!(kind.as_str(), wire);
+            let json = serde_json::to_string(&kind).expect("serialize");
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: MessageKind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, kind);
+        }
+        assert!(!MessageKind::StrokePoint.is_laser());
+        assert!(!MessageKind::PositionReport.is_laser());
     }
 
     #[test]

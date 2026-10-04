@@ -20,6 +20,7 @@ use super::chat::handle_chat_message;
 use super::codes;
 use super::drawing;
 use super::error::RoomError;
+use super::laser::laser_event;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::permissions::handle_permission_set;
 use super::playback::handle_playback_cmd;
@@ -96,6 +97,7 @@ pub async fn dispatch_room_message(
         MessageKind::StrokeClear => Some(Command::DrawClear),
         MessageKind::PermissionSet => Some(Command::PermissionSet),
         MessageKind::ChatMessage => Some(Command::ChatMessage),
+        MessageKind::LaserMove | MessageKind::LaserOff => Some(Command::Laser),
         _ => None,
     };
     if let Some(cmd) = command {
@@ -135,6 +137,13 @@ pub async fn dispatch_room_message(
                     now_ms,
                 ));
                 return out;
+            }
+            // P5-T04: laser refusals are silent too (same eviction
+            // reason), and only debug-logged: a client without the
+            // bit may keep sending at up to 60 Hz.
+            if cmd == Command::Laser {
+                tracing::debug!(user_id = %user_id, error = %e, "laser denied");
+                return RoomDispatchOutcome::default();
             }
             tracing::warn!(
                 user_id = %user_id,
@@ -182,6 +191,13 @@ pub async fn dispatch_room_message(
         }
         MessageKind::StrokeUndo => handle_stroke_undo_dispatch(envelope, registry, user_id).await,
         MessageKind::StrokeClear => handle_stroke_clear_dispatch(envelope, registry, user_id).await,
+        // P5-T04: authorized above (member of `envelope.room_id` with
+        // LASER). Relayed by the WS layer after dispatch, outside any
+        // room lock; invalid frames are dropped silently.
+        MessageKind::LaserMove | MessageKind::LaserOff => RoomDispatchOutcome {
+            events: laser_event(&envelope, user_id).into_iter().collect(),
+            ..RoomDispatchOutcome::default()
+        },
         MessageKind::PermissionSet => {
             match handle_permission_set(envelope, registry, store, user_id, now_ms).await {
                 // Already published by the handler under the room
@@ -2551,6 +2567,96 @@ mod tests {
             slow_canvas.strokes, truth,
             "A and B are gone after recovery"
         );
+    }
+
+    /// P5-T04: publish `n` laser moves from `user` into `room`.
+    fn publish_lasers(reg: &RoomRegistry, room: Uuid, user: Uuid, n: usize) {
+        let events: Vec<RoomEvent> = (0..n)
+            .map(|i| RoomEvent::LaserMove {
+                room_id: room,
+                sender_id: user,
+                payload: locast_protocol::room::LaserMovePayload {
+                    x: (i % 100) as f32 / 100.0,
+                    y: 0.5,
+                },
+            })
+            .collect();
+        reg.publish_events(&events, |_| room);
+    }
+
+    /// P5-T04: a lag that cost only transient laser items (no drawing
+    /// event) needs no DRAW_SYNC, so laser traffic cannot turn every
+    /// ring overflow into a snapshot.
+    #[tokio::test]
+    async fn a_lag_of_only_laser_items_needs_no_snapshot() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [33u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut slow = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut canvas = Canvas::default();
+        d.stroke(Uuid::now_v7(), 2).await;
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 0);
+
+        publish_lasers(&reg, room, user, OVERFLOW);
+        canvas.drain(&mut slow, &reg).await;
+        assert_eq!(canvas.syncs, 0, "no drawing event was lost");
+        let lasers = canvas
+            .delivered
+            .iter()
+            .filter(|(k, _)| *k == MessageKind::LaserMove)
+            .count();
+        assert!(lasers > 0 && lasers < OVERFLOW, "lagged: got {lasers}");
+        assert_eq!(canvas.strokes, authoritative(&reg, room).await);
+    }
+
+    /// P5-T04: a drawing event lost behind laser traffic (the first
+    /// item after the lag is a laser) is still recovered by DRAW_SYNC.
+    #[tokio::test]
+    async fn an_undo_lost_behind_laser_items_is_recovered() {
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("db");
+        let relay = fresh_relay();
+        let seed = [34u8; 32];
+        let (room, user, pk) = drawing_room(&reg, &db, &clock, seed).await;
+        let d = Drawer {
+            reg: &reg,
+            db: &db,
+            clock: &clock,
+            relay: &relay,
+            room,
+            user,
+            pk,
+            seed,
+        };
+        let mut slow = test_feed(room, reg.subscribe(room).await.unwrap());
+        let mut canvas = Canvas::default();
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        d.stroke(a, 2).await;
+        d.stroke(b, 2).await;
+        canvas.drain(&mut slow, &reg).await;
+
+        d.undo(b).await;
+        publish_lasers(&reg, room, user, OVERFLOW);
+        canvas.drain(&mut slow, &reg).await;
+
+        let truth = authoritative(&reg, room).await;
+        assert_eq!(truth.iter().map(|s| s.0).collect::<Vec<_>>(), vec![a]);
+        assert!(!canvas.saw(MessageKind::StrokeUndo), "undo was dropped");
+        assert_eq!(canvas.syncs, 1);
+        assert_eq!(canvas.strokes, truth);
     }
 
     #[tokio::test]

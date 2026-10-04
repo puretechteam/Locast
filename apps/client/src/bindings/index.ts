@@ -62,6 +62,10 @@
 // `inviteUrl` argument of `roomJoin`, `you_user_id` on
 // `RoomSummaryIpc`, `transfer_started` on `DownloadSessionIpc`, and
 // the `manifestState` event listener (`manifest://state`).
+// P5-T04 added the `laserSend` command (and the `LaserSendInput` /
+// `LaserSendResult` types) plus the `laserMove` / `laserOff` event
+// listeners (`laser://move` / `laser://off`, payloads
+// `LaserMoveEvent` / `LaserOffEvent`).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -224,6 +228,14 @@ export const commands = {
   async drawingSend(input: DrawingSendInput): Promise<DrawingSendResult> {
     return await __TAURI_INVOKE<DrawingSendResult>("drawing_send", { input });
   },
+  // P5-T04: send one LASER_MOVE / LASER_OFF to the current room.
+  // Unsigned; the server stamps the authenticated sender on the
+  // relay. The React layer throttles to <= 60 Hz
+  // (src/laser/laserTransport.ts); see
+  // apps/client/src-tauri/src/commands/laser.rs.
+  async laserSend(input: LaserSendInput): Promise<LaserSendResult> {
+    return await __TAURI_INVOKE<LaserSendResult>("laser_send", { input });
+  },
   // P6-T03: send a chat message. The caller passes
   // the text (max 2 KiB) and an optional reply_to
   // message id. The server validates the CHAT cap
@@ -289,6 +301,24 @@ export interface DrawingSendResult {
   envelope_id: string;
   // `null` for a `clear` (it concerns no single stroke).
   stroke_id: string | null;
+}
+
+// P5-T04: typed shape for `laser_send`. Mirrors the Rust
+// `LaserSendInput` enum (Move / Off discriminated by `action`).
+// `x` / `y` are normalized to the video frame and must be finite
+// and within [0, 1]; the command rejects anything else.
+export type LaserSendInput =
+  | {
+      action: "move";
+      x: number;
+      y: number;
+    }
+  | {
+      action: "off";
+    };
+
+export interface LaserSendResult {
+  envelope_id: string;
 }
 
 /* Types */
@@ -569,6 +599,24 @@ export type StrokeClearEvent = {
     seq?: number;
 };
 
+// P5-T04: the `laser://move` event payload. Emitted when the server
+// relays another participant's LASER_MOVE. `sender_id` is the
+// server-stamped sender (never read from the wire payload). The
+// local user's own laser is never delivered.
+export type LaserMoveEvent = {
+    room_id: string;
+    sender_id: string;
+    x: number;
+    y: number;
+};
+
+// P5-T04: the `laser://off` event payload. Emitted when the server
+// relays another participant's LASER_OFF (they released the laser).
+export type LaserOffEvent = {
+    room_id: string;
+    sender_id: string;
+};
+
 // The `drawing://sync` event payload: the room's authoritative drawing
 // state as of drawing sequence `seq`, sent when this client's room
 // subscription dropped events. It replaces the drawing state; only
@@ -761,6 +809,16 @@ export const events = {
   strokeClear: <EventListener<StrokeClearEvent>>((h) =>
     __listenAs__("drawing://clear", h)
   ),
+  // P5-T04: another participant's laser position (relayed
+  // LASER_MOVE, never the local user's own).
+  laserMove: <EventListener<LaserMoveEvent>>((h) =>
+    __listenAs__("laser://move", h)
+  ),
+  // P5-T04: another participant released its laser (relayed
+  // LASER_OFF). Fades that sender's trail.
+  laserOff: <EventListener<LaserOffEvent>>((h) =>
+    __listenAs__("laser://off", h)
+  ),
   // P6-T03: inbound CHAT_MESSAGE from a remote participant.
   // Emitted when a chat message is accepted and rebroadcast
   // by the server. The sender_id is the server-authoritative
@@ -782,4 +840,6 @@ export const strokePointChanged = events.strokePoint;
 export const strokeEndChanged = events.strokeEnd;
 export const strokeUndoChanged = events.strokeUndo;
 export const strokeClearChanged = events.strokeClear;
+export const laserMoveChanged = events.laserMove;
+export const laserOffChanged = events.laserOff;
 export const chatMessageChanged = events.chatMessage;

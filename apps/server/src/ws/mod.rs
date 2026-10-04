@@ -76,11 +76,19 @@ const BAD_MSG_WINDOW_MS: i64 = 60_000;
 const RATE_THROTTLE_MS: i64 = 1_000;
 
 /// Rate-bucket state for a single connection.
+///
+/// Tokens are kept in thousandths so a refill credits exactly
+/// `elapsed_ms * refill_per_sec / 1000` tokens with nothing lost to
+/// rounding. (Whole-token refills that reset the clock dropped the
+/// fractional token every time: a sender at exactly the sustained
+/// rate, e.g. a 60 Hz laser against a 60/s bucket, was throttled to
+/// about two thirds of it once its burst ran out.)
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: u32,
     refill_per_sec: u32,
-    tokens: u32,
+    /// Available tokens x 1000.
+    milli_tokens: u64,
     last_refill_ms: i64,
 }
 
@@ -96,57 +104,52 @@ impl TokenBucket {
     }
 
     pub fn new_with(capacity: u32, refill_per_sec: u32) -> Self {
+        Self::new_at(capacity, refill_per_sec, now_ms())
+    }
+
+    /// [`TokenBucket::new_with`] at an explicit clock reading (tests).
+    pub fn new_at(capacity: u32, refill_per_sec: u32, now_ms: i64) -> Self {
         Self {
             capacity,
             refill_per_sec,
-            tokens: capacity,
-            last_refill_ms: now_ms(),
+            milli_tokens: capacity as u64 * 1_000,
+            last_refill_ms: now_ms,
         }
     }
 
     /// Try to consume one token. Returns `true` if the
     /// connection is under the rate limit, `false` otherwise.
     pub fn try_consume(&mut self) -> bool {
-        // Use u64 arithmetic so a long-quiet connection
-        // (large `delta_ms`) does not overflow when
-        // multiplied by `refill_per_sec`.
-        let now = now_ms();
-        let delta_ms = (now - self.last_refill_ms).max(0) as u64;
-        let refill_per_sec = self.refill_per_sec as u64;
-        let refill = (delta_ms * refill_per_sec) / 1_000;
-        if refill > 0 {
-            let refill = refill.min(self.capacity as u64);
-            self.tokens = (self.tokens as u64 + refill).min(self.capacity as u64) as u32;
-            self.last_refill_ms = now;
-        }
-        if self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
+        self.try_consume_n_at(1, now_ms())
     }
 
     /// Try to consume `n` tokens at once. Returns `true` if the
     /// bucket had `n` tokens available (and consumes them),
     /// `false` otherwise.
     pub fn try_consume_n(&mut self, n: u32) -> bool {
-        // Refill first so a long-quiet connection can burst.
-        // Use u64 to avoid overflow when `delta` (ms since
-        // last refill) and `refill_per_sec` (e.g. 1_000_000
-        // for the bytes bucket) are both large.
-        let now = now_ms();
-        let delta_ms = (now - self.last_refill_ms).max(0) as u64;
-        let refill_per_sec = self.refill_per_sec as u64;
-        let refill = (delta_ms * refill_per_sec) / 1_000;
-        if refill > 0 {
-            let refill = refill.min(self.capacity as u64);
-            self.tokens = (self.tokens as u64 + refill).min(self.capacity as u64) as u32;
-            self.last_refill_ms = now;
-        }
-        if self.tokens < n {
+        self.try_consume_n_at(n, now_ms())
+    }
+
+    /// [`TokenBucket::try_consume_n`] at an explicit clock reading.
+    pub fn try_consume_n_at(&mut self, n: u32, now_ms: i64) -> bool {
+        // Refill first so a long-quiet connection can burst. u64
+        // throughout: `elapsed_ms * refill_per_sec` (e.g. 1_000_000
+        // for the bytes bucket) must not overflow, and a long-quiet
+        // connection is capped at `capacity` anyway.
+        let elapsed_ms = (now_ms - self.last_refill_ms).max(0) as u64;
+        let cap = self.capacity as u64 * 1_000;
+        self.milli_tokens = self
+            .milli_tokens
+            .saturating_add(elapsed_ms.saturating_mul(self.refill_per_sec as u64))
+            .min(cap);
+        // A clock that steps backwards credits nothing and does not
+        // move the reference point back.
+        self.last_refill_ms = self.last_refill_ms.max(now_ms);
+        let need = n as u64 * 1_000;
+        if self.milli_tokens < need {
             return false;
         }
-        self.tokens -= n;
+        self.milli_tokens -= need;
         true
     }
 }
@@ -486,6 +489,15 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             }
             continue;
         }
+        // P5-T04: laser frames have their own per-connection rate
+        // (on top of the msg / bytes buckets above). Excess is
+        // dropped silently: no RATE_LIMIT, no throttle window and
+        // no bad-message strike, so an over-eager but valid client
+        // keeps its connection and its other traffic.
+        if envelope.r#type.is_laser() && !limiter.lock().await.check_laser() {
+            debug!(request_id = %request_id, "laser over rate; dropped");
+            continue;
+        }
         if envelope.room_id.is_some() {
             // P3-T14: a non-null `room_id` is only valid when
             // the authenticated user is currently a member of
@@ -503,6 +515,14 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 (Some((uid, _)), Some(rid)) => state.rooms.is_user_in_room(uid, rid).await,
                 _ => false,
             };
+            if !caller_in_room && envelope.r#type.is_laser() {
+                // P5-T04: a pointer still moving when its user left,
+                // was kicked or the room closed has a few frames in
+                // flight. Drop them without a bad-message strike, or
+                // that would close the whole connection.
+                debug!(request_id = %request_id, "laser outside a room; dropped");
+                continue;
+            }
             if !caller_in_room {
                 warn!(
                     request_id = %request_id,
@@ -1917,6 +1937,7 @@ fn routes_to_room_dispatch(kind: &MessageKind) -> bool {
         || kind.is_signal_lifecycle()
         || kind.is_playback_lifecycle()
         || kind.is_position_report()
+        || kind.is_laser()
         || matches!(
             kind,
             MessageKind::ChatMessage

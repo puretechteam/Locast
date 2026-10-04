@@ -101,57 +101,57 @@ const handleLeft = useCallback(() => {
     usePositionReportBridge();
 
     // P4-T02: derive `isHost` and `localUserId` from
-    // the cached room summary. The "local user" is
-    // the participant whose `user_id` matches
-    // `summary.host_user_id`; if no participant is
-    // marked as host in the snapshot (race during
-    // host migration), fall back to "not the host".
+    // the cached room summary.
     //
-    // P4-T05 fix: `isHost` now means "the LOCAL user
-    // is the current host", not "the room has a
-    // host". The previous derivation returned true
-    // for any room with a host participant, which
-    // mistakenly gave viewers the host-authoritative
-    // Sync branch. The local user id is read from
-    // the identity store in production. The Vite
-    // harness exposes it through the
-    // `__locastRoomStore.setLocalUserId` test seam
-    // (see `tests/playwright/fixtures/vite-app.ts`).
+    // P4-T05 fix: `isHost` means "the LOCAL user is the
+    // current host", not "the room has a host".
+    //
+    // P5-T04: `localUserId` is the local user's canonical
+    // server-assigned id in production too: the Rust room
+    // client fills `summary.you_user_id` from ROOM_CREATED /
+    // ROOM_JOINED `you.user_id`; before that is known the
+    // signaling session's AUTH_OK `user_id` is the fallback.
+    // (`identityGet` is NOT used: its `user_id` is a pubkey
+    // hash, not the server id.) It is set for viewers as well
+    // as hosts. In Vite test mode the Playwright harness may
+    // still override the id through
+    // `__locastRoomStore.setLocalUserId` (see
+    // `tests/playwright/fixtures/vite-app.ts`); production
+    // never reads that seam.
+    //
+    // `isHost` is deliberately NOT derived from the production
+    // id yet: it gates host-only UI (playback controls,
+    // permissions, authoritative manual sync) that has so far
+    // only ever run under the test seam, and at least one path
+    // is not production-ready (the host's PLAYBACK_CMD is not
+    // applied to its own <video>). Enabling it is its own task;
+    // until then it stays true only through the test override,
+    // exactly as before. Capability checks (laser, drawing) use
+    // `you_cap_set`, which the host holds in full.
+    const signalingUserId = signaling?.user_id ?? null;
     const { isHost, localUserId, hostPositionMs } = useMemo(() => {
-        // P4-T05 test-only: in Vite test mode the local
-        // user id is set by the Playwright harness via
-        // `__locastRoomStore.setLocalUserId`. The
-        // production path (when `import.meta.env.MODE
-        // !== "test"`) reads the same value from the
-        // identity store; that is wired in a later
-        // task. Until then, the test-only path is
-        // enough for P4-T05.
-        let localUserIdValue: string | null = null;
+        let overrideId: string | null = null;
         if (import.meta.env.MODE === "test") {
             const w = window as unknown as {
                 __locastRoomStore?: {
                     getLocalUserId?: () => string | null;
                 };
             };
-            localUserIdValue = w.__locastRoomStore?.getLocalUserId?.() ?? null;
+            overrideId = w.__locastRoomStore?.getLocalUserId?.() ?? null;
         }
-        const host = summary?.participants.find((p) => p.is_host);
-        const localUserIsHost =
-            host !== undefined &&
-            summary !== null &&
-            localUserIdValue !== null &&
-            host.user_id === localUserIdValue;
         const userId =
-            localUserIsHost && host !== undefined
-                ? host.user_id
-                : null;
+            summary == null
+                ? null
+                : overrideId ?? summary.you_user_id ?? signalingUserId ?? null;
+        const localUserIsHost =
+            summary != null && overrideId !== null && summary.host_user_id === overrideId;
         const pos = usePlaybackStore.getState().lastApplied?.media_position_ms ?? 0;
         return {
             isHost: localUserIsHost,
             localUserId: userId,
             hostPositionMs: pos,
         };
-    }, [summary]);
+    }, [summary, signalingUserId]);
 const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const displayPositionMs = lastApplied?.media_position_ms ?? hostPositionMs;
 

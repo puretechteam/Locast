@@ -3532,3 +3532,432 @@ async fn drawing_rebroadcasts_carry_contiguous_room_sequence_numbers() {
     );
     drop(harness);
 }
+
+// ---------------------------------------------------------------------------
+// P5-T04: LASER_MOVE / LASER_OFF relay over the real WebSocket path.
+// ---------------------------------------------------------------------------
+
+fn laser_move_envelope(token: [u8; 32], room_id: Uuid, x: f32, y: f32) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::LaserMove,
+        room_id,
+        json!({ "x": x, "y": y }),
+    )
+}
+
+fn laser_off_envelope(token: [u8; 32], room_id: Uuid) -> Envelope {
+    room_scoped_envelope(token, MessageKind::LaserOff, room_id, json!({}))
+}
+
+/// A relayed laser frame: right room, the authenticated `sender`, no
+/// identity (or bearer) in the payload, unsequenced.
+fn assert_laser_frame(env: &Envelope, kind: MessageKind, room_id: Uuid, sender: Uuid, ctx: &str) {
+    assert_eq!(env.r#type, kind, "{ctx}: kind");
+    assert_eq!(env.room_id, Some(room_id), "{ctx}: room");
+    assert_eq!(
+        env.sender.as_ref().map(|s| s.user_id),
+        Some(sender),
+        "{ctx}: sender is the authenticated connection"
+    );
+    assert_eq!(env.seq, 0, "{ctx}: lasers are unsequenced");
+    for key in ["sender", "sender_id", "user_id", "bearer"] {
+        assert!(
+            env.payload.get(key).is_none(),
+            "{ctx}: payload must not carry `{key}`: {}",
+            env.payload
+        );
+    }
+}
+
+/// Count the LASER_MOVE frames reaching `ws` until it has been quiet
+/// for `quiet`. Returns the count and when the last one arrived.
+async fn drain_laser_moves(ws: &mut Ws, quiet: Duration) -> (usize, tokio::time::Instant) {
+    let mut count = 0;
+    let mut last = tokio::time::Instant::now();
+    while let Ok(Some(bytes)) = tokio::time::timeout(quiet, read_binary(ws)).await {
+        let env = decode(&bytes);
+        assert_ne!(env.r#type, MessageKind::RoomError, "unexpected ROOM_ERROR");
+        if env.r#type == MessageKind::LaserMove {
+            count += 1;
+            last = tokio::time::Instant::now();
+        }
+    }
+    (count, last)
+}
+
+/// A (host) points: B and C get every move and the off, attributed to
+/// A by the server; A gets no echo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn laser_reaches_every_other_participant_with_the_authenticated_sender() {
+    let mut r = draw_room().await;
+    let moves = [(0.1f32, 0.2f32), (0.5, 0.5), (1.0, 0.0)];
+    for (x, y) in moves {
+        send_envelope(
+            &mut r.ws_a,
+            &laser_move_envelope(r.a.token, r.room_id, x, y),
+        )
+        .await;
+    }
+    send_envelope(&mut r.ws_a, &laser_off_envelope(r.a.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        for (x, y) in moves {
+            let env = next_of_kind(ws, MessageKind::LaserMove, who).await;
+            assert_laser_frame(&env, MessageKind::LaserMove, r.room_id, r.a.user_id, who);
+            assert_eq!(env.payload, json!({ "x": x, "y": y }), "{who}: in order");
+        }
+        let env = next_of_kind(ws, MessageKind::LaserOff, who).await;
+        assert_laser_frame(&env, MessageKind::LaserOff, r.room_id, r.a.user_id, who);
+        assert_eq!(env.payload, json!({}), "{who}: empty off payload");
+    }
+    for kind in [
+        MessageKind::LaserMove,
+        MessageKind::LaserOff,
+        MessageKind::RoomError,
+    ] {
+        assert_no_kind_within(&mut r.ws_a, kind, Duration::from_millis(300), "A: no echo").await;
+    }
+    r.harness.handle.abort();
+}
+
+/// A participant without LASER is dropped silently (no ROOM_ERROR, so
+/// its room survives); DRAW does not imply LASER; a LASER grant works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn laser_needs_the_laser_capability_and_a_refusal_keeps_the_sender_in_the_room() {
+    let mut r = draw_room().await;
+    send_envelope(
+        &mut r.ws_b,
+        &laser_move_envelope(r.b.token, r.room_id, 0.5, 0.5),
+    )
+    .await;
+    send_envelope(&mut r.ws_b, &laser_off_envelope(r.b.token, r.room_id)).await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_c, "C")] {
+        for kind in [MessageKind::LaserMove, MessageKind::LaserOff] {
+            assert_no_kind_within(ws, kind, Duration::from_millis(300), who).await;
+        }
+    }
+    assert_no_kind_within(
+        &mut r.ws_b,
+        MessageKind::RoomError,
+        Duration::from_millis(300),
+        "B: refusal is silent",
+    )
+    .await;
+    // B is still a connected member: its chat goes through.
+    send_envelope(
+        &mut r.ws_b,
+        &chat_envelope(r.b.token, r.room_id, r.b.user_id, "still here"),
+    )
+    .await;
+    next_of_kind(&mut r.ws_a, MessageKind::ChatMessage, "A gets B's chat").await;
+
+    // DRAW alone is not LASER.
+    grant(&mut r.ws_a, &r.a, r.room_id, &mut r.ws_b, &r.b, cap::DRAW).await;
+    send_envelope(
+        &mut r.ws_b,
+        &laser_move_envelope(r.b.token, r.room_id, 0.5, 0.5),
+    )
+    .await;
+    assert_no_kind_within(
+        &mut r.ws_c,
+        MessageKind::LaserMove,
+        Duration::from_millis(300),
+        "C: DRAW only",
+    )
+    .await;
+
+    grant(&mut r.ws_a, &r.a, r.room_id, &mut r.ws_b, &r.b, cap::LASER).await;
+    send_envelope(
+        &mut r.ws_b,
+        &laser_move_envelope(r.b.token, r.room_id, 0.25, 0.75),
+    )
+    .await;
+    for (ws, who) in [(&mut r.ws_a, "A"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::LaserMove, who).await;
+        assert_laser_frame(&env, MessageKind::LaserMove, r.room_id, r.b.user_id, who);
+        assert_eq!(env.payload, json!({ "x": 0.25, "y": 0.75 }));
+    }
+    r.harness.handle.abort();
+}
+
+/// Neither `Envelope::sender` nor identity fields in the payload can
+/// make a laser look like it came from someone else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn laser_sender_cannot_be_spoofed() {
+    let mut r = draw_room().await;
+    let pk_b = r.kp_b.verifying_key().to_bytes();
+    // A claims to be B, in both places.
+    let spoof = with_claimed_sender(
+        room_scoped_envelope(
+            r.a.token,
+            MessageKind::LaserMove,
+            r.room_id,
+            json!({ "x": 0.5, "y": 0.5, "user_id": r.b.user_id, "sender_id": r.b.user_id }),
+        ),
+        r.b.user_id,
+        pk_b,
+    );
+    send_envelope(&mut r.ws_a, &spoof).await;
+    for (ws, who) in [(&mut r.ws_b, "B"), (&mut r.ws_c, "C")] {
+        let env = next_of_kind(ws, MessageKind::LaserMove, who).await;
+        assert_laser_frame(&env, MessageKind::LaserMove, r.room_id, r.a.user_id, who);
+        assert_eq!(env.payload, json!({ "x": 0.5, "y": 0.5 }));
+    }
+    // B (no LASER) claims to be the host A: judged as B, so refused.
+    let pk_a = r.kp_a.verifying_key().to_bytes();
+    let spoof = with_claimed_sender(
+        room_scoped_envelope(
+            r.b.token,
+            MessageKind::LaserMove,
+            r.room_id,
+            json!({ "x": 0.5, "y": 0.5, "user_id": r.a.user_id }),
+        ),
+        r.a.user_id,
+        pk_a,
+    );
+    send_envelope(&mut r.ws_b, &spoof).await;
+    assert_no_kind_within(
+        &mut r.ws_c,
+        MessageKind::LaserMove,
+        Duration::from_millis(300),
+        "C: spoofed host laser",
+    )
+    .await;
+    r.harness.handle.abort();
+}
+
+/// Out-of-range or malformed coordinates are dropped silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_laser_coordinates_are_dropped_silently() {
+    let mut r = draw_room().await;
+    for payload in [
+        json!({ "x": 1.5, "y": 0.5 }),
+        json!({ "x": 0.5, "y": -0.1 }),
+        json!({ "x": 0.5 }),
+    ] {
+        send_envelope(
+            &mut r.ws_a,
+            &room_scoped_envelope(r.a.token, MessageKind::LaserMove, r.room_id, payload),
+        )
+        .await;
+    }
+    send_envelope(
+        &mut r.ws_a,
+        &laser_move_envelope(r.a.token, r.room_id, 0.75, 0.25),
+    )
+    .await;
+    let env = next_of_kind(&mut r.ws_b, MessageKind::LaserMove, "B").await;
+    assert_eq!(
+        env.payload,
+        json!({ "x": 0.75, "y": 0.25 }),
+        "only the valid move is relayed"
+    );
+    assert_no_kind_within(
+        &mut r.ws_a,
+        MessageKind::RoomError,
+        Duration::from_millis(300),
+        "A: silent drop",
+    )
+    .await;
+    r.harness.handle.abort();
+}
+
+/// A full-rate (60 Hz) laser is relayed in full, well past the point
+/// where its 60-frame burst alone would have run out (so the refill
+/// really sustains 60/s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_60_hz_laser_is_relayed_in_full() {
+    let mut r = draw_room().await;
+    const FRAMES: usize = 360;
+    let mut tick = tokio::time::interval(Duration::from_micros(16_667));
+    for i in 0..FRAMES {
+        tick.tick().await;
+        let x = i as f32 / FRAMES as f32;
+        send_envelope(
+            &mut r.ws_a,
+            &laser_move_envelope(r.a.token, r.room_id, x, 0.5),
+        )
+        .await;
+    }
+    let (count, _) = drain_laser_moves(&mut r.ws_b, Duration::from_millis(500)).await;
+    assert_eq!(count, FRAMES, "every 60 Hz move reaches B");
+    assert_no_kind_within(
+        &mut r.ws_a,
+        MessageKind::RateLimit,
+        Duration::from_millis(100),
+        "A: within budget",
+    )
+    .await;
+    r.harness.handle.abort();
+}
+
+/// A laser flood is capped at the laser bucket and the excess dropped
+/// silently: no RATE_LIMIT, no ROOM_ERROR, no disconnect, and the
+/// sender's other traffic (and later lasers) keep flowing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_laser_flood_is_capped_without_disconnecting_the_sender() {
+    let mut r = draw_room().await;
+    const FLOOD: usize = 150;
+    let started = tokio::time::Instant::now();
+    for i in 0..FLOOD {
+        let x = i as f32 / FLOOD as f32;
+        send_envelope(
+            &mut r.ws_a,
+            &laser_move_envelope(r.a.token, r.room_id, x, 0.5),
+        )
+        .await;
+    }
+    let (count, last) = drain_laser_moves(&mut r.ws_b, Duration::from_millis(500)).await;
+    // 60 burst plus 60/s refill over the time the server could have
+    // been taking frames (generously: until the last relay arrived).
+    let window = last.duration_since(started).as_secs_f64();
+    let allowed = 60 + (60.0 * window).ceil() as usize + 1;
+    assert!(count >= 50, "the burst gets through (got {count})");
+    assert!(
+        count <= allowed && count < FLOOD,
+        "flood capped: {count} relayed, at most {allowed} allowed over {window:.3}s"
+    );
+    for kind in [MessageKind::RateLimit, MessageKind::RoomError] {
+        assert_no_kind_within(
+            &mut r.ws_a,
+            kind,
+            Duration::from_millis(200),
+            "A: silent drop",
+        )
+        .await;
+    }
+    // After the bucket refills the same connection lasers and chats.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    send_envelope(
+        &mut r.ws_a,
+        &laser_move_envelope(r.a.token, r.room_id, 0.5, 0.5),
+    )
+    .await;
+    let env = next_of_kind(&mut r.ws_b, MessageKind::LaserMove, "B after refill").await;
+    assert_eq!(env.payload, json!({ "x": 0.5, "y": 0.5 }));
+    send_envelope(
+        &mut r.ws_a,
+        &chat_envelope(r.a.token, r.room_id, r.a.user_id, "hi"),
+    )
+    .await;
+    next_of_kind(&mut r.ws_b, MessageKind::ChatMessage, "B gets A's chat").await;
+    r.harness.handle.abort();
+}
+
+async fn create_room_as(ws: &mut Ws, who: &AuthedClient, title: &str) -> RoomSummary {
+    send_envelope(ws, &room_create_envelope(who.token, title, false)).await;
+    let env = next_of_kind(ws, MessageKind::RoomCreated, title).await;
+    serde_json::from_value::<RoomCreatedPayload>(env.payload)
+        .unwrap()
+        .room
+}
+
+/// Lasers stay in the room they were sent to: X hosts room 1 (with Y)
+/// and is a plain viewer in Z's room 2 (with W). X's laser in room 1
+/// never reaches room 2; X has no LASER in room 2, so its laser there
+/// is refused; a laser naming a room the sender is not in is dropped;
+/// Z's laser in room 2 never reaches Y.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn laser_events_never_cross_rooms() {
+    let harness = spawn_test_server().await;
+    let (kp_x, _) = fresh_keypair();
+    let (kp_y, _) = fresh_keypair();
+    let (kp_z, _) = fresh_keypair();
+    let (kp_w, _) = fresh_keypair();
+    let mut ws_x = connect(harness.addr).await;
+    let mut ws_y = connect(harness.addr).await;
+    let mut ws_z = connect(harness.addr).await;
+    let mut ws_w = connect(harness.addr).await;
+    let x = complete_handshake(&mut ws_x, &kp_x).await;
+    let y = complete_handshake(&mut ws_y, &kp_y).await;
+    let z = complete_handshake(&mut ws_z, &kp_z).await;
+    let w = complete_handshake(&mut ws_w, &kp_w).await;
+
+    let room_1 = create_room_as(&mut ws_x, &x, "one").await;
+    let room_2 = create_room_as(&mut ws_z, &z, "two").await;
+    send_envelope(&mut ws_y, &room_join_envelope(y.token, &room_1.code, "Y")).await;
+    next_of_kind(&mut ws_y, MessageKind::RoomJoined, "Y joins 1").await;
+    send_envelope(&mut ws_w, &room_join_envelope(w.token, &room_2.code, "W")).await;
+    next_of_kind(&mut ws_w, MessageKind::RoomJoined, "W joins 2").await;
+    send_envelope(&mut ws_x, &room_join_envelope(x.token, &room_2.code, "X")).await;
+    next_of_kind(&mut ws_x, MessageKind::RoomJoined, "X joins 2").await;
+
+    // Room 1: Y sees it.
+    send_envelope(
+        &mut ws_x,
+        &laser_move_envelope(x.token, room_1.id, 0.5, 0.5),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_y, MessageKind::LaserMove, "Y").await;
+    assert_laser_frame(&env, MessageKind::LaserMove, room_1.id, x.user_id, "Y");
+    // Room 2: X is only a viewer there, so refused.
+    send_envelope(
+        &mut ws_x,
+        &laser_move_envelope(x.token, room_2.id, 0.5, 0.5),
+    )
+    .await;
+    // A room Y is not in: dropped before dispatch.
+    send_envelope(
+        &mut ws_y,
+        &laser_move_envelope(y.token, room_2.id, 0.5, 0.5),
+    )
+    .await;
+    for (ws, who) in [(&mut ws_z, "Z"), (&mut ws_w, "W")] {
+        assert_no_kind_within(ws, MessageKind::LaserMove, Duration::from_millis(400), who).await;
+    }
+    // Z (host of room 2) points: W (room 2) sees it, Y (room 1)
+    // never does. (X is only a sender here: a connection follows one
+    // room's broadcast, and X's follows room 1.)
+    send_envelope(
+        &mut ws_z,
+        &laser_move_envelope(z.token, room_2.id, 0.1, 0.9),
+    )
+    .await;
+    let env = next_of_kind(&mut ws_w, MessageKind::LaserMove, "W").await;
+    assert_laser_frame(&env, MessageKind::LaserMove, room_2.id, z.user_id, "W");
+    assert_no_kind_within(
+        &mut ws_y,
+        MessageKind::LaserMove,
+        Duration::from_millis(300),
+        "Y: nothing from room 2",
+    )
+    .await;
+    harness.handle.abort();
+}
+
+/// Laser frames still in flight after their sender left the room (or
+/// was kicked, or the room closed) are dropped without the
+/// bad-message strikes that would close the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lasers_in_flight_after_leaving_do_not_cost_the_connection() {
+    let mut r = draw_room().await;
+    send_envelope(
+        &mut r.ws_a,
+        &laser_move_envelope(r.a.token, r.room_id, 0.5, 0.5),
+    )
+    .await;
+    next_of_kind(&mut r.ws_b, MessageKind::LaserMove, "B").await;
+    next_of_kind(&mut r.ws_c, MessageKind::LaserMove, "C").await;
+    send_envelope(&mut r.ws_b, &room_leave_envelope(r.b.token)).await;
+    next_of_kind(&mut r.ws_a, MessageKind::ParticipantLeft, "A sees B leave").await;
+    // More than the 3-strike bad-message threshold, from a former member.
+    for _ in 0..5 {
+        send_envelope(
+            &mut r.ws_b,
+            &laser_move_envelope(r.b.token, r.room_id, 0.5, 0.5),
+        )
+        .await;
+    }
+    // B's connection is still alive and usable.
+    let room = create_room_as(&mut r.ws_b, &r.b, "after").await;
+    assert_ne!(room.id, r.room_id);
+    // Nothing reached the old room.
+    assert_no_kind_within(
+        &mut r.ws_c,
+        MessageKind::LaserMove,
+        Duration::from_millis(300),
+        "C: nothing from a former member",
+    )
+    .await;
+    r.harness.handle.abort();
+}

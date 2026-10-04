@@ -760,6 +760,31 @@ pub struct StrokeUndoPayload {
 #[ts(export_to = "ts/index.ts")]
 pub struct StrokeClearPayload {}
 
+/// LASER_MOVE (C -> S, S -> all others). P5-T04.
+///
+/// One laser pointer position, normalized to the video frame
+/// (both in `[0, 1]`). Requires `cap::LASER`. The room comes from
+/// `Envelope::room_id`; the payload carries no identity: the
+/// server relays it to every OTHER participant with the
+/// authenticated sender as `Envelope::sender` (any identity field
+/// a client adds is ignored). Unsequenced (`Envelope::seq` is 0)
+/// and never replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct LaserMovePayload {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// LASER_OFF (C -> S, S -> all others). P5-T04.
+///
+/// The sender released its laser; receivers fade that user's
+/// trail out. Empty payload, attributed and relayed like
+/// [`LaserMovePayload`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS, Default)]
+#[ts(export_to = "ts/index.ts")]
+pub struct LaserOffPayload {}
+
 /// DRAW_SYNC (S -> one client): the room's authoritative drawing
 /// state as of drawing sequence `seq`.
 ///
@@ -1030,6 +1055,25 @@ mod tests {
         );
         let _: StrokeClearPayload =
             serde_json::from_value(json!({ "user_id": Uuid::nil() })).unwrap();
+    }
+
+    #[test]
+    fn laser_payloads_have_the_documented_wire_shape() {
+        let mv = serde_json::to_value(LaserMovePayload { x: 0.25, y: 0.5 }).unwrap();
+        assert_eq!(mv, json!({ "x": 0.25, "y": 0.5 }));
+        // Identity fields a client adds are dropped on decode, so a
+        // re-serialized relay can never carry a client-chosen sender.
+        let spoofed: LaserMovePayload = serde_json::from_value(
+            json!({ "x": 0.25, "y": 0.5, "user_id": Uuid::nil(), "sender_id": Uuid::nil() }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(spoofed).unwrap(),
+            json!({ "x": 0.25, "y": 0.5 })
+        );
+        assert_eq!(serde_json::to_value(LaserOffPayload {}).unwrap(), json!({}));
+        let _: LaserOffPayload = serde_json::from_value(json!({ "user_id": Uuid::nil() })).unwrap();
+        assert!(serde_json::from_value::<LaserMovePayload>(json!({ "x": 0.5 })).is_err());
     }
 
     #[test]

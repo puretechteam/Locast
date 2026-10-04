@@ -179,6 +179,18 @@ pub enum RoomEvent {
     /// participant, the actor included, with `actor_id` as
     /// `Envelope::sender`.
     StrokeClear { room_id: Uuid, actor_id: Uuid },
+    /// P5-T04: an accepted LASER_MOVE. Relayed to every OTHER
+    /// participant (the sender is the originator, so it gets no
+    /// echo) with `sender_id`, the authenticated connection's user
+    /// id, as `Envelope::sender`. Unsequenced: never part of a
+    /// DRAW_SYNC.
+    LaserMove {
+        room_id: Uuid,
+        sender_id: Uuid,
+        payload: locast_protocol::room::LaserMovePayload,
+    },
+    /// P5-T04: an accepted LASER_OFF, relayed like `LaserMove`.
+    LaserOff { room_id: Uuid, sender_id: Uuid },
     /// P6-T02: the host has granted or revoked capabilities
     /// for a participant. Broadcast to all room participants.
     CapabilityUpdated(CapabilityUpdated),
@@ -279,9 +291,11 @@ pub struct BroadcastItem {
     /// outgoing `Envelope::sender` (with empty `pubkey` / `sig`: it
     /// is a server attestation, not a client signature). `Some` only
     /// for DRAW_BEGIN / DRAW_POINT / DRAW_END, whose payloads are
-    /// forwarded verbatim and so cannot carry the author themselves.
-    /// It is always the stroke owner recorded server-side at
-    /// DRAW_BEGIN, never a client-supplied value. `None` otherwise.
+    /// forwarded verbatim and so cannot carry the author themselves
+    /// (the stroke owner recorded server-side at DRAW_BEGIN), for
+    /// DRAW_UNDO / DRAW_CLEAR (the authenticated actor) and for
+    /// LASER_MOVE / LASER_OFF (the authenticated sender). Never a
+    /// client-supplied value. `None` otherwise.
     pub sender: Option<Uuid>,
     /// The room's drawing sequence number for DRAW_BEGIN / POINT /
     /// END / UNDO / CLEAR (assigned under the room write lock, in
@@ -456,6 +470,10 @@ impl RoomRegistry {
                 // P5-T03: undo / clear reach everyone, the actor
                 // included (see `RoomEvent::StrokeUndo`).
                 RoomEvent::StrokeUndo { .. } | RoomEvent::StrokeClear { .. } => None,
+                // P5-T04: the laser reaches everyone but its sender.
+                RoomEvent::LaserMove { sender_id, .. } | RoomEvent::LaserOff { sender_id, .. } => {
+                    Some(*sender_id)
+                }
                 // P6-T02: capability update is server-broadcast
                 // from the host's PERMISSION_SET. The host SHOULD
                 // receive the update so it can confirm the change.
@@ -477,6 +495,8 @@ impl RoomRegistry {
                 RoomEvent::StrokeEnd { room_id, .. } => *room_id,
                 RoomEvent::StrokeUndo { room_id, .. } => *room_id,
                 RoomEvent::StrokeClear { room_id, .. } => *room_id,
+                RoomEvent::LaserMove { room_id, .. } => *room_id,
+                RoomEvent::LaserOff { room_id, .. } => *room_id,
                 RoomEvent::ChatMessage(ChatMessage { room_id, .. }) => *room_id,
                 _ => room_id_for_event(event),
             };
@@ -484,6 +504,16 @@ impl RoomRegistry {
             item.seq = seq;
             self.publish(room_id, item);
         }
+    }
+
+    /// The last drawing sequence number the room published, `None`
+    /// if the room is gone. Takes the room's read lock (same order as
+    /// [`RoomRegistry::drawing_snapshot`]). The room feed uses it to
+    /// tell whether a lag cost a drawing event.
+    pub async fn drawing_seq(&self, room_id: Uuid) -> Option<u64> {
+        let handle = self.get_by_id(room_id).await?;
+        let state = handle.read().await;
+        Some(state.drawing.seq())
     }
 
     /// The room's drawing state for a DRAW_SYNC, `None` if the room
@@ -1872,6 +1902,16 @@ fn event_to_broadcast_item(
             locast_protocol::envelope::MessageKind::StrokeClear,
             serde_json::json!({}),
         ),
+        // P5-T04: the typed payload is re-serialized, so nothing but
+        // the coordinates (and no client bearer) is relayed.
+        RoomEvent::LaserMove { payload, .. } => (
+            locast_protocol::envelope::MessageKind::LaserMove,
+            serde_json::to_value(payload).unwrap_or(serde_json::json!({})),
+        ),
+        RoomEvent::LaserOff { .. } => (
+            locast_protocol::envelope::MessageKind::LaserOff,
+            serde_json::json!({}),
+        ),
         // P6-T02: rebroadcast the capability update as a
         // CAPABILITY_UPDATE envelope carrying the new cap_set.
         RoomEvent::CapabilityUpdated(evt) => {
@@ -1911,6 +1951,10 @@ fn event_to_broadcast_item(
         // The authenticated actor of an undo / clear.
         RoomEvent::StrokeUndo { actor_id, .. } | RoomEvent::StrokeClear { actor_id, .. } => {
             Some(*actor_id)
+        }
+        // P5-T04: the authenticated laser sender.
+        RoomEvent::LaserMove { sender_id, .. } | RoomEvent::LaserOff { sender_id, .. } => {
+            Some(*sender_id)
         }
         _ => None,
     };
@@ -2073,6 +2117,57 @@ mod tests {
             serde_json::json!({ "stroke_id": stroke_id })
         );
         assert_eq!(clear_item.payload, serde_json::json!({}));
+    }
+
+    /// P5-T04: laser events go to the event's own room only, skip
+    /// their sender (originator), name it as the envelope sender,
+    /// carry only the coordinates and are unsequenced.
+    #[test]
+    fn laser_events_skip_the_sender_name_it_and_stay_in_their_room() {
+        let sender = uid(2);
+        let r = RoomRegistry::new(cfg());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("rt");
+        let (mv, off, other_room_empty) = rt.block_on(async {
+            let (room_a, _) = r
+                .create(&store(), "A".into(), sender, keypair(2), true, 1_000)
+                .await
+                .expect("create A");
+            let (room_b, _) = r
+                .create(&store(), "B".into(), uid(3), keypair(3), true, 1_000)
+                .await
+                .expect("create B");
+            let mut rx_a = r.subscribe(room_a.id).await.expect("subscribe A");
+            let mut rx_b = r.subscribe(room_b.id).await.expect("subscribe B");
+            let events = [
+                RoomEvent::LaserMove {
+                    room_id: room_a.id,
+                    sender_id: sender,
+                    payload: locast_protocol::room::LaserMovePayload { x: 0.5, y: 0.25 },
+                },
+                RoomEvent::LaserOff {
+                    room_id: room_a.id,
+                    sender_id: sender,
+                },
+            ];
+            // The fallback room closure must not matter: the event
+            // carries its own room.
+            r.publish_events(&events, |_| room_b.id);
+            let mv = rx_a.try_recv().expect("move item");
+            let off = rx_a.try_recv().expect("off item");
+            (mv, off, rx_b.try_recv().is_err())
+        });
+        assert!(other_room_empty, "laser events never reach another room");
+        for item in [&mv, &off] {
+            assert_eq!(item.originator, Some(sender), "no echo to the sender");
+            assert_eq!(item.sender, Some(sender));
+            assert_eq!(item.seq, 0, "lasers are unsequenced");
+        }
+        assert_eq!(mv.kind, locast_protocol::envelope::MessageKind::LaserMove);
+        assert_eq!(mv.payload, serde_json::json!({ "x": 0.5, "y": 0.25 }));
+        assert_eq!(off.kind, locast_protocol::envelope::MessageKind::LaserOff);
+        assert_eq!(off.payload, serde_json::json!({}));
     }
 
     /// DRAW_* broadcast items name the stroke owner in `sender`

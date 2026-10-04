@@ -16,6 +16,7 @@ pub mod drawing;
 pub mod error;
 pub mod feed;
 pub mod host;
+pub mod laser;
 pub mod manifest;
 pub mod permissions;
 pub mod playback;

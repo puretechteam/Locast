@@ -15,8 +15,9 @@
 #![warn(rust_2018_idioms)]
 
 pub use crate::net::room::{
-    ManifestStateEvent, PlaybackStateEvent, PositionReportEvent, RoomSummaryIpc, StrokeBeginEvent,
-    StrokeClearEvent, StrokeEndEvent, StrokePointEvent, StrokeUndoEvent,
+    LaserMoveEvent, LaserOffEvent, ManifestStateEvent, PlaybackStateEvent, PositionReportEvent,
+    RoomSummaryIpc, StrokeBeginEvent, StrokeClearEvent, StrokeEndEvent, StrokePointEvent,
+    StrokeUndoEvent,
 };
 pub use crate::net::state::ConnectionState as SignalingConnectionState;
 pub use crate::transfer::events::{DownloadProgressEvent, DownloadStateEvent};

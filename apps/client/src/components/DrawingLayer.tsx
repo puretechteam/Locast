@@ -359,6 +359,7 @@ export function DrawingLayer({
                 videoRef={videoRef}
                 localUserId={userId ?? "local"}
                 laserActive={keyboard.laserActive}
+                roomId={roomId ?? null}
             />
             {/* P5-T06: drawing toolbar */}
             <DrawingToolbar
