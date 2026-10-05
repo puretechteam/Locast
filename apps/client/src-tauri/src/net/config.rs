@@ -1,9 +1,10 @@
 //! `net::config` - runtime configuration of the signaling client.
 //!
-//! The URL is read from `LOCAST_SIGNALING_URL` at the moment the
-//! `SignalingClient` is constructed. The default is the local dev
+//! The URL is read once, at the moment the `SignalingClient` is
+//! constructed, from `LOCAST_SIGNALING_URL` or else from the address
+//! saved in Settings (`SETTING_URL_KEY`). The default is the local dev
 //! server (`ws://127.0.0.1:8787/ws`). Production deployments MUST
-//! override the env var; the client never bakes a production
+//! supply one of the two; the client never bakes a production
 //! endpoint into the binary.
 
 #![deny(unsafe_code)]
@@ -67,9 +68,28 @@ impl SignalingConfig {
     /// once; this function does not retain any reference to the
     /// environment.
     pub fn from_env() -> Self {
+        Self::from_env_with_stored(None)
+    }
+
+    /// Like [`Self::from_env`], but with the URL the user saved in
+    /// Settings as a fallback. Precedence: the `LOCAST_SIGNALING_URL`
+    /// env var, then the stored URL (re-validated here, so a value
+    /// edited in the database cannot bypass the rules), then the
+    /// local-dev default.
+    pub fn from_env_with_stored(stored_url: Option<&str>) -> Self {
         let url = std::env::var(ENV_URL)
             .ok()
             .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                let stored = stored_url?;
+                match validate_signaling_url(stored) {
+                    Ok(valid) => Some(valid),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ignoring the saved server address");
+                        None
+                    }
+                }
+            })
             .unwrap_or_else(|| DEFAULT_URL.to_string());
         let handshake_timeout_ms = std::env::var(ENV_HANDSHAKE_TIMEOUT_MS)
             .ok()
@@ -107,6 +127,74 @@ impl SignalingConfig {
     }
 }
 
+/// `settings` table key holding the user's chosen signaling URL.
+pub const SETTING_URL_KEY: &str = "network.signaling_url";
+
+/// Why a signaling URL was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SignalingUrlError {
+    #[error("enter a server address")]
+    Empty,
+    #[error("not a valid URL")]
+    Invalid,
+    #[error("the address must start with wss:// (or ws:// for this computer only)")]
+    BadScheme,
+    #[error("the address needs a host name")]
+    MissingHost,
+    #[error("ws:// is only allowed for localhost; use wss:// for a remote server")]
+    InsecureRemote,
+    #[error("the address must not contain a user name or password")]
+    HasCredentials,
+    #[error("the address needs a path, for example /ws")]
+    MissingPath,
+}
+
+/// Validate a signaling URL entered by the user and return its
+/// normalized form. Only `wss://` is accepted for remote hosts: the
+/// handshake and every room message ride this socket, so a plaintext
+/// remote endpoint is refused. `ws://` is allowed for loopback so local
+/// development keeps working. (The env var is the unrestricted override
+/// for other setups, such as a server on a trusted LAN.)
+pub fn validate_signaling_url(raw: &str) -> Result<String, SignalingUrlError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(SignalingUrlError::Empty);
+    }
+    let url = url::Url::parse(raw).map_err(|_| SignalingUrlError::Invalid)?;
+    // The parser reads `wss:///ws` as host `ws` (and treats `\` as `/`);
+    // an empty authority is a typo, not a host.
+    if raw
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.starts_with(['/', '\\']))
+    {
+        return Err(SignalingUrlError::MissingHost);
+    }
+    let host = url.host().ok_or(SignalingUrlError::MissingHost)?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SignalingUrlError::HasCredentials);
+    }
+    match url.scheme() {
+        "wss" => {}
+        "ws" => {
+            let loopback = match host {
+                url::Host::Domain(d) => d.eq_ignore_ascii_case("localhost"),
+                url::Host::Ipv4(ip) => ip.is_loopback(),
+                url::Host::Ipv6(ip) => ip.is_loopback(),
+            };
+            if !loopback {
+                return Err(SignalingUrlError::InsecureRemote);
+            }
+        }
+        _ => return Err(SignalingUrlError::BadScheme),
+    }
+    // The server serves the socket on a path (`/ws`); a bare host would
+    // connect to `/` and fail in a way that is hard to diagnose.
+    if url.path() == "/" {
+        return Err(SignalingUrlError::MissingPath);
+    }
+    Ok(url.to_string())
+}
+
 /// Detect the host platform and map it onto the wire
 /// [`Platform`] enum. Unknown OSes default to `Linux` so the
 /// client never panics on a new platform; the server will reject
@@ -127,6 +215,81 @@ mod tests {
     fn detect_platform_is_one_of_three() {
         let p = detect_platform();
         matches!(p, Platform::Win | Platform::Mac | Platform::Linux);
+    }
+
+    #[test]
+    fn validate_accepts_wss_and_loopback_ws() {
+        assert_eq!(
+            validate_signaling_url("  wss://locast.example.com/ws ").as_deref(),
+            Ok("wss://locast.example.com/ws")
+        );
+        for ok in [
+            "ws://127.0.0.1:8787/ws",
+            "ws://localhost:8787/ws",
+            "ws://LOCALHOST/ws",
+            "ws://[::1]:8787/ws",
+        ] {
+            assert!(validate_signaling_url(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn validate_returns_the_normalized_form_that_is_stored() {
+        assert_eq!(
+            validate_signaling_url("WSS://Locast.Example.COM/ws").as_deref(),
+            Ok("wss://locast.example.com/ws")
+        );
+        assert_eq!(
+            validate_signaling_url("ws://127.1/ws").as_deref(),
+            Ok("ws://127.0.0.1/ws")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unsafe_or_malformed_urls() {
+        use SignalingUrlError::*;
+        let cases = [
+            ("", Empty),
+            ("   ", Empty),
+            ("not a url", Invalid),
+            ("http://locast.example.com/ws", BadScheme),
+            ("https://locast.example.com/ws", BadScheme),
+            ("ftp://locast.example.com/ws", BadScheme),
+            ("ws://locast.example.com/ws", InsecureRemote),
+            ("ws://192.168.1.5:8787/ws", InsecureRemote),
+            ("wss://user:pw@locast.example.com/ws", HasCredentials),
+            ("wss://user@locast.example.com/ws", HasCredentials),
+            ("wss:///ws", MissingHost),
+            ("ws://\\evil.com/ws", MissingHost),
+            // Look-alike and userinfo tricks must not pass as loopback.
+            ("wss://localhost@evil.com/ws", HasCredentials),
+            ("ws://localhost.evil.com/ws", InsecureRemote),
+            ("ws://127.0.0.1.evil.com/ws", InsecureRemote),
+            ("ws://localhost./ws", InsecureRemote),
+            ("ws://0.0.0.0/ws", InsecureRemote),
+            ("ws://[::]/ws", InsecureRemote),
+            ("WS://evil.com/ws", InsecureRemote),
+            // The server serves the socket on a path.
+            ("wss://locast.example.com", MissingPath),
+            ("wss://locast.example.com/", MissingPath),
+        ];
+        for (input, want) in cases {
+            assert_eq!(validate_signaling_url(input), Err(want), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn stored_url_is_used_but_never_unvalidated() {
+        // Only meaningful when the env override is not set in this process.
+        if std::env::var(ENV_URL).is_ok_and(|s| !s.trim().is_empty()) {
+            return;
+        }
+        let good = SignalingConfig::from_env_with_stored(Some("wss://locast.example.com/ws"));
+        assert_eq!(good.url, "wss://locast.example.com/ws");
+        let bad = SignalingConfig::from_env_with_stored(Some("ws://evil.example.com/ws"));
+        assert_eq!(bad.url, DEFAULT_URL, "an invalid stored value falls back");
+        let none = SignalingConfig::from_env_with_stored(None);
+        assert_eq!(none.url, DEFAULT_URL);
     }
 
     #[test]

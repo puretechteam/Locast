@@ -25,6 +25,7 @@ pub mod protocol;
 pub mod quota;
 pub mod room;
 pub mod scan;
+pub mod settings;
 pub mod signaling;
 pub mod temp_files;
 

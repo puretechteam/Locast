@@ -92,6 +92,8 @@ pub fn invoke_handler<R: tauri::Runtime>(
         commands::identity::identity_get,
         commands::identity::identity_rotate,
         commands::identity::identity_set_display_name,
+        commands::settings::settings_get_server,
+        commands::settings::settings_set_server_url,
         commands::signaling::signaling_get_state,
         commands::signaling::signaling_connect,
         commands::signaling::signaling_disconnect,
@@ -218,7 +220,15 @@ pub fn run() {
             app.manage(accountant);
             app.manage(protocol_handler);
             app.manage(identity_service.clone());
-            let signaling_config = SignalingConfig::from_env();
+            // The address saved in Settings is the fallback below the env
+            // var; an unreadable setting just means the default is used.
+            let stored_signaling_url = tauri::async_runtime::block_on(
+                storage::settings::get_json::<String>(&storage, net::config::SETTING_URL_KEY),
+            )
+            .ok()
+            .flatten();
+            let signaling_config =
+                SignalingConfig::from_env_with_stored(stored_signaling_url.as_deref());
             let signaling_client = std::sync::Arc::new(SignalingClient::new(
                 signaling_config,
                 identity_service.clone(),

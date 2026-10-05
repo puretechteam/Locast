@@ -59,6 +59,7 @@ export function LibraryPage(): JSX.Element {
                     <Link to="/rooms/new">Create a room</Link>
                     <Link to="/rooms/join">Join a room</Link>
                     <Link to="/rooms">Rooms</Link>
+                    <Link to="/settings">Settings</Link>
                 </nav>
             </div>
 

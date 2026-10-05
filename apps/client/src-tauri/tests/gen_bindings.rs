@@ -100,6 +100,8 @@ mod inner {
                 commands::identity::identity_get,
                 commands::identity::identity_rotate,
                 commands::identity::identity_set_display_name,
+                commands::settings::settings_get_server,
+                commands::settings::settings_set_server_url,
                 commands::signaling::signaling_get_state,
                 commands::signaling::signaling_connect,
                 commands::signaling::signaling_disconnect,

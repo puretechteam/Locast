@@ -114,6 +114,12 @@ export const commands = {
   async identitySetDisplayName(displayName: string): Promise<Identity> {
     return await __TAURI_INVOKE("identity_set_display_name", { displayName });
   },
+  async settingsGetServer(): Promise<ServerSettingsIpc> {
+    return await __TAURI_INVOKE("settings_get_server");
+  },
+  async settingsSetServerUrl(url: string | null): Promise<ServerSettingsIpc> {
+    return await __TAURI_INVOKE("settings_set_server_url", { url });
+  },
   async signalingGetState(): Promise<ConnectionState> {
     return await __TAURI_INVOKE("signaling_get_state");
   },
@@ -694,6 +700,17 @@ export type ManifestStateEvent = {
   room_id: string;
   manifest_hash: string;
   version: number;
+};
+
+// The server address as the Settings page needs it. A saved address
+// applies on the next launch (`next_url` is what that launch will use, so
+// a restart is needed when it differs from `active_url`); `env_override`
+// means LOCAST_SIGNALING_URL wins over it.
+export type ServerSettingsIpc = {
+    configured_url: string | null;
+    active_url: string;
+    next_url: string;
+    env_override: boolean;
 };
 
 // P4-T06: the SKEW_PROBE round-trip's 4-timestamp sample
