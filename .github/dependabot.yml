@@ -12,6 +12,15 @@
 # hand after that review. GitHub Actions are tag-pinned (for example
 # actions/checkout@v4), so their majors DO arrive, as separate PRs.
 #
+# Security updates: GitHub documents `ignore` as applying to Dependabot
+# security updates as well as version updates, and `ignore` has no
+# applies-to key. So an advisory whose only fix is a new major will not
+# produce a Dependabot PR. That is accepted: it still fails cargo-deny and
+# pnpm audit (the `supply chain` job in ci.yml, re-run weekly by
+# .github/workflows/supply-chain-schedule.yml), and the major is then taken
+# by hand after the architecture review. Dropping the ignore would instead
+# open ungrouped PRs for every ordinary major.
+#
 # Docker is deliberately NOT covered. apps/server/Dockerfile pins a Rust
 # toolchain image (rust:1.82-bookworm); bumping it would change the project's
 # Rust version policy, which is an architecture decision, not a routine

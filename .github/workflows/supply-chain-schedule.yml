@@ -1,0 +1,51 @@
+# Weekly supply-chain re-check.
+#
+# The `supply chain` job in ci.yml (cargo-deny advisories, pnpm audit) only
+# runs on pull requests and pushes to main. A RustSec or npm advisory that is
+# published while main is quiet would not be noticed until the next push.
+# This workflow runs the same two checks on a schedule so that a new
+# advisory turns a run red on its own.
+#
+# Why this matters for Dependabot: .github/dependabot.yml ignores semver-major
+# updates, and GitHub documents `ignore` as applying to security updates too,
+# so a fix that exists only in a new major would not arrive as a Dependabot
+# PR. These checks do not look at update types, so such an advisory still
+# fails here and is then handled by hand after the architecture review.
+#
+# Keep the steps in sync with the `supply-chain` job in ci.yml.
+
+name: supply-chain-schedule
+
+on:
+  schedule:
+    # Mondays 06:00 UTC, ahead of the Monday Dependabot runs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    name: supply chain (scheduled)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm audit (production, high and above)
+        run: pnpm audit --prod --audit-level=high
