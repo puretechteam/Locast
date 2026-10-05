@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use tauri::State as TauriState;
 use tokio::fs as tokio_fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::core::hashing::{Blake3Hasher, Sha256Hasher};
@@ -285,7 +285,13 @@ pub async fn import_one(
     //   present" implies that the scanner can rebuild rows from the
     //   filesystem state.
     let import_id = Uuid::new_v4();
-    let staged = stage_source(library_root, &import_id, &sha256, source).await?;
+    let staged = stage_source(
+        library_root,
+        &import_id,
+        (size_bytes, &sha256, &blake3),
+        source,
+    )
+    .await?;
 
     let final_path =
         library_fs::complete_download(library_root, &sha256, &staged, &sanitized).await?;
@@ -375,15 +381,24 @@ async fn hash_file(source: &Path) -> Result<(i64, String, String), AppError> {
 /// to `library::fs::complete_download`, which performs the atomic
 /// rename to the content-addressed path.
 ///
-/// `sha` is used in the filename purely for human-readability; the
-/// importer UUID is the uniqueness key.
+/// `expected` is the `(size, sha256, blake3)` that `hash_file` measured
+/// in an earlier pass. The source is read again here, so a file that was
+/// still being written (or replaced) in between would otherwise be stored
+/// under the hash of its old contents: the dedup lookup and the sha-keyed
+/// library path would be wrong, and the host would later serve bytes that
+/// do not match the manifest. The copy is therefore hashed as it is
+/// written and must match; otherwise the staged file is removed and the
+/// import fails with a read error (a retry re-measures the file).
+///
+/// `expected.1` is also used in the filename purely for
+/// human-readability; the importer UUID is the uniqueness key.
 async fn stage_source(
     library_root: &Path,
     import_id: &Uuid,
-    sha: &str,
+    expected: (i64, &str, &str),
     source: &Path,
 ) -> Result<PathBuf, AppError> {
-    let staged = paths::staging_partial_path(library_root, &import_id.to_string(), sha)?;
+    let staged = paths::staging_partial_path(library_root, &import_id.to_string(), expected.1)?;
     if let Some(parent) = staged.parent() {
         tokio_fs::create_dir_all(parent)
             .await
@@ -391,25 +406,47 @@ async fn stage_source(
                 message: e.to_string(),
             })?;
     }
-    let mut src = tokio_fs::File::open(source)
-        .await
-        .map_err(|e| AppError::Read {
-            message: e.to_string(),
-        })?;
-    let mut dst = tokio_fs::File::create(&staged)
-        .await
-        .map_err(|e| AppError::Read {
-            message: e.to_string(),
-        })?;
-    tokio::io::copy(&mut src, &mut dst)
-        .await
-        .map_err(|e| AppError::Read {
-            message: e.to_string(),
-        })?;
-    dst.sync_all().await.map_err(|e| AppError::Read {
+    let result = copy_and_verify(source, &staged, expected).await;
+    if result.is_err() {
+        // Never leave a partial or mismatching copy in staging: its bytes
+        // would count against the quota with nothing able to delete them.
+        let _ = tokio_fs::remove_file(&staged).await;
+    }
+    result.map(|()| staged)
+}
+
+async fn copy_and_verify(
+    source: &Path,
+    staged: &Path,
+    expected: (i64, &str, &str),
+) -> Result<(), AppError> {
+    let read_err = |e: std::io::Error| AppError::Read {
         message: e.to_string(),
-    })?;
-    Ok(staged)
+    };
+    let mut src = tokio_fs::File::open(source).await.map_err(read_err)?;
+    let mut dst = tokio_fs::File::create(staged).await.map_err(read_err)?;
+    let mut sha = Sha256Hasher::new();
+    let mut blake = Blake3Hasher::new();
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut total: i64 = 0;
+    loop {
+        let n = src.read(&mut buf).await.map_err(read_err)?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+        blake.update(&buf[..n]);
+        dst.write_all(&buf[..n]).await.map_err(read_err)?;
+        total += n as i64;
+    }
+    dst.sync_all().await.map_err(read_err)?;
+    if total != expected.0 || sha.finalize_hex() != expected.1 || blake.finalize_hex() != expected.2
+    {
+        return Err(AppError::Read {
+            message: "source file changed while it was being imported".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Look up an existing `media_items` row by SHA-256. Returns `Some`
@@ -539,4 +576,50 @@ fn unix_millis_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(now.as_millis()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn staging_a_source_that_changed_since_hashing_is_refused_and_leaves_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let source = root.join("movie.mkv");
+        std::fs::write(&source, vec![7u8; 300_000]).expect("write");
+        let (size, sha, blake) = hash_file(&source).await.expect("hash");
+
+        // The file changes after it was measured (a download still
+        // finishing, a re-encode replacing it).
+        std::fs::write(&source, vec![8u8; 300_000]).expect("rewrite");
+        let id = Uuid::new_v4();
+        let err = stage_source(root, &id, (size, &sha, &blake), &source)
+            .await
+            .expect_err("a changed source must not be staged");
+        assert!(matches!(err, AppError::Read { .. }), "{err:?}");
+        let staged = paths::staging_partial_path(root, &id.to_string(), &sha).expect("path");
+        assert!(!staged.exists(), "no mismatching copy may stay in staging");
+
+        // A file that grew or shrank is caught by the size check too.
+        std::fs::write(&source, vec![7u8; 100]).expect("shrink");
+        assert!(stage_source(root, &id, (size, &sha, &blake), &source)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn staging_an_unchanged_source_copies_it_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let source = root.join("movie.mkv");
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&source, &bytes).expect("write");
+        let (size, sha, blake) = hash_file(&source).await.expect("hash");
+        let id = Uuid::new_v4();
+        let staged = stage_source(root, &id, (size, &sha, &blake), &source)
+            .await
+            .expect("staged");
+        assert_eq!(std::fs::read(&staged).expect("read staged"), bytes);
+    }
 }
