@@ -387,10 +387,13 @@ async fn rate_limit_flood_isolated_to_offender() {
          the test would not actually exercise the production 100 msg/s limit"
     );
 
-    // Drain the flood task's ws_c. The server should
-    // send a RATE_LIMIT within the 1 s throttle window.
-    let rate_limit_hit =
-        drain_until_close_or_rate_limit(&mut ws_c, Duration::from_millis(1500)).await;
+    // Drain the flood task's ws_c until the server's RATE_LIMIT arrives.
+    // Before it does, the server works through the 200 frames that fit in
+    // the burst bucket, one at a time (a bearer lookup and a room creation
+    // each, with a reply per frame), which a loaded debug runner can take
+    // more than a second to do. The drain returns as soon as the frame
+    // arrives, so the ceiling only matters when something is really wrong.
+    let rate_limit_hit = drain_until_close_or_rate_limit(&mut ws_c, Duration::from_secs(30)).await;
 
     let hit = rate_limit_hit.expect("expected at least one RATE_LIMIT during flood");
     assert_eq!(hit.scope, RateLimitScope::Conn);

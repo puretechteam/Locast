@@ -982,6 +982,7 @@ async fn test_rate_limit_throttles_not_disconnects() {
                         {
                             if f.reason == AuthFailReason::Rate {
                                 rate_fail_seen = true;
+                                break;
                             }
                         }
                     }
@@ -1002,7 +1003,9 @@ async fn test_rate_limit_throttles_not_disconnects() {
             }
         }
     };
-    let _ = tokio::time::timeout(Duration::from_millis(500), read_loop).await;
+    // The loop stops at the first AUTH_FAIL(Rate); the ceiling only matters if
+    // it never comes. (It used to be 500 ms, which a slow response could miss.)
+    let _ = tokio::time::timeout(Duration::from_secs(30), read_loop).await;
     assert!(
         rate_fail_seen,
         "expected at least one AUTH_FAIL(Rate) under low-rate config"
@@ -1178,8 +1181,13 @@ async fn test_silent_connection_is_closed_at_the_handshake_timeout() {
 /// connection (a viewer who is just watching) must stay open.
 #[tokio::test]
 async fn test_authenticated_connection_outlives_the_handshake_timeout() {
+    // The whole handshake (HELLO, WELCOME, CHALLENGE, AUTH with an Ed25519
+    // verify and a database write, AUTH_OK) has to finish inside this timeout.
+    // It is generous so a slow debug runner never trips it; the test only needs
+    // to wait out the timeout afterwards.
+    let timeout_ms = 3_000;
     let mut cfg = test_config(30_000, 1_048_576);
-    cfg.handshake_timeout_ms = 400;
+    cfg.handshake_timeout_ms = timeout_ms;
     let (addr, _h, _db) = spawn_server(cfg).await;
     let (kp, _pk) = fresh_keypair();
     let mut ws = connect(addr).await;
@@ -1199,8 +1207,8 @@ async fn test_authenticated_connection_outlives_the_handshake_timeout() {
     let ok = decode(&read_binary(&mut ws).await.expect("auth_ok"));
     assert_eq!(ok.r#type.as_str(), "AUTH_OK");
 
-    // Well past the handshake deadline, with no traffic.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Past the handshake deadline, with no traffic.
+    tokio::time::sleep(Duration::from_millis(timeout_ms as u64 + 600)).await;
 
     ws.send(Message::Ping(b"still here".to_vec()))
         .await

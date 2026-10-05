@@ -525,7 +525,14 @@ async fn many_concurrent_creates_yield_unique_codes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn host_rejoin_within_grace_restores_host() {
-    let harness = spawn_test_server().await;
+    // The host must get a whole new connection (TCP, upgrade, HELLO, AUTH, a
+    // bearer insert) back in before the grace ends. With the suite's 200 ms
+    // grace a slow debug runner can spend all of it, the ticker then ends the
+    // room, and HOST_RECONNECTED never comes. A long grace still tests "within
+    // grace", because the rejoin lands well inside it.
+    let mut config = test_config();
+    config.host_disconnect_grace_ms = 30_000;
+    let harness = spawn_test_server_with_config(config).await;
     let (kp_a, _) = fresh_keypair();
     let (kp_b, _) = fresh_keypair();
     let mut ws_a = connect(harness.addr).await;
@@ -1124,11 +1131,13 @@ async fn stale_participant_removed_after_disconnect_timeout() {
         Arc::new(locast_server::rooms::DbRoomStore::new(harness.db.clone()));
     let now = harness.clock.now_ms();
     harness.rooms.tick_presence_timeout(now).await;
-    harness.clock.advance(600);
-    let now = harness.clock.now_ms();
+    // Pass the later time explicitly. Advancing the shared clock and reading
+    // it back races with the harness ticker, which re-syncs the mock clock to
+    // wall time every 50 ms and could undo the advance in between.
+    let later = now + 600;
     harness
         .rooms
-        .tick_stale_participants(store.as_ref(), now)
+        .tick_stale_participants(store.as_ref(), later)
         .await;
 
     let handle = harness.rooms.get_by_id(room_id).await.expect("room exists");
