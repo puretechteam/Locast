@@ -70,6 +70,10 @@ use super::state::RoomLifecycle;
 use crate::db::Db;
 use crate::time::Clock;
 
+/// How many of a room's most recent manifest versions the database keeps. Only
+/// the latest is ever read; a few more are kept for debugging.
+pub const MANIFEST_VERSIONS_KEPT: i64 = 5;
+
 /// Run the manifest publish flow. The caller (the dispatch
 /// layer) is responsible for the bearer / rate-limit /
 /// capability gate; this function only runs after those
@@ -212,6 +216,14 @@ pub async fn handle_manifest_publish(
     )
     .await
     .map_err(|e| RoomError::Internal(format!("insert_room_manifest: {e}")))?;
+    // Keep the table bounded: only the newest versions are ever read. A failed
+    // prune must not fail a publish that already succeeded.
+    if let Err(e) = db
+        .prune_room_manifests(room_id, MANIFEST_VERSIONS_KEPT)
+        .await
+    {
+        tracing::warn!(room_id = %room_id, error = %e, "pruning old manifest versions failed");
+    }
 
     // 5. Update the in-memory cache.
     registry

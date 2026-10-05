@@ -932,6 +932,25 @@ impl Db {
         Ok(())
     }
 
+    /// Delete all but the newest `keep` manifest versions of `room_id` and
+    /// return how many rows were removed. Only the latest row is ever read
+    /// (late-join fetch and the next version/hash), but every publish stores up
+    /// to about 1 MiB, so without this a host could grow the database without
+    /// bound by publishing in a loop.
+    pub async fn prune_room_manifests(&self, room_id: Uuid, keep: i64) -> Result<u64, sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        let res = sqlx::query(
+            "DELETE FROM room_manifests \
+             WHERE room_id = ?1 \
+               AND version <= (SELECT MAX(version) FROM room_manifests WHERE room_id = ?1) - ?2",
+        )
+        .bind(room_id.to_string())
+        .bind(keep)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Look up the latest `room_manifests` row for `room_id`.
     /// Returns the row in the same shape as
     /// [`insert_room_manifest`] takes so the caller can pass
@@ -1185,6 +1204,76 @@ mod tests {
         assert_eq!(purged, 1);
         assert!(db.validate_bearer(&stale).await.expect("v").is_none());
         assert!(db.validate_bearer(&live).await.expect("v").is_some());
+    }
+
+    #[tokio::test]
+    async fn prune_room_manifests_keeps_the_newest_and_only_for_that_room() {
+        let db = fresh_db().await;
+        let store = crate::rooms::DbRoomStore::new(db.clone());
+        let host_pk = random_pubkey();
+        let host = db.upsert_user(&host_pk).await.expect("upsert host");
+        let registry = crate::rooms::RoomRegistry::new(crate::rooms::RoomRegistryConfig {
+            max_participants: 8,
+            host_disconnect_grace_ms: 30_000,
+            participant_stale_after_ms: 300_000,
+            participant_disconnect_after_ms: 15_000,
+        });
+        let (a, _) = registry
+            .create(&store, "A".into(), host, host_pk, true, 1)
+            .await
+            .expect("room a");
+        let host2_pk = random_pubkey();
+        let host2 = db.upsert_user(&host2_pk).await.expect("upsert host 2");
+        let (b, _) = registry
+            .create(&store, "B".into(), host2, host2_pk, true, 2)
+            .await
+            .expect("room b");
+        for version in 1..=6 {
+            for (room, who) in [(a.id, host), (b.id, host2)] {
+                db.insert_room_manifest(Uuid::now_v7(), room, version, 0, "{}", &[0u8; 32], who)
+                    .await
+                    .expect("insert manifest");
+            }
+        }
+
+        let removed = db.prune_room_manifests(a.id, 2).await.expect("prune");
+        assert_eq!(removed, 4, "room A keeps versions 5 and 6");
+        let count = |room: Uuid| {
+            let db = db.clone();
+            async move {
+                let (n,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM room_manifests WHERE room_id = ?1")
+                        .bind(room.to_string())
+                        .fetch_one(db.pool())
+                        .await
+                        .expect("count");
+                n
+            }
+        };
+        assert_eq!(count(a.id).await, 2);
+        assert_eq!(
+            count(b.id).await,
+            6,
+            "another room's manifests are untouched"
+        );
+        assert_eq!(
+            db.get_latest_room_manifest(a.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
+            6
+        );
+        assert_eq!(
+            db.prune_room_manifests(a.id, 2).await.unwrap(),
+            0,
+            "idempotent"
+        );
+        assert_eq!(
+            db.prune_room_manifests(Uuid::now_v7(), 2).await.unwrap(),
+            0,
+            "an unknown room is a no-op"
+        );
     }
 
     #[tokio::test]

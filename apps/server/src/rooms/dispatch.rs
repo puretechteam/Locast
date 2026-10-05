@@ -2142,6 +2142,51 @@ mod tests {
         );
     }
 
+    /// Every publish stores up to about 1 MiB and used to be kept forever.
+    /// Only the newest versions are read, so only a few are kept.
+    #[tokio::test]
+    async fn publishing_many_manifests_keeps_only_the_newest_versions() {
+        use crate::rooms::manifest::MANIFEST_VERSIONS_KEPT;
+        let (reg, clock) = fresh_registry();
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let (room_id, (host, host_pk, host_seed), _viewer) = manifest_room(&reg, &db, &clock).await;
+
+        let total = MANIFEST_VERSIONS_KEPT + 4;
+        for n in 0..total {
+            crate::rooms::handle_manifest_publish(
+                &publish_envelope(room_id, &host_seed, 1_000 + n),
+                &reg,
+                &db,
+                &clock,
+                host,
+                host_pk,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("publish {n}: {e:?}"));
+        }
+
+        let versions: Vec<(i64,)> = sqlx::query_as(
+            "SELECT version FROM room_manifests WHERE room_id = ?1 ORDER BY version",
+        )
+        .bind(room_id.to_string())
+        .fetch_all(db.pool())
+        .await
+        .expect("versions");
+        let versions: Vec<i64> = versions.into_iter().map(|(v,)| v).collect();
+        let newest = total;
+        let expected: Vec<i64> = ((newest - MANIFEST_VERSIONS_KEPT + 1)..=newest).collect();
+        assert_eq!(versions, expected, "only the newest versions remain");
+
+        // What readers use is untouched: the latest row and the cache.
+        let latest = db
+            .get_latest_room_manifest(room_id)
+            .await
+            .unwrap()
+            .expect("latest row");
+        assert_eq!(latest.version, newest);
+        assert_eq!(reg.current_manifest(room_id).await.unwrap().version, newest);
+    }
+
     /// The signer must be the authenticated publisher: the host
     /// presenting a manifest validly signed by another key is
     /// refused before anything is written.
