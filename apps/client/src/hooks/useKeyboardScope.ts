@@ -91,6 +91,17 @@ export function useKeyboardScope(handlers: {
         onUndoRef.current?.();
     }, []);
 
+    // Revoking DRAW must close an already-open toolbar and leave any
+    // active drawing tool. `canDraw` is otherwise only consulted when
+    // the toolbar is opened. Laser is a separate capability and is not
+    // touched here.
+    useEffect(() => {
+        if (!canDraw) {
+            setToolbarVisible(false);
+            setDrawingModeState("none");
+        }
+    }, [canDraw]);
+
     useEffect(() => {
         const onKeyDown = (e: KeyboardEvent): void => {
             if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {

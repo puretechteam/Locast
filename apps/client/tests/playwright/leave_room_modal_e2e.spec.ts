@@ -22,26 +22,32 @@ async function navigate(page: Page) {
     await page.waitForSelector('[data-testid="locast-player"]', { timeout: 5_000 });
 }
 
-async function addTempFiles(page: Page, ids: string[]) {
-    for (const id of ids) {
-        await page.evaluate(({ dlId }) => import("/tests/playwright/shim/tauriShim.ts").then((mod) => {
-            mod.__emit("download://state", { v: 1, id: dlId, media_id: dlId, state: "transferring", error_message: null });
-            mod.__emit("download://progress", { v: 1, id: dlId, state: "transferring", transferred_bytes: 1024, total_bytes: 2048, bytes_per_sec_ema: 1024, eta_seconds: 1 });
-        }), { dlId: id });
-    }
+// get_temp_files in the shim returns whatever the test seeded for the room.
+async function seedTempFiles(page: Page, ids: string[]) {
+    await page.evaluate(({ roomId, hostId, fileIds }) => {
+        const w = window as unknown as { __locast_tempFiles: Record<string, unknown[]> };
+        w.__locast_tempFiles[roomId] = fileIds.map((id, i) => ({
+            file_id: id,
+            room_id: roomId,
+            filename: `${id}.mp4`,
+            size_bytes: 1024 * (i + 1),
+            created_ms: 1_700_000_000_000 + i,
+            owner_user_id: hostId,
+        }));
+    }, { roomId: ROOM_ID, hostId: HOST_ID, fileIds: ids });
 }
-
-test.beforeEach(async ({ page: _page, locast }) => { await locast.waitForBridge(); });
 
 test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ page, locast }) => {
     await navigate(page);
-    await addTempFiles(page, ["dl-1", "dl-2", "dl-3"]);
+    await seedTempFiles(page, ["dl-1", "dl-2", "dl-3"]);
     await page.locator(".room-footer__leave").click();
     await expect(page.locator(".lrm-panel")).toBeVisible();
     await expect(page.locator(".lrm-item")).toHaveCount(3);
     await locast.resetInvokeLog();
     await page.locator(".lrm-btn--delete").click();
-    await page.waitForTimeout(300);
+    await expect
+        .poll(async () => (await locast.readInvokeLog()).filter((e) => e.name === "delete_files_to_trash").length)
+        .toBe(1);
     const log = await locast.readInvokeLog();
     const deletes = log.filter((e) => e.name === "delete_files_to_trash");
     expect(deletes).toHaveLength(1);
@@ -50,13 +56,15 @@ test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ p
 
 test("Keep: 3 temp files listed, mark_files_permanent IPC logged", async ({ page, locast }) => {
     await navigate(page);
-    await addTempFiles(page, ["dl-k1", "dl-k2", "dl-k3"]);
+    await seedTempFiles(page, ["dl-k1", "dl-k2", "dl-k3"]);
     await page.locator(".room-footer__leave").click();
     await expect(page.locator(".lrm-panel")).toBeVisible();
     await expect(page.locator(".lrm-item")).toHaveCount(3);
     await locast.resetInvokeLog();
     await page.locator(".lrm-btn--keep").click();
-    await page.waitForTimeout(300);
+    await expect
+        .poll(async () => (await locast.readInvokeLog()).filter((e) => e.name === "mark_files_permanent").length)
+        .toBe(1);
     const log = await locast.readInvokeLog();
     const keeps = log.filter((e) => e.name === "mark_files_permanent");
     expect(keeps).toHaveLength(1);

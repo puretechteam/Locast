@@ -266,8 +266,10 @@ test("P6-T04: host participant has Host badge", async ({ page }) => {
     await navigateAndHydrateP6(page, summary);
     const hostBadge = page.locator(".participant-tile__badge").filter({ hasText: "Host" });
     await expect(hostBadge).toHaveCount(1);
-    const tileWithBadge = hostBadge.locator("..");
-    await expect(tileWithBadge.locator(".participant-tile__name")).toContainText("host-alice");
+    // The badge is a child of `.participant-tile__name`, which also holds the display name.
+    const nameEl = page.locator(".participant-tile__name").filter({ has: hostBadge });
+    await expect(nameEl).toHaveCount(1);
+    await expect(nameEl).toContainText("host-alice");
 });
 
 test("P6-T04: quality bar is present on each tile", async ({ page }) => {

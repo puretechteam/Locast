@@ -40,6 +40,10 @@ const ROOM = {
     ],
     host_disconnected: false,
     host_disconnect_deadline_ms: null,
+    // DRAW (0x02) | LASER (0x04). The `d` / `l` key tests need the
+    // capability store to grant DRAW, otherwise `canDraw` is false and
+    // the toolbar never opens.
+    you_cap_set: 0x02 | 0x04,
 };
 
 async function spaNavigate(page: Page, path: string): Promise<void> {

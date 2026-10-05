@@ -21,7 +21,7 @@
     "smoke:drawing-sync": "node --experimental-strip-types --no-warnings src/drawing/drawingSync.smoke.ts",
     "smoke:laser": "node --experimental-strip-types --no-warnings src/laser/laserTransport.smoke.ts",
     "test:e2e": "playwright test --config=tests/playwright/playwright.config.ts",
-    "test:e2e:gate": "playwright test --config=tests/playwright/playwright.config.ts dedup_e2e.spec.ts download_modal.spec.ts drawing_e2e.spec.ts drawing_sync_e2e.spec.ts drift_e2e.spec.ts host_production_e2e.spec.ts laser_transport_e2e.spec.ts library_e2e.spec.ts manual_sync_e2e.spec.ts playback_e2e.spec.ts playback_local_e2e.spec.ts reconnect_status_e2e.spec.ts shared_media_e2e.spec.ts skew_threshold_e2e.spec.ts",
+    "test:e2e:gate": "playwright test --config=tests/playwright/playwright.config.ts dedup_e2e.spec.ts download_modal.spec.ts drawing_e2e.spec.ts drawing_sync_e2e.spec.ts drift_e2e.spec.ts host_production_e2e.spec.ts laser_transport_e2e.spec.ts library_e2e.spec.ts manual_sync_e2e.spec.ts playback_e2e.spec.ts playback_local_e2e.spec.ts reconnect_status_e2e.spec.ts shared_media_e2e.spec.ts skew_threshold_e2e.spec.ts laser_e2e.spec.ts leave_room_modal_e2e.spec.ts permission_e2e.spec.ts",
     "test:e2e:summary": "node scripts/e2e-summary.mjs",
     "test:perf": "playwright test --config=tests/perf/playwright.config.ts",
     "perf:flag": "node tests/perf/flag-long-tasks.mjs",
@@ -54,6 +54,6 @@
     "vite": "^5.4.21"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6"
   }
 }

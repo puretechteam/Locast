@@ -453,7 +453,11 @@ const SHIM_SOURCE = `
                 return Promise.resolve(null);
             }
             if (name === "get_temp_files") {
-                return Promise.resolve([]);
+                // Tests seed w.__locast_tempFiles[roomId] with
+                // TempFileInfo rows; an unseeded room has none.
+                var tempByRoom = w.__locast_tempFiles || {};
+                var tempRows = args && tempByRoom[args.roomId];
+                return Promise.resolve(tempRows ? tempRows.slice() : []);
             }
             if (name === "mark_files_permanent" || name === "delete_files_to_trash") {
                 w.__locast_invoke_log.push({ name: name, args: args });
@@ -471,6 +475,8 @@ const SHIM_SOURCE = `
         // P4-T05: per-test invoke log (FIFO). resetInvokeLog
         // empties it between scenarios.
         w.__locast_invoke_log = [];
+        // P6-T06: seedable per-room temp file rows for get_temp_files.
+        w.__locast_tempFiles = {};
         w.__locast_resetInvokeLog = function() {
             w.__locast_invoke_log = [];
         };
