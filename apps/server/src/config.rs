@@ -297,13 +297,11 @@ impl Config {
             parse_env_usize(&get, "LOCAST_ROOM_CODE_LENGTH")?.unwrap_or(DEFAULT_ROOM_CODE_LENGTH);
         let room_code_alphabet = get("LOCAST_ROOM_CODE_ALPHABET")
             .unwrap_or_else(|_| DEFAULT_ROOM_CODE_ALPHABET.to_string());
-        let room_max_participants = parse_env_u32(&get, "LOCAST_ROOM_MAX_PARTICIPANTS")?
-            .map(|v| v as u8)
+        let room_max_participants = parse_env_u8(&get, "LOCAST_ROOM_MAX_PARTICIPANTS")?
             .unwrap_or(DEFAULT_ROOM_MAX_PARTICIPANTS);
         let host_disconnect_grace_ms = parse_env_i64(&get, "LOCAST_HOST_DISCONNECT_GRACE_MS")?
             .unwrap_or(DEFAULT_HOST_DISCONNECT_GRACE_MS);
-        let room_create_max_collisions = parse_env_u32(&get, "LOCAST_ROOM_CREATE_MAX_COLLISIONS")?
-            .map(|v| v as u8)
+        let room_create_max_collisions = parse_env_u8(&get, "LOCAST_ROOM_CREATE_MAX_COLLISIONS")?
             .unwrap_or(DEFAULT_ROOM_CREATE_MAX_COLLISIONS);
         let participant_stale_after_ms = parse_env_i64(&get, "LOCAST_PARTICIPANT_STALE_AFTER_MS")?
             .unwrap_or(DEFAULT_PARTICIPANT_STALE_AFTER_MS);
@@ -398,6 +396,22 @@ where
     }
 }
 
+/// Parse a `u8` setting. A value above 255 is an error: parsing it as a
+/// `u32` and casting would silently wrap it (256 becomes 0, 300 becomes 44).
+fn parse_env_u8<F>(get: &F, name: &str) -> Result<Option<u8>, ConfigError>
+where
+    F: Fn(&str) -> Result<String, env::VarError>,
+{
+    match get(name) {
+        Ok(s) => s
+            .parse::<u8>()
+            .map(Some)
+            .map_err(|e| ConfigError::InvalidNumber(name.to_string(), s, e.to_string())),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(ConfigError::Env(name.to_string(), e)),
+    }
+}
+
 /// Errors raised while loading configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -445,6 +459,33 @@ mod tests {
             cfg.sensitive.db_key.as_ref().map(SecretString::expose),
             Some(DBKEY)
         );
+    }
+
+    #[test]
+    fn small_numeric_settings_reject_values_that_do_not_fit() {
+        // These used to be parsed as u32 and cast to u8: 256 became 0 and
+        // 300 became 44, silently.
+        for (name, bad) in [
+            ("LOCAST_ROOM_MAX_PARTICIPANTS", "256"),
+            ("LOCAST_ROOM_MAX_PARTICIPANTS", "300"),
+            ("LOCAST_ROOM_CREATE_MAX_COLLISIONS", "256"),
+            ("LOCAST_ROOM_CREATE_MAX_COLLISIONS", "70000"),
+            ("LOCAST_ROOM_MAX_PARTICIPANTS", "-1"),
+        ] {
+            let err = Config::from_lookup(lookup(&[(name, bad)]))
+                .expect_err(&format!("{name}={bad} must be refused"));
+            assert!(
+                matches!(&err, ConfigError::InvalidNumber(n, v, _) if n == name && v == bad),
+                "{name}={bad}: {err:?}"
+            );
+        }
+        let cfg = Config::from_lookup(lookup(&[
+            ("LOCAST_ROOM_MAX_PARTICIPANTS", "255"),
+            ("LOCAST_ROOM_CREATE_MAX_COLLISIONS", "7"),
+        ]))
+        .expect("values that fit are accepted");
+        assert_eq!(cfg.room_max_participants, 255);
+        assert_eq!(cfg.room_create_max_collisions, 7);
     }
 
     #[test]

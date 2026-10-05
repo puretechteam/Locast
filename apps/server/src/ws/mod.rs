@@ -1174,7 +1174,9 @@ async fn handle_hello(
         config: WelcomeConfig {
             max_room_size: 8,
             rate: WelcomeRate {
-                msgs_per_sec: state.config.rate_msgs_per_sec as u16,
+                // The wire field is a u16; a larger setting saturates
+                // instead of wrapping to a small, wrong number.
+                msgs_per_sec: u16::try_from(state.config.rate_msgs_per_sec).unwrap_or(u16::MAX),
                 bytes_per_sec: state.config.rate_bytes_per_sec,
             },
         },
