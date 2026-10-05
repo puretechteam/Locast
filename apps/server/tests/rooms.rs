@@ -74,6 +74,7 @@ struct TestHarness {
     clock: Arc<MockClock>,
     db: Db,
     rooms: Arc<RoomRegistry>,
+    relay: locast_server::SignalRelay,
 }
 
 async fn spawn_test_server() -> TestHarness {
@@ -84,13 +85,14 @@ async fn spawn_test_server_with_config(config: Config) -> TestHarness {
     let db = Db::open(&config).await.expect("open db");
     let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&config)));
     let clock = Arc::new(MockClock::new(1_000_000));
+    let relay = locast_server::SignalRelay::new();
     let state = AppState {
         config: Arc::new(config),
         metrics: Metrics::new(),
         db: db.clone(),
         rooms: rooms.clone(),
         clock: clock.clone(),
-        signal_relay: locast_server::SignalRelay::new(),
+        signal_relay: relay.clone(),
         epoch_counter: std::sync::Arc::new(std::sync::Mutex::new(
             locast_server::auth::EpochCounter::default(),
         )),
@@ -123,6 +125,7 @@ async fn spawn_test_server_with_config(config: Config) -> TestHarness {
         clock,
         db,
         rooms,
+        relay,
     }
 }
 
@@ -3969,4 +3972,95 @@ async fn lasers_in_flight_after_leaving_do_not_cost_the_connection() {
     )
     .await;
     r.harness.handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Stale connection teardown vs. a newer connection of the same user.
+// ---------------------------------------------------------------------------
+
+/// The relay hands out one token per registration; only the connection
+/// that still owns the slot may remove it, and it learns whether it did.
+#[tokio::test]
+async fn relay_unregister_only_removes_the_current_connection() {
+    let relay = locast_server::SignalRelay::new();
+    let user = Uuid::now_v7();
+    let (tx_old, mut rx_old) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let (tx_new, mut rx_new) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let old = relay.register(user, tx_old).await;
+    let new = relay.register(user, tx_new).await;
+    assert_ne!(old, new);
+
+    // The stale connection's teardown must neither remove the newer
+    // slot nor claim the user was lost.
+    assert!(!relay.unregister(user, old).await);
+    assert!(relay.is_registered(user).await);
+    relay
+        .send(user, hello_envelope())
+        .await
+        .expect("the newer connection still receives");
+    assert!(rx_new.recv().await.is_some());
+    assert!(
+        rx_old.try_recv().is_err(),
+        "the replaced sender gets nothing"
+    );
+
+    // The current connection's teardown removes it and says so, once.
+    assert!(relay.unregister(user, new).await);
+    assert!(!relay.is_registered(user).await);
+    assert!(!relay.unregister(user, new).await);
+}
+
+/// The server never pings, so a client that reconnects after a network
+/// flap has a second connection open while the first is still held by
+/// the server. When the first finally closes, the user's room and relay
+/// slot must survive: before the fix, its teardown ended a live host's
+/// room (no migration) and removed the live connection's relay slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_connection_teardown_does_not_end_a_live_hosts_room() {
+    let harness = spawn_test_server().await;
+    let (kp_h, _) = fresh_keypair();
+    let (kp_v, _) = fresh_keypair();
+    let mut ws_h1 = connect(harness.addr).await;
+    let mut ws_v = connect(harness.addr).await;
+    let h = complete_handshake(&mut ws_h1, &kp_h).await;
+    let v = complete_handshake(&mut ws_v, &kp_v).await;
+    send_envelope(&mut ws_h1, &room_create_envelope(h.token, "M", false)).await;
+    let env = expect_envelope(&mut ws_h1, MessageKind::RoomCreated).await;
+    let code = serde_json::from_value::<RoomCreatedPayload>(env.payload)
+        .unwrap()
+        .room
+        .code;
+    send_envelope(&mut ws_v, &room_join_envelope(v.token, &code, "V")).await;
+    let _ = expect_envelope(&mut ws_v, MessageKind::RoomJoined).await;
+    let _ = expect_envelope(&mut ws_h1, MessageKind::ParticipantJoined).await;
+
+    // The host's client reconnects while the server still holds the
+    // old transport.
+    let mut ws_h2 = connect(harness.addr).await;
+    let h2 = complete_handshake(&mut ws_h2, &kp_h).await;
+    assert_eq!(h2.user_id, h.user_id);
+
+    // The old transport finally dies. Watch the server state for a
+    // while: an absence check has to observe a window, and the teardown
+    // is a few in-memory operations plus one database write.
+    drop(ws_h1);
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            harness.rooms.get_user_room(h.user_id).await.is_some(),
+            "a stale connection closing ended the live host's room"
+        );
+        assert!(
+            harness.relay.is_registered(h.user_id).await,
+            "a stale connection closing removed the live connection's relay slot"
+        );
+    }
+
+    // The live connection still receives relayed envelopes.
+    harness
+        .relay
+        .send(h.user_id, hello_envelope())
+        .await
+        .expect("relay delivers to the live connection");
+    let _ = next_of_kind(&mut ws_h2, MessageKind::Hello, "live host connection").await;
 }

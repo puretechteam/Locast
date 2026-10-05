@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -26,6 +27,9 @@ use locast_protocol::room::SignalPayload;
 use super::registry::RoomRegistry;
 use crate::time::Clock;
 
+/// One user's slot: the owning connection's token and its outbound channel.
+type RelaySlot = (u64, mpsc::UnboundedSender<Envelope>);
+
 /// Per-user outbound channel registry. Keyed by `user_id`
 /// because each authenticated user owns at most one active
 /// connection in v1 (a single desktop client). The channel is
@@ -36,7 +40,8 @@ use crate::time::Clock;
 /// `room_bcast_forwarder` in `apps/server/src/ws/mod.rs:1144`).
 #[derive(Default, Clone)]
 pub struct SignalRelay {
-    inner: Arc<tokio::sync::RwLock<HashMap<Uuid, mpsc::UnboundedSender<Envelope>>>>,
+    inner: Arc<tokio::sync::RwLock<HashMap<Uuid, RelaySlot>>>,
+    next_token: Arc<AtomicU64>,
 }
 
 /// Failure to deliver a SIGNAL envelope to a target user.
@@ -55,20 +60,35 @@ impl SignalRelay {
         Self::default()
     }
 
-    /// Register a connection's outbound channel under `user_id`.
-    /// If a previous sender is registered (reconnect), it is
-    /// replaced; the old sender is dropped, which causes the
-    /// old WS task's recv to fail and exit cleanly.
-    pub async fn register(&self, user_id: Uuid, tx: mpsc::UnboundedSender<Envelope>) {
+    /// Register a connection's outbound channel under `user_id` and
+    /// return the connection's token. If a previous connection is
+    /// registered (the client reconnected before the server noticed the
+    /// old transport was dead), its slot is replaced; the old connection
+    /// keeps running until its own transport fails, and its token no
+    /// longer matches, so [`unregister`](Self::unregister) tells it that
+    /// it is stale.
+    pub async fn register(&self, user_id: Uuid, tx: mpsc::UnboundedSender<Envelope>) -> u64 {
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut g = self.inner.write().await;
-        g.insert(user_id, tx);
+        g.insert(user_id, (token, tx));
+        token
     }
 
-    /// Unregister a connection. Called from the WS task's
-    /// shutdown path. No-op if `user_id` is not registered.
-    pub async fn unregister(&self, user_id: Uuid) {
+    /// Unregister the connection that was given `token`. Called from the
+    /// WS task's shutdown path. Returns `true` when that connection still
+    /// owned the user's slot (the slot is removed), and `false` when the
+    /// user has no slot or a newer connection replaced it, in which case
+    /// the newer connection's slot is left alone and the caller must not
+    /// treat the user as having lost their connection.
+    pub async fn unregister(&self, user_id: Uuid, token: u64) -> bool {
         let mut g = self.inner.write().await;
-        g.remove(&user_id);
+        match g.get(&user_id) {
+            Some((current, _)) if *current == token => {
+                g.remove(&user_id);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Send a SIGNAL envelope to `target_user_id`. Returns
@@ -80,7 +100,7 @@ impl SignalRelay {
     pub async fn send(&self, target_user_id: Uuid, envelope: Envelope) -> Result<(), SendError> {
         let g = self.inner.read().await;
         match g.get(&target_user_id) {
-            Some(tx) => tx.send(envelope).map_err(|_| SendError::NoRecipient),
+            Some((_, tx)) => tx.send(envelope).map_err(|_| SendError::NoRecipient),
             None => Err(SendError::NoRecipient),
         }
     }

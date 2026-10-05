@@ -276,6 +276,10 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // the failure-handling code stays uniform.
     let auth_failures: Arc<Mutex<VecDeque<i64>>> = Arc::new(Mutex::new(VecDeque::new()));
     let mut authed: Option<(Uuid, [u8; 32])> = None;
+    // Token from the SignalRelay slot this connection owns; set together
+    // with `authed`. Teardown uses it to tell a live connection from one
+    // a newer connection of the same user has already replaced.
+    let mut relay_token: Option<u64> = None;
     // The room the connection loop last subscribed the
     // forwarder to (`None` if the user is not in a room or
     // not yet authed). The loop itself takes each room's
@@ -676,10 +680,12 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     // bearer has been validated, so an
                     // unauthenticated transport never
                     // occupies a relay slot.
-                    state
-                        .signal_relay
-                        .register(user_id, outbound_tx.clone())
-                        .await;
+                    relay_token = Some(
+                        state
+                            .signal_relay
+                            .register(user_id, outbound_tx.clone())
+                            .await,
+                    );
                     // Security finding #2 (auth-order DoS):
                     // a successful AUTH earns a clean rate
                     // budget. Without this, a connection that
@@ -721,20 +727,6 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // (mark Disconnected and let the stale cleanup task
     // remove them after 5 min of silence).
     if let Some((user_id, _pubkey)) = authed {
-        // Use the AppState clock so the deadline is on the
-        // same timeline as the room ticker's `now_ms`.
-        // The free `now_ms()` helper reads wall time and
-        // would drift from the test `MockClock`.
-        let now = state.clock.now_ms();
-        let store: Arc<dyn crate::rooms::RoomStore> =
-            Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
-        if let Err(e) = state
-            .rooms
-            .on_connection_lost(store.as_ref(), user_id, now)
-            .await
-        {
-            debug!(request_id = %request_id, error = %e, "on_connection_lost noop");
-        }
         // P3-T05: drop this user's SignalRelay slot so a
         // future SIGNAL targeting them surfaces as
         // RecipientNotInRoom (or no-ops if a fresh
@@ -742,7 +734,42 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         // outbound_tx has already been dropped above
         // (`drop(outbound_tx)`); the explicit unregister
         // also keeps the HashMap small.
-        state.signal_relay.unregister(user_id).await;
+        //
+        // The server never pings, so a client whose network flapped
+        // can reconnect (a second connection for the same user) while
+        // this one is still open and only now fails. Then the relay
+        // slot belongs to the newer connection, `unregister` leaves it
+        // alone and returns false, and this stale teardown must not
+        // report the user as gone: that would mark a live viewer
+        // Disconnected, or start the grace period (or end the room) for
+        // a live host. Registration and the registry's rejoin are two
+        // steps, so a teardown landing between them can still slip
+        // through; the window is a few in-memory operations wide.
+        let still_current = match relay_token {
+            Some(token) => state.signal_relay.unregister(user_id, token).await,
+            None => true,
+        };
+        if still_current {
+            // Use the AppState clock so the deadline is on the
+            // same timeline as the room ticker's `now_ms`.
+            // The free `now_ms()` helper reads wall time and
+            // would drift from the test `MockClock`.
+            let now = state.clock.now_ms();
+            let store: Arc<dyn crate::rooms::RoomStore> =
+                Arc::new(crate::rooms::DbRoomStore::new(state.db.clone()));
+            if let Err(e) = state
+                .rooms
+                .on_connection_lost(store.as_ref(), user_id, now)
+                .await
+            {
+                debug!(request_id = %request_id, error = %e, "on_connection_lost noop");
+            }
+        } else {
+            debug!(
+                request_id = %request_id,
+                "stale connection closed; a newer connection owns this user"
+            );
+        }
     }
     debug!(request_id = %request_id, "ws connection closed");
 }
