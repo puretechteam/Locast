@@ -59,6 +59,16 @@ pub const MAX_RETAINED_POINTS_PER_STROKE: usize = 10_000;
 /// DRAW_SYNC, so a client cannot make the server hold large strings.
 pub const MAX_RETAINED_COLOR_BYTES: usize = 64;
 
+/// Most strokes one participant may have open (begun, not yet ended)
+/// at once. A real client has one: a stroke ends at pointer-up. The
+/// slack covers a lost DRAW_END followed by a new stroke.
+pub const MAX_OPEN_STROKES_PER_USER: usize = 8;
+
+/// Most strokes open at once in one room. Participants are capped, so
+/// this is only reached by strokes whose owner left without ending
+/// them.
+pub const MAX_OPEN_STROKES_PER_ROOM: usize = 64;
+
 /// The content of one stroke, kept for DRAW_SYNC.
 #[derive(Debug, Clone)]
 struct StrokeContent {
@@ -241,6 +251,54 @@ impl StrokeBookkeeping {
         if self.evict_order.len() > 2 * MAX_COMMITTED_STROKES {
             let committed = &self.committed;
             self.evict_order.retain(|id| committed.contains_key(id));
+        }
+    }
+
+    /// Make room for one more stroke that `user` is about to begin.
+    ///
+    /// Only DRAW_END removes an entry from `pending`, so a client that
+    /// begins strokes and never ends them (or one that disconnects
+    /// mid-stroke) would otherwise grow `pending` and `content`
+    /// without bound, and every DRAW_SYNC snapshot lists them all.
+    /// While `user` has [`MAX_OPEN_STROKES_PER_USER`] strokes open, or
+    /// the room has [`MAX_OPEN_STROKES_PER_ROOM`], finish the OLDEST
+    /// one (that user's, then the room's) as DRAW_END would: it is
+    /// committed and stays on every screen. A cleared stroke is just
+    /// forgotten.
+    ///
+    /// Returns `(stroke_id, owner)` for each stroke that was committed,
+    /// oldest first, so the caller can broadcast its DRAW_END and
+    /// every client closes it too.
+    pub fn finish_oldest_open_strokes(&mut self, user: Uuid, now_ms: i64) -> Vec<(Uuid, Uuid)> {
+        let mut finished = Vec::new();
+        loop {
+            let user_open = self
+                .pending
+                .values()
+                .filter(|p| p.sender_id == user)
+                .count();
+            let over_user = user_open >= MAX_OPEN_STROKES_PER_USER;
+            let over_room = self.pending.len() >= MAX_OPEN_STROKES_PER_ROOM;
+            if !over_user && !over_room {
+                return finished;
+            }
+            let victim = self
+                .pending
+                .iter()
+                .filter(|(_, p)| !over_user || p.sender_id == user)
+                .min_by_key(|(id, p)| (p.started_ms, **id))
+                .map(|(id, p)| (*id, *p));
+            let Some((stroke_id, stroke)) = victim else {
+                return finished;
+            };
+            self.pending.remove(&stroke_id);
+            if stroke.cleared {
+                self.forget_content(&stroke_id);
+            } else {
+                self.commit(stroke_id, stroke.sender_id);
+                self.record_end(&stroke_id, now_ms);
+                finished.push((stroke_id, stroke.sender_id));
+            }
         }
     }
 

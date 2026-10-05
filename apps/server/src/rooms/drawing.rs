@@ -215,6 +215,24 @@ pub async fn handle_stroke_begin(
             reason(DrawingError::StrokeIdMismatch).to_string(),
         );
     }
+    // Bound the open strokes: finish the oldest abandoned ones (a lost
+    // DRAW_END, a participant who left mid-stroke) before adding this one.
+    // Each committed stroke is announced with a DRAW_END so every client
+    // closes it as well.
+    let room_id = envelope.room_id.unwrap_or(state.id);
+    let mut events: Vec<super::registry::RoomEvent> = state
+        .drawing
+        .finish_oldest_open_strokes(user_id, now_ms)
+        .into_iter()
+        .map(|(stroke_id, owner)| super::registry::RoomEvent::StrokeEnd {
+            room_id,
+            sender_id: owner,
+            payload: locast_protocol::room::StrokeEndPayload {
+                stroke_id,
+                ts_ms: now_ms,
+            },
+        })
+        .collect();
     // Bind the stroke to this sender.
     state.drawing.pending.insert(
         payload.stroke_id,
@@ -227,14 +245,14 @@ pub async fn handle_stroke_begin(
     );
     // Keep the stroke's content for DRAW_SYNC snapshots.
     state.drawing.record_begin(user_id, &payload);
-    let evt = super::registry::RoomEvent::StrokeBegin {
-        room_id: envelope.room_id.unwrap_or(state.id),
+    events.push(super::registry::RoomEvent::StrokeBegin {
+        room_id,
         sender_id: user_id,
         payload,
-    };
+    });
     RoomDispatchOutcome {
         to_caller: Vec::new(),
-        events: vec![evt],
+        events,
         close_caller: false,
     }
 }
@@ -490,6 +508,7 @@ fn envelope_with_payload<T: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::{MAX_OPEN_STROKES_PER_ROOM, MAX_OPEN_STROKES_PER_USER};
     use super::*;
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -542,6 +561,183 @@ mod tests {
             0,
             0,
         )
+    }
+
+    /// Begin one stroke as `uid` (signing with `sk`) and return the outcome.
+    async fn begin_stroke(
+        state: &mut RoomState,
+        room_id: Uuid,
+        (uid, sk, pk): (Uuid, &SigningKey, [u8; 32]),
+        stroke_id: Uuid,
+        now_ms: i64,
+    ) -> RoomDispatchOutcome {
+        let payload = StrokeBeginPayload {
+            stroke_id,
+            tool: locast_protocol::room::StrokeTool::Pen,
+            color: "#000000".into(),
+            width: 2.0,
+            x: 0.1,
+            y: 0.2,
+            pressure: 0.5,
+            ts_ms: now_ms,
+        };
+        let sig = sign_begin(sk, &payload);
+        let env = begin_envelope(uid, pk, sig, room_id, payload);
+        handle_stroke_begin(env, state, uid, pk, now_ms).await
+    }
+
+    fn open_strokes_of(state: &RoomState, uid: Uuid) -> usize {
+        state
+            .drawing
+            .pending
+            .values()
+            .filter(|p| p.sender_id == uid)
+            .count()
+    }
+
+    /// Only DRAW_END removed an entry from `pending`, so a client that began
+    /// strokes and never ended them grew room memory without bound (and every
+    /// DRAW_SYNC snapshot listed them all).
+    #[tokio::test]
+    async fn open_strokes_per_user_are_bounded_and_the_oldest_is_finished() {
+        let room_id = Uuid::now_v7();
+        let (sk, pk) = fresh_keypair();
+        let uid = Uuid::now_v7();
+        let mut state = sample_state(room_id, uid, pk);
+        let ids: Vec<Uuid> = (0..MAX_OPEN_STROKES_PER_USER + 3)
+            .map(|_| Uuid::now_v7())
+            .collect();
+
+        for (i, id) in ids.iter().enumerate() {
+            let out =
+                begin_stroke(&mut state, room_id, (uid, &sk, pk), *id, 1_000 + i as i64).await;
+            assert!(out.to_caller.is_empty(), "begin {i} must be accepted");
+            assert!(
+                open_strokes_of(&state, uid) <= MAX_OPEN_STROKES_PER_USER,
+                "begin {i}: open strokes exceed the limit"
+            );
+            if i == MAX_OPEN_STROKES_PER_USER {
+                // The (limit + 1)th begin finishes the oldest stroke first.
+                assert_eq!(out.events.len(), 2, "a DRAW_END, then the DRAW_BEGIN");
+                match &out.events[0] {
+                    super::super::registry::RoomEvent::StrokeEnd {
+                        sender_id, payload, ..
+                    } => {
+                        assert_eq!(payload.stroke_id, ids[0], "the oldest stroke is finished");
+                        assert_eq!(*sender_id, uid);
+                    }
+                    other => panic!("expected StrokeEnd first, got {other:?}"),
+                }
+                assert!(matches!(
+                    out.events[1],
+                    super::super::registry::RoomEvent::StrokeBegin { .. }
+                ));
+            }
+        }
+
+        assert_eq!(open_strokes_of(&state, uid), MAX_OPEN_STROKES_PER_USER);
+        for finished in &ids[..3] {
+            assert!(!state.drawing.pending.contains_key(finished));
+            assert_eq!(
+                state.drawing.owner_of(finished),
+                Some(uid),
+                "a finished stroke is committed, so it stays on screens and is undoable"
+            );
+        }
+        for open in &ids[3..] {
+            assert!(state.drawing.pending.contains_key(open));
+        }
+    }
+
+    /// A participant who leaves mid-stroke leaves their strokes behind; many
+    /// joiners doing that must not grow the room without bound.
+    #[tokio::test]
+    async fn open_strokes_per_room_are_bounded() {
+        let room_id = Uuid::now_v7();
+        let (_host_sk, host_pk) = fresh_keypair();
+        let host_uid = Uuid::now_v7();
+        let mut state = sample_state(room_id, host_uid, host_pk);
+
+        for i in 0..MAX_OPEN_STROKES_PER_ROOM + 10 {
+            let (sk, pk) = fresh_keypair();
+            let uid = Uuid::now_v7();
+            let out = begin_stroke(
+                &mut state,
+                room_id,
+                (uid, &sk, pk),
+                Uuid::now_v7(),
+                1_000 + i as i64,
+            )
+            .await;
+            assert!(out.to_caller.is_empty());
+            assert!(
+                state.drawing.pending.len() <= MAX_OPEN_STROKES_PER_ROOM,
+                "user {i}: the room holds too many open strokes"
+            );
+        }
+        assert_eq!(state.drawing.pending.len(), MAX_OPEN_STROKES_PER_ROOM);
+    }
+
+    /// A stroke that a DRAW_CLEAR already removed from every screen is
+    /// forgotten when it is evicted: it is not committed (so it cannot come
+    /// back through undo) and no DRAW_END is announced for it.
+    #[tokio::test]
+    async fn an_evicted_cleared_stroke_is_forgotten_not_committed() {
+        let room_id = Uuid::now_v7();
+        let (sk, pk) = fresh_keypair();
+        let uid = Uuid::now_v7();
+        let mut state = sample_state(room_id, uid, pk);
+        let ids: Vec<Uuid> = (0..MAX_OPEN_STROKES_PER_USER)
+            .map(|_| Uuid::now_v7())
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            begin_stroke(&mut state, room_id, (uid, &sk, pk), *id, 1_000 + i as i64).await;
+        }
+        state
+            .drawing
+            .pending
+            .get_mut(&ids[0])
+            .expect("oldest is open")
+            .cleared = true;
+
+        let out = begin_stroke(&mut state, room_id, (uid, &sk, pk), Uuid::now_v7(), 2_000).await;
+
+        assert_eq!(out.events.len(), 1, "only the new DRAW_BEGIN is announced");
+        assert!(!state.drawing.pending.contains_key(&ids[0]));
+        assert_eq!(state.drawing.owner_of(&ids[0]), None, "not committed");
+        assert_eq!(open_strokes_of(&state, uid), MAX_OPEN_STROKES_PER_USER);
+    }
+
+    /// A well-behaved client (one stroke at a time, always ended) never
+    /// triggers the limit.
+    #[tokio::test]
+    async fn a_normal_client_is_unaffected_by_the_open_stroke_limit() {
+        let room_id = Uuid::now_v7();
+        let (sk, pk) = fresh_keypair();
+        let uid = Uuid::now_v7();
+        let mut state = sample_state(room_id, uid, pk);
+        for i in 0..50i64 {
+            let id = Uuid::now_v7();
+            let out = begin_stroke(&mut state, room_id, (uid, &sk, pk), id, 1_000 + i * 10).await;
+            assert_eq!(out.events.len(), 1, "stroke {i}: just the DRAW_BEGIN");
+            let end = Envelope {
+                v: 1,
+                r#type: MessageKind::StrokeEnd,
+                id: Uuid::now_v7(),
+                room_id: Some(room_id),
+                sender: None,
+                ts_ms: 0,
+                seq: 0,
+                payload: serde_json::to_value(locast_protocol::room::StrokeEndPayload {
+                    stroke_id: id,
+                    ts_ms: 1_000 + i * 10 + 5,
+                })
+                .expect("payload"),
+            };
+            let out = handle_stroke_end(end, &mut state, uid).await;
+            assert_eq!(out.events.len(), 1, "stroke {i}: just the DRAW_END");
+        }
+        assert!(state.drawing.pending.is_empty());
     }
 
     #[tokio::test]
