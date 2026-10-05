@@ -28,6 +28,7 @@ import {
     deriveDriftSample,
     expectedPositionMs,
     initialDriftState,
+    nextHostPaused,
 } from "./drift.ts";
 
 let failures = 0;
@@ -62,6 +63,139 @@ check(
     "negative elapsed clamped to 0",
     expectedPositionMs({ mediaPositionMs: 10_000, serverTsMs: 5_000 }, 1_000, 0) === 10_000,
 );
+
+// ----- paused host: the expected-position clock stops -----
+process.stdout.write("expectedPositionMs (paused host)\n");
+{
+    const T0 = 1_000;
+    // 1. host playing -> expected position advances.
+    const playing = { mediaPositionMs: 10_000, serverTsMs: T0 };
+    check(
+        "playing: expected at +1s is base + 1000",
+        expectedPositionMs(playing, T0 + 1_000, 0) === 11_000,
+    );
+    check(
+        "playing: expected at +5s is base + 5000",
+        expectedPositionMs(playing, T0 + 5_000, 0) === 15_000,
+    );
+
+    // 2. host pauses at 15000 -> expected position stays fixed.
+    const paused = { mediaPositionMs: 15_000, serverTsMs: T0 + 5_000, paused: true };
+    check(
+        "paused: expected at the pause instant is the pause position",
+        expectedPositionMs(paused, T0 + 5_000, 0) === 15_000,
+    );
+    check(
+        "paused: expected 60s later is still the pause position",
+        expectedPositionMs(paused, T0 + 65_000, 0) === 15_000,
+    );
+    check(
+        "paused: skew does not move the frozen position",
+        expectedPositionMs(paused, T0 + 65_000, 750) === 15_000,
+    );
+    check(
+        "paused: explicit paused=false still advances",
+        expectedPositionMs({ ...paused, paused: false }, T0 + 65_000, 0) === 75_000,
+    );
+
+    // Drift while the host is paused is measured against the frozen position.
+    check(
+        "paused: drift of a viewer that kept playing is vs the frozen position",
+        computeRawDrift({
+            localMs: 20_000,
+            hostCommand: paused,
+            nowMs: T0 + 65_000,
+            skewMs: 0,
+        }) === 5_000,
+    );
+    check(
+        "playing: normal drift calculation is unchanged",
+        computeRawDrift({
+            localMs: 16_000,
+            hostCommand: playing,
+            nowMs: T0 + 5_000,
+            skewMs: 0,
+        }) === 1_000,
+    );
+
+    // 3. sync while paused -> the seek target is the fixed position.
+    const syncPaused = computeSyncTarget({
+        roomId: "r-1",
+        isHost: false,
+        lastApplied: { room_id: "r-1", media_position_ms: 15_000, server_ts_ms: T0 + 5_000 },
+        hostPaused: true,
+        mediaReady: true,
+        nowMs: T0 + 65_000,
+        skewMs: 0,
+    });
+    check("sync while paused => canSync true", syncPaused.canSync === true);
+    check(
+        "sync while paused => hostTargetMs is the paused position, not extrapolated",
+        syncPaused.hostTargetMs === 15_000,
+    );
+    check(
+        "sync while paused (host branch) => same fixed target",
+        computeSyncTarget({
+            roomId: "r-1",
+            isHost: true,
+            lastApplied: { room_id: "r-1", media_position_ms: 15_000, server_ts_ms: T0 + 5_000 },
+            hostPaused: true,
+            mediaReady: true,
+            nowMs: T0 + 600_000,
+            skewMs: 0,
+        }).hostTargetMs === 15_000,
+    );
+
+    // 4. host resumes -> expected position advances from that same position.
+    const resumed = { mediaPositionMs: 15_000, serverTsMs: T0 + 65_000, paused: false };
+    check(
+        "resume: expected at the resume instant equals the paused position",
+        expectedPositionMs(resumed, T0 + 65_000, 0) === 15_000,
+    );
+    check(
+        "resume: expected advances from the paused position (+2s)",
+        expectedPositionMs(resumed, T0 + 67_000, 0) === 17_000,
+    );
+    check(
+        "resume: sync target advances from the paused position",
+        computeSyncTarget({
+            roomId: "r-1",
+            isHost: false,
+            lastApplied: { room_id: "r-1", media_position_ms: 15_000, server_ts_ms: T0 + 65_000 },
+            hostPaused: false,
+            mediaReady: true,
+            nowMs: T0 + 67_000,
+            skewMs: 0,
+        }).hostTargetMs === 17_000,
+    );
+
+    // computeSyncTarget without hostPaused keeps the playing behavior.
+    check(
+        "computeSyncTarget: hostPaused omitted => playing behavior",
+        computeSyncTarget({
+            roomId: "r-1",
+            isHost: false,
+            lastApplied: { room_id: "r-1", media_position_ms: 10_000, server_ts_ms: T0 },
+            mediaReady: true,
+            nowMs: T0 + 5_000,
+            skewMs: 0,
+        }).hostTargetMs === 15_000,
+    );
+}
+
+// ----- nextHostPaused: SEEK preserves the play/pause state -----
+process.stdout.write("nextHostPaused\n");
+check("play => not paused", nextHostPaused(true, "play") === false);
+check("pause => paused", nextHostPaused(false, "pause") === true);
+check("seek while playing stays playing", nextHostPaused(false, "seek") === false);
+check("seek while paused stays paused", nextHostPaused(true, "seek") === true);
+{
+    let p = false;
+    for (const k of ["play", "pause", "seek", "seek"] as const) p = nextHostPaused(p, k);
+    check("play,pause,seek,seek => still paused", p === true);
+    p = nextHostPaused(p, "play");
+    check("...then play => resumed", p === false);
+}
 
 // ----- computeRawDrift -----
 process.stdout.write("computeRawDrift\n");

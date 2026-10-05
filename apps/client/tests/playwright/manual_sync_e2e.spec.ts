@@ -383,3 +383,135 @@ test("Sync button is disabled when media is not ready", async ({ page }) => {
     await expect(btn).toBeDisabled();
     await expect(btn).toHaveAttribute("data-can-sync", "false");
 });
+
+// ---------------------------------------------------------------
+// Paused-host drift clock. While the host is PAUSED, the expected
+// host position (used by drift and Sync to Host) must stay fixed at
+// the paused position; resume continues from that same position.
+// These tests drive REAL playback://state events through the store
+// (not the forced-command seam) so the hostPaused tracking is
+// covered, including SEEK preserving the paused state.
+// ---------------------------------------------------------------
+
+const REMOTE_HOST_ID = "33333333-3333-3333-3333-333333333333";
+
+async function readHostTarget(page: Page): Promise<number | null> {
+    return await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastDrift?: { hostTargetMs: () => number | null };
+        };
+        return w.__locastDrift?.hostTargetMs() ?? null;
+    });
+}
+
+async function readHostPaused(page: Page): Promise<boolean> {
+    return await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastStore?: { getHostPaused: () => boolean };
+        };
+        return w.__locastStore?.getHostPaused() ?? false;
+    });
+}
+
+test("paused host: expected position freezes, Sync uses it, resume advances from it", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    const ev = (
+        seq: number,
+        kind: "play" | "pause" | "seek",
+        pos: number,
+        ts: number,
+    ) => ({
+        room_id: VIEWER_ROOM.id,
+        server_seq: seq,
+        server_ts_ms: ts,
+        sender_id: REMOTE_HOST_ID,
+        monotonic_seq: seq,
+        kind,
+        media_position_ms: pos,
+    });
+
+    // 1. host playing -> expected position advances.
+    await locast.emitPlaybackState(ev(1, "play", 10_000, Date.now() - 2_000));
+    await expect.poll(() => readHostPaused(page)).toBe(false);
+    const p1 = (await readHostTarget(page)) ?? -1;
+    expect(p1).toBeGreaterThanOrEqual(12_000);
+    await page.waitForTimeout(500);
+    const p2 =(await readHostTarget(page)) ?? -1;
+    expect(p2 - p1).toBeGreaterThanOrEqual(250);
+
+    // 2. host pauses -> expected position stays fixed.
+    await locast.emitPlaybackState(ev(2, "pause", 15_000, Date.now()));
+    await expect.poll(() => readHostPaused(page)).toBe(true);
+    expect(await readHostTarget(page)).toBe(15_000);
+    await page.waitForTimeout(400);
+    expect(await readHostTarget(page)).toBe(15_000);
+
+    // 3. sync while paused -> the viewer seeks to the fixed position.
+    const btn = page.locator('[data-testid="sync-button"]');
+    await expect(btn).toBeEnabled();
+    await resetLocalSeekTick(page);
+    await btn.click();
+    await page.waitForTimeout(50);
+    expect(await readLocalSeekTick(page)).toBe(1);
+    expect(await readHostTarget(page)).toBe(15_000);
+
+    // A SEEK while paused keeps the room paused at the new position.
+    await locast.emitPlaybackState(ev(3, "seek", 20_000, Date.now()));
+    await expect.poll(() => readHostTarget(page)).toBe(20_000);
+    expect(await readHostPaused(page)).toBe(true);
+    await page.waitForTimeout(300);
+    expect(await readHostTarget(page)).toBe(20_000);
+
+    // 4. host resumes -> expected position advances from that same position.
+    await locast.emitPlaybackState(ev(4, "play", 20_000, Date.now()));
+    await expect.poll(() => readHostPaused(page)).toBe(false);
+    const r1 = (await readHostTarget(page)) ?? -1;
+    expect(r1).toBeGreaterThanOrEqual(20_000);
+    expect(r1).toBeLessThan(20_000 + 1_000);
+    await page.waitForTimeout(500);
+    const r2 =(await readHostTarget(page)) ?? -1;
+    expect(r2 - r1).toBeGreaterThanOrEqual(250);
+});
+
+test("paused HOST clicking Sync emits a seek at the frozen paused position", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, HOST_ROOM, "11111111-1111-1111-1111-111111111111");
+    const hostId = "11111111-1111-1111-1111-111111111111";
+    await locast.emitPlaybackState({
+        room_id: HOST_ROOM.id,
+        server_seq: 1,
+        server_ts_ms: Date.now() - 5_000,
+        sender_id: hostId,
+        monotonic_seq: 1,
+        kind: "play",
+        media_position_ms: 10_000,
+    });
+    await locast.emitPlaybackState({
+        room_id: HOST_ROOM.id,
+        server_seq: 2,
+        server_ts_ms: Date.now() - 3_000,
+        sender_id: hostId,
+        monotonic_seq: 2,
+        kind: "pause",
+        media_position_ms: 12_000,
+    });
+    await expect.poll(() => readHostPaused(page)).toBe(true);
+    await page.waitForTimeout(400);
+    const btn = page.locator('[data-testid="sync-button"]');
+    await expect(btn).toBeEnabled();
+    await locast.resetInvokeLog();
+    await btn.click();
+    await page.waitForTimeout(100);
+    const sends = (await readInvokeLog(page)).filter((e) => e.name === "playback_send");
+    expect(sends).toHaveLength(1);
+    const args = sends[0].args as {
+        cmd?: { action?: string; media_position_ms?: number };
+    } | null;
+    expect(args?.cmd?.action).toBe("seek");
+    expect(args?.cmd?.media_position_ms).toBe(12_000);
+});

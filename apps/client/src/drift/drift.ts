@@ -118,6 +118,10 @@ export interface DriftSampleInput {
     hostCommand: {
         mediaPositionMs: number;
         serverTsMs: number;
+        /** True while the room is PAUSED. The host position
+         *  is frozen at `mediaPositionMs` and the expected
+         *  position does not advance. Omitted means playing. */
+        paused?: boolean;
     } | null;
     /** Local wall clock at sample time, integer ms. */
     nowMs: number;
@@ -174,15 +178,31 @@ export function initialDriftState(): DriftState {
     };
 }
 
+/** Whether the room is paused after `kind` is accepted,
+ *  given whether it was paused before. PLAY resumes, PAUSE
+ *  pauses, and SEEK preserves the previous play/pause state
+ *  (architecture §13.1), so a SEEK while paused stays
+ *  paused. */
+export function nextHostPaused(
+    prevPaused: boolean,
+    kind: "play" | "pause" | "seek",
+): boolean {
+    if (kind === "play") return false;
+    if (kind === "pause") return true;
+    return prevPaused;
+}
+
 /** Compute the expected room position at `nowMs` from the
  *  host's last accepted command. Mirrors §13.3's formula
- *  verbatim. */
+ *  for a playing room; while the room is paused the
+ *  position is frozen at the command's `mediaPositionMs`. */
 export function expectedPositionMs(
     hostCommand: DriftSampleInput["hostCommand"],
     nowMs: number,
     skewMs: number,
 ): number | null {
     if (hostCommand === null) return null;
+    if (hostCommand.paused === true) return hostCommand.mediaPositionMs;
     // Server-stamped time at command acceptance, projected
     // into local time by subtracting the local-to-server
     // skew.
@@ -401,6 +421,9 @@ export function computeSyncTarget(args: {
     lastApplied:
         | { room_id: string; media_position_ms: number; server_ts_ms: number }
         | null;
+    /** True while the host is paused; the target is then the
+     *  frozen paused position. Defaults to false (playing). */
+    hostPaused?: boolean;
     mediaReady: boolean;
     nowMs: number;
     skewMs: number;
@@ -419,6 +442,7 @@ export function computeSyncTarget(args: {
                   {
                       mediaPositionMs: last.media_position_ms,
                       serverTsMs: last.server_ts_ms,
+                      paused: args.hostPaused === true,
                   },
                   args.nowMs,
                   args.skewMs,

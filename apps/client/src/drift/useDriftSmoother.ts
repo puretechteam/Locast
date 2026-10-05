@@ -151,6 +151,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                     ? {
                           mediaPositionMs: hostEvent.media_position_ms,
                           serverTsMs: hostEvent.server_ts_ms,
+                          paused: usePlaybackStore.getState().hostPaused,
                       }
                     : null;
             // P4-T06: the drift projection's
@@ -261,6 +262,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                     room_id: string;
                     media_position_ms: number;
                     server_ts_ms: number;
+                    paused?: boolean;
                 } | null) => void;
                 readLocalSeekTick: () => number;
                 resetLocalSeekTick: () => void;
@@ -294,6 +296,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                           return {
                               mediaPositionMs: ev.media_position_ms,
                               serverTsMs: ev.server_ts_ms,
+                              paused: usePlaybackStore.getState().hostPaused,
                           };
                       })();
             if (hc === null) return null;
@@ -318,6 +321,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
                         : {
                               mediaPositionMs: payload.media_position_ms,
                               serverTsMs: payload.server_ts_ms,
+                              paused: payload.paused === true,
                           },
                 );
                 setTick((t) => (t + 1) % 1_000_000);

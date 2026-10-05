@@ -383,3 +383,45 @@ test("Permissions Apply replaces only the changed participants' cap sets", async
         removeCapSet: 0xffff_ffff,
     });
 });
+
+test("a paused host's Sync to Host seeks to the frozen paused position, not an extrapolated one", async ({
+    page,
+}) => {
+    await mountRoom(page, room(HOST_ID, HOST_ID, ALL_CAPS));
+    const sync = page.locator('[data-testid="sync-button"]');
+    const hostPaused = async (): Promise<boolean> =>
+        await page.evaluate(
+            () =>
+                (
+                    window as unknown as {
+                        __locastStore?: { getHostPaused: () => boolean };
+                    }
+                ).__locastStore?.getHostPaused() ?? false,
+        );
+
+    await setVideoTime(page, 5);
+    await page.locator(play).click();
+    await expect.poll(hostPaused).toBe(false);
+
+    // The host's own PAUSE is recorded via recordHostCommand (the
+    // server never echoes it back), so it must freeze the clock.
+    await setVideoTime(page, 20);
+    await page.locator(pause).click();
+    await expect.poll(hostPaused).toBe(true);
+    await page.waitForTimeout(1_200);
+
+    await expect(sync).toBeEnabled();
+    await sync.click();
+    await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(3);
+    let sends = await invokes(page, "playback_send");
+    expect(sends[2].args.cmd?.action).toBe("seek");
+    // Exactly the paused position: 1.2 s of wall time did not leak in.
+    expect(sends[2].args.cmd?.media_position_ms).toBe(20_000);
+    // A SEEK keeps the room paused, so the next Sync stays frozen too.
+    expect(await hostPaused()).toBe(true);
+    await page.waitForTimeout(500);
+    await sync.click();
+    await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(4);
+    sends = await invokes(page, "playback_send");
+    expect(sends[3].args.cmd?.media_position_ms).toBe(20_000);
+});

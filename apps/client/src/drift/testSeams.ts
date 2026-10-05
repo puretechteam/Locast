@@ -40,12 +40,14 @@ const forcedHostCommand: {
     payload: {
         mediaPositionMs: number;
         serverTsMs: number;
+        paused?: boolean;
     } | null;
 } = { payload: null };
 
 export function setForcedHostCommand(payload: {
     mediaPositionMs: number;
     serverTsMs: number;
+    paused?: boolean;
 } | null): void {
     if (import.meta.env.MODE !== "test") return;
     forcedHostCommand.payload = payload;
@@ -58,6 +60,7 @@ export function clearForcedHostCommand(): void {
 export function getForcedHostCommand(): {
     mediaPositionMs: number;
     serverTsMs: number;
+    paused?: boolean;
 } | null {
     if (import.meta.env.MODE !== "test") return null;
     return forcedHostCommand.payload;

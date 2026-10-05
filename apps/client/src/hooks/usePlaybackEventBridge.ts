@@ -69,6 +69,9 @@ export function usePlaybackEventBridge(): null {
                 setMediaSrc: (s: string) => void;
                 setMediaReady: (r: boolean) => void;
                 getLastApplied: () => unknown;
+                /** Whether the host is currently paused (the
+                 *  drift clock is frozen while true). */
+                getHostPaused: () => boolean;
                 /** P4-T07: read the current per-sender
                  *  dedup state for the test seam. */
                 getDedupSnapshot: () => unknown;
@@ -84,6 +87,7 @@ export function usePlaybackEventBridge(): null {
             setMediaSrc: (s) => usePlaybackStore.getState().setMediaSrc(s),
             setMediaReady: (r) => usePlaybackStore.getState().setMediaReady(r),
             getLastApplied: () => usePlaybackStore.getState().lastApplied,
+            getHostPaused: () => usePlaybackStore.getState().hostPaused,
             getDedupSnapshot: () => {
                 const s = usePlaybackStore.getState().getDedupState();
                 return {

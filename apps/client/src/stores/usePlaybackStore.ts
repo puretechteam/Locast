@@ -7,6 +7,7 @@ import {
     tickDedup,
     type DedupState,
 } from "../drift/dedup";
+import { nextHostPaused } from "../drift/drift";
 
 export type { PlaybackStateEvent };
 
@@ -39,6 +40,14 @@ interface PlaybackStoreState {
      * Null on first mount, before any accepted event
      * arrives. */
     lastApplied: PlaybackStateEvent | null;
+
+    /** True while the room is PAUSED by the host. Tracked
+     * separately from `lastApplied.kind` because a SEEK
+     * preserves the previous play/pause state, so
+     * `kind === "seek"` alone cannot say whether the host
+     * position is advancing. The drift clock and Sync-to-Host
+     * freeze the expected position while this is true. */
+    hostPaused: boolean;
 
     /** The event the <video> element should consume
      * when it becomes ready. The Player component
@@ -193,6 +202,7 @@ interface PlaybackStoreState {
 export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
     roomId: null,
     lastApplied: null,
+    hostPaused: false,
     pending: null,
     lastAppliedServerSeq: 0,
     mediaReady: false,
@@ -216,6 +226,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             set({
                 roomId,
                 lastApplied: null,
+                hostPaused: false,
                 pending: null,
                 lastAppliedServerSeq: 0,
                 hostNextSeq: 1,
@@ -302,6 +313,15 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             dedup.decision.drain !== undefined
                 ? dedup.decision.drain.event
                 : event;
+        // Track the host's play/pause state across the
+        // accepted stream (including a drained successor),
+        // independent of whether the media is ready, so the
+        // drift clock freezes while the host is paused.
+        let hostPaused = nextHostPaused(state.hostPaused, event.kind);
+        if (drained !== event) {
+            hostPaused = nextHostPaused(hostPaused, drained.kind);
+        }
+        set({ hostPaused });
         if (state.mediaReady) {
             set({ lastApplied: drained });
             return true;
@@ -337,6 +357,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         set({
             roomId: null,
             lastApplied: null,
+            hostPaused: false,
             pending: null,
             lastAppliedServerSeq: 0,
             mediaReady: false,
@@ -381,6 +402,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         if (state.roomId !== null && state.roomId !== event.room_id) return;
         set({
             lastApplied: { ...event, server_seq: state.lastAppliedServerSeq },
+            hostPaused: nextHostPaused(state.hostPaused, event.kind),
         });
     },
 
@@ -425,6 +447,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         }
         set({
             dedupState: next,
+            hostPaused: nextHostPaused(state.hostPaused, applied.event.kind),
             lastApplied: state.mediaReady ? applied.event : state.lastApplied,
             pending: state.mediaReady
                 ? state.pending

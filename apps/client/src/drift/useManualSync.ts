@@ -99,10 +99,13 @@ function resolveHostCommand(
 ): {
     last: PlaybackStateEvent | null;
     kind: "play" | "pause" | "seek" | null;
+    /** True while the host is paused: the sync target is the
+     *  frozen paused position, not an extrapolated one. */
+    paused: boolean;
 } {
     const forced = getForcedHostCommand();
     if (forced !== null) {
-        if (roomId === null) return { last: null, kind: null };
+        if (roomId === null) return { last: null, kind: null, paused: false };
         // Synthesize a PlaybackStateEvent-like record
         // from the override so the rest of the hook
         // does not need to know the override exists.
@@ -117,13 +120,18 @@ function resolveHostCommand(
                 media_position_ms: forced.mediaPositionMs,
             },
             kind: "play",
+            paused: forced.paused === true,
         };
     }
-    if (storeLast === null) return { last: null, kind: null };
+    if (storeLast === null) return { last: null, kind: null, paused: false };
     if (roomId !== null && storeLast.room_id !== roomId) {
-        return { last: null, kind: null };
+        return { last: null, kind: null, paused: false };
     }
-    return { last: storeLast, kind: storeLast.kind };
+    return {
+        last: storeLast,
+        kind: storeLast.kind,
+        paused: usePlaybackStore.getState().hostPaused,
+    };
 }
 
 export interface ManualSyncResult extends ManualSyncTarget {
@@ -187,6 +195,8 @@ export function useManualSync(args: {
             roomId,
             isHost,
             lastApplied,
+            hostPaused:
+                forced !== null ? forced.paused === true : state.hostPaused,
             mediaReady: state.mediaReady,
             nowMs: Date.now(),
             skewMs,
@@ -197,12 +207,16 @@ export function useManualSync(args: {
         const state = usePlaybackStore.getState();
         if (state.mediaReady === false) return false;
         if (roomId === null) return false;
-        const { last, kind } = resolveHostCommand(state.lastApplied, roomId);
+        const { last, kind, paused } = resolveHostCommand(
+            state.lastApplied,
+            roomId,
+        );
         if (last === null) return false;
         const targetMs = expectedPositionMs(
             {
                 mediaPositionMs: last.media_position_ms,
                 serverTsMs: last.server_ts_ms,
+                paused,
             },
             Date.now(),
             skewMs,
@@ -267,12 +281,13 @@ export function useManualSync(args: {
         // passed again.
         if (roomId === null) return false;
         const state = usePlaybackStore.getState();
-        const { last } = resolveHostCommand(state.lastApplied, roomId);
+        const { last, paused } = resolveHostCommand(state.lastApplied, roomId);
         if (last === null) return false;
         const targetMs = expectedPositionMs(
             {
                 mediaPositionMs: last.media_position_ms,
                 serverTsMs: last.server_ts_ms,
+                paused,
             },
             Date.now(),
             skewMs,
