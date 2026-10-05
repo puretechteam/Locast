@@ -51,6 +51,17 @@ test("a failed create shows the server's reason", async ({ page }) => {
     await expect(error).not.toContainText("[object Object]");
 });
 
+// Neither page had any link out, so a user who opened one by mistake had no
+// visible way back.
+for (const path of ["/rooms/new", "/rooms/join"]) {
+    test(`${path} offers a way back to the library`, async ({ page }) => {
+        await injectLocastShim(page);
+        await page.goto(path);
+        await page.getByRole("link", { name: "Back to library" }).click();
+        await expect(page).toHaveURL(/\/library$/);
+    });
+}
+
 test("an error with no message shows its kind rather than an object", async ({ page }) => {
     await rejectWith(page, "room_join", { kind: "SourceMissing", path: "C:\\x" });
     await page.goto("/rooms/join");

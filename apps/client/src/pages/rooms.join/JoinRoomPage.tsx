@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { errorText } from "../../services/errors";
 import { connectSignaling, joinRoom } from "../../services/room";
 
@@ -123,6 +123,9 @@ export function JoinRoomPage(): JSX.Element {
             >
                 {submitting ? "Joining..." : "Join"}
             </button>
+            <p>
+                <Link to="/library">Back to library</Link>
+            </p>
         </form>
     );
 }
