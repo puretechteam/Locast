@@ -856,7 +856,23 @@ async fn run_multi_source_inner(
                 };
                 let (chosen_peer_id, chosen_transport, chosen_sched) = match chosen {
                     Some(t) => t,
-                    None => continue,
+                    None => {
+                        // No source can take this chunk now. If every
+                        // source has been demoted for it nothing will ever
+                        // change, so fail instead of ticking forever.
+                        // Sources that are only unavailable or cooling down
+                        // may come back, so those are waited for.
+                        let exhausted = {
+                            let g = sources.lock().await;
+                            !g.is_empty() && g.iter().all(|h| tried.contains(&h.peer_id))
+                        };
+                        if exhausted {
+                            return Err(MultiSourceError::AllSourcesExhausted {
+                                index: chunk_index,
+                            });
+                        }
+                        continue;
+                    }
                 };
                 // Acquire the per-source scheduler slot.
                 chosen_sched.try_acquire_slot(chunk_index, None).await?;
@@ -944,7 +960,15 @@ async fn run_multi_source_inner(
                         .lock()
                         .await
                         .remove(&(idx, peer_id.clone()));
-                    if let Err(MultiSourceError::AllSourcesExhausted { .. }) = apply_nak(
+                    // `apply_nak` returns `AllSourcesExhausted` once the
+                    // chunk's retry budget is spent. It does so BEFORE
+                    // demoting the peer or dropping the in-flight record,
+                    // so the chunk stays in flight, never becomes
+                    // pending again, and no later dispatch could pick
+                    // anything. Swallowing the error here left the
+                    // download ticking forever; end it like the other
+                    // NAK paths do.
+                    if let Err(e @ MultiSourceError::AllSourcesExhausted { .. }) = apply_nak(
                         idx,
                         &peer_id,
                         &chunk_retries,
@@ -956,9 +980,7 @@ async fn run_multi_source_inner(
                     )
                     .await
                     {
-                        // Demoted past MAX_CHUNK_RETRIES.
-                        // The next dispatch will pick a new
-                        // source.
+                        return Err(e);
                     }
                 }
             }
@@ -1044,19 +1066,10 @@ async fn run_multi_source_inner(
                         // chunk; treat as a NAK. Update
                         // retry counters; potentially demote.
                         //
-                        // Note: `handle_chunk` has already
-                        // removed the inflight record for
-                        // this chunk before returning
-                        // NakTrigger (the record is consumed
-                        // at the top of that function).
-                        // `apply_nak`'s in-flight guard will
-                        // therefore see an empty map and
-                        // return early without incrementing
-                        // any counter; the Nak-resend
-                        // immediately below is also a no-op
-                        // because the peer is not in
-                        // `chunk_tried[index]` (no demotion
-                        // happened). No double-send.
+                        // `handle_chunk` leaves the in-flight
+                        // record in place on NakTrigger, so
+                        // `apply_nak`'s guard passes and the
+                        // failure counts against this peer.
                         let nak_outcome = apply_nak(
                             index,
                             &peer_id,
@@ -1070,6 +1083,24 @@ async fn run_multi_source_inner(
                         .await;
                         if let Err(MultiSourceError::AllSourcesExhausted { .. }) = nak_outcome {
                             return Err(nak_outcome.unwrap_err());
+                        }
+                        // `apply_nak` keeps the record while the peer is
+                        // still under the NAK threshold (a silent peer is
+                        // waited on). A bad chunk is not waiting for
+                        // anything: drop the record and the scheduler slot
+                        // so the chunk is requested again right away, from
+                        // this peer until it is demoted for the chunk and
+                        // then from another source.
+                        if in_flight.lock().await.remove(&index).is_some() {
+                            let sched = {
+                                let g = sources.lock().await;
+                                g.iter()
+                                    .find(|h| h.peer_id == peer_id)
+                                    .map(|h| h.sched.clone())
+                            };
+                            if let Some(sched) = sched {
+                                sched.release_slot(index).await;
+                            }
                         }
                         // On demote we re-send a Nak to the
                         // offending peer so it stops trying
@@ -1319,10 +1350,16 @@ async fn handle_chunk(
     _total_bytes: u64,
     cancel: &CancellationToken,
 ) -> Result<HandleOutcome, MultiSourceError> {
-    // Look up the inflight record; drop mismatched-peer chunks.
+    // Look up the inflight record WITHOUT consuming it. It is removed only
+    // once the chunk has been verified and stored. A corrupt chunk (or one
+    // from the wrong peer) must leave it in place so `apply_nak` can count
+    // the failure against the peer that sent it. Consuming it up front made
+    // `apply_nak` return early (its guard needs the record), so a bad chunk
+    // never counted toward a retry or a demotion and the same source was
+    // asked for the same chunk again, forever.
     let record = {
-        let mut g = in_flight.lock().await;
-        g.remove(&chunk.chunk_index)
+        let g = in_flight.lock().await;
+        g.get(&chunk.chunk_index).cloned()
     };
     let _record = match record {
         Some(r) => r,
@@ -1376,9 +1413,17 @@ async fn handle_chunk(
             "chunk index {} out of range",
             chunk.chunk_index
         ))))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(chunk.bytes_b64.as_bytes())
-        .map_err(|e| MultiSourceError::Io(format!("base64 decode: {e}")))?;
+    // Undecodable base64 is a bad chunk from this peer (a NAK), not a local
+    // I/O failure: aborting here would let one source end the whole download.
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(chunk.bytes_b64.as_bytes()) {
+        Ok(b) => b,
+        Err(_) => {
+            return Ok(HandleOutcome::NakTrigger {
+                index: chunk.chunk_index,
+                peer_id: peer_id.to_string(),
+            });
+        }
+    };
     if bytes.len() != expected.length as usize {
         // Treat as NAK from this peer.
         return Ok(HandleOutcome::NakTrigger {
@@ -1411,6 +1456,8 @@ async fn handle_chunk(
     store
         .mark_chunk_verified(&plan.download_id, chunk.chunk_index, &expected.sha256)
         .await?;
+    // Verified and stored: the request is now answered.
+    in_flight.lock().await.remove(&chunk.chunk_index);
     // Reset this (chunk, peer) NAK counter.
     nak_counters
         .lock()
