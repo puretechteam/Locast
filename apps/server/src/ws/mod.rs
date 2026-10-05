@@ -427,7 +427,7 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     let mut t = throttle.lock().await;
                     *t = now_ms() + RATE_THROTTLE_MS;
                 }
-                if authed.is_some() {
+                let sent = if authed.is_some() {
                     send_rate_limit_envelope(
                         &mut sender,
                         RateLimitHit {
@@ -438,9 +438,12 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                         },
                         request_id,
                     )
-                    .await;
+                    .await
                 } else {
-                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await
+                };
+                if !sent {
+                    break;
                 }
                 continue;
             }
@@ -451,20 +454,27 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             Message::Text(_) => {
                 warn!(request_id = %request_id, "rejected text frame");
                 if record_bad_msg(&bad_msgs, started).await {
-                    let _ = sender
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = send_bounded(
+                        &mut sender,
+                        Message::Close(Some(CloseFrame {
                             code: 1008,
                             reason: "bad_msg".into(),
-                        })))
-                        .await;
+                        })),
+                        WRITE_TIMEOUT,
+                    )
+                    .await;
                     break;
                 }
                 continue;
             }
             Message::Close(_) => break,
             Message::Ping(p) => {
-                if let Err(e) = sender.send(Message::Pong(p)).await {
-                    debug!(request_id = %request_id, error = %e, "pong send failed");
+                if send_bounded(&mut sender, Message::Pong(p), WRITE_TIMEOUT)
+                    .await
+                    .is_err()
+                {
+                    debug!(request_id = %request_id, "pong send failed or timed out");
+                    break;
                 }
                 continue;
             }
@@ -511,7 +521,7 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     let mut t = throttle.lock().await;
                     *t = now_ms() + RATE_THROTTLE_MS;
                 }
-                if authed.is_some() {
+                let sent = if authed.is_some() {
                     send_rate_limit_envelope(
                         &mut sender,
                         RateLimitHit {
@@ -522,9 +532,12 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                         },
                         request_id,
                     )
-                    .await;
+                    .await
                 } else {
-                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await;
+                    send_auth_fail_bytes(&mut sender, AuthFailReason::Rate, request_id).await
+                };
+                if !sent {
+                    break;
                 }
                 continue;
             }
@@ -535,12 +548,15 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             Err(err) => {
                 warn!(request_id = %request_id, error = %err, "msgpack decode failed");
                 if record_bad_msg(&bad_msgs, started).await {
-                    let _ = sender
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = send_bounded(
+                        &mut sender,
+                        Message::Close(Some(CloseFrame {
                             code: 1008,
                             reason: "bad_msg".into(),
-                        })))
-                        .await;
+                        })),
+                        WRITE_TIMEOUT,
+                    )
+                    .await;
                     break;
                 }
                 continue;
@@ -554,12 +570,15 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 "rejected message with v != 1"
             );
             if record_bad_msg(&bad_msgs, started).await {
-                let _ = sender
-                    .send(Message::Close(Some(CloseFrame {
+                let _ = send_bounded(
+                    &mut sender,
+                    Message::Close(Some(CloseFrame {
                         code: 1008,
                         reason: "bad_msg".into(),
-                    })))
-                    .await;
+                    })),
+                    WRITE_TIMEOUT,
+                )
+                .await;
                 break;
             }
             continue;
@@ -605,12 +624,15 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                     "rejected non-null room_id outside a room"
                 );
                 if record_bad_msg(&bad_msgs, started).await {
-                    let _ = sender
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = send_bounded(
+                        &mut sender,
+                        Message::Close(Some(CloseFrame {
                             code: 1008,
                             reason: "bad_msg".into(),
-                        })))
-                        .await;
+                        })),
+                        WRITE_TIMEOUT,
+                    )
+                    .await;
                     break;
                 }
                 continue;
@@ -643,19 +665,22 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         for action in outcome.actions {
             match action {
                 Action::Send(msg) => {
-                    if let Err(e) = sender.send(msg).await {
-                        debug!(request_id = %request_id, error = %e, "ws send failed");
+                    if send_bounded(&mut sender, msg, WRITE_TIMEOUT).await.is_err() {
+                        debug!(request_id = %request_id, "ws send failed or timed out");
                         should_break = true;
                         break;
                     }
                 }
                 Action::Close(reason) => {
-                    let _ = sender
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = send_bounded(
+                        &mut sender,
+                        Message::Close(Some(CloseFrame {
                             code: 1000,
                             reason: reason.into(),
-                        })))
-                        .await;
+                        })),
+                        WRITE_TIMEOUT,
+                    )
+                    .await;
                     should_break = true;
                     break;
                 }
@@ -1776,11 +1801,13 @@ async fn handle_skew_probe(
     }
 }
 
+/// Returns `false` when the peer is not draining its socket and the
+/// connection should be closed.
 async fn send_auth_fail_bytes(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     reason: AuthFailReason,
     request_id: Uuid,
-) {
+) -> bool {
     let env = Envelope {
         v: 1,
         r#type: MessageKind::AuthFail,
@@ -1793,11 +1820,13 @@ async fn send_auth_fail_bytes(
     };
     match encode_envelope_message(&env) {
         Ok(msg) => {
-            let _ = sender.send(msg).await;
-            debug!(request_id = %request_id, "sent AUTH_FAIL");
+            let sent = send_bounded(sender, msg, WRITE_TIMEOUT).await.is_ok();
+            debug!(request_id = %request_id, sent, "sent AUTH_FAIL");
+            sent
         }
         Err(e) => {
             warn!(request_id = %request_id, error = %e, "encode AUTH_FAIL failed");
+            true
         }
     }
 }
@@ -1806,11 +1835,13 @@ async fn send_auth_fail_bytes(
 /// emit path for the new envelope. The `hit` carries the
 /// scope, the observed rate, the configured limit, and the
 /// retry hint.
+/// Returns `false` when the peer is not draining its socket and the
+/// connection should be closed.
 async fn send_rate_limit_envelope(
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     hit: crate::ratelimit::RateLimitHit,
     request_id: Uuid,
-) {
+) -> bool {
     let payload = hit.to_payload();
     let env = Envelope {
         v: 1,
@@ -1830,17 +1861,20 @@ async fn send_rate_limit_envelope(
     };
     match encode_envelope_message(&env) {
         Ok(msg) => {
-            let _ = sender.send(msg).await;
+            let sent = send_bounded(sender, msg, WRITE_TIMEOUT).await.is_ok();
             debug!(
                 request_id = %request_id,
                 observed = hit.observed,
                 limit = hit.limit,
                 retry_after_ms = hit.retry_after_ms,
+                sent,
                 "sent RATE_LIMIT"
             );
+            sent
         }
         Err(e) => {
             warn!(request_id = %request_id, error = %e, "encode RATE_LIMIT failed");
+            true
         }
     }
 }
@@ -2130,6 +2164,38 @@ mod tests {
         .await;
         assert!(res.is_ok());
         assert_eq!(sink.0, 1);
+    }
+
+    /// Every write to the client socket must go through `send_bounded`.
+    /// A bare `sender.send(..).await` parks the connection task for good
+    /// when the peer stops reading (a full TCP buffer), and a host is
+    /// exempt from the presence timeout, so nothing else would end it.
+    /// This pins the property for the production half of this file: the
+    /// only raw write left is the one inside `send_bounded`.
+    #[test]
+    fn every_socket_write_is_bounded() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("split always yields a first part");
+        // Built from pieces so this test does not match itself.
+        let raw_write = concat!("sender", ".send(");
+        let raw_writes: Vec<usize> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(raw_write))
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert_eq!(
+            raw_writes.len(),
+            1,
+            "found unbounded socket writes at lines {raw_writes:?}; use send_bounded"
+        );
+        assert!(
+            production.contains("timeout(limit, sender.send(msg))"),
+            "the one raw write must be the one inside send_bounded"
+        );
     }
 
     #[test]
