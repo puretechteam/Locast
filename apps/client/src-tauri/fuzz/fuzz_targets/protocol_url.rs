@@ -19,7 +19,8 @@
 //! - `parse_single_range` `Ok((start, end))` satisfies
 //!   `start <= end < total_size`;
 //! - `LocastUrl::parse` `Ok` carries only non-empty segments with no
-//!   `..`, `/`, `\` or NUL (`decode_segment` contract), and the
+//!   segment equal to `.` or `..`, and none containing `/`, `\` or NUL
+//!   (`decode_segment` contract), and the
 //!   segments survive an `encode_segment` / `parse` round trip.
 //!
 //! The corpus in `corpus/protocol_url/` is committed: a few valid and
@@ -59,7 +60,10 @@ fuzz_target!(|data: &[u8]| {
         let (host, a, b) = segments(&url);
         for seg in [a, b] {
             assert!(!seg.is_empty(), "empty segment accepted: {text:?}");
-            assert!(!seg.contains(".."), "traversal accepted: {text:?}");
+            assert!(
+                seg != "." && seg != "..",
+                "traversal segment accepted: {text:?}"
+            );
             assert!(
                 !seg.contains(['/', '\\', '\0']),
                 "separator or NUL accepted: {text:?}"

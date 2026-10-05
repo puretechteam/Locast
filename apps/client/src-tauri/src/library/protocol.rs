@@ -160,7 +160,11 @@ fn strip_scheme(url: &str) -> Option<&str> {
 }
 
 /// Percent-decode one segment and refuse anything that could change which
-/// file is addressed: empty segments, path separators, NUL, or `..`.
+/// file is addressed: empty segments, path separators, NUL, or a segment that
+/// is exactly `.` or `..`. A `..` inside a name (`Movie..2019.mkv`) is an
+/// ordinary file name: the sanitizer stores it as is, and the segment is only
+/// a database lookup key (the file itself is reached through the stored
+/// relative path, which `validate_library_path` checks segment by segment).
 fn decode_segment(raw: &str) -> Result<String, ProtocolError> {
     let decoded = percent_decode_str(raw)
         .decode_utf8()
@@ -169,8 +173,8 @@ fn decode_segment(raw: &str) -> Result<String, ProtocolError> {
     if decoded.is_empty() {
         return Err(ProtocolError::BadUrl("empty segment".into()));
     }
-    if decoded.contains("..") {
-        return Err(ProtocolError::BadUrl("traversal sequence".into()));
+    if decoded == "." || decoded == ".." {
+        return Err(ProtocolError::BadUrl("traversal segment".into()));
     }
     if decoded.contains(['/', '\\', '\0']) {
         return Err(ProtocolError::BadUrl("separator in segment".into()));
@@ -196,7 +200,7 @@ pub enum LocastUrl {
 impl LocastUrl {
     /// Parse a `locast://` URL. Returns `BadUrl` if the scheme
     /// is not `locast`, the host is not one of the known shapes,
-    /// or any segment is empty / contains a `..` traversal.
+    /// or any segment is empty, `.` or `..`.
     pub fn parse(url: &str) -> Result<Self, ProtocolError> {
         let rest = strip_scheme(url)
             .ok_or_else(|| ProtocolError::BadUrl(format!("not a locast:// URL: {url:?}")))?;
@@ -733,7 +737,24 @@ mod tests {
     #[test]
     fn url_parse_rejects_traversal() {
         assert!(LocastUrl::parse("locast://media/0123456789abcdef/..").is_err());
+        assert!(LocastUrl::parse("locast://media/0123456789abcdef/.").is_err());
         assert!(LocastUrl::parse("locast://media/../foo").is_err());
+    }
+
+    #[test]
+    fn url_parse_accepts_dots_inside_a_name() {
+        for name in ["a..b.mkv", "Movie..2019.mkv", "...", "a...", "..a", "a.."] {
+            let parsed = LocastUrl::parse(&format!("locast://media/0123456789abcdef/{name}"))
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            assert_eq!(
+                parsed,
+                LocastUrl::Media {
+                    sha_prefix: "0123456789abcdef".into(),
+                    filename: name.into(),
+                },
+                "{name}"
+            );
+        }
     }
 
     #[test]

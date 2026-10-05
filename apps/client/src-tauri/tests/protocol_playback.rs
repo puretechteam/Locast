@@ -103,6 +103,32 @@ async fn resolve_encodes_awkward_file_names_and_the_handler_serves_them() {
     assert_eq!(header(&resp, "Content-Length"), Some("2048"));
 }
 
+/// A `..` inside a file name is legal (the sanitizer keeps it), so the
+/// resolved URL for such a file must parse and be served. The URL layer
+/// used to refuse any segment containing `..`, so these files could be
+/// imported and listed but never played.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_names_with_inner_dots_are_served() {
+    let f = fixture().await;
+    for (i, name) in ["Movie..2019.mkv", "Wait..What.mp4"]
+        .into_iter()
+        .enumerate()
+    {
+        // Distinct content per file: media rows are unique by sha256.
+        let bytes = vec![3u8 + i as u8; 1024];
+        let (id, _) = add_media(&f, name, &bytes).await;
+        let url = resolve_media_url(&f.storage, &id).await.expect("resolve");
+        assert!(url.ends_with(name), "{url}");
+        let resp = f
+            .handler
+            .handle(&url, "GET", None)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(resp.status, 200, "{name}");
+        assert_eq!(header(&resp, "Content-Length"), Some("1024"), "{name}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_webview_url_form_reaches_the_same_media() {
     let f = fixture().await;
@@ -141,6 +167,9 @@ fn encoded_separators_and_traversal_are_refused() {
     for bad in [
         format!("locast://media/{sha}/..%2F..%2Fsecret.mp4"),
         format!("locast://media/{sha}/%2e%2e"),
+        format!("locast://media/{sha}/%2e"),
+        format!("locast://media/{sha}/."),
+        format!("locast://media/{sha}/a..%2Fb.mp4"),
         format!("locast://media/{sha}/a%2Fb.mp4"),
         format!("locast://media/{sha}/a%5Cb.mp4"),
         format!("locast://media/{sha}/a%00b.mp4"),

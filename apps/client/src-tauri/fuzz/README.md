@@ -87,7 +87,7 @@ and near-`u64::MAX` sizes are all common), then the rest decoded with
 header. Lossy decoding is deliberate: a single broken UTF-8 byte keeps
 a mostly-intact string instead of discarding the input. Asserted:
 `Ok((start, end))` satisfies `start <= end < total_size`; an accepted
-URL has only non-empty segments with no `..`, `/`, `\` or NUL; and
+URL has only non-empty segments that are not `.` or `..` and contain no `/`, `\` or NUL; and
 `encode_segment` followed by `parse` returns the same URL.
 
 ## Corpus
