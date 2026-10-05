@@ -598,7 +598,30 @@ pub async fn run_multi_source(
     // and the receive loops); nothing else would, so they would otherwise
     // outlive every download that was not cancelled.
     receiver.cancel.cancel();
+    discard_scratch_after_terminal_failure(&receiver).await;
     result
+}
+
+/// `Failed` and `Cancelled` are terminal: a new attempt gets a new download
+/// id, so the chunk files under `tmp/incomplete/<id>/` and the staging dir
+/// can never be resumed. They are also counted against the disk quota
+/// (`walk_tmp_bytes`), so leaving them behind leaks space for good and
+/// eventually makes imports fail with `QuotaExceeded` while nothing visible
+/// can be deleted. Only the success path used to clean up. Decided from the
+/// state the store recorded, so every exit route (assemble error, hash
+/// mismatch, cancel frame, cancel token, lost sources) is covered at once.
+async fn discard_scratch_after_terminal_failure(receiver: &MultiSourceReceiver) {
+    let id = &receiver.plan.download_id;
+    let state = receiver.store.fetch(id).await.ok().map(|r| r.state);
+    if !matches!(
+        state,
+        Some(DownloadState::Failed | DownloadState::Cancelled)
+    ) {
+        return;
+    }
+    if let Err(e) = cleanup_incomplete(&receiver.library_root, id).await {
+        warn!(download_id = %id, error = %e, "could not remove a finished download's scratch files");
+    }
 }
 
 /// The orchestrator has many `return Err(..)` exits (the cancel token

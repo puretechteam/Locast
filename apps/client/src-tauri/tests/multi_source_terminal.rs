@@ -198,6 +198,18 @@ fn source() -> (SourceHandle, Arc<dyn Transport>) {
     (handle, host)
 }
 
+/// Leave bytes where a half-finished download would have: a verified chunk
+/// under `tmp/incomplete/<id>/` and a partial under `tmp/staging/<id>/`.
+fn leave_scratch(lib_root: &Path, id: &str) -> (PathBuf, PathBuf) {
+    let incomplete = lib_root.join("tmp").join("incomplete").join(id);
+    let staging = lib_root.join("tmp").join("staging").join(id);
+    std::fs::create_dir_all(&incomplete).expect("incomplete dir");
+    std::fs::create_dir_all(&staging).expect("staging dir");
+    std::fs::write(incomplete.join("00000000.chunk"), vec![1u8; 4096]).expect("chunk");
+    std::fs::write(staging.join("partial.partial"), vec![2u8; 4096]).expect("partial");
+    (incomplete, staging)
+}
+
 async fn row_state(store: &DownloadStore, id: &str) -> String {
     store
         .fetch(id)
@@ -242,6 +254,35 @@ async fn cancelling_the_download_records_cancelled() {
     );
     assert_eq!(states.iter().filter(|(s, _)| s == "cancelled").count(), 1);
     assert_eq!(row_state(&f.store, &f.plan.download_id).await, "cancelled");
+}
+
+/// A cancelled download can never be resumed (`Cancelled` is terminal), and
+/// its scratch bytes count against the quota, so they must not outlive it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_download_leaves_no_scratch_files() {
+    let f = fixture("01234567-89ab-cdef-0123-456789abcf03").await;
+    let (incomplete, staging) = leave_scratch(&f.lib_root, &f.plan.download_id);
+    let (handle, _host_end) = source();
+    let receiver = Arc::new(
+        MultiSourceReceiver::new(
+            f.plan.clone(),
+            f.store.clone(),
+            f.lib_root.clone(),
+            HOST_PUBKEY,
+            vec![handle],
+        )
+        .expect("receiver"),
+    );
+    receiver.cancel_handle().cancel();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_multi_source(receiver, "fixture.bin".into()),
+    )
+    .await
+    .expect("must return, not hang");
+    assert_eq!(row_state(&f.store, &f.plan.download_id).await, "cancelled");
+    assert!(!incomplete.exists(), "tmp/incomplete/<id> must be removed");
+    assert!(!staging.exists(), "tmp/staging/<id> must be removed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -290,4 +331,33 @@ async fn losing_every_source_records_failed_with_a_reason() {
         );
     }
     assert_eq!(row_state(&f.store, &f.plan.download_id).await, last);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_download_leaves_no_scratch_files() {
+    let f = fixture("01234567-89ab-cdef-0123-456789abcf04").await;
+    let (incomplete, staging) = leave_scratch(&f.lib_root, &f.plan.download_id);
+    let (handle, host_end) = source();
+    host_end.close().await;
+    drop(host_end);
+    let receiver = Arc::new(
+        MultiSourceReceiver::new(
+            f.plan.clone(),
+            f.store.clone(),
+            f.lib_root.clone(),
+            HOST_PUBKEY,
+            vec![handle],
+        )
+        .expect("receiver"),
+    );
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_multi_source(receiver, "fixture.bin".into()),
+    )
+    .await
+    .expect("must return, not hang");
+    let state = row_state(&f.store, &f.plan.download_id).await;
+    assert!(state == "failed" || state == "cancelled", "got {state}");
+    assert!(!incomplete.exists(), "tmp/incomplete/<id> must be removed");
+    assert!(!staging.exists(), "tmp/staging/<id> must be removed");
 }

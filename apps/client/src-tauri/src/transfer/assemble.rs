@@ -270,8 +270,10 @@ async fn verify_full_blake3_via_file(
 }
 
 /// Remove all `incomplete/<download_id>/` chunk files plus
-/// the `staging/<download_id>/` directory. Used by the
-/// cancel path and by the integration test teardown.
+/// the `staging/<download_id>/` directory. Used when a download
+/// finishes, whether it completed or ended `Failed` / `Cancelled`
+/// (see `multi_source::run_multi_source`), and by the integration
+/// test teardown.
 pub async fn cleanup_incomplete(
     library_root: &Path,
     download_id: &str,
