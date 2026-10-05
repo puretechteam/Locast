@@ -694,13 +694,23 @@ async fn five_cycle_reconnect_within_jitter_tolerance() {
     // close-grace and a generous 550ms for dial/handshake,
     // so the full cycle is bounded in [800ms, 2000ms] --
     // no more 5x slack on the upper bound.
+    //
+    // The lower bound allows for observation latency: the clock starts when
+    // `wait_for_phase` (which polls every 25 ms) notices Reconnecting, and
+    // stops when it notices Authenticated, so a sleep drawn at the bottom of
+    // the jitter range can be measured up to a poll interval or two short.
+    // A cycle of 791 ms failed an exact 800 ms bound on a macOS runner. A
+    // loop that is not paced at all takes a few milliseconds, so 750 ms still
+    // proves the backoff is applied.
+    const OBSERVATION_SLACK_MS: u128 = 50;
     for (i, d) in cycle_durations.iter().enumerate() {
         let ms = d.as_millis();
         assert!(
-            (800..=2000).contains(&ms),
-            "cycle {i} took {ms}ms outside [800, 2000]ms \
+            (800 - OBSERVATION_SLACK_MS..=2000).contains(&ms),
+            "cycle {i} took {ms}ms outside [{}, 2000]ms \
              (this suggests the backoff did not pace the loop \
-             or the upper bound allowed too much dial/handshake slack)"
+             or the upper bound allowed too much dial/handshake slack)",
+            800 - OBSERVATION_SLACK_MS
         );
     }
 }
