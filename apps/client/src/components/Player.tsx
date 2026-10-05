@@ -90,13 +90,22 @@ export function Player({
     const setMediaReady = usePlaybackStore((s) => s.setMediaReady);
     const markApplied = usePlaybackStore((s) => s.markApplied);
 
+    // Choosing a different file starts clean.
+    useEffect(() => {
+        setErrorMessage(null);
+    }, [mediaSrc]);
+
     // Wire the `<video>` element's `canplay` /
     // `loadedmetadata` events to `mediaReady = true`.
+    // A banner from an earlier failure must not outlive a working file: once
+    // the media can play, the load error no longer describes it.
     const onCanPlay = useCallback(() => {
         setMediaReady(true);
+        setErrorMessage(null);
     }, [setMediaReady]);
     const onLoadedMetadata = useCallback(() => {
         setMediaReady(true);
+        setErrorMessage(null);
     }, [setMediaReady]);
     const onError = useCallback(() => {
         const v = ref.current;
