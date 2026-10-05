@@ -155,6 +155,23 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     // `displayPositionMs` above.
     const viewerPositions = useViewerPositionStore((s) => s.byUserId);
 
+    // Forget a viewer's position when they leave. `removeViewer` existed for
+    // this but nothing called it, so a participant who left stayed in the
+    // host's list with an age counter that grew forever, and still counted
+    // toward the room median. Only someone seen LEAVING the participant list
+    // is removed, not everyone absent from it, so a report that arrives before
+    // its sender's first summary is kept.
+    const previousParticipantIdsRef = useRef<Set<string>>(new Set());
+    useEffect(() => {
+        const current = new Set((summary?.participants ?? []).map((p) => p.user_id));
+        for (const id of previousParticipantIdsRef.current) {
+            if (!current.has(id)) {
+                useViewerPositionStore.getState().removeViewer(id);
+            }
+        }
+        previousParticipantIdsRef.current = current;
+    }, [summary]);
+
     // P4-T04: the drift sampler. The smoother reads
     // the local media position from a shared ref
     // (`videoRef`) that the same `<video>` element
