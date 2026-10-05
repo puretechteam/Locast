@@ -258,7 +258,6 @@ export function useManualSync(args: {
             const res = v.play();
             if (res && typeof (res as Promise<void>).then === "function") {
                 (res as Promise<void>).catch((err: unknown) => {
-                    // eslint-disable-next-line no-console
                     console.warn("local play() after sync rejected", err);
                 });
             }

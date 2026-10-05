@@ -193,7 +193,6 @@ export class DrawingSession {
         this.onError =
             opts.onError ??
             ((err, input) => {
-                // eslint-disable-next-line no-console
                 console.warn(`drawing_send ${input.action} failed`, err);
             });
     }

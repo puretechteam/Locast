@@ -4,7 +4,6 @@ type Unlisten = () => void;
 
 const listeners: Map<string, Set<Handler>> = new Map();
 const queues: Map<string, Envelope[]> = new Map();
-let counter = 1;
 
 export function listen(event: string, handler: Handler): Promise<Unlisten> {
     let set = listeners.get(event);
@@ -19,7 +18,6 @@ export function listen(event: string, handler: Handler): Promise<Unlisten> {
             handler(env);
         }
     }
-    counter++;
     return Promise.resolve(() => {
         set!.delete(handler);
     });
@@ -46,7 +44,6 @@ export function __emit(event: string, payload: unknown): number {
 export function __reset(): void {
     listeners.clear();
     queues.clear();
-    counter = 1;
 }
 
 export function __has_listeners(event: string): boolean {

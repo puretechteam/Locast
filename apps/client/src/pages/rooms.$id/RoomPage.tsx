@@ -343,6 +343,7 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                 if (u) u();
             }
         };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `setLastKnownHostPositionMs` is a stable zustand action selected from the store.
     }, [setSummary, setSignaling]);
 
     // P6-T02: sync you_cap_set from the room summary to the

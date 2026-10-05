@@ -25,7 +25,7 @@ export function RoomTopBar({ summary }: RoomTopBarProps): JSX.Element | null {
     const prevSummaryRef = useRef<RoomSummaryIpc | null>(null);
 
     useEffect(() => {
-        let cancelled = false;
+        const cancelled = false;
 
         async function subscribe(): Promise<void> {
             const unlisten = await events.roomState((next: RoomSummaryIpc | null) => {

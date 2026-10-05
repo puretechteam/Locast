@@ -13,7 +13,7 @@ async function navigate(page: Page) {
         window.dispatchEvent(new PopStateEvent("popstate"));
     }, `/rooms/${ROOM_ID}`);
     await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
-    await page.waitFunction(() => (window as { __locastRoomStore?: unknown }).__locastRoomStore !== undefined, undefined, { timeout: 5_000 });
+    await page.waitForFunction(() => (window as { __locastRoomStore?: unknown }).__locastRoomStore !== undefined, undefined, { timeout: 5_000 });
     await page.evaluate((s) => { (window as { __locastRoomStore?: { setSummary: (s: unknown) => void } }).__locastRoomStore!.setSummary(s); }, {
         id: ROOM_ID, code: "P6T06", title: "P6-T06", host_user_id: HOST_ID, host_migration_enabled: true, created_ms: 1_700_000_000_000,
         participants: [{ user_id: HOST_ID, display_name: "host", joined_ms: 1_700_000_000_000, status: "Connected" as const, last_seen_ms: 1_700_000_000_000, is_host: true }],
@@ -31,7 +31,7 @@ async function addTempFiles(page: Page, ids: string[]) {
     }
 }
 
-test.beforeEach(async ({ page, locast }) => { await locast.waitForBridge(); });
+test.beforeEach(async ({ page: _page, locast }) => { await locast.waitForBridge(); });
 
 test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ page, locast }) => {
     await navigate(page);

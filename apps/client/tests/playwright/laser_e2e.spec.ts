@@ -117,7 +117,7 @@ test("laser canvas is present with correct testid and class", async ({
 });
 
 test("adding positions accumulates a trail", async ({ page }) => {
-    const stateBefore = await page.evaluate(() => {
+    await page.evaluate(() => {
         const w = window as unknown as {
             __locastLaser?: {
                 getState?: () => {

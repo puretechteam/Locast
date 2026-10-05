@@ -104,6 +104,7 @@ export function Player({
             ? `media load failed (code ${v.error.code})`
             : "media load failed";
         setErrorMessage(msg);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
     }, []);
 
     // Apply the latest accepted event to the
@@ -131,6 +132,7 @@ export function Player({
             );
         });
         markApplied(lastApplied.server_seq);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
     }, [lastApplied, localUserId, isHost, markApplied]);
 
     // Drain the `pending` slot when `mediaReady` flips
@@ -196,6 +198,7 @@ export function Player({
             stopped = true;
             window.clearInterval(handle);
         };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
     }, [mediaReady, summaryId]);
 
 return (

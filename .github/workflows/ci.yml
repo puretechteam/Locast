@@ -137,10 +137,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Node 22: the client unit tests run TypeScript directly via
+      # --experimental-strip-types (22.6+), and ESLint 10 needs 20.19+/22.13+.
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@9.15.0 --activate
@@ -159,11 +161,116 @@ jobs:
       - name: pnpm typecheck
         run: pnpm -r typecheck
 
+      # Real ESLint run (apps/client/eslint.config.js), --max-warnings 0.
       - name: pnpm lint
         run: pnpm -r lint
 
+      # Runs every apps/client/src/**/*.smoke.ts via
+      # apps/client/scripts/run-unit-tests.mjs; fails if none are found.
       - name: pnpm test
         run: pnpm -r test
+
+  # Browser e2e, part 1 of 2: the hard gate. Runs only the Playwright specs
+  # that are green today (apps/client package.json "test:e2e:gate"). Any
+  # failure here fails CI. Traces, videos and the HTML report are uploaded
+  # when it fails. When a spec in the baseline job below is fixed, add its
+  # file to "test:e2e:gate".
+  e2e-gate:
+    name: e2e gate (chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        working-directory: apps/client
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Playwright gate specs
+        working-directory: apps/client
+        run: pnpm test:e2e:gate
+
+      - name: Summarize gate results
+        if: always()
+        working-directory: apps/client
+        run: pnpm -s test:e2e:summary playwright-report/results.json "e2e gate"
+
+      - name: Upload Playwright report, traces and videos
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-gate-failure
+          path: |
+            apps/client/playwright-report/
+            apps/client/test-results/
+          if-no-files-found: warn
+
+  # Browser e2e, part 2 of 2: the full-suite baseline. Runs EVERY spec,
+  # including the ones with known failures. It does not gate: the test step is
+  # continue-on-error, so the job stays green while the failing step is shown
+  # as failed, every failing test is emitted as a warning annotation and listed
+  # in the run summary, and a final warning states the outcome. The report,
+  # traces and videos are always uploaded. Known failures are inventoried in
+  # apps/client/tests/playwright/BASELINE.md.
+  e2e-baseline:
+    name: e2e full-suite baseline (non-gating)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        working-directory: apps/client
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Playwright full suite
+        id: e2e
+        continue-on-error: true
+        working-directory: apps/client
+        run: pnpm test:e2e
+
+      - name: Summarize baseline
+        if: always()
+        working-directory: apps/client
+        run: pnpm -s test:e2e:summary playwright-report/results.json "e2e full-suite baseline"
+
+      - name: State the baseline outcome
+        if: steps.e2e.outcome == 'failure'
+        run: echo "::warning title=e2e baseline::The full Playwright suite has failing tests. This job is non-gating; see the run summary and apps/client/tests/playwright/BASELINE.md."
+
+      - name: Upload Playwright report, traces and videos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-baseline
+          path: |
+            apps/client/playwright-report/
+            apps/client/test-results/
+          if-no-files-found: warn
 
   # P8-T04: supply-chain gates (docs/ARCHITECTURE.md section 21.13).
   # cargo-deny checks advisories, licenses, bans, and sources per deny.toml.

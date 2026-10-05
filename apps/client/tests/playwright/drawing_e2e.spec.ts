@@ -114,7 +114,7 @@ async function resetInvokeLog(page: Page): Promise<void> {
 
 test("DRAW_BEGIN produces exactly one outbound DRAW_BEGIN envelope", async ({
     page,
-    locast,
+    locast: _locast,
 }) => {
     await spaNavigate(page, `/rooms/${ROOM.id}`);
     await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });

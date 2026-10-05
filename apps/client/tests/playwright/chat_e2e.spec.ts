@@ -64,7 +64,7 @@ async function setupClient(p: Page): Promise<void> {
     await p.waitForLoadState("domcontentloaded");
     await spaNavigate(p, `/rooms/${ROOM_ID}`);
     await p.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
-    await p.waitFunction(
+    await p.waitForFunction(
         () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
             undefined,
         undefined,
@@ -235,7 +235,7 @@ async function navigateAndHydrateP6(page: Page, summary: ReturnType<typeof makeP
     await page.waitForLoadState("domcontentloaded");
     await spaNavigate(page, `/rooms/${ROOM_ID_P6}`);
     await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
-    await page.waitFunction(
+    await page.waitForFunction(
         () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !==
             undefined,
         undefined,

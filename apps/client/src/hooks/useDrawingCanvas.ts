@@ -252,6 +252,7 @@ export function useDrawingCanvas(
             intrinsicSize,
             cssWidth,
         );
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `canvasRef` is a ref object owned by the caller; its identity does not change.
     }, [strokes, remoteStrokes, intrinsicSize]);
 
     /**

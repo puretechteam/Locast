@@ -50,7 +50,7 @@ export function LibraryGrid({ items, onPlay, onMakePermanent, onDelete }: Librar
         // Only react to keys pressed on the tile itself, never on its buttons.
         if (e.target !== e.currentTarget) return;
         const last = items.length - 1;
-        let next = index;
+        let next: number;
         switch (e.key) {
             case "ArrowRight":
                 next = Math.min(last, index + 1);

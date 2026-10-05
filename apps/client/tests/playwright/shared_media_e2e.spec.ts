@@ -100,6 +100,7 @@ interface BackendConfig {
 async function setup(page: Page, cfg: BackendConfig): Promise<void> {
     await injectLocastShim(page);
     await page.addInitScript((c: BackendConfig) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- in-page shim over the untyped Tauri IPC surface
         const w = window as unknown as Record<string, any>;
         w.__locast_library = { items: c.library, failList: false, nextPick: null, imported: [], serial: 1 };
         const be = (w.__slice3 = {
@@ -117,6 +118,7 @@ async function setup(page: Page, cfg: BackendConfig): Promise<void> {
         };
         const ROOM = c.summary?.id ?? "";
         const orig = w.__TAURI_INTERNALS__.invoke;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- in-page shim over the untyped Tauri IPC surface
         w.__TAURI_INTERNALS__.invoke = (name: string, args: any) => {
             const record = () => be.log.push({ name, args });
             switch (name) {

@@ -81,7 +81,6 @@ export async function sendHostPlaybackCommand(args: {
     const mediaPositionMs = Math.max(0, Math.round(args.mediaPositionMs));
     if (video !== null) {
         applyPlaybackToVideo(video, kind, mediaPositionMs, (err) => {
-            // eslint-disable-next-line no-console
             console.warn("host play() rejected", err);
         });
     }
@@ -95,7 +94,6 @@ export async function sendHostPlaybackCommand(args: {
         });
     } catch (err) {
         usePlaybackStore.getState().rollbackHostSeq(seq);
-        // eslint-disable-next-line no-console
         console.warn("playback_send failed", err);
         return false;
     }

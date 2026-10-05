@@ -233,8 +233,7 @@ process.stdout.write("multi-sender independence\n");
 // ----- clearDedupState empties the map -----
 process.stdout.write("clearDedupState\n");
 {
-    let s = initialDedupState<Ev>();
-    s = evaluateDedup(s, { sender_id: "host", monotonic_seq: 1, tag: "a" }, 1000).next;
+    evaluateDedup(initialDedupState<Ev>(), { sender_id: "host", monotonic_seq: 1, tag: "a" }, 1000);
     const cleared = clearDedupState<Ev>();
     check("cleared state has empty map", cleared.bySender.size === 0);
     // After clearing, the same sender can re-bootstrap with

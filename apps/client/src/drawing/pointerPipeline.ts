@@ -103,7 +103,6 @@ export class PointerStrokePipeline {
         this.onError =
             opts.onError ??
             ((err) => {
-                // eslint-disable-next-line no-console
                 console.warn("drawing pipeline error", err);
             });
     }

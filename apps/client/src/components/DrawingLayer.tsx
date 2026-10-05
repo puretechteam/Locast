@@ -136,6 +136,7 @@ export function DrawingLayer({
     // P5-T02: the production send path. One DrawingService
     // per room (a new roomId gives a fresh instance, so no
     // stroke id or queued send leaks across rooms).
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- roomId is a deliberate memo key: a new room gets a fresh DrawingService.
     const service = useMemo(() => new DrawingService(), [roomId]);
     useEffect(() => {
         // A new room (service) starts with a clean slate; unmount stops
