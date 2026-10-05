@@ -589,6 +589,55 @@ pub async fn run_multi_source(
     receiver: Arc<MultiSourceReceiver>,
     sanitized_filename: String,
 ) -> Result<DownloadState, MultiSourceError> {
+    let result = run_multi_source_inner(receiver.clone(), sanitized_filename).await;
+    if let Err(err) = &result {
+        record_terminal_state_after_error(&receiver, err).await;
+    }
+    result
+}
+
+/// The orchestrator has many `return Err(..)` exits (the cancel token
+/// firing, every source gone, retry budgets, I/O errors) that record
+/// nothing, and the caller only logs the error. Left alone the download
+/// stays at `transferring` in the store and in the UI, whose modal blocks
+/// the app while a download runs. If the run did not already reach a
+/// terminal state, record `cancelled` for a cancellation and `failed`
+/// (with a sanitized reason) for anything else, once.
+async fn record_terminal_state_after_error(receiver: &MultiSourceReceiver, err: &MultiSourceError) {
+    let plan = &receiver.plan;
+    let store = &receiver.store;
+    let current = store.fetch(&plan.download_id).await.ok().map(|r| r.state);
+    if matches!(
+        current,
+        Some(DownloadState::Cancelled | DownloadState::Failed | DownloadState::Complete)
+    ) {
+        return;
+    }
+    let (state, message) = match err {
+        MultiSourceError::Cancelled => (DownloadState::Cancelled, None),
+        other => (
+            DownloadState::Failed,
+            Some(sanitize_error_message(&format!("{other}"))),
+        ),
+    };
+    if let Some(message) = &message {
+        let _ = store.set_last_error(&plan.download_id, message).await;
+    }
+    let _ = store.transition(&plan.download_id, state).await;
+    receiver.emitter.record_state(DownloadStateEvent {
+        v: 1,
+        id: plan.download_id.clone(),
+        media_id: plan.media_id.clone(),
+        state: state.as_str().to_string(),
+        error_message: message,
+    });
+    receiver.emitter.shutdown();
+}
+
+async fn run_multi_source_inner(
+    receiver: Arc<MultiSourceReceiver>,
+    sanitized_filename: String,
+) -> Result<DownloadState, MultiSourceError> {
     let cancel = receiver.cancel.clone();
     let plan = receiver.plan.clone();
     let store = receiver.store.clone();
