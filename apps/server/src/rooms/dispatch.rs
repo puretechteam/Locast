@@ -29,7 +29,7 @@ use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
 use super::state::RoomState;
 use super::store::RoomStore;
-use super::validation::validate_display_name;
+use super::validation::{validate_display_name, validate_room_title, MAX_ROOM_TITLE_CHARS};
 use crate::db::Db;
 use crate::time::Clock;
 
@@ -266,6 +266,17 @@ async fn handle_room_create(
         }
     };
     let mut out = RoomDispatchOutcome::default();
+    if validate_room_title(&payload.title).is_err() {
+        out.to_caller.push(err_envelope(
+            MessageKind::RoomError,
+            RoomErrorCode::InvalidState,
+            format!(
+                "title invalid: at most {MAX_ROOM_TITLE_CHARS} characters, no control characters"
+            ),
+            now_ms,
+        ));
+        return out;
+    }
     match registry
         .create(
             store,
@@ -1008,6 +1019,75 @@ mod tests {
         assert_eq!(out.to_caller.len(), 1);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::InvalidState);
+    }
+
+    /// A room title is stored, kept in memory and copied into every snapshot a
+    /// joiner receives, so one near the frame cap (about 1 MiB) was a cheap way
+    /// to burn memory, disk and bandwidth.
+    #[tokio::test]
+    async fn dispatch_rejects_an_oversized_or_control_character_room_title() {
+        for title in [
+            "a".repeat(MAX_ROOM_TITLE_CHARS + 1),
+            "a".repeat(1_000_000),
+            "bad\ntitle".to_string(),
+        ] {
+            let (reg, clock) = fresh_registry();
+            let s = super::super::store::NoopRoomStore;
+            let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+            let relay = fresh_relay();
+            let env = Envelope {
+                v: 1,
+                r#type: MessageKind::RoomCreate,
+                id: Uuid::now_v7(),
+                room_id: None,
+                sender: None,
+                ts_ms: clock.now_ms(),
+                seq: 1,
+                payload: serde_json::to_value(RoomCreatePayload {
+                    title: title.clone(),
+                    migration_enabled: true,
+                })
+                .unwrap(),
+            };
+            let out =
+                dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey())
+                    .await;
+            assert_eq!(out.to_caller.len(), 1);
+            assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
+            let p: RoomErrorPayload =
+                serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+            assert_eq!(p.code, RoomErrorCode::InvalidState);
+            assert!(
+                reg.get_user_room(uid(1)).await.is_none(),
+                "a rejected title must not create a room"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_accepts_a_title_at_the_limit() {
+        let (reg, clock) = fresh_registry();
+        let s = super::super::store::NoopRoomStore;
+        let db = crate::db::Db::open_in_memory().await.expect("in-memory db");
+        let relay = fresh_relay();
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::RoomCreate,
+            id: Uuid::now_v7(),
+            room_id: None,
+            sender: None,
+            ts_ms: clock.now_ms(),
+            seq: 1,
+            payload: serde_json::to_value(RoomCreatePayload {
+                title: "a".repeat(MAX_ROOM_TITLE_CHARS),
+                migration_enabled: true,
+            })
+            .unwrap(),
+        };
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), uid(1), pubkey()).await;
+        assert_eq!(out.to_caller.len(), 1);
+        assert_eq!(out.to_caller[0].r#type, MessageKind::RoomCreated);
     }
 
     #[tokio::test]

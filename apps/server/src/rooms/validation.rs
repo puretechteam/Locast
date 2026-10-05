@@ -27,6 +27,29 @@ use super::error::RoomError;
 /// Maximum display-name length, in Unicode scalar values.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
 
+/// Maximum room-title length, in Unicode scalar values. The client's New
+/// Room page already limits titles to this.
+pub const MAX_ROOM_TITLE_CHARS: usize = 80;
+
+/// Validate a room title: at most [`MAX_ROOM_TITLE_CHARS`] scalar values
+/// and no C0 / C1 control characters. Without a limit a title could be as
+/// large as the frame cap (about 1 MiB); it is stored in the database,
+/// kept in memory for the life of the room, and copied into every
+/// snapshot sent to a joiner. Content is otherwise unrestricted, and an
+/// empty title is allowed (it is only a label).
+pub fn validate_room_title(title: &str) -> Result<&str, RoomError> {
+    if title.chars().count() > MAX_ROOM_TITLE_CHARS {
+        return Err(RoomError::InvalidState);
+    }
+    for c in title.chars() {
+        let cu = c as u32;
+        if cu < 0x20 || (0x7F..=0x9F).contains(&cu) {
+            return Err(RoomError::InvalidState);
+        }
+    }
+    Ok(title)
+}
+
 /// Validate that a `f32` lies in the unit range `[0, 1]`.
 ///
 /// Used by P5-T02's drawing dispatcher to reject
@@ -91,6 +114,34 @@ pub fn validate_display_name(name: &str) -> Result<&str, RoomError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_title_accepts_ordinary_titles() {
+        for ok in [
+            "",
+            "Movie night",
+            "Stra\u{00DF}e \u{1F3AC}",
+            &"a".repeat(80),
+        ] {
+            assert_eq!(validate_room_title(ok).unwrap(), ok);
+        }
+    }
+
+    #[test]
+    fn room_title_counts_characters_not_bytes() {
+        // 80 three-byte characters are 240 bytes but still 80 characters.
+        assert!(validate_room_title(&"\u{20AC}".repeat(80)).is_ok());
+        assert!(validate_room_title(&"\u{20AC}".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn room_title_rejects_oversized_and_control_characters() {
+        assert!(validate_room_title(&"a".repeat(81)).is_err());
+        assert!(validate_room_title(&"a".repeat(1_000_000)).is_err());
+        for bad in ["a\nb", "a\u{0}b", "a\u{1B}[31m", "a\u{85}b", "a\u{7F}b"] {
+            assert!(validate_room_title(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn valid_ascii_passes() {
