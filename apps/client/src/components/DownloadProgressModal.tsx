@@ -49,8 +49,12 @@ function pctOf(p: DownloadProgressEvent | undefined): number {
 
 export function DownloadProgressModal(): JSX.Element | null {
     const active = useDownloadStore((s) => s.activeDownloads());
+    const dismiss = useDownloadStore((s) => s.dismiss);
     if (active.length === 0) return null;
     const primary = active[0]!;
+    // A failed download is not in progress: it stays visible so the error
+    // can be read, but the user must be able to leave it.
+    const failed = primary.state === "failed";
 
     const onKeyDown = (e: KeyboardEvent) => {
         if (e.key === "Escape") {
@@ -77,7 +81,7 @@ export function DownloadProgressModal(): JSX.Element | null {
                 data-testid="dlm-dialog"
             >
                 <h2 id="dlm-title" className="dlm-title">
-                    Download in progress
+                    {failed ? "Download failed" : "Download in progress"}
                 </h2>
                 <p id="dlm-desc" className="dlm-desc">
                     {stateLabel(primary.state)} media <code>{shortId(primary.mediaId)}</code>
@@ -109,6 +113,16 @@ export function DownloadProgressModal(): JSX.Element | null {
                     <p className="dlm-multi">
                         {active.length - 1} more download{active.length - 1 === 1 ? "" : "s"} in progress.
                     </p>
+                )}
+                {failed && (
+                    <button
+                        type="button"
+                        className="dlm-dismiss"
+                        data-testid="dlm-dismiss"
+                        onClick={() => dismiss(primary.id)}
+                    >
+                        Dismiss
+                    </button>
                 )}
             </dialog>
         </div>

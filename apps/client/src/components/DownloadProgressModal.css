@@ -88,6 +88,22 @@
     margin: 0.75rem 0 0 0;
 }
 
+.dlm-dismiss {
+    margin-top: 1rem;
+    padding: 0.4rem 1rem;
+    border: 1px solid #5b6168;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.dlm-dismiss:hover,
+.dlm-dismiss:focus-visible {
+    border-color: #9aa3ad;
+}
+
 @media (prefers-reduced-motion: reduce) {
     .dlm-progress > span { transition: none; }
 }

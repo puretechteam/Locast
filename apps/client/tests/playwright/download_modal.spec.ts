@@ -111,3 +111,32 @@ test("failed does NOT auto-close", async ({ page, locast }) => {
     await expect(page.locator(DLG)).toBeVisible();
     await expect(page.locator('[data-testid="dlm-error"]')).toContainText("disk full");
 });
+
+// A failed download used to leave the full-screen modal up with no control, and
+// the blocking guard hid every route, so the only way out was restarting the app.
+test("a failed download can be dismissed, which unblocks the app", async ({ page, locast }) => {
+    await locast.emitDownloadState({
+        id: "d1",
+        media_id: "aabbccdd-1111-2222-3333-444455556666",
+        state: "failed",
+        error_message: "host left the room",
+    });
+    await expect(page.locator(DLG)).toBeVisible();
+    await spaNavigate(page, "/rooms/abc");
+    await expect(page.locator(ROOM_EMPTY)).toHaveCount(0);
+
+    await page.locator('[data-testid="dlm-dismiss"]').click();
+
+    await expect(page.locator(DLG)).toHaveCount(0);
+    await expect(page.locator(ROOM_EMPTY)).toBeVisible();
+});
+
+test("an in-progress download cannot be dismissed", async ({ page, locast }) => {
+    await locast.emitDownloadState({
+        id: "d1",
+        media_id: "aabbccdd-1111-2222-3333-444455556666",
+        state: "transferring",
+    });
+    await expect(page.locator(DLG)).toBeVisible();
+    await expect(page.locator('[data-testid="dlm-dismiss"]')).toHaveCount(0);
+});

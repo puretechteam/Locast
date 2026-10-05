@@ -21,6 +21,9 @@ interface DownloadStoreState {
     setProgress: (e: DownloadProgressEvent) => void;
     setState: (e: DownloadStateEvent) => void;
     clear: () => void;
+    /** Forget one download (its state and progress). Used to dismiss a
+     *  failed download, which otherwise keeps blocking the app. */
+    dismiss: (id: string) => void;
     hasActiveDownload: () => boolean;
     activeDownloads: () => ActiveDownload[];
 }
@@ -31,6 +34,12 @@ export const useDownloadStore = create<DownloadStoreState>((set, get) => ({
     setProgress: (e) => set((prev) => ({ downloads: { ...prev.downloads, [e.id]: e } })),
     setState: (e) => set((prev) => ({ states: { ...prev.states, [e.id]: e } })),
     clear: () => set({ downloads: {}, states: {} }),
+    dismiss: (id) =>
+        set((prev) => {
+            const { [id]: _state, ...states } = prev.states;
+            const { [id]: _progress, ...downloads } = prev.downloads;
+            return { states, downloads };
+        }),
     hasActiveDownload: () =>
         Object.values(get().states).some((s) => ACTIVE_STATES.has(s.state)),
     activeDownloads: () => {
