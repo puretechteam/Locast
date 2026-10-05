@@ -1,5 +1,9 @@
+import { useState } from "react";
 import type { KeyboardEvent, MouseEvent } from "react";
+import { errorText } from "../services/errors";
+import { leaveRoom } from "../services/room";
 import { useDownloadStore } from "../stores/useDownloadStore";
+import { useSharedMediaStore } from "../stores/useSharedMediaStore";
 import type { DownloadProgressEvent, DownloadState } from "../services/downloads";
 import "./DownloadProgressModal.css";
 
@@ -50,11 +54,34 @@ function pctOf(p: DownloadProgressEvent | undefined): number {
 export function DownloadProgressModal(): JSX.Element | null {
     const active = useDownloadStore((s) => s.activeDownloads());
     const dismiss = useDownloadStore((s) => s.dismiss);
+    const [leaving, setLeaving] = useState(false);
+    const [leaveError, setLeaveError] = useState<string | null>(null);
     if (active.length === 0) return null;
     const primary = active[0]!;
     // A failed download is not in progress: it stays visible so the error
     // can be read, but the user must be able to leave it.
     const failed = primary.state === "failed";
+    // A download that has not started (no source is connected yet) is not
+    // "downloading" either. The shared-media bridge keeps retrying while the
+    // host's connection comes up, and may never succeed (for example behind a
+    // restrictive NAT), so the user needs a way out: leaving the room.
+    const notStarted = primary.state === "pending";
+
+    async function leaveRoomInstead(): Promise<void> {
+        if (leaving) return;
+        setLeaving(true);
+        setLeaveError(null);
+        try {
+            await leaveRoom();
+            // Stop the bridge's retry loop from raising this modal again.
+            useSharedMediaStore.getState().reset(null, false);
+            useDownloadStore.getState().clear();
+        } catch (err) {
+            setLeaveError(errorText(err));
+        } finally {
+            setLeaving(false);
+        }
+    }
 
     const onKeyDown = (e: KeyboardEvent) => {
         if (e.key === "Escape") {
@@ -123,6 +150,27 @@ export function DownloadProgressModal(): JSX.Element | null {
                     >
                         Dismiss
                     </button>
+                )}
+                {notStarted && (
+                    <>
+                        <p className="dlm-multi" data-testid="dlm-waiting">
+                            Waiting for the host to connect. You can leave the room instead.
+                        </p>
+                        {leaveError !== null && (
+                            <p className="dlm-error" role="alert" data-testid="dlm-leave-error">
+                                {leaveError}
+                            </p>
+                        )}
+                        <button
+                            type="button"
+                            className="dlm-dismiss"
+                            data-testid="dlm-leave"
+                            disabled={leaving}
+                            onClick={() => void leaveRoomInstead()}
+                        >
+                            {leaving ? "Leaving..." : "Leave room"}
+                        </button>
+                    </>
                 )}
             </dialog>
         </div>
