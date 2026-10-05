@@ -460,6 +460,70 @@ async fn cancellation_during_inflight_does_not_emit_progress_after_cancel() {
     );
 }
 
+/// Deterministic version of the race the test above can hit on a slow host:
+/// when the transport is already closed at the moment the receiver sends its
+/// first frame, the session must still end in a terminal state, not stop at
+/// `transferring` (which leaves the UI waiting forever). The timing-based
+/// test failed on macOS CI because its cancel sometimes landed at exactly
+/// such a point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_closed_at_start_still_ends_in_a_terminal_state() {
+    let host_tmp = tempfile::tempdir().expect("host tmpdir");
+    let recv_tmp = tempfile::tempdir().expect("recv tmpdir");
+    let host_lib_root: PathBuf = host_tmp.path().to_path_buf();
+    let recv_lib_root: PathBuf = recv_tmp.path().to_path_buf();
+
+    let fixture_staging = host_lib_root.join("staging-fixture.bin");
+    write_fixture(&fixture_staging).await;
+    let plan = build_plan("01234567-89ab-cdef-0123-456789abce03", &fixture_staging).await;
+
+    let storage = open_storage_in(&recv_lib_root).await;
+    let store = DownloadStore::new(storage.pool().clone());
+    seed_fk_deps(&store, "u-1", "media-uuid").await;
+    create_download(&store, &plan).await;
+
+    let (_host_side, recv_side) = loopback_pair(0, 0);
+    let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
+    recv_transport.close().await;
+
+    let recorder = Arc::new(RecordingSink::default());
+    let emitter = DownloadEventEmitter::new(recorder.clone());
+    let session = ReceiverSession::new_with_emitter(
+        &plan,
+        recv_transport,
+        store.clone(),
+        recv_lib_root,
+        VIEWER_PUBKEY,
+        emitter,
+    );
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        session.run("fixture.bin".to_string()),
+    )
+    .await
+    .expect("the session must return, not hang");
+
+    let states: Vec<String> = recorder
+        .states
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.state.clone())
+        .collect();
+    assert_eq!(
+        states.last().map(String::as_str),
+        Some("cancelled"),
+        "a closed transport must end in a terminal state, got {states:?}"
+    );
+    assert_eq!(
+        states.iter().filter(|s| *s == "cancelled").count(),
+        1,
+        "exactly one terminal event, got {states:?}"
+    );
+    let row = store.fetch(&plan.download_id).await.expect("row");
+    assert_eq!(row.state.as_str(), "cancelled", "the store agrees");
+}
+
 #[allow(dead_code)]
 fn _planned_chunk_pin(c: &PlannedChunk) -> u32 {
     c.index

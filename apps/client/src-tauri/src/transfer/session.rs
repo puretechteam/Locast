@@ -515,6 +515,48 @@ impl<'a> ReceiverSession<'a> {
     /// any error, the store is left in `Failed` so the user
     /// can inspect `last_error`.
     pub async fn run(&self, sanitized_filename: String) -> Result<DownloadState, SessionError> {
+        let result = self.run_inner(sanitized_filename).await;
+        if matches!(result, Err(SessionError::Cancelled)) {
+            self.ensure_cancelled_terminal().await;
+        }
+        result
+    }
+
+    /// A cancellation can surface through a `?` anywhere in the session (a
+    /// send on a transport that was just closed, a read after the
+    /// cancellation token fired), where nothing records the outcome. Left
+    /// alone the download would stay at `transferring` in the store and in
+    /// the UI. If the session did not already reach a terminal state, record
+    /// `cancelled` once.
+    async fn ensure_cancelled_terminal(&self) {
+        let plan = self.plan;
+        let current = self
+            .store
+            .fetch(&plan.download_id)
+            .await
+            .ok()
+            .map(|r| r.state);
+        if matches!(
+            current,
+            Some(DownloadState::Cancelled | DownloadState::Failed | DownloadState::Complete)
+        ) {
+            return;
+        }
+        let _ = self
+            .store
+            .transition(&plan.download_id, DownloadState::Cancelled)
+            .await;
+        self.emitter.record_state(DownloadStateEvent {
+            v: 1,
+            id: plan.download_id.clone(),
+            media_id: plan.media_id.clone(),
+            state: DownloadState::Cancelled.as_str().to_string(),
+            error_message: None,
+        });
+        self.emitter.shutdown();
+    }
+
+    async fn run_inner(&self, sanitized_filename: String) -> Result<DownloadState, SessionError> {
         let cancel = self.cancel.clone();
         let transport = Arc::clone(&self.transport);
         let plan = self.plan;
