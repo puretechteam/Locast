@@ -129,11 +129,16 @@ pub fn invoke_handler<R: tauri::Runtime>(
 
 /// Build and run the Locast desktop client.
 ///
-/// The Tauri 2 builder is configured per `docs/ARCHITECTURE.md` section 5:
-/// a single main window is opened, and only the plugins whose capabilities
-/// are listed in `capabilities/default.json` are initialized. No shell or
-/// arbitrary HTTP capability is granted to the webview; all privileged
-/// filesystem and network operations stay in Rust.
+/// The Tauri 2 builder follows the process model in `docs/ARCHITECTURE.md`
+/// section 5, with a narrower plugin set than that section's capability
+/// table: a single main window is opened, and only two plugins are initialized:
+/// log (Rust-side logging, no webview grant) and dialog (the import picker,
+/// `dialog:allow-open` in `capabilities/default.json`). A plugin registered
+/// without a grant still injects its init script, and some of those scripts
+/// call the plugin's commands, so unused plugins are not registered at all
+/// (`tests/capabilities.rs` pins this). No shell or arbitrary HTTP capability
+/// is granted to the webview; all privileged filesystem and network
+/// operations stay in Rust.
 pub fn run() {
     let log_plugin = tauri_plugin_log::Builder::new()
         .targets([
@@ -157,11 +162,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(log_plugin)
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_process::init())
         .setup(move |app| {
             let _registry_cell = registry_cell_for_setup;
             let _main = app
