@@ -1137,3 +1137,25 @@ code {
     color: #ff8a80;
     font-size: 0.85rem;
 }
+
+.error-boundary {
+    max-width: 32rem;
+    margin: 4rem auto;
+    padding: 0 1rem;
+    color: #e6e9ed;
+}
+
+.error-boundary h1 {
+    font-size: 1.3rem;
+}
+
+.error-boundary__detail {
+    color: #f5a3a3;
+    font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+    font-size: 0.85rem;
+    word-break: break-word;
+}
+
+.error-boundary a {
+    color: #4dabf5;
+}

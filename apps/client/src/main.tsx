@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { PageShell } from "./components/PageShell";
 import { DownloadBlockingGuard } from "./components/DownloadBlockingGuard";
 import { DownloadProgressModal } from "./components/DownloadProgressModal";
@@ -50,6 +51,8 @@ if (!container) {
 }
 createRoot(container).render(
     <StrictMode>
-        <App />
+        <ErrorBoundary>
+            <App />
+        </ErrorBoundary>
     </StrictMode>,
 );
