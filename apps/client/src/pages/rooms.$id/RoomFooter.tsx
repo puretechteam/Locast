@@ -36,18 +36,21 @@ export function RoomFooter({
     const [error, setError] = useState<string | null>(null);
     const [showModal, setShowModal] = useState(false);
 
+    // Leave the room. A failure rejects, so the leave dialog (which called this)
+    // shows it: the footer's own error text sits behind the dialog's backdrop.
     async function onLeave(): Promise<void> {
         if (leaving) return;
         setLeaving(true);
         setError(null);
         try {
             await leaveRoom();
-            onLeft();
-            navigate("/rooms");
         } catch (err) {
-            setError(errorText(err));
             setLeaving(false);
+            setError(errorText(err));
+            throw err;
         }
+        onLeft();
+        navigate("/rooms");
     }
 
     const phase = signaling?.phase ?? "Disconnected";
