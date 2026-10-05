@@ -325,6 +325,33 @@ impl IdentityService {
         Ok(id)
     }
 
+    /// Make sure a keypair exists, generating one on first launch,
+    /// and return it. Unlike [`Self::get_or_create`] this never
+    /// rewrites the `display_name` of an existing identity, so it is
+    /// safe to call at every app start. `default_display_name` seeds
+    /// the `user_identities` row only when the keypair is new.
+    ///
+    /// The signaling handshake, room commands and the host chunk
+    /// dispatcher all need the keypair, and none of them creates it
+    /// (`load_keypair` returns `NotInitialized`). Calling this during
+    /// setup means a fresh install can create or join a room without
+    /// first visiting a page that happens to call `identity_get`.
+    pub async fn ensure_keypair(
+        &self,
+        default_display_name: &str,
+    ) -> Result<Keypair, IdentityServiceError> {
+        validate_display_name(default_display_name)?;
+        let _g = self.lock.lock().await;
+        if let Some(existing) = self.keyring.load().await? {
+            return Ok(existing);
+        }
+        let k = super::types::generate();
+        self.keyring.store(&k).await?;
+        let id = Identity::from_signing_key(&k.signing, default_display_name);
+        self.upsert_user_identity(&id).await?;
+        Ok(k)
+    }
+
     /// Read the current identity. Returns `NotInitialized` if no
     /// keypair has been generated yet.
     /// Load the raw keypair from the keyring without going

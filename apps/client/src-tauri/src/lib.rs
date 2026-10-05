@@ -383,14 +383,18 @@ pub fn run() {
             // on the WebRtcManager. The dispatch consults the
             // host's verified manifest and serves chunks over
             // the inbound `files` DataChannel. The local
-            // pubkey is derived from the OS keyring; if the
-            // keyring read fails (e.g. on a fresh install
-            // where the keypair has not been generated yet),
-            // the dispatch is skipped and the manager falls
-            // back to the viewer-only path. The next
-            // `identity_get` will create the keypair, and a
-            // future setup-hook replay will re-install the
-            // dispatch.
+            // pubkey is derived from the OS keyring. A fresh
+            // install has no keypair yet, so create it first:
+            // otherwise the signaling handshake fails with
+            // "identity not initialized" and the dispatch below
+            // is never installed. If the keyring is unusable the
+            // dispatch is skipped and the manager falls back to
+            // the viewer-only path.
+            if let Err(e) = tauri::async_runtime::block_on(
+                identity_service.ensure_keypair(identity::DEFAULT_DISPLAY_NAME),
+            ) {
+                tracing::warn!(error = %e, "identity bootstrap failed");
+            }
             {
                 let webrtc_for_dispatch = webrtc_for_state.clone();
                 let identity_for_dispatch = identity_service.clone();

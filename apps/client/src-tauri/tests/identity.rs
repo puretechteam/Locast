@@ -123,6 +123,84 @@ async fn identity_get_returns_not_initialized_when_empty() {
     ));
 }
 
+/// Regression: a fresh install had no keypair until some page called
+/// `identity_get`, so the first signaling handshake failed with
+/// "identity not initialized". `ensure_keypair` is what app setup calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_keypair_creates_the_keypair_on_first_launch() {
+    let tmp = TempDir::new().expect("tempdir");
+    let storage = open_storage(tmp.path()).await;
+    let keyring = Arc::new(MockKeyring::new());
+    let service = IdentityService::with_keyring(keyring.clone(), storage);
+
+    assert!(
+        matches!(
+            service.load_keypair().await,
+            Err(locast_client_lib::identity::keystore::IdentityServiceError::NotInitialized)
+        ),
+        "precondition: nothing exists before first launch"
+    );
+
+    let created = service.ensure_keypair("guest").await.expect("ensure");
+    let loaded = service.load_keypair().await.expect("load after ensure");
+    assert_eq!(
+        created.signing.verifying_key().to_bytes(),
+        loaded.signing.verifying_key().to_bytes(),
+        "the keypair handed back is the one stored in the keyring"
+    );
+    let stored = keyring.load().await.expect("load").expect("present");
+    assert_eq!(
+        stored.signing.verifying_key().to_bytes(),
+        loaded.signing.verifying_key().to_bytes()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_keypair_is_idempotent_and_keeps_the_display_name() {
+    let tmp = TempDir::new().expect("tempdir");
+    let storage = open_storage(tmp.path()).await;
+    let keyring = Arc::new(MockKeyring::new());
+    let service = IdentityService::with_keyring(keyring, storage.clone());
+
+    let first = service.ensure_keypair("guest").await.expect("first");
+    let named = service
+        .get_or_create("Alice")
+        .await
+        .expect("user sets a name");
+    let second = service.ensure_keypair("guest").await.expect("second start");
+
+    assert_eq!(
+        first.signing.verifying_key().to_bytes(),
+        second.signing.verifying_key().to_bytes(),
+        "restarting must never mint a new identity"
+    );
+    let stored_name: String =
+        sqlx::query_scalar("SELECT display_name FROM user_identities WHERE id = ?1")
+            .bind(&named.user_id)
+            .fetch_one(&storage.pool())
+            .await
+            .expect("identity row");
+    assert_eq!(
+        stored_name, "Alice",
+        "ensure_keypair must not overwrite a name the user chose"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ensure_keypair_rejects_an_invalid_default_name() {
+    let tmp = TempDir::new().expect("tempdir");
+    let storage = open_storage(tmp.path()).await;
+    let service = IdentityService::with_keyring(Arc::new(MockKeyring::new()), storage);
+    assert!(service.ensure_keypair("").await.is_err());
+    assert!(
+        matches!(
+            service.load_keypair().await,
+            Err(locast_client_lib::identity::keystore::IdentityServiceError::NotInitialized)
+        ),
+        "a rejected name must not create a keypair"
+    );
+}
+
 fn sha256_hex(bytes: Vec<u8>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

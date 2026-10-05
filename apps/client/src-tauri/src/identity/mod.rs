@@ -29,6 +29,11 @@
 pub mod keystore;
 pub mod types;
 
+/// Display name stored with a keypair that was created automatically on
+/// first launch. The name used in a room is chosen per join, so this only
+/// labels the local `user_identities` row until the user sets one.
+pub const DEFAULT_DISPLAY_NAME: &str = "guest";
+
 pub use keystore::{IdentityKeyring, MockKeyring, OsKeyring};
 pub use types::{
     derive_user_id, generate, validate_display_name, DisplayNameError, Identity, Keypair,
