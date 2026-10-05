@@ -772,19 +772,31 @@ async fn e2e_resume_from_persisted_bitmap() {
             recv_lib_root_for_run,
             VIEWER_PUBKEY,
         );
-        // Give it a brief window, then drop the transport to
-        // simulate a peer disappearing mid-transfer.
-        let res = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            session.run("fixture.bin".to_string()),
-        )
-        .await;
-        // Close the transport to unstick the sender.
-        recv_transport_clone.close().await;
-        let _ = recv_store_for_kill;
-        res
+        session.run("fixture.bin".to_string()).await
     });
+    // Kill the receiver as soon as the store shows a verified chunk. This used
+    // to be a fixed 500 ms window, which a slow host (a debug build hashing on
+    // a busy CI runner) can spend before the first chunk is verified.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let done = recv_store_for_kill
+            .completed_chunk_indices(&plan.download_id)
+            .await
+            .expect("poll verified chunks");
+        if !done.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no chunk was verified within 120 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // Simulate a peer disappearing mid-transfer: stop the receiver and close
+    // the transport to unstick the sender.
+    receiver_handle.abort();
     let _ = receiver_handle.await;
+    recv_transport_clone.close().await;
     let _ = sender_handle.await;
 
     // The store should now have some verified chunks.
