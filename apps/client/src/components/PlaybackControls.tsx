@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import {
@@ -56,6 +56,10 @@ export function PlaybackControls({
         (s) => s.lastApplied !== null && s.lastApplied.room_id === roomId,
     );
 
+    // The host's own video moves before the command is sent, so a failed send
+    // leaves the host watching something that viewers are not. Say so.
+    const [sendFailed, setSendFailed] = useState(false);
+
     const send = useCallback(
         (kind: PlaybackKind, fixedPositionMs?: number): void => {
             if (!isHost || roomId === null) return;
@@ -64,13 +68,15 @@ export function PlaybackControls({
             const mediaPositionMs =
                 fixedPositionMs ??
                 (video !== null ? video.currentTime * 1000 : positionMs);
-            void sendHostPlaybackCommand({
+            sendHostPlaybackCommand({
                 roomId,
                 localUserId,
                 kind,
                 mediaPositionMs,
                 video,
-            });
+            })
+                .then((sent) => setSendFailed(!sent))
+                .catch(() => setSendFailed(true));
         },
         [isHost, roomId, localUserId, getVideo, positionMs],
     );
@@ -123,6 +129,15 @@ export function PlaybackControls({
             {!isHost && (
                 <span className="playback-controls__hint">
                     (host only)
+                </span>
+            )}
+            {sendFailed && (
+                <span
+                    className="playback-controls__hint"
+                    role="alert"
+                    data-testid="playback-send-failed"
+                >
+                    Could not reach the room: viewers did not get that command. Try again.
                 </span>
             )}
         </div>
