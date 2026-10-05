@@ -10,6 +10,7 @@
 // room started with the previous room's video and positions.
 
 import { useCapabilityStore } from "./useCapabilityStore";
+import { useChatStore } from "./useChatStore";
 import { useClockSkewStore } from "./useClockSkewStore";
 import { useConnectionQualityStore } from "./useConnectionQualityStore";
 import { useDownloadStore } from "./useDownloadStore";
@@ -25,6 +26,7 @@ export function resetRoomScopedStores(): void {
     useViewerPositionStore.getState().clear();
     useRoomStore.getState().clear();
     useCapabilityStore.getState().clear();
+    useChatStore.getState().clear();
     useConnectionQualityStore.getState().clear();
     useClockSkewStore.getState().clear();
     // Stops the shared-media bridge's retry loop for the old room.

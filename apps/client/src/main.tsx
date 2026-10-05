@@ -6,6 +6,7 @@ import { PageShell } from "./components/PageShell";
 import { DownloadBlockingGuard } from "./components/DownloadBlockingGuard";
 import { DownloadProgressModal } from "./components/DownloadProgressModal";
 import { DownloadEventBridge } from "./hooks/useDownloadEventBridge";
+import { ChatBridge } from "./hooks/useChatBridge";
 import { RoomEndBridge } from "./hooks/useRoomEndBridge";
 import { SharedMediaBridge } from "./hooks/useSharedMediaBridge";
 import { LibraryPage } from "./pages/library";
@@ -23,6 +24,7 @@ function App(): JSX.Element {
             <DownloadEventBridge />
             <SharedMediaBridge />
             <RoomEndBridge />
+            <ChatBridge />
             <Routes>
                 <Route path="/" element={<Navigate to="/library" replace />} />
                 <Route path="/library" element={<PageShell title="Library"><LibraryPage /></PageShell>} />

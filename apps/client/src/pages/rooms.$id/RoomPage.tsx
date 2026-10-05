@@ -4,7 +4,7 @@ import { events } from "../../services/ipc";
 import { getRoomState } from "../../services/room";
 import { getSignalingState } from "../../services/signaling";
 import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
-import type { ChatMessage } from "../../services/chat";
+import { useChatStore } from "../../stores/useChatStore";
 import type { PositionReportEvent } from "../../bindings";
 import { useRoomStore } from "../../stores/useRoomStore";
 import { resetRoomScopedStores } from "../../stores/resetRoomScopedStores";
@@ -37,7 +37,7 @@ export function RoomPage(): JSX.Element {
     const setSignaling = useRoomStore((s) => s.setSignaling);
     const setLastKnownHostPositionMs = useRoomStore((s) => s.setLastKnownHostPositionMs);
     const [hydrated, setHydrated] = useState(false);
-    const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const messages = useChatStore((s) => s.messages);
     const [showPermissions, setShowPermissions] = useState(false);
     // P1-T10: media chosen from the library, played locally.
     const localMediaSrc = usePlaybackStore((s) => s.mediaSrc);
@@ -302,16 +302,9 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                 }
                 unlistens.push(u3);
 
-                // P6-T03: listen for chat://message events relayed from the server.
-                const u4 = await events.chatMessage((next: ChatMessage) => {
-                    if (cancelled) return;
-                    setMessages((prev) => [...prev, next]);
-                });
-                if (cancelled) {
-                    u4();
-                    return;
-                }
-                unlistens.push(u4);
+                // Chat messages are collected by the app-level `ChatBridge`
+                // into `useChatStore`, so they are not lost while this page
+                // is unmounted.
 
                 // P7-T06: listen for position://report events to track
                 // the host's last known position. The host is the
