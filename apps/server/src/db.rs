@@ -420,6 +420,20 @@ impl Db {
         Ok(res.rows_affected())
     }
 
+    /// Purge session-resume tokens that have already expired. One row is
+    /// written per authentication and an expired row is ignored by
+    /// [`Self::validate_resume_token`] but was never deleted, so the table
+    /// only grew.
+    pub async fn purge_expired_resume_tokens(&self) -> Result<u64, sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        let now = now_ms();
+        let res = sqlx::query("DELETE FROM session_resume_tokens WHERE expires_ms <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     // ------------------------------------------------------------------
     // P2-T04: room + room_participants persistence.
     // ------------------------------------------------------------------
@@ -1021,7 +1035,8 @@ pub struct RoomManifestRow {
 }
 
 /// Spawn a background task that periodically purges expired
-/// bearers. The task lives for the lifetime of the server.
+/// bearers and session-resume tokens. The task lives for the lifetime
+/// of the server.
 pub fn spawn_bearer_cleanup(db: Db, interval: Duration) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -1032,6 +1047,11 @@ pub fn spawn_bearer_cleanup(db: Db, interval: Duration) {
                 Ok(0) => {}
                 Ok(n) => tracing::debug!(purged = n, "locast-server bearer cleanup"),
                 Err(e) => tracing::warn!(error = %e, "locast-server bearer cleanup failed"),
+            }
+            match db.purge_expired_resume_tokens().await {
+                Ok(0) => {}
+                Ok(n) => tracing::debug!(purged = n, "locast-server resume token cleanup"),
+                Err(e) => tracing::warn!(error = %e, "locast-server resume token cleanup failed"),
             }
         }
     });
@@ -1165,6 +1185,41 @@ mod tests {
         assert_eq!(purged, 1);
         assert!(db.validate_bearer(&stale).await.expect("v").is_none());
         assert!(db.validate_bearer(&live).await.expect("v").is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_expired_resume_tokens_removes_only_expired() {
+        let db = fresh_db().await;
+        let pk = random_pubkey();
+        let user_id = db.upsert_user(&pk).await.expect("upsert");
+
+        let stale = [5u8; 32];
+        let live = [6u8; 32];
+        db.insert_resume_token(&stale, user_id, 1, None, now_ms() - 1)
+            .await
+            .expect("insert stale");
+        db.insert_resume_token(&live, user_id, 2, None, now_ms() + 60_000)
+            .await
+            .expect("insert live");
+
+        let count_rows = || async {
+            let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM session_resume_tokens")
+                .fetch_one(db.pool())
+                .await
+                .expect("count");
+            n
+        };
+        assert_eq!(count_rows().await, 2, "an expired row is kept until purged");
+
+        let purged = db.purge_expired_resume_tokens().await.expect("purge");
+        assert_eq!(purged, 1);
+        assert_eq!(count_rows().await, 1, "the expired row is gone");
+        assert!(db
+            .validate_resume_token(&live)
+            .await
+            .expect("validate")
+            .is_some());
+        assert_eq!(db.purge_expired_resume_tokens().await.expect("again"), 0);
     }
 
     #[tokio::test]
