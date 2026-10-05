@@ -1332,13 +1332,20 @@ impl RoomClient {
     }
 
     /// Drop what a post-reconnect rejoin or a republish would use: the
-    /// join credentials and the host's media selection. Called whenever
-    /// the user is no longer in the room, whether they left or the
-    /// server ended it, so a later WS reconnect does not re-join a dead
-    /// room.
+    /// join credentials, the host's media selection and any envelopes
+    /// buffered while the WS was down. Called whenever the user is no
+    /// longer in the room, whether they left or the server ended it, so
+    /// a later WS reconnect does not re-join a dead room. The buffer is
+    /// room-scoped (chat, drawing, and the `ROOM_LEAVE` that `room_leave`
+    /// just queued); left in place it would be flushed into whichever
+    /// room is joined next, where a stale `ROOM_LEAVE` removes the user
+    /// or ends the room for a host.
     fn forget_room_session(&self) {
         if let Ok(mut g) = self.active_room_code.lock() {
             *g = None;
+        }
+        if let Ok(mut g) = self.pending_outbound.lock() {
+            g.clear();
         }
         self.set_host_media_selection(None);
     }
@@ -3060,6 +3067,36 @@ mod tests {
             rc.rejoin_active_room().await.is_ok(),
             "with no credentials the rejoin is a no-op and sends nothing"
         );
+    }
+
+    /// Envelopes buffered while the WS was down belong to the session
+    /// that just ended. If they survive, the next reconnect after a
+    /// later join flushes them into the new room (a stale `ROOM_LEAVE`
+    /// would remove the user from it).
+    #[tokio::test]
+    async fn ending_the_room_session_discards_buffered_envelopes() {
+        let stale = || envelope(MessageKind::RoomLeave, None, RoomLeavePayload {});
+
+        // Server ends the room.
+        let rc = fresh_room_client().await;
+        *rc.active_room_code.lock().expect("lock") = Some(("ABC123".into(), "viewer".into()));
+        rc.pending_outbound.lock().expect("lock").push(stale());
+        let env = env_of(
+            MessageKind::RoomClosed,
+            serde_json::to_value(locast_protocol::room::RoomClosedPayload {
+                reason: "host_left".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        assert!(rc.pending_outbound.lock().expect("lock").is_empty());
+
+        // The user leaves (room_leave ends in the same call).
+        let rc = fresh_room_client().await;
+        rc.pending_outbound.lock().expect("lock").push(stale());
+        rc.pending_outbound.lock().expect("lock").push(stale());
+        rc.forget_room_session();
+        assert!(rc.pending_outbound.lock().expect("lock").is_empty());
     }
 
     #[tokio::test]
