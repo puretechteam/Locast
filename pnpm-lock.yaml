@@ -11,8 +11,8 @@ importers:
   apps/client:
     dependencies:
       '@tauri-apps/api':
-        specifier: ^2.11.1
-        version: 2.11.1
+        specifier: ^2.12.1
+        version: 2.12.1
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -30,14 +30,14 @@ importers:
         specifier: ^10.0.1
         version: 10.0.1(eslint@10.12.0)
       '@playwright/test':
-        specifier: ^1.49.0
-        version: 1.62.1
+        specifier: ^1.63.0
+        version: 1.63.0
       '@tauri-apps/cli':
-        specifier: ^2.11.4
-        version: 2.11.4
+        specifier: ^2.12.1
+        version: 2.12.1
       '@types/node':
-        specifier: ^22.10.5
-        version: 22.20.1
+        specifier: ^22.20.5
+        version: 22.20.5
       '@types/react':
         specifier: ^18.3.29
         version: 18.3.31
@@ -46,7 +46,7 @@ importers:
         version: 18.3.7(@types/react@18.3.31)
       '@vitejs/plugin-react':
         specifier: ^4.7.0
-        version: 4.7.0(vite@5.4.21(@types/node@22.20.1))
+        version: 4.7.0(vite@5.4.21(@types/node@22.20.5))
       eslint:
         specifier: ^10.12.0
         version: 10.12.0
@@ -64,7 +64,7 @@ importers:
         version: 8.71.0(eslint@10.12.0)(typescript@5.9.3)
       vite:
         specifier: ^5.4.21
-        version: 5.4.21(@types/node@22.20.1)
+        version: 5.4.21(@types/node@22.20.5)
 
   shared/protocol:
     devDependencies:
@@ -390,9 +390,10 @@ packages:
     engines: {node: ^22.20 || ^24.12 || >=25}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
-  '@playwright/test@1.62.1':
-    resolution: {integrity: sha512-DTcUc8qii+cpHvtOwggMtBRMjKZHXYWdw8syRYu2vtzuq4Wxphqq4NfCs5Zt44L6mA8rfDfj+PHnxFc/FeK6mQ==}
+  '@playwright/test@1.63.0':
+    resolution: {integrity: sha512-oxMK4vllB9RK5NQ2l1pq1IfOf2AvnEuj/vYGDj0H2nMtmtZpKtCwt/l00GEO6xjGfpBNAvjovvYdCm50dRQkpQ==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -437,66 +438,79 @@ packages:
     resolution: {integrity: sha512-FQwsTRvLNuHoTdICABJQfbPUSEueISGmnpT06tXTMpfprf5NiKLSXKA0A+w45wJnCmZAnzgqBwbt6ARFuyOi5w==}
     cpu: [arm]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-arm-musleabihf@4.63.0':
     resolution: {integrity: sha512-BBVTXziw8mY1a4ZbWME9tZyfzqXCDPqaC7Z3heQ29p5dkvXzwL0NwelO8zLa8c3RBKvl3YTuSnBgsBhYBtwjIw==}
     cpu: [arm]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-arm64-gnu@4.63.0':
     resolution: {integrity: sha512-w2Iyy9+RqKwx3d9qWMKsJg0FfRBsY0/pXNv0mCQ3ueRvJI6+QAScfD4nrMlzFLs2HNVW6Ew+mtZfDl9b7Ew5/Q==}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-arm64-musl@4.63.0':
     resolution: {integrity: sha512-YK++KtrFRHYE0P6/RtYEAy9t8F37znP+K03RrIuLPYOL6SVlObRumf/0OE4V/h63xL9DwkWbNssZfmA9hawuDA==}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-loong64-gnu@4.63.0':
     resolution: {integrity: sha512-aBfOG6fP7YkkPmTqPwufRJeFyz7WPpECv9XNbnsk9+vg7rxdih0lbtEel7jcRng4LZrrmU3FfitCFyEj4BWDWg==}
     cpu: [loong64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-loong64-musl@4.63.0':
     resolution: {integrity: sha512-LGaHEOeHNAag9VuS1Crs5DFg4RrU9MPi2nVnNJk9DTePx/B6RRYKVmrIXt2h7YOJlwjaFJ6lwtFDliZxScTLrQ==}
     cpu: [loong64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-ppc64-gnu@4.63.0':
     resolution: {integrity: sha512-jClvk+J0FC3b7Udvegiw5/4hErbHtmsNsQgENnKXDWtNCJXsJYZH5WURvu7imDOO38xYml24eeh5x3A04ppwCw==}
     cpu: [ppc64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-ppc64-musl@4.63.0':
     resolution: {integrity: sha512-0OJlaGK+8+B777Ql5okIpD7ua5Ro9+VB9Ve0OKa28OQJZ1RbuUBVNHK/e3pr4BROqsyPl1JrPO1ZxJseCNffcA==}
     cpu: [ppc64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-riscv64-gnu@4.63.0':
     resolution: {integrity: sha512-Ygsx+HoNH7afwi1bTIXbnTvVnsO+zurPLSYxybV1hHFVU72OWOCl6v05ql/z0hkpAPx+DK7Kn9Bi7MayCcjLTA==}
     cpu: [riscv64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-riscv64-musl@4.63.0':
     resolution: {integrity: sha512-pDQxtMGb+OvG3fLwR2OkZlSd47hW+kWg4BYMG/++sR6RqorQccwPTDsxda5hPwiIeIErAnCF9ma3SAU06bdQtQ==}
     cpu: [riscv64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-linux-s390x-gnu@4.63.0':
     resolution: {integrity: sha512-0BnUG9mS8I4SSHr3XsxVhuCMEiu+rX61xxZF5vujso4LaiAGFZFxvDjg6Xn6tLPNTUAfuCvQYas4LMQMVsKRSQ==}
     cpu: [s390x]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-x64-gnu@4.63.0':
     resolution: {integrity: sha512-Adu/VttB1dpPNW+FEacrZ+xVm9tFty84+RrFzsqlFaPxoJB+9XXyDGtp5dCOoBwGBIEVH0To7lExFXEx0BIF4A==}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
   '@rollup/rollup-linux-x64-musl@4.63.0':
     resolution: {integrity: sha512-NQ3bDvjUbFKmP23671xUlXtKmqVsUBd6M4PQCvbmNtOy06hnQIdKHy8oG/6S3R/S6He1JgPk6A5VT+prAJMYEw==}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
   '@rollup/rollup-openbsd-x64@4.63.0':
     resolution: {integrity: sha512-u2eDAl4+0aFvA13GxlGBtTI3SS3sdgwgtV0HyjZ0QaQVCgNE+jqNGey+GtxWiq+wxr/UycAx/OnfJzApCFamvA==}
@@ -528,77 +542,82 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@tauri-apps/api@2.11.1':
-    resolution: {integrity: sha512-M2FPuYND2m+wh5hfW9ZpSdxMPdEJovPBWwoHJmwUpysTYNHaOkVFN419m/K0LIgjb/7KU2vBgsUepJWugQCvAA==}
+  '@tauri-apps/api@2.12.1':
+    resolution: {integrity: sha512-DeyFHa3wynpyoqTDikDEDGTJIq4LQ5USfolQGRmGIWT6JMADyxZBTDa5cAdT3tDg73rUXufPaCwN7aXBos4OnQ==}
 
-  '@tauri-apps/cli-darwin-arm64@2.11.4':
-    resolution: {integrity: sha512-1ryOF3ZhpZ/nemHV5zVwBQBz9jDGKmKPvWPADOhc83ig0P4bMc2iER4NbC6r9sjeIZ6RVQ4g3RZIYvezhcl4TQ==}
+  '@tauri-apps/cli-darwin-arm64@2.12.1':
+    resolution: {integrity: sha512-8bMnbpJ2jKO/ufrOPL65EMHC3ptw7fzeraoQkwibyfGLqIl+UCWsC0152kmNbW6r9NvVQduXqAZF5mH1QgTWhw==}
     engines: {node: '>= 10'}
     cpu: [arm64]
     os: [darwin]
 
-  '@tauri-apps/cli-darwin-x64@2.11.4':
-    resolution: {integrity: sha512-uFsGQAAfuyz1k/yGLmkWfkBlgKAqZfxqlHmLWx81QU27RJWfmbNHCIq8T8w1e+VClleIuZUjpHWfoE4E3DLo3A==}
+  '@tauri-apps/cli-darwin-x64@2.12.1':
+    resolution: {integrity: sha512-G+2qte8GNqNlEZ9ftd21rbu/APVkl3r/nzNDI7LVxEoqJWVNe9GbEgQUMH1r4PHT20Z2UxR3KjCkltIb0e/Wjg==}
     engines: {node: '>= 10'}
     cpu: [x64]
     os: [darwin]
 
-  '@tauri-apps/cli-linux-arm-gnueabihf@2.11.4':
-    resolution: {integrity: sha512-IaHZn5CdBL21oUmjiVOS1ctw6Ip1O0pjp70FwOWmYz1myWe0SY96ZIj2FYf7pT0m8bI2h/hrs5ZbEXXh44/MkQ==}
+  '@tauri-apps/cli-linux-arm-gnueabihf@2.12.1':
+    resolution: {integrity: sha512-5b3n4DaTW+A1Zntnh4Yn44VyLrlPEpB8kMOBRfWkzNnzolBk+AYhKIfKjCLmoC8Mob3ETodxAEOMkE2YPKEWzQ==}
     engines: {node: '>= 10'}
     cpu: [arm]
     os: [linux]
 
-  '@tauri-apps/cli-linux-arm64-gnu@2.11.4':
-    resolution: {integrity: sha512-N41/ukTRVe6XSuUTESuFdGeOW2i7k62tK+6gHK5Kd5/q5RPvvi19GaWAVPPb9u95HSGmTChSolBfzynUsssFaA==}
+  '@tauri-apps/cli-linux-arm64-gnu@2.12.1':
+    resolution: {integrity: sha512-APArHhDu+8pXSCkCQmvaz1nD3d8WTmlCoSS/oG475TJ6AATBvyQOAmf5qELgsQ4s2+8MOsop0Zd699RKELF1Cw==}
     engines: {node: '>= 10'}
     cpu: [arm64]
     os: [linux]
+    libc: [glibc]
 
-  '@tauri-apps/cli-linux-arm64-musl@2.11.4':
-    resolution: {integrity: sha512-v277UnT/fB64xAfSroL5N3Km3tLmvATWqJJw/wRI+g6o+HkeD0slyE7gOhNs1MbjE41R7bQOTxMVoL3aomUJmw==}
+  '@tauri-apps/cli-linux-arm64-musl@2.12.1':
+    resolution: {integrity: sha512-JaCxcLoV0oGtllVkLr4UAHWG/wTfkEunnUqnsEsGYOp0VRxnUwHg63wFBD0jU2ul5eFfSLIDS4RF2gfzsSo5Jg==}
     engines: {node: '>= 10'}
     cpu: [arm64]
     os: [linux]
+    libc: [musl]
 
-  '@tauri-apps/cli-linux-riscv64-gnu@2.11.4':
-    resolution: {integrity: sha512-qqgNkQ2u1yZHxjhxsZaxUtRDW8dIqIYm33rx/mzwQv0SfY9x1B+iraj8vWeFiXjjSVVhEMepXSOts1TqPzvXNQ==}
+  '@tauri-apps/cli-linux-riscv64-gnu@2.12.1':
+    resolution: {integrity: sha512-K5+VXM7+SGVDwZleA2+lMgvbTVuA5e1tkiVEawu1Yxj26ZyEfO8h8xTC1rBdRX2xgJDSwCk6vPUBCS6i+Z5slQ==}
     engines: {node: '>= 10'}
     cpu: [riscv64]
     os: [linux]
+    libc: [glibc]
 
-  '@tauri-apps/cli-linux-x64-gnu@2.11.4':
-    resolution: {integrity: sha512-2VRNWl84FOH0m2giiDkO2h0QXlcMJeX+zJDpI5kDIQAx6s+geF3v48F4DXfJez4GS/FdoDGnPnw1C2iYGbQ7bQ==}
+  '@tauri-apps/cli-linux-x64-gnu@2.12.1':
+    resolution: {integrity: sha512-Z1QGPr49HJZMktu+Spu6Q1b/f9ANadXvqZZZt2645ua1x1ev6prOgp85eiGv2jRzohFEMLo6aJyaLjLUX5KIvA==}
     engines: {node: '>= 10'}
     cpu: [x64]
     os: [linux]
+    libc: [glibc]
 
-  '@tauri-apps/cli-linux-x64-musl@2.11.4':
-    resolution: {integrity: sha512-o9GyhYor/nc7xarmwDE3ka2szuW3uuZzXjHWh64Q8YX5AtSgxdQkFWzrY4O8KiGtVNvFBI14H3Q49Qj5TOIP/A==}
+  '@tauri-apps/cli-linux-x64-musl@2.12.1':
+    resolution: {integrity: sha512-nHuEhRPOMSJ/8RRhtMRxB9B9lVr7xxpe4DapBz8x1GIau3vdzjHHJ1hAfmw+PyayPLZ6XoaVIHPgI17rX6ii8w==}
     engines: {node: '>= 10'}
     cpu: [x64]
     os: [linux]
+    libc: [musl]
 
-  '@tauri-apps/cli-win32-arm64-msvc@2.11.4':
-    resolution: {integrity: sha512-ld5Ehb598m0VkYyylRPNeCFsBe/km0jxis6KgMpl3IGY6I/i1RwQXO05I1AsXUXO2WC6AvB/Lw4qTf/asiuEiQ==}
+  '@tauri-apps/cli-win32-arm64-msvc@2.12.1':
+    resolution: {integrity: sha512-I0oPk2uGh86R8dAs2X5OxSP+/GqSc8jh1Px3l8EqrocSNivsRHDTh2k3PVOqdv163dlV6PIVvmhZAbH/lPfZrA==}
     engines: {node: '>= 10'}
     cpu: [arm64]
     os: [win32]
 
-  '@tauri-apps/cli-win32-ia32-msvc@2.11.4':
-    resolution: {integrity: sha512-12Hxi0XX/H5VFxO/bGgHkFWhml9VMgEOu9CidjeCeTNQ1l6fpUlbiGgSP7CLI3PFtW9/FfbeHieZ+kyWK5H7CA==}
+  '@tauri-apps/cli-win32-ia32-msvc@2.12.1':
+    resolution: {integrity: sha512-baNZRBfepAJ5qNFRMwzgBk94xQmkcmTZrNDjZjnzrq2vAaTC3NAhallb/zo3hyoCGQlMS13sdovktrg46NZz6Q==}
     engines: {node: '>= 10'}
     cpu: [ia32]
     os: [win32]
 
-  '@tauri-apps/cli-win32-x64-msvc@2.11.4':
-    resolution: {integrity: sha512-+vDiqBIU5dMISg/wNvX3sF+ZHfgJGJ5T0AcO+EHNXV9GGAG+P5fzodlDXD3QdKCRgZxMoCm5PPvj3BqLNjBthw==}
+  '@tauri-apps/cli-win32-x64-msvc@2.12.1':
+    resolution: {integrity: sha512-dIFaKslrzcbesb+bBh+E1R9km241pHyj32w6D9FPtvQeYpRUFbiCLEa/2S+S0UnIytfxepp4P+X8IerGqnXeYg==}
     engines: {node: '>= 10'}
     cpu: [x64]
     os: [win32]
 
-  '@tauri-apps/cli@2.11.4':
-    resolution: {integrity: sha512-R8xGtMpwyetawSqm9kYOuMmEqkhUbvcUy8n0aNXIxollKBLESUu5f4Fx+64hgASYm1H+jSWq6jCW6zqTnH6hqQ==}
+  '@tauri-apps/cli@2.12.1':
+    resolution: {integrity: sha512-kEDEiGzG+yAc5FeLxtXpES/VN+F2C8H0r4gDVtfRLKxT9np9101d9REG/Kgo2lr0hKi0IpDsODiHnU3+naOmLg==}
     engines: {node: '>= 10'}
     hasBin: true
 
@@ -623,8 +642,8 @@ packages:
   '@types/json-schema@7.0.15':
     resolution: {integrity: sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==}
 
-  '@types/node@22.20.1':
-    resolution: {integrity: sha512-EANqOCF9QFyra+4pfxUcX9STKJpCLjMbObVzljIJomAWSnuSIEAvyzEU53GaajbXJEgdh0iEcPL+DGvpUd4k1Q==}
+  '@types/node@22.20.5':
+    resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
 
   '@types/prop-types@15.7.15':
     resolution: {integrity: sha512-F6bEyamV9jKGAFBEmlQnesRPGOQqS2+Uwi0Em15xenOxHaf2hv6L8YCVn3rPdPJOiJfPiCnLIRyvwVaqMY3MIw==}
@@ -856,11 +875,6 @@ packages:
   flatted@3.4.4:
     resolution: {integrity: sha512-5+ybhBZANEJxaH3X5evAFatUxLfEHSr7n6kYJ+1Qd0mUqr4eu9gIf6GDbWHf8RJijHrjjO8G+la14SlL2SeS1Q==}
 
-  fsevents@2.3.2:
-    resolution: {integrity: sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==}
-    engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
-    os: [darwin]
-
   fsevents@2.3.3:
     resolution: {integrity: sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==}
     engines: {node: ^8.16.0 || ^10.6.0 || >=11.0.0}
@@ -1000,13 +1014,13 @@ packages:
     resolution: {integrity: sha512-qcJu88Q2IWqJsDD529JKMdwGm/dvInW4HvQnRwiH9JtihJvzGOscDtHE3x1pBKeUOTysQ8kVmLnJ2kJu7yhcGA==}
     engines: {node: '>=12'}
 
-  playwright-core@1.62.1:
-    resolution: {integrity: sha512-wPYSwEBJY9GHraISXqyqtx0na0LpO3XEX7jNDhntbex7tzUS7kLnZsOlFruFJB4Hi/rhDMjXGqHewDZ68nYZVw==}
+  playwright-core@1.63.0:
+    resolution: {integrity: sha512-rYCsBF/M5HjUch52bbtVONEFjv6Xu8sm8h72dNlR5bzIE1fvC/bxgspzkjSfU+MweEMmPM8KJebG6nnyxo5mCg==}
     engines: {node: '>=20'}
     hasBin: true
 
-  playwright@1.62.1:
-    resolution: {integrity: sha512-0M+L3LAD8/nm554LOla9Ayx0j0tmFZ0FBcoQ7F1VuVHpM/XpiC8RcDzBQB8W5+hA8L22THxELzeF+2WcUzvcLg==}
+  playwright@1.63.0:
+    resolution: {integrity: sha512-+7ziBLidS4NaNCdt57SUDT+wYmmd5fmiQejUic/kb+YsYSCPyOOE9sebzMjNmQrsnNpDJqd4WHvV/8lfKfUDUg==}
     engines: {node: '>=20'}
     hasBin: true
 
@@ -1470,9 +1484,9 @@ snapshots:
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true
 
-  '@playwright/test@1.62.1':
+  '@playwright/test@1.63.0':
     dependencies:
-      playwright: 1.62.1
+      playwright: 1.63.0
 
   '@remix-run/router@1.23.4': {}
 
@@ -1553,54 +1567,54 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.63.0':
     optional: true
 
-  '@tauri-apps/api@2.11.1': {}
+  '@tauri-apps/api@2.12.1': {}
 
-  '@tauri-apps/cli-darwin-arm64@2.11.4':
+  '@tauri-apps/cli-darwin-arm64@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-darwin-x64@2.11.4':
+  '@tauri-apps/cli-darwin-x64@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-arm-gnueabihf@2.11.4':
+  '@tauri-apps/cli-linux-arm-gnueabihf@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-arm64-gnu@2.11.4':
+  '@tauri-apps/cli-linux-arm64-gnu@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-arm64-musl@2.11.4':
+  '@tauri-apps/cli-linux-arm64-musl@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-riscv64-gnu@2.11.4':
+  '@tauri-apps/cli-linux-riscv64-gnu@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-x64-gnu@2.11.4':
+  '@tauri-apps/cli-linux-x64-gnu@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-linux-x64-musl@2.11.4':
+  '@tauri-apps/cli-linux-x64-musl@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-win32-arm64-msvc@2.11.4':
+  '@tauri-apps/cli-win32-arm64-msvc@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-win32-ia32-msvc@2.11.4':
+  '@tauri-apps/cli-win32-ia32-msvc@2.12.1':
     optional: true
 
-  '@tauri-apps/cli-win32-x64-msvc@2.11.4':
+  '@tauri-apps/cli-win32-x64-msvc@2.12.1':
     optional: true
 
-  '@tauri-apps/cli@2.11.4':
+  '@tauri-apps/cli@2.12.1':
     optionalDependencies:
-      '@tauri-apps/cli-darwin-arm64': 2.11.4
-      '@tauri-apps/cli-darwin-x64': 2.11.4
-      '@tauri-apps/cli-linux-arm-gnueabihf': 2.11.4
-      '@tauri-apps/cli-linux-arm64-gnu': 2.11.4
-      '@tauri-apps/cli-linux-arm64-musl': 2.11.4
-      '@tauri-apps/cli-linux-riscv64-gnu': 2.11.4
-      '@tauri-apps/cli-linux-x64-gnu': 2.11.4
-      '@tauri-apps/cli-linux-x64-musl': 2.11.4
-      '@tauri-apps/cli-win32-arm64-msvc': 2.11.4
-      '@tauri-apps/cli-win32-ia32-msvc': 2.11.4
-      '@tauri-apps/cli-win32-x64-msvc': 2.11.4
+      '@tauri-apps/cli-darwin-arm64': 2.12.1
+      '@tauri-apps/cli-darwin-x64': 2.12.1
+      '@tauri-apps/cli-linux-arm-gnueabihf': 2.12.1
+      '@tauri-apps/cli-linux-arm64-gnu': 2.12.1
+      '@tauri-apps/cli-linux-arm64-musl': 2.12.1
+      '@tauri-apps/cli-linux-riscv64-gnu': 2.12.1
+      '@tauri-apps/cli-linux-x64-gnu': 2.12.1
+      '@tauri-apps/cli-linux-x64-musl': 2.12.1
+      '@tauri-apps/cli-win32-arm64-msvc': 2.12.1
+      '@tauri-apps/cli-win32-ia32-msvc': 2.12.1
+      '@tauri-apps/cli-win32-x64-msvc': 2.12.1
 
   '@types/babel__core@7.20.5':
     dependencies:
@@ -1629,7 +1643,7 @@ snapshots:
 
   '@types/json-schema@7.0.15': {}
 
-  '@types/node@22.20.1':
+  '@types/node@22.20.5':
     dependencies:
       undici-types: 6.21.0
 
@@ -1735,7 +1749,7 @@ snapshots:
       '@typescript-eslint/types': 8.71.0
       eslint-visitor-keys: 5.0.1
 
-  '@vitejs/plugin-react@4.7.0(vite@5.4.21(@types/node@22.20.1))':
+  '@vitejs/plugin-react@4.7.0(vite@5.4.21(@types/node@22.20.5))':
     dependencies:
       '@babel/core': 7.29.7
       '@babel/plugin-transform-react-jsx-self': 7.29.7(@babel/core@7.29.7)
@@ -1743,7 +1757,7 @@ snapshots:
       '@rolldown/pluginutils': 1.0.0-beta.27
       '@types/babel__core': 7.20.5
       react-refresh: 0.17.0
-      vite: 5.4.21(@types/node@22.20.1)
+      vite: 5.4.21(@types/node@22.20.5)
     transitivePeerDependencies:
       - supports-color
 
@@ -1936,9 +1950,6 @@ snapshots:
 
   flatted@3.4.4: {}
 
-  fsevents@2.3.2:
-    optional: true
-
   fsevents@2.3.3:
     optional: true
 
@@ -2046,13 +2057,11 @@ snapshots:
 
   picomatch@4.0.7: {}
 
-  playwright-core@1.62.1: {}
+  playwright-core@1.63.0: {}
 
-  playwright@1.62.1:
+  playwright@1.63.0:
     dependencies:
-      playwright-core: 1.62.1
-    optionalDependencies:
-      fsevents: 2.3.2
+      playwright-core: 1.63.0
 
   postcss@8.5.26:
     dependencies:
@@ -2182,13 +2191,13 @@ snapshots:
     dependencies:
       react: 18.3.1
 
-  vite@5.4.21(@types/node@22.20.1):
+  vite@5.4.21(@types/node@22.20.5):
     dependencies:
       esbuild: 0.21.5
       postcss: 8.5.26
       rollup: 4.63.0
     optionalDependencies:
-      '@types/node': 22.20.1
+      '@types/node': 22.20.5
       fsevents: 2.3.3
 
   which@2.0.2:
