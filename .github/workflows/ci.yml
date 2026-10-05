@@ -63,7 +63,7 @@ jobs:
       - name: Cache pnpm store
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@9.15.0 --activate
@@ -291,7 +291,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@9.15.0 --activate
@@ -363,7 +363,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -407,7 +407,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install pnpm
         run: corepack enable && corepack prepare pnpm@9.15.0 --activate
@@ -464,7 +464,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
