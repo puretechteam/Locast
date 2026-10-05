@@ -70,6 +70,17 @@ jobs:
     name: signing preflight
     runs-on: ubuntu-latest
     steps:
+      # A tag push must name the version the installers will carry (read from
+      # tauri.conf.json); otherwise v1.0.0 would publish installers versioned
+      # 0.0.0. Manual runs have no tag, so this is skipped for them.
+      - name: Checkout
+        if: github.ref_type == 'tag'
+        uses: actions/checkout@v4
+
+      - name: Tag matches the app version
+        if: github.ref_type == 'tag'
+        run: bash scripts/check-release-version.sh "$GITHUB_REF_NAME"
+
       - name: Require signing credentials
         if: env.SIGNED == 'true'
         env:
