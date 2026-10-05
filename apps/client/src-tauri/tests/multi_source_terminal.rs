@@ -263,6 +263,8 @@ async fn losing_every_source_records_failed_with_a_reason() {
         .expect("receiver"),
     );
 
+    let cancel = receiver.cancel_handle();
+    assert!(!cancel.is_cancelled(), "precondition: not cancelled yet");
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         run_multi_source(receiver, "fixture.bin".into()),
@@ -270,6 +272,10 @@ async fn losing_every_source_records_failed_with_a_reason() {
     .await
     .expect("must return, not hang");
     assert!(res.is_err(), "a download that lost its source is an error");
+    assert!(
+        cancel.is_cancelled(),
+        "a finished run releases the tasks waiting on its cancel token"
+    );
 
     let states = states_for(&sink, &f.plan.download_id);
     let (last, message) = states.last().cloned().expect("some state");

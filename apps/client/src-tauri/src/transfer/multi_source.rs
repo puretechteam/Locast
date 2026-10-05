@@ -593,6 +593,11 @@ pub async fn run_multi_source(
     if let Err(err) = &result {
         record_terminal_state_after_error(&receiver, err).await;
     }
+    // The run is over, whatever the outcome. Cancelling the token releases
+    // the per-source tasks that wait on it (the watcher spawned in `new`
+    // and the receive loops); nothing else would, so they would otherwise
+    // outlive every download that was not cancelled.
+    receiver.cancel.cancel();
     result
 }
 
