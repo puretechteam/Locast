@@ -1326,12 +1326,21 @@ impl RoomClient {
         // it.
         *self.state.lock().await = None;
         *self.local_user_id.lock().await = None;
+        self.forget_room_session();
+        self.abort_presence_loop().await;
+        Ok(())
+    }
+
+    /// Drop what a post-reconnect rejoin or a republish would use: the
+    /// join credentials and the host's media selection. Called whenever
+    /// the user is no longer in the room, whether they left or the
+    /// server ended it, so a later WS reconnect does not re-join a dead
+    /// room.
+    fn forget_room_session(&self) {
         if let Ok(mut g) = self.active_room_code.lock() {
             *g = None;
         }
         self.set_host_media_selection(None);
-        self.abort_presence_loop().await;
-        Ok(())
     }
 
     /// P7-T01: send an envelope, buffering it if the
@@ -1938,6 +1947,7 @@ impl RoomClient {
             MessageKind::RoomClosed | MessageKind::RoomError => {
                 *self.state.lock().await = None;
                 *self.local_user_id.lock().await = None;
+                self.forget_room_session();
                 self.emit_state_cleared().await;
                 self.abort_presence_loop().await;
             }
@@ -3022,6 +3032,34 @@ mod tests {
         );
         rc.handle_inbound(env).await;
         assert!(rc.state().await.is_none());
+    }
+
+    /// After the server ends the room, a later WS reconnect must not
+    /// re-join it (the post-AUTH_OK hook reads these credentials), and
+    /// the host's media selection must not leak into the next room.
+    #[tokio::test]
+    async fn room_closed_forgets_the_rejoin_credentials_and_media_selection() {
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+        *rc.active_room_code.lock().expect("lock") = Some(("ABC123".into(), "viewer".into()));
+        rc.set_host_media_selection(Some(vec!["m1".into()]));
+
+        let env = env_of(
+            MessageKind::RoomClosed,
+            serde_json::to_value(locast_protocol::room::RoomClosedPayload {
+                reason: "host_left".into(),
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+
+        assert!(rc.active_room_code.lock().expect("lock").is_none());
+        assert!(rc.host_media_selection().is_none());
+        assert!(
+            rc.rejoin_active_room().await.is_ok(),
+            "with no credentials the rejoin is a no-op and sends nothing"
+        );
     }
 
     #[tokio::test]
