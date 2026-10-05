@@ -816,17 +816,7 @@ impl RoomRegistry {
         };
 
         let id = Uuid::now_v7();
-        let cap_set = cap::PLAYBACK_CONTROL
-            | cap::DRAW
-            | cap::LASER
-            | cap::MANAGE_ROOM
-            | cap::KICK
-            | cap::PUBLISH_MANIFEST
-            | cap::INVITE
-            | cap::CHAT
-            | cap::UNDO_OWN
-            | cap::UNDO_ANY
-            | cap::CLEAR_ALL;
+        let cap_set = cap::HOST;
         // Persist the room row first.
         store
             .insert_room(
@@ -1712,17 +1702,7 @@ impl RoomRegistry {
             // synthesize one. We synthesize one with the
             // room's host_user_id and the full cap set
             // (matching what `create` does).
-            let cap_set = cap::PLAYBACK_CONTROL
-                | cap::DRAW
-                | cap::LASER
-                | cap::MANAGE_ROOM
-                | cap::KICK
-                | cap::PUBLISH_MANIFEST
-                | cap::INVITE
-                | cap::CHAT
-                | cap::UNDO_OWN
-                | cap::UNDO_ANY
-                | cap::CLEAR_ALL;
+            let cap_set = cap::HOST;
             let status = if deadline.is_some() {
                 ParticipantStatus::Reconnecting
             } else {

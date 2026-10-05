@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import { sendPositionReport } from "../services/playback";
+import { applyPlaybackToVideo } from "../services/hostPlayback";
 import { usePlayerRoomEvents } from "../hooks/usePlayerRoomEvents";
 import { DrawingLayer } from "./DrawingLayer";
 
@@ -46,16 +47,15 @@ import { DrawingLayer } from "./DrawingLayer";
  *
  * Host echo suppression
  * ---------------------
- * When the host's client receives its own
- * `playback://state` event (the server rebroadcasts
- * to every participant), this component ignores the
- * event if the originating `sender_id` matches the
- * `localUserId` prop AND the local user is the host
- * (per the `isHost` prop). The host applied the
- * command locally before sending; the rebroadcast
- * is just the server's confirmation. This is purely
- * a no-op (we still record `lastAppliedServerSeq` so
- * stale events from a future host are dropped).
+ * The server does not rebroadcast a PLAYBACK_CMD to the
+ * host that sent it, so the host applies each command to
+ * its own <video> before sending and then records it in
+ * the store itself (`services/hostPlayback.ts`). When
+ * `lastApplied` carries a `sender_id` equal to the
+ * `localUserId` prop AND the local user is the host (per
+ * the `isHost` prop), this component skips the DOM: the
+ * <video> is already in that state. `markApplied` still
+ * runs so the store's bookkeeping stays consistent.
  */
 export interface PlayerProps {
     /** The local user's user_id, used to detect host
@@ -115,35 +115,21 @@ export function Player({
         const v = ref.current;
         if (!v) return;
         if (isHost && localUserId && lastApplied.sender_id === localUserId) {
-            // Host echo: the host applied the change
-            // locally before sending. Record the
-            // server_seq and skip DOM mutation; the
+            // The host's own command, recorded by
+            // `sendHostPlaybackCommand` after it applied
+            // the change locally: skip DOM mutation; the
             // <video> is already in the correct state.
             markApplied(lastApplied.server_seq);
             return;
         }
-        // The wire unit is milliseconds; the DOM unit
-        // is seconds. P4-T02 only deals with positions
-        // in ms (the spec is ms end-to-end).
-        const targetSec = lastApplied.media_position_ms / 1000;
-        if (Math.abs(v.currentTime - targetSec) > 0.01) {
-            v.currentTime = targetSec;
-        }
         const kind: PlaybackKind = lastApplied.kind as PlaybackKind;
-        if (kind === "play") {
-            const res = v.play();
-            if (res && typeof (res as Promise<void>).then === "function") {
-                (res as Promise<void>).catch((err: unknown) => {
-                    setErrorMessage(
-                        err instanceof Error
-                            ? `local play() rejected: ${err.message}`
-                            : "local play() rejected",
-                    );
-                });
-            }
-        } else if (kind === "pause") {
-            v.pause();
-        }
+        applyPlaybackToVideo(v, kind, lastApplied.media_position_ms, (err) => {
+            setErrorMessage(
+                err instanceof Error
+                    ? `local play() rejected: ${err.message}`
+                    : "local play() rejected",
+            );
+        });
         markApplied(lastApplied.server_seq);
     }, [lastApplied, localUserId, isHost, markApplied]);
 

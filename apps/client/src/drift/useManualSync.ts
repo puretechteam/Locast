@@ -75,7 +75,7 @@
 
 import { useCallback } from "react";
 import { usePlaybackStore, type PlaybackStateEvent } from "../stores/usePlaybackStore";
-import { sendPlaybackCommand } from "../services/playback";
+import { sendHostPlaybackCommand } from "../services/hostPlayback";
 import {
     computeSyncTarget,
     expectedPositionMs,
@@ -138,14 +138,12 @@ export interface ManualSyncResult extends ManualSyncTarget {
     localSeek: () => Promise<boolean>;
     /** Host branch: local seek + emit a
      *  `PLAYBACK_CMD{action:"seek"}` envelope through
-     *  the existing `sendPlaybackCommand` IPC path.
-     *  Resolves to `true` on the server's acceptance,
-     *  `false` on cap-gate rejection or any other
-     *  IPC error. The local seek is always attempted
-     *  (matches the existing host-echo behavior: the
-     *  host's local `<video>` element is moved
-     *  immediately; the rebroadcast is suppressed by
-     *  Player.tsx's host-echo check). */
+     *  `sendHostPlaybackCommand`. Resolves to `true` once
+     *  the envelope is sent, `false` when the local seek
+     *  was skipped or the send failed (the server's
+     *  verdict is asynchronous). The host's local
+     *  `<video>` element is moved immediately; the server
+     *  never echoes the command back to the host. */
     authoritativeSeek: () => Promise<boolean>;
 }
 
@@ -161,8 +159,11 @@ export function useManualSync(args: {
     /** Skew offset (server - local), ms. Defaults to 0
      *  in v1; P4-T06 will populate. */
     skewMs?: number;
+    /** The local user's id, stamped on the host branch's
+     *  recorded SEEK (see `sendHostPlaybackCommand`). */
+    localUserId?: string | null;
 }): ManualSyncResult {
-    const { roomId, isHost, getVideo, skewMs = 0 } = args;
+    const { roomId, isHost, getVideo, skewMs = 0, localUserId = null } = args;
 
     const target: ManualSyncTarget = (() => {
         // Re-derive on every render. The call is cheap
@@ -252,21 +253,22 @@ export function useManualSync(args: {
     }, [roomId, getVideo, skewMs]);
 
     const authoritativeSeek = useCallback(async (): Promise<boolean> => {
-        // Step 1: local seek (same as the viewer branch;
-        // matches the existing host-echo behavior where
-        // the host's local <video> is moved immediately
-        // and the server's rebroadcast is suppressed).
+        // Step 1: local seek (same as the viewer branch):
+        // the host's local <video> is moved immediately,
+        // since the server never echoes the command back.
         const localOk = await localSeek();
         if (localOk === false) return false;
         // Step 2: emit PLAYBACK_CMD{action:"seek"} through
-        // the existing IPC path. The host's monotonic
-        // seq is read+advanced atomically in
-        // `bumpHostSeq` so a click during an in-flight
-        // emit gets a fresh seq.
+        // `sendHostPlaybackCommand`, which owns the seq, the
+        // give-back on a failed send, and recording the
+        // command as the host's own `lastApplied` (the
+        // server does not echo it back). The <video> was
+        // already moved by `localSeek`, so it is not
+        // passed again.
+        if (roomId === null) return false;
         const state = usePlaybackStore.getState();
         const { last } = resolveHostCommand(state.lastApplied, roomId);
         if (last === null) return false;
-        const seq = state.bumpHostSeq();
         const targetMs = expectedPositionMs(
             {
                 mediaPositionMs: last.media_position_ms,
@@ -276,19 +278,14 @@ export function useManualSync(args: {
             skewMs,
         );
         if (targetMs === null) return false;
-        try {
-            await sendPlaybackCommand({
-                action: "seek",
-                monotonic_seq: seq,
-                media_position_ms: targetMs,
-            });
-            return true;
-        } catch (err) {
-            // eslint-disable-next-line no-console
-            console.warn("manual sync seek failed", err);
-            return false;
-        }
-    }, [localSeek, roomId, skewMs]);
+        return await sendHostPlaybackCommand({
+            roomId,
+            localUserId,
+            kind: "seek",
+            mediaPositionMs: targetMs,
+            video: null,
+        });
+    }, [localSeek, roomId, localUserId, skewMs]);
 
     return {
         ...target,

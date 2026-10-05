@@ -1,6 +1,10 @@
 import { useCallback } from "react";
-import { usePlaybackStore } from "../stores/usePlaybackStore";
-import { sendPlaybackCommand } from "../services/playback";
+import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
+import { useRoomStore } from "../stores/useRoomStore";
+import {
+    hostCommandAllowed,
+    sendHostPlaybackCommand,
+} from "../services/hostPlayback";
 
 /**
  * P4-T02: host-only playback control buttons.
@@ -10,98 +14,83 @@ import { sendPlaybackCommand } from "../services/playback";
  * the server's cap gate (P4-T01) rejects non-host
  * callers with a single-caller `ROOM_ERROR(NotHost)`.
  *
- * The host's `monotonic_seq` is tracked locally in a
- * `useRef`. The host is the only sender that needs a
- * monotonic sequence; the server's per-sender table
- * (`last_acked_seq`) keys on `user_id` (not pubkey),
- * so the sequence survives the host's own reconnect
- * within a single session but resets to 0 across
- * host migrations (the new host's first command is
- * always `monotonic_seq = 1`).
+ * Every send goes through `sendHostPlaybackCommand`
+ * (`services/hostPlayback.ts`): the command is applied to
+ * the host's own `<video>` first (the server never echoes
+ * a PLAYBACK_CMD back to its sender), then sent with the
+ * shared host `monotonic_seq` (`usePlaybackStore.bumpHostSeq`,
+ * also used by the Sync button's host branch), then
+ * recorded as the host's `lastApplied`.
  *
- * The host's local `<video>` element applies the
- * command locally before `sendPlaybackCommand`
- * resolves; the server's rebroadcast is ignored by the
- * Player's host-echo suppression (see `Player.tsx`).
+ * PLAY and PAUSE carry the host's actual `<video>`
+ * position, so viewers land where the host is. Pause and
+ * Seek stay disabled until the room has a known command:
+ * the server rejects them while the room is still `Open`.
  */
 export interface PlaybackControlsProps {
     /** Whether the local user is the current host. If
      * `false`, the controls render as disabled and
      * the `send` calls are blocked. */
     isHost: boolean;
-    /** The current media position in milliseconds, for
-     * display + a sensible default SEEK value. The
-     * server is the authority; the host's UI shows
-     * whatever the most recently applied event
-     * carried. */
+    /** The last known room position in milliseconds, used
+     * for PLAY / PAUSE only when the host's `<video>` is not
+     * mounted. */
     positionMs: number;
+    /** The local user's id, stamped on the host's recorded
+     * command so the Player's host-echo check recognizes it. */
+    localUserId?: string | null;
+    /** The host's live `<video>` element (null while no
+     * media is mounted). */
+    getVideo?: () => HTMLVideoElement | null;
 }
 
 export function PlaybackControls({
     isHost,
     positionMs,
+    localUserId = null,
+    getVideo,
 }: PlaybackControlsProps): React.ReactNode {
-    // P4-T05: the host's monotonic sequence is now
-    // shared across all host-authoritative emit paths
-    // (the existing Play/Pause/Seek buttons here AND
-    // the Sync button's host branch) via
-    // `usePlaybackStore.bumpHostSeq`. We read+advance
-    // atomically in `send` and on server rejection the
-    // counter is NOT rolled back, so a retry must NOT
-    // call `bumpHostSeq` again -- it must reuse the
-    // same `seq`. The local `useRef` counter that lived
-    // here previously is removed; the store is the
-    // single source of truth.
-    const bumpHostSeq = usePlaybackStore((s) => s.bumpHostSeq);
+    const roomId = useRoomStore((s) => s.summary?.id ?? null);
+    // Re-render when a command lands so Pause / Seek enable.
+    const hasRoomCommand = usePlaybackStore(
+        (s) => s.lastApplied !== null && s.lastApplied.room_id === roomId,
+    );
 
     const send = useCallback(
-        async (
-            action: "play" | "pause" | "seek",
-            media_position_ms: number,
-        ): Promise<void> => {
-            if (!isHost) return;
-            const seq = bumpHostSeq();
-            try {
-                await sendPlaybackCommand({
-                    action,
-                    monotonic_seq: seq,
-                    media_position_ms,
-                });
-                // Reaching this line means the server
-                // accepted the command. The counter has
-                // already been advanced by `bumpHostSeq`
-                // above; on rejection it is left
-                // advanced so the next emit does NOT
-                // reuse this seq (the server already
-                // rejected it as out-of-order or
-                // invalid). The caller can recover by
-                // resetting the store on room change.
-            } catch (err) {
-                // Surface to the host's console. The
-                // host can recover by leaving/rejoining
-                // the room which resets `hostNextSeq` via
-                // `setRoomId` -> `clear()`.
-                // eslint-disable-next-line no-console
-                console.warn("playback_send failed", err);
-            }
+        (kind: PlaybackKind, fixedPositionMs?: number): void => {
+            if (!isHost || roomId === null) return;
+            if (!hostCommandAllowed(kind, roomId)) return;
+            const video = getVideo?.() ?? null;
+            const mediaPositionMs =
+                fixedPositionMs ??
+                (video !== null ? video.currentTime * 1000 : positionMs);
+            void sendHostPlaybackCommand({
+                roomId,
+                localUserId,
+                kind,
+                mediaPositionMs,
+                video,
+            });
         },
-        [isHost, bumpHostSeq],
+        [isHost, roomId, localUserId, getVideo, positionMs],
     );
 
     const onPlay = useCallback(() => {
-        void send("play", positionMs);
-    }, [send, positionMs]);
+        send("play");
+    }, [send]);
     const onPause = useCallback(() => {
-        void send("pause", positionMs);
-    }, [send, positionMs]);
+        send("pause");
+    }, [send]);
     // SEEK to 60 s is the literal P4-T02 acceptance
     // test target. The host can also use the
     // <video> element's native scrubber to seek; the
-    // scrubber is NOT wired to send PLAYBACK_CMD in
-    // P4-T02 (that is a P4-T05 / "manual sync" task).
+    // scrubber is NOT wired to send PLAYBACK_CMD (only
+    // these buttons and the Sync button send).
     const onSeek60 = useCallback(() => {
-        void send("seek", 60_000);
+        send("seek", 60_000);
     }, [send]);
+    const needsPlayFirst = isHost && !hasRoomCommand;
+    const playFirstHint = needsPlayFirst ? "Press Play first" : undefined;
 
     return (
         <div className="playback-controls" data-testid="locast-playback-controls">
@@ -116,7 +105,8 @@ export function PlaybackControls({
             <button
                 type="button"
                 onClick={onPause}
-                disabled={!isHost}
+                disabled={!isHost || needsPlayFirst}
+                title={playFirstHint}
                 data-testid="locast-playback-pause"
             >
                 Pause
@@ -124,7 +114,8 @@ export function PlaybackControls({
             <button
                 type="button"
                 onClick={onSeek60}
-                disabled={!isHost}
+                disabled={!isHost || needsPlayFirst}
+                title={playFirstHint}
                 data-testid="locast-playback-seek60"
             >
                 Seek 60s

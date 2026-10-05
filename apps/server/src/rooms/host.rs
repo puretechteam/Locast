@@ -75,17 +75,7 @@ pub(super) fn elect_new_host(state: &mut RoomState) -> Option<Uuid> {
     for p in state.participants.iter_mut() {
         if p.user_id == new_host {
             p.is_host = true;
-            p.cap_set = locast_protocol::room::cap::PLAYBACK_CONTROL
-                | locast_protocol::room::cap::DRAW
-                | locast_protocol::room::cap::LASER
-                | locast_protocol::room::cap::MANAGE_ROOM
-                | locast_protocol::room::cap::KICK
-                | locast_protocol::room::cap::PUBLISH_MANIFEST
-                | locast_protocol::room::cap::INVITE
-                | locast_protocol::room::cap::CHAT
-                | locast_protocol::room::cap::UNDO_OWN
-                | locast_protocol::room::cap::UNDO_ANY
-                | locast_protocol::room::cap::CLEAR_ALL;
+            p.cap_set = locast_protocol::room::cap::HOST;
         } else if p.is_host && p.user_id != new_host {
             p.is_host = false;
             p.cap_set = locast_protocol::room::cap::CHAT;

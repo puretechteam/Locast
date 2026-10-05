@@ -33,3 +33,10 @@ export async function grantCapability(targetUserId: string, cap: Cap): Promise<v
 export async function revokeCapability(targetUserId: string, cap: Cap): Promise<void> {
     await commands.roomPermissionSet(targetUserId, 0, cap);
 }
+
+/** Replace the participant's whole cap set with `caps`. The
+ *  server treats `remove_cap_set == u32::MAX` as "replace"
+ *  (`apps/server/src/rooms/permissions.rs`). */
+export async function setCapabilities(targetUserId: string, caps: Cap): Promise<void> {
+    await commands.roomPermissionSet(targetUserId, caps, 0xffff_ffff);
+}

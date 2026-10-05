@@ -96,6 +96,12 @@ pub enum PlaybackError {
     NotJoined,
     #[error("room is not open for playback commands")]
     RoomClosed,
+    /// The room is live but its lifecycle does not accept this
+    /// action (PAUSE / SEEK before the first PLAY). Wire code
+    /// `InvalidState`, so the client keeps the room: only the
+    /// command was refused.
+    #[error("playback action not allowed in the room's current state")]
+    InvalidTransition,
     #[error("caller may not issue playback commands")]
     NotHost,
     #[error("playback monotonic_seq gap (got {got}, expected {expected})")]
@@ -197,7 +203,7 @@ pub async fn handle_playback_cmd(
             // §11.1: idempotent. Drops through.
         }
         (RoomLifecycle::Playing | RoomLifecycle::Paused, PlaybackAction::Seek) => {}
-        _ => return Err(PlaybackError::RoomClosed),
+        _ => return Err(PlaybackError::InvalidTransition),
     }
 
     // 5. Per-sender monotonic-seq check. The valid window is
@@ -284,6 +290,7 @@ impl From<PlaybackError> for RoomError {
             PlaybackError::NoRoomId => RoomError::InvalidState,
             PlaybackError::NotJoined => RoomError::NotJoined,
             PlaybackError::RoomClosed => RoomError::RoomClosed,
+            PlaybackError::InvalidTransition => RoomError::InvalidState,
             PlaybackError::NotHost => RoomError::NotHost,
             PlaybackError::StaleCommand { got, expected } => {
                 RoomError::StaleCommand { got, expected }
@@ -549,8 +556,17 @@ mod tests {
         let env = envelope(room_id, host_uid, host_pk, PlaybackAction::Pause, 1, 0);
         let err = handle_playback_cmd(&env, &reg, &clock, host_uid, host_pk)
             .await
-            .expect_err("expected RoomClosed");
-        assert!(matches!(err, PlaybackError::RoomClosed), "got {err:?}");
+            .expect_err("expected InvalidTransition");
+        assert!(
+            matches!(err, PlaybackError::InvalidTransition),
+            "got {err:?}"
+        );
+        // The room is still live: the wire code must not tell
+        // the client the room ended.
+        assert_eq!(
+            locast_protocol::room::RoomErrorCode::from(RoomError::from(err)),
+            locast_protocol::room::RoomErrorCode::InvalidState
+        );
     }
 
     #[tokio::test]

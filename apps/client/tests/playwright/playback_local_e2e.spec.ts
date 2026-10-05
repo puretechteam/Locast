@@ -216,9 +216,7 @@ test("a room://event is received and changes nothing about playback", async ({ p
 
     // A same-room update, as the server sends for capability changes. The room
     // page applies it to its summary; the Player's listener must just observe it.
-    // (The harness's event shim hands listeners `envelope.payload`, but the
-    // bindings read `.payload` off that, so the summary is wrapped once more.)
-    await locast.emitCapabilityUpdate({ payload: { ...ROOM, title: "P1-T10 renamed" } } as never);
+    await locast.emitCapabilityUpdate({ ...ROOM, title: "P1-T10 renamed" } as never);
     await expect.poll(async () => (await listeners(page)).received).toBe(receivedBefore + 1);
 
     const after = await snapshot();

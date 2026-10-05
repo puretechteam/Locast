@@ -37,7 +37,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
     HostMigratedPayload, Participant, ParticipantStatus, PresencePayload, RoomCreatePayload,
-    RoomErrorCode, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload, RoomSummary,
+    RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload,
+    RoomSummary,
 };
 use serde::Serialize;
 use specta::Type;
@@ -242,6 +243,38 @@ impl From<RoomSummary> for RoomSummaryIpc {
             you_cap_set: None,
             you_user_id: None,
         }
+    }
+}
+
+/// Whether a ROOM_ERROR means the local user is no longer
+/// in the room. A payload that does not decode counts as
+/// ending it (the conservative, pre-existing behavior).
+fn room_error_ends_membership(env: &Envelope) -> bool {
+    match decode_payload::<RoomErrorPayload>(env) {
+        Ok(p) => matches!(
+            p.code,
+            RoomErrorCode::Unauthorized
+                | RoomErrorCode::RoomNotFound
+                | RoomErrorCode::RoomClosed
+                | RoomErrorCode::NotJoined
+        ),
+        Err(_) => true,
+    }
+}
+
+/// The local user's cap set after a HOST_MIGRATED: the
+/// promoted participant gets `cap::HOST`, the demoted host
+/// `cap::CHAT` (as `rooms::host::elect_new_host` on the
+/// server sets them); anyone else keeps `previous`.
+fn migrated_you_cap_set(
+    previous: Option<u32>,
+    local: Option<Uuid>,
+    m: &HostMigratedPayload,
+) -> Option<u32> {
+    match local {
+        Some(me) if me == m.new_host_user_id => Some(locast_protocol::room::cap::HOST),
+        Some(me) if me == m.previous_host_user_id => Some(locast_protocol::room::cap::CHAT),
+        _ => previous,
     }
 }
 
@@ -1729,8 +1762,13 @@ impl RoomClient {
                 if let Ok(state) = decode_payload::<RoomStatePayload>(&env) {
                     let local = *self.local_user_id.lock().await;
                     self.mirror_room_snapshot(&state.room, local).await;
-                    let summary = RoomSummaryIpc::from(state.room);
-                    *self.state.lock().await = Some(summary.clone());
+                    let mut summary = RoomSummaryIpc::from(state.room);
+                    // ROOM_STATE carries no `you` record: keep the
+                    // cap set the last create / join / update set.
+                    let mut g = self.state.lock().await;
+                    summary.you_cap_set = g.as_ref().and_then(|s| s.you_cap_set);
+                    *g = Some(summary.clone());
+                    drop(g);
                     self.emit_state(&summary).await;
                 }
             }
@@ -1771,18 +1809,32 @@ impl RoomClient {
                 }
             }
             MessageKind::HostMigrated => {
-                if let Ok(m) = decode_payload::<HostMigratedPayload>(&env) {
+                if let Ok(mut m) = decode_payload::<HostMigratedPayload>(&env) {
                     // P2-T05: if the server included a
                     // post-migration summary, REPLACE the
                     // cached state entirely. Otherwise
                     // fall back to the pre-P2-T05
                     // behavior of updating only the host
                     // fields.
-                    if let Some(boxed) = m.summary {
-                        let local = *self.local_user_id.lock().await;
+                    //
+                    // HOST_MIGRATED carries no `you` record and no
+                    // CAPABILITY_UPDATE follows it, so the local
+                    // cap set is carried over from the cached
+                    // summary (a DRAW / LASER grant must not vanish
+                    // from the UI) and only rewritten when the
+                    // migration changed the local user's role, the
+                    // same way the server does (`cap::HOST` for the
+                    // promoted participant, `cap::CHAT` for the
+                    // demoted host).
+                    let local = *self.local_user_id.lock().await;
+                    if let Some(boxed) = m.summary.take() {
                         self.mirror_room_snapshot(&boxed, local).await;
-                        let summary = RoomSummaryIpc::from(*boxed);
-                        *self.state.lock().await = Some(summary.clone());
+                        let mut summary = RoomSummaryIpc::from(*boxed);
+                        let mut g = self.state.lock().await;
+                        let previous = g.as_ref().and_then(|s| s.you_cap_set);
+                        summary.you_cap_set = migrated_you_cap_set(previous, local, &m);
+                        *g = Some(summary.clone());
+                        drop(g);
                         self.emit_state(&summary).await;
                         self.emit_event(&summary).await;
                     } else {
@@ -1791,6 +1843,7 @@ impl RoomClient {
                             s.host_user_id = m.new_host_user_id.to_string();
                             s.host_disconnected = false;
                             s.host_disconnect_deadline_ms = None;
+                            s.you_cap_set = migrated_you_cap_set(s.you_cap_set, local, &m);
                         }
                         if let Some(s) = g.as_ref() {
                             self.emit_state(s).await;
@@ -1874,6 +1927,13 @@ impl RoomClient {
             // end the room.
             MessageKind::RoomError if resolved == Some(MessageKind::ManifestResponse) => {
                 tracing::debug!("ROOM_ERROR answered a manifest fetch; room state kept");
+            }
+            // An unsolicited ROOM_ERROR that only rejects one
+            // fire-and-forget command (PLAYBACK_CMD, drawing,
+            // laser, PERMISSION_SET) does not end the room;
+            // only a code saying the membership is gone does.
+            MessageKind::RoomError if resolved.is_none() && !room_error_ends_membership(&env) => {
+                tracing::warn!("ROOM_ERROR rejected a command; room state kept");
             }
             MessageKind::RoomClosed | MessageKind::RoomError => {
                 *self.state.lock().await = None;
@@ -2832,6 +2892,92 @@ mod tests {
         assert_eq!(s.participants.len(), 1);
     }
 
+    /// Run one HOST_MIGRATED (A -> B, with or without the
+    /// post-migration summary) against a client whose local
+    /// user is `me` and whose cached `you_cap_set` is `caps`;
+    /// return the resulting `you_cap_set`.
+    async fn you_cap_set_after_migration(me: Uuid, caps: u32, with_summary: bool) -> Option<u32> {
+        let rc = fresh_room_client().await;
+        let host_a = Uuid::from_bytes([1u8; 16]);
+        let host_b = Uuid::from_bytes([2u8; 16]);
+        let mut cached = RoomSummaryIpc::from(sample_summary(host_a));
+        cached.you_cap_set = Some(caps);
+        *rc.state.lock().await = Some(cached);
+        *rc.local_user_id.lock().await = Some(me);
+        let payload = HostMigratedPayload {
+            previous_host_user_id: host_a,
+            new_host_user_id: host_b,
+            summary: with_summary.then(|| Box::new(sample_summary(host_b))),
+        };
+        let env = env_of(
+            MessageKind::HostMigrated,
+            serde_json::to_value(payload).unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        rc.state().await.expect("state").you_cap_set
+    }
+
+    #[tokio::test]
+    async fn host_migrated_keeps_a_bystanders_granted_caps() {
+        use locast_protocol::room::cap;
+        let bystander = Uuid::from_bytes([3u8; 16]);
+        let granted = cap::CHAT | cap::DRAW | cap::LASER;
+        for with_summary in [true, false] {
+            assert_eq!(
+                you_cap_set_after_migration(bystander, granted, with_summary).await,
+                Some(granted),
+                "with_summary = {with_summary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_migrated_gives_the_promoted_local_user_host_caps() {
+        use locast_protocol::room::cap;
+        let host_b = Uuid::from_bytes([2u8; 16]);
+        for with_summary in [true, false] {
+            assert_eq!(
+                you_cap_set_after_migration(host_b, cap::CHAT | cap::DRAW, with_summary).await,
+                Some(cap::HOST),
+                "with_summary = {with_summary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_migrated_drops_the_demoted_local_host_to_chat() {
+        use locast_protocol::room::cap;
+        let host_a = Uuid::from_bytes([1u8; 16]);
+        for with_summary in [true, false] {
+            assert_eq!(
+                you_cap_set_after_migration(host_a, cap::HOST, with_summary).await,
+                Some(cap::CHAT),
+                "with_summary = {with_summary}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn room_state_keeps_the_cached_you_cap_set() {
+        use locast_protocol::room::cap;
+        let rc = fresh_room_client().await;
+        let host = Uuid::from_bytes([1u8; 16]);
+        let mut cached = RoomSummaryIpc::from(sample_summary(host));
+        cached.you_cap_set = Some(cap::CHAT | cap::DRAW);
+        *rc.state.lock().await = Some(cached);
+        let env = env_of(
+            MessageKind::RoomState,
+            serde_json::to_value(RoomStatePayload {
+                room: sample_summary(host),
+                host_disconnect_deadline_ms: None,
+            })
+            .unwrap(),
+        );
+        rc.handle_inbound(env).await;
+        let s = rc.state().await.expect("state");
+        assert_eq!(s.you_cap_set, Some(cap::CHAT | cap::DRAW));
+    }
+
     #[tokio::test]
     async fn participant_left_removes_user() {
         let rc = fresh_room_client().await;
@@ -2900,19 +3046,53 @@ mod tests {
 
     #[tokio::test]
     async fn room_error_clears_cache() {
-        let rc = fresh_room_client().await;
-        let host = Uuid::from_bytes([1u8; 16]);
-        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
-        let env = env_of(
-            MessageKind::RoomError,
-            serde_json::to_value(RoomErrorPayload {
-                code: RoomErrorCode::Internal,
-                message: "boom".into(),
-            })
-            .unwrap(),
-        );
-        rc.handle_inbound(env).await;
-        assert!(rc.state().await.is_none());
+        for code in [
+            RoomErrorCode::Unauthorized,
+            RoomErrorCode::RoomNotFound,
+            RoomErrorCode::RoomClosed,
+            RoomErrorCode::NotJoined,
+        ] {
+            let rc = fresh_room_client().await;
+            let host = Uuid::from_bytes([1u8; 16]);
+            *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+            let env = env_of(
+                MessageKind::RoomError,
+                serde_json::to_value(RoomErrorPayload {
+                    code,
+                    message: "gone".into(),
+                })
+                .unwrap(),
+            );
+            rc.handle_inbound(env).await;
+            assert!(rc.state().await.is_none(), "{code:?}");
+        }
+    }
+
+    /// A rejected fire-and-forget command (e.g. a host
+    /// PLAYBACK_CMD the server refused) must not drop the
+    /// local user out of the room.
+    #[tokio::test]
+    async fn room_error_rejecting_a_command_keeps_the_room() {
+        for code in [
+            RoomErrorCode::InvalidState,
+            RoomErrorCode::NotHost,
+            RoomErrorCode::StaleCommand,
+            RoomErrorCode::Internal,
+        ] {
+            let rc = fresh_room_client().await;
+            let host = Uuid::from_bytes([1u8; 16]);
+            *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(host)));
+            let env = env_of(
+                MessageKind::RoomError,
+                serde_json::to_value(RoomErrorPayload {
+                    code,
+                    message: "playback rejected".into(),
+                })
+                .unwrap(),
+            );
+            rc.handle_inbound(env).await;
+            assert!(rc.state().await.is_some(), "{code:?}");
+        }
     }
 
     #[tokio::test]

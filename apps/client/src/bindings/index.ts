@@ -66,6 +66,8 @@
 // `LaserSendResult` types) plus the `laserMove` / `laserOff` event
 // listeners (`laser://move` / `laser://off`, payloads
 // `LaserMoveEvent` / `LaserOffEvent`).
+// `cap_set` on `ParticipantIpc` (serialized since P6-T02; known
+// only after a CAPABILITY_UPDATE, room snapshots carry 0).
 
 import { invoke as __TAURI_INVOKE } from "@tauri-apps/api/core";
 import { listen as __TAURI_LISTEN } from "@tauri-apps/api/event";
@@ -417,6 +419,7 @@ export type ParticipantIpc = {
   status: ParticipantStatusIpc;
   last_seen_ms: number;
   is_host: boolean;
+  cap_set: number;
 };
 
 export type ParticipantStatusIpc =

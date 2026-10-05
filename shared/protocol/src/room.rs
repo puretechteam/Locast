@@ -41,6 +41,22 @@ pub mod cap {
     pub const UNDO_ANY: u32 = 0x400;
     /// P5-T03: wipe every stroke in the room (`drawing.clear_all`).
     pub const CLEAR_ALL: u32 = 0x800;
+    /// The cap set the server gives the room's host: on create,
+    /// on rehydrate, and on a host migration (the promoted
+    /// participant). A host demoted by a migration drops to
+    /// `CHAT`. Clients mirror this when a HOST_MIGRATED changes
+    /// the local user's role (no CAPABILITY_UPDATE follows it).
+    pub const HOST: u32 = PLAYBACK_CONTROL
+        | DRAW
+        | LASER
+        | MANAGE_ROOM
+        | KICK
+        | PUBLISH_MANIFEST
+        | INVITE
+        | CHAT
+        | UNDO_OWN
+        | UNDO_ANY
+        | CLEAR_ALL;
 }
 
 /// ROOM_CREATE (C -> S). The creator chooses the migration

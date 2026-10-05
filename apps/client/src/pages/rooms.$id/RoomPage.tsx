@@ -119,15 +119,12 @@ const handleLeft = useCallback(() => {
     // `tests/playwright/fixtures/vite-app.ts`); production
     // never reads that seam.
     //
-    // `isHost` is deliberately NOT derived from the production
-    // id yet: it gates host-only UI (playback controls,
-    // permissions, authoritative manual sync) that has so far
-    // only ever run under the test seam, and at least one path
-    // is not production-ready (the host's PLAYBACK_CMD is not
-    // applied to its own <video>). Enabling it is its own task;
-    // until then it stays true only through the test override,
-    // exactly as before. Capability checks (laser, drawing) use
-    // `you_cap_set`, which the host holds in full.
+    // `isHost` is `host_user_id === localUserId`, so it follows
+    // HOST_MIGRATED / HOST_RECONNECTED summaries. It gates
+    // host-only UI (playback controls, permissions, viewer
+    // positions, the authoritative manual-sync branch); the
+    // server still enforces every host-only action. Capability
+    // checks (laser, drawing) use `you_cap_set`.
     const signalingUserId = signaling?.user_id ?? null;
     const { isHost, localUserId, hostPositionMs } = useMemo(() => {
         let overrideId: string | null = null;
@@ -144,7 +141,7 @@ const handleLeft = useCallback(() => {
                 ? null
                 : overrideId ?? summary.you_user_id ?? signalingUserId ?? null;
         const localUserIsHost =
-            summary != null && overrideId !== null && summary.host_user_id === overrideId;
+            summary != null && userId !== null && summary.host_user_id === userId;
         const pos = usePlaybackStore.getState().lastApplied?.media_position_ms ?? 0;
         return {
             isHost: localUserIsHost,
@@ -175,6 +172,7 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     // EMA state so old samples cannot leak across
     // rooms.
     const videoRef = useRef<HTMLVideoElement | null>(null);
+    const getVideo = useCallback(() => videoRef.current, []);
     const drift = useDriftSmoother({
         roomId: summary?.id ?? null,
         getLocalMs: () => {
@@ -218,6 +216,7 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
         isHost,
         getVideo: () => videoRef.current,
         skewMs: measuredSkewMs ?? 0,
+        localUserId,
     });
 
     // P4-T06: mount the 60s NTP measurement driver. The
@@ -310,8 +309,11 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
                 // participant with is_host === true in the summary.
                 const u5 = await events.positionReport((next: PositionReportEvent) => {
                     if (cancelled) return;
-                    if (summary === null) return;
-                    const host = summary.participants.find((p) => p.is_host);
+                    // Read the live summary: this listener is
+                    // registered once, when `summary` was still null.
+                    const current = useRoomStore.getState().summary;
+                    if (current === null) return;
+                    const host = current.participants.find((p) => p.is_host);
                     if (host && next.sender_id === host.user_id) {
                         setLastKnownHostPositionMs(next.media_position_ms);
                     }
@@ -518,6 +520,8 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
             <PlaybackControls
                 isHost={isHost}
                 positionMs={displayPositionMs}
+                localUserId={localUserId}
+                getVideo={getVideo}
             />
             {/* P4-T05: standalone "Sync to Host" button.
              * The DriftIndicator's Resync button is

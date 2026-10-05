@@ -237,9 +237,12 @@ const SHIM_SOURCE = `
                 var callbackInfo = callbackId != null ? w.__TAURI_CALLBACKS__.get(callbackId) : null;
                 var eventName = args && args.event;
                 if (callbackInfo && eventName && w.__tauriShim) {
-                    // Wrap the stored callback to extract payload from envelope.
+                    // The stored callback is the one @tauri-apps/api/event
+                    // listen() registered: it takes the whole event
+                    // ({ event, id, payload }), as the Tauri runtime
+                    // delivers it, and the bindings read .payload.
                     var wrappedHandler = function(envelope) {
-                        callbackInfo.callback(envelope.payload);
+                        callbackInfo.callback(envelope);
                     };
                     w.__tauriShim.listen(eventName, wrappedHandler).then(function(unlisten) {
                         // Store unlisten for cleanup (though tests don't call it).
@@ -350,6 +353,14 @@ const SHIM_SOURCE = `
             // branch can call sendPlaybackCommand without
             // a TypeError.
             if (name === "playback_send") {
+                // __locast_playbackSendFailures = n makes the
+                // next n sends reject, as a failed local send
+                // (signaling socket down) does in production.
+                if ((w.__locast_playbackSendFailures || 0) > 0) {
+                    w.__locast_playbackSendFailures -= 1;
+                    w.__locast_invoke_log.push({ name: name, args: args, failed: true });
+                    return Promise.reject(new Error("send_envelope: not connected"));
+                }
                 w.__locast_invoke_log.push({ name: name, args: args });
                 return Promise.resolve({
                     envelope_id: "envelope-" + (w.__locast_invoke_log.length),
@@ -436,6 +447,11 @@ const SHIM_SOURCE = `
             // returns a list of TempFileInfo objects for the room.
             // mark_files_permanent flips status to permanent.
             // delete_files_to_trash moves files to OS trash.
+            // The host's PermissionsModal Apply.
+            if (name === "room_permission_set") {
+                w.__locast_invoke_log.push({ name: name, args: args });
+                return Promise.resolve(null);
+            }
             if (name === "get_temp_files") {
                 return Promise.resolve([]);
             }

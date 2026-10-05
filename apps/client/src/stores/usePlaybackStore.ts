@@ -107,6 +107,28 @@ interface PlaybackStoreState {
      * the server rejects (the existing `PlaybackControls`
      * pattern — see comments there). */
     bumpHostSeq: () => number;
+    /** Give back `seq` after a host PLAYBACK_CMD that never
+     * reached the server (`playback_send` failed locally,
+     * e.g. the signaling socket was down), so the next
+     * command does not open a `monotonic_seq` gap the
+     * server would reject forever. A no-op unless `seq`
+     * is still the most recently issued one. A command the
+     * SERVER rejected is never rolled back (the reply is
+     * asynchronous and does not reach this path). */
+    rollbackHostSeq: (seq: number) => void;
+    /** Record the local host's own PLAYBACK_CMD as
+     * `lastApplied`. The server does not echo a
+     * PLAYBACK_CMD to its originator, so without this the
+     * host would never hold a "last host command" (the
+     * reference manual sync, drift and the controls'
+     * position use). The host already applied the command
+     * to its own <video>; the Player's host-echo check
+     * skips the DOM for it. The event keeps the current
+     * `lastAppliedServerSeq` as its `server_seq` (the real
+     * one is never learned), so a later rebroadcast from
+     * another sender (e.g. a host migrated away) is still
+     * accepted. Ignored for a different room. */
+    recordHostCommand: (event: PlaybackStateEvent) => void;
 
     /** P4-T07: per-sender `monotonic_seq` dedup state.
      *  Lives inside the playback store so it is
@@ -346,6 +368,20 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         const next = get().hostNextSeq;
         set({ hostNextSeq: next + 1 });
         return next;
+    },
+
+    rollbackHostSeq: (seq) => {
+        if (get().hostNextSeq === seq + 1) {
+            set({ hostNextSeq: seq });
+        }
+    },
+
+    recordHostCommand: (event) => {
+        const state = get();
+        if (state.roomId !== null && state.roomId !== event.room_id) return;
+        set({
+            lastApplied: { ...event, server_seq: state.lastAppliedServerSeq },
+        });
     },
 
     /** P4-T07: read-only view of the per-sender dedup
