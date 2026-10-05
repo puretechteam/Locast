@@ -17,6 +17,7 @@ import { PermissionsModal } from "../../components/PermissionsModal";
 import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { useManualSync } from "../../drift/useManualSync";
 import { useClockSkew } from "../../drift/useClockSkew";
+import { probeClockSkewOnce } from "../../drift/clockSkewProbe";
 import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
@@ -219,16 +220,15 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
         localUserId,
     });
 
-    // P4-T06: mount the 60s NTP measurement driver. The
-    // probe is wired to a no-op stub in v1; a future
-    // P-task will thread the Tauri `clockSkewProbe`
-    // command through. The hook still runs the test
-    // seam (`__locastClockSkew.setSkewJitter`) so the
-    // drift threshold widening can be exercised in
-    // Playwright.
+    // P4-T06: mount the 60s NTP measurement driver. The probe is the Tauri
+    // `clock_skew_probe` command (a stable module-level function: the hook
+    // restarts its cadence whenever `probeOnce` changes). Until the first
+    // burst completes `skewMs` stays null and the consumers use 0. The test
+    // seam (`__locastClockSkew.setSkewJitter`) still drives the store
+    // directly in Playwright.
     useClockSkew({
         roomId: summary?.id ?? null,
-        probeOnce: async () => null,
+        probeOnce: probeClockSkewOnce,
     });
 
     // P4-T05: real Resync handler. The DriftIndicator's
