@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import type { MouseEvent } from "react";
 import { useRoomStore } from "../stores/useRoomStore";
+import { errorText } from "../services/errors";
 import { setCapabilities, CAP } from "../services/permissions";
 import type { Cap } from "../services/permissions";
 import "../styles/permissions-modal.css";
@@ -46,6 +47,7 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
     });
     const [initialSelections] = useState(selections);
     const [applying, setApplying] = useState(false);
+    const [error, setError] = useState<string | null>(null);
 
     // A click on the backdrop itself does nothing (the modal
     // closes only through X / Apply). Clicks inside the panel
@@ -65,8 +67,9 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
     }, [onClose]);
 
     const handleApply = useCallback(async () => {
-        if (!summary) return;
+        if (!summary || applying) return;
         setApplying(true);
+        setError(null);
         try {
             for (const p of summary.participants) {
                 if (p.is_host) continue;
@@ -76,11 +79,16 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
                 // must take the higher preset's caps away.
                 await setCapabilities(p.user_id, presetToCaps(newPreset));
             }
+            onClose();
+        } catch (err) {
+            // Stay open and say so: closing here made a failure look like
+            // success, with only some of the changes applied. Retrying is
+            // safe because each call replaces a participant's caps.
+            setError(`Could not apply all changes: ${errorText(err)}`);
         } finally {
             setApplying(false);
-            onClose();
         }
-    }, [summary, selections, initialSelections, onClose]);
+    }, [summary, applying, selections, initialSelections, onClose]);
 
     const handlePresetChange = useCallback((userId: string, preset: Preset) => {
         setSelections((prev) => ({ ...prev, [userId]: preset }));
@@ -168,6 +176,12 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
                         );
                     })}
                 </ul>
+
+                {error !== null && (
+                    <p className="form__error" role="alert" data-testid="permissions-error">
+                        {error}
+                    </p>
+                )}
 
                 <footer className="permissions-modal__footer">
                     <button
