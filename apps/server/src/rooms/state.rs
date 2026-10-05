@@ -534,7 +534,8 @@ impl RoomState {
     pub fn self_view(&self, user_id: Uuid) -> Option<ParticipantSelf> {
         self.participants
             .iter()
-            .find(|p| p.user_id == user_id)
+            .rev()
+            .find(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
             .map(|p| ParticipantSelf {
                 user_id: p.user_id,
                 cap_set: p.cap_set,

@@ -929,6 +929,13 @@ impl RoomRegistry {
             cap_set,
         };
         let public = rec.to_public();
+        // A returning participant must not leave their `Left` record
+        // behind: first-match lookups would resolve to its stale
+        // `cap_set` / `joined_ms`, and the list would grow with every
+        // join/leave cycle.
+        state
+            .participants
+            .retain(|p| !(p.user_id == user_id && p.status == ParticipantStatus::Left));
         state.participants.push(rec);
 
         let summary = state.snapshot();
@@ -2483,6 +2490,70 @@ mod tests {
             }
             other => panic!("expected Left, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn rejoin_reports_fresh_caps_and_keeps_a_single_record() {
+        let r = RoomRegistry::new(cfg());
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        r.join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
+            .await
+            .expect("join");
+        r.update_participant_cap_set(summary.id, uid(2), cap::CHAT | cap::DRAW, 1_600)
+            .await
+            .expect("grant draw");
+        r.leave(&store(), uid(2), true, 2_000).await.expect("leave");
+
+        let (joined, _) = r
+            .join(&store(), &code, uid(2), keypair(2), "B".into(), 3_000)
+            .await
+            .expect("rejoin");
+        assert_eq!(
+            joined.you.cap_set,
+            cap::CHAT,
+            "a rejoin starts from the default caps, not the previous session's grant"
+        );
+        assert_eq!(joined.you.joined_ms, 3_000);
+
+        let handle = r.get_by_id(summary.id).await.expect("room");
+        let state = handle.read().await;
+        let records = state
+            .participants
+            .iter()
+            .filter(|p| p.user_id == uid(2))
+            .count();
+        assert_eq!(records, 1, "the stale Left record must not accumulate");
+    }
+
+    #[tokio::test]
+    async fn repeated_join_leave_cycles_do_not_grow_the_participant_list() {
+        let r = RoomRegistry::new(cfg());
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        for i in 0..5i64 {
+            r.join(
+                &store(),
+                &code,
+                uid(2),
+                keypair(2),
+                "B".into(),
+                2_000 + i * 10,
+            )
+            .await
+            .expect("join");
+            r.leave(&store(), uid(2), true, 2_005 + i * 10)
+                .await
+                .expect("leave");
+        }
+        let handle = r.get_by_id(summary.id).await.expect("room");
+        assert_eq!(handle.read().await.participants.len(), 2);
     }
 
     #[tokio::test]
