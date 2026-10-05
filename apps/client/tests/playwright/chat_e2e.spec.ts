@@ -229,8 +229,46 @@ function makeP6Summary(participantCount: number) {
     };
 }
 
-async function navigateAndHydrateP6(page: Page, summary: ReturnType<typeof makeP6Summary>) {
+// The shim answers unknown commands with null, which the connection-quality
+// hook treats as a failed probe. Stub `clock_skew_probe` so a spec controls the
+// measured round-trip time: the probe resolves after `rttMs` and reports it.
+// Must be registered after `injectLocastShim`, which installs the invoke it wraps.
+async function stubClockSkewProbe(page: Page, rttMs: number): Promise<void> {
+    await page.addInitScript((rtt: number) => {
+        const w = window as unknown as {
+            __TAURI_INTERNALS__: {
+                invoke: (name: string, args?: unknown, options?: unknown) => Promise<unknown>;
+            };
+        };
+        const original = w.__TAURI_INTERNALS__.invoke;
+        w.__TAURI_INTERNALS__.invoke = (name, args, options) => {
+            if (name !== "clock_skew_probe") {
+                return original(name, args, options);
+            }
+            const t0 = Date.now();
+            return new Promise((resolve) => {
+                setTimeout(() => {
+                    resolve({
+                        t0_local_ms: t0,
+                        t3_local_ms: t0 + rtt,
+                        server_ts_ms: t0,
+                        client_send_ms_echo: t0,
+                    });
+                }, rtt);
+            });
+        };
+    }, rttMs);
+}
+
+async function navigateAndHydrateP6(
+    page: Page,
+    summary: ReturnType<typeof makeP6Summary>,
+    probeRttMs?: number,
+) {
     await injectLocastShim(page);
+    if (probeRttMs !== undefined) {
+        await stubClockSkewProbe(page, probeRttMs);
+    }
     await page.goto("/");
     await page.waitForLoadState("domcontentloaded");
     await spaNavigate(page, `/rooms/${ROOM_ID_P6}`);
@@ -272,28 +310,27 @@ test("P6-T04: host participant has Host badge", async ({ page }) => {
     await expect(nameEl).toContainText("host-alice");
 });
 
-test("P6-T04: quality bar is present on each tile", async ({ page }) => {
+test("P6-T04: quality bar appears on each tile when the connection degrades", async ({ page }) => {
     const summary = makeP6Summary(2);
-    await navigateAndHydrateP6(page, summary);
+    // 200 ms round trip classifies as "fair". Quality starts at "good" (no bar),
+    // so the bar only appears if the memoized tiles re-render on a quality change.
+    await navigateAndHydrateP6(page, summary, 200);
     const tiles = page.locator(".participant-tile");
-    const count = await tiles.count();
-    for (let i = 0; i < count; i++) {
+    await expect(tiles).toHaveCount(2);
+    for (let i = 0; i < 2; i++) {
         const qualityBar = tiles.nth(i).locator(".participant-tile__quality");
-        await expect(qualityBar).toBeAttached({ timeout: 2_000 });
+        await expect(qualityBar).toHaveClass(/participant-tile__quality--fair/, {
+            timeout: 5_000,
+        });
     }
 });
 
 test("P6-T04: quality bar shows poor class when probe responses are delayed", async ({ page }) => {
     const summary = makeP6Summary(1);
-    await page.route("**/v1/call/clock_skew_probe", async (route) => {
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        await route.continue();
-    });
-    await navigateAndHydrateP6(page, summary);
+    await navigateAndHydrateP6(page, summary, 500);
     const tile = page.locator(".participant-tile").first();
     const qualityBar = tile.locator(".participant-tile__quality");
-    await expect(qualityBar).toBeAttached({ timeout: 2_000 });
-    await page.waitForTimeout(2_000);
-    const qualityClass = await qualityBar.getAttribute("class");
-    expect(qualityClass ?? "").toContain("poor");
+    await expect(qualityBar).toHaveClass(/participant-tile__quality--poor/, {
+        timeout: 5_000,
+    });
 });

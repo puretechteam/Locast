@@ -48,5 +48,7 @@ export const ParticipantTile = React.memo(
             </li>
         );
     },
-    (prevProps, nextProps) => prevProps.participant === nextProps.participant
+    (prevProps, nextProps) =>
+        prevProps.participant === nextProps.participant &&
+        prevProps.quality === nextProps.quality
 );
