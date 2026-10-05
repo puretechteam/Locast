@@ -431,6 +431,76 @@ async fn signal_forwarded_to_recipient() {
     assert_eq!(recv_payload.kind, SignalKind::Offer);
 }
 
+/// The client puts its bearer in every message's payload. The relay forwards
+/// the envelope to another participant, who must not receive it: it is the
+/// sender's session credential. The signature covers only the typed payload,
+/// so removing the bearer must leave the signed content intact.
+#[tokio::test]
+async fn signal_forwarded_to_recipient_carries_no_bearer() {
+    let cfg = test_config();
+    let db = Db::open(&cfg).await.expect("open db");
+    let rooms = Arc::new(RoomRegistry::new(RoomRegistryConfig::from_config(&cfg)));
+    let clock = MockClock::new(1_000_000);
+    let store: Arc<dyn locast_server::rooms::RoomStore> = Arc::new(DbRoomStore::new(db.clone()));
+    let relay = SignalRelay::new();
+    let ctx = DispatchContext {
+        registry: &rooms,
+        store: store.as_ref(),
+        db: &db,
+        clock: &clock,
+        relay: &relay,
+    };
+    let (host_sk, host_uid, host_pk, room_id, viewer_uid, _viewer_pk) =
+        build_room_with_two_users(&db, &rooms, &clock).await;
+    let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    relay.register(viewer_uid, b_tx).await;
+
+    let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+    let payload = SignalPayload {
+        to_user_id: viewer_uid,
+        kind: SignalKind::Offer,
+        sdp: Some(sdp.into()),
+        candidates: None,
+    };
+    let sig = sign_signal(&host_sk, &payload);
+    let mut env = signal_envelope(
+        host_uid,
+        host_pk,
+        sig,
+        viewer_uid,
+        room_id,
+        SignalKind::Offer,
+        Some(sdp),
+    );
+    env.payload
+        .as_object_mut()
+        .expect("payload is an object")
+        .insert("bearer".into(), json!([7u8; 32].to_vec()));
+
+    let out = dispatch_room_message(env, &ctx, host_uid, host_pk).await;
+    assert!(out.to_caller.is_empty(), "the relay accepted the signal");
+
+    let received = tokio::time::timeout(std::time::Duration::from_secs(1), b_rx.recv())
+        .await
+        .expect("no timeout")
+        .expect("channel closed");
+    assert!(
+        received.payload.get("bearer").is_none(),
+        "the recipient must not receive the sender's bearer: {}",
+        received.payload
+    );
+    // What the signature covers is untouched.
+    let recv_payload: SignalPayload = serde_json::from_value(received.payload.clone()).unwrap();
+    assert_eq!(recv_payload, payload);
+    let signed = locast_crypto::signal_signed_bytes(&recv_payload).expect("encode");
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(&host_pk).expect("key");
+    assert!(
+        vk.verify_strict(&signed, &ed25519_dalek::Signature::from_bytes(&sig))
+            .is_ok(),
+        "the forwarded payload still verifies against the sender's signature"
+    );
+}
+
 #[tokio::test]
 async fn signal_oversized_returns_invalid_state() {
     let cfg = test_config();

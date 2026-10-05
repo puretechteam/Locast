@@ -220,9 +220,17 @@ pub async fn handle_signal(
         return error_outcome(SignalError::BadSignature, now_ms);
     }
 
-    // 7. Forward the original envelope to the recipient via
-    //    the SignalRelay. We do NOT inspect or rewrite the
-    //    SDP / ICE bodies; we forward verbatim.
+    // 7. Forward the envelope to the recipient via the
+    //    SignalRelay. We do NOT inspect or rewrite the SDP / ICE
+    //    bodies. The one thing removed is the `bearer` field the
+    //    client adds to every payload: it is the SENDER's session
+    //    credential, already validated by the WS layer, and the
+    //    recipient has no use for it. The signature covers only
+    //    the typed payload (checked above), so it still verifies.
+    let mut envelope = envelope;
+    if let Some(obj) = envelope.payload.as_object_mut() {
+        obj.remove("bearer");
+    }
     match relay.send(payload.to_user_id, envelope).await {
         Ok(()) => SignalOutcome::default(),
         Err(SendError::NoRecipient) => {
