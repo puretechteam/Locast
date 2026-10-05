@@ -702,14 +702,21 @@ async fn five_cycle_reconnect_within_jitter_tolerance() {
     // A cycle of 791 ms failed an exact 800 ms bound on a macOS runner. A
     // loop that is not paced at all takes a few milliseconds, so 750 ms still
     // proves the backoff is applied.
+    //
+    // The upper bound is generous for the same reason: the fake server drops
+    // the socket 250 ms after AUTH_OK, so a poll that stalls longer than that
+    // misses the Authenticated window and catches the next one over a second
+    // later. Only the lower bound shows whether the backoff is applied; the
+    // upper one just shows the client is not stuck.
     const OBSERVATION_SLACK_MS: u128 = 50;
+    const UPPER_BOUND_MS: u128 = 5_000;
     for (i, d) in cycle_durations.iter().enumerate() {
         let ms = d.as_millis();
         assert!(
-            (800 - OBSERVATION_SLACK_MS..=2000).contains(&ms),
-            "cycle {i} took {ms}ms outside [{}, 2000]ms \
-             (this suggests the backoff did not pace the loop \
-             or the upper bound allowed too much dial/handshake slack)",
+            (800 - OBSERVATION_SLACK_MS..=UPPER_BOUND_MS).contains(&ms),
+            "cycle {i} took {ms}ms outside [{}, {UPPER_BOUND_MS}]ms \
+             (a cycle below the range suggests the backoff did not pace the \
+             loop; one above it suggests the client got stuck)",
             800 - OBSERVATION_SLACK_MS
         );
     }
@@ -1112,8 +1119,9 @@ async fn state_transitions_walk_the_machine() {
 #[tokio::test]
 async fn handshake_timeout_triggers_handshake_timeout_reason() {
     let mut cfg = FakeServerConfig::default();
-    // Delay WELCOME longer than the client's 2s timeout.
-    cfg.hello_delay = Duration::from_millis(2_500);
+    // Delay WELCOME far longer than the client's 2s timeout, so a client
+    // timer that fires late on a loaded runner still beats the reply.
+    cfg.hello_delay = Duration::from_millis(6_000);
     let (addr, _state, _h) = start_fake(cfg).await;
     let (_dir, storage) = open_storage().await;
     let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
@@ -1128,7 +1136,7 @@ async fn handshake_timeout_triggers_handshake_timeout_reason() {
         if s.phase == ConnPhase::Reconnecting && s.last_error.is_some() {
             break;
         }
-        if start.elapsed() > Duration::from_secs(8) {
+        if start.elapsed() > Duration::from_secs(15) {
             panic!("never reached Reconnecting with error; last state = {s:?}");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

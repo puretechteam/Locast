@@ -362,7 +362,12 @@ async fn cancellation_during_inflight_does_not_emit_progress_after_cancel() {
     seed_fk_deps(&store, "u-1", "media-uuid").await;
     create_download(&store, &plan).await;
 
-    let (host_side, recv_side) = loopback_pair(0, 0);
+    // Per-frame delivery jitter (up to 30 ms) keeps the 8-chunk transfer
+    // running for a while, so cancelling right after the first progress event
+    // always lands mid-transfer. Without it a fast runner could finish the
+    // whole transfer before a fixed-delay cancel, and a slow one could cancel
+    // before any work began.
+    let (host_side, recv_side) = loopback_pair(0, 30);
 
     let recorder = Arc::new(RecordingSink::default());
     let emitter = DownloadEventEmitter::new(recorder.clone());
@@ -397,7 +402,16 @@ async fn cancellation_during_inflight_does_not_emit_progress_after_cancel() {
         .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Cancel once a chunk has been verified and reported: mid-transfer by
+    // construction, however fast or slow the host is.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while recorder.progresses.lock().unwrap().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no progress event within 60 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
     let _ = locast_client_lib::transfer::cancel_session(
         &recv_transport_for_cancel,
         &plan_for_cancel.download_id,
