@@ -9,7 +9,7 @@
     "dev:test": "vite --mode test --port 1420 --strictPort",
     "build": "tsc -b --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -b --noEmit",
+    "typecheck": "tsc -b --noEmit && tsc -p tests/playwright/tsconfig.json",
     "test": "node scripts/run-unit-tests.mjs",
     "smoke:drift": "node --experimental-strip-types --no-warnings src/drift/drift.smoke.ts",
     "smoke:dedup": "node --experimental-strip-types --no-warnings src/drift/dedup.smoke.ts",

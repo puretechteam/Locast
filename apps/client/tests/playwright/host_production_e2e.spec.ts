@@ -11,7 +11,7 @@
 // rejects `play()` on a source that never loads) so the specs
 // can see exactly what the host's own element was told to do.
 
-import { test, expect, injectLocastShim } from "./fixtures/vite-app";
+import { test, expect, injectLocastShim, nth } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
 
 const HOST_ID = "11111111-1111-4111-8111-111111111111";
@@ -244,7 +244,7 @@ test("host Play / Pause / Seek drive the host's own <video> and send seq 1, 2, 3
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(1);
     let sends = await invokes(page, "playback_send");
     // PLAY carries where the host's video actually is.
-    expect(sends[0].args.cmd).toEqual({
+    expect(nth(sends, 0).args.cmd).toEqual({
         action: "play",
         monotonic_seq: 1,
         media_position_ms: 12_500,
@@ -265,7 +265,7 @@ test("host Play / Pause / Seek drive the host's own <video> and send seq 1, 2, 3
     await page.locator(pause).click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(2);
     sends = await invokes(page, "playback_send");
-    expect(sends[1].args.cmd).toEqual({
+    expect(nth(sends, 1).args.cmd).toEqual({
         action: "pause",
         monotonic_seq: 2,
         media_position_ms: 20_000,
@@ -274,7 +274,7 @@ test("host Play / Pause / Seek drive the host's own <video> and send seq 1, 2, 3
     await page.locator(seek60).click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(3);
     sends = await invokes(page, "playback_send");
-    expect(sends[2].args.cmd).toEqual({
+    expect(nth(sends, 2).args.cmd).toEqual({
         action: "seek",
         monotonic_seq: 3,
         media_position_ms: 60_000,
@@ -305,8 +305,8 @@ test("a playback_send that fails locally gives its monotonic_seq back", async ({
     await page.locator(play).click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(2);
     const sends = await invokes(page, "playback_send");
-    expect(sends[0].failed).toBe(true);
-    expect(sends[1].failed).toBeUndefined();
+    expect(nth(sends, 0).failed).toBe(true);
+    expect(nth(sends, 1).failed).toBeUndefined();
     // The retry reuses seq 1: the server never saw the first.
     expect(sends.map((s) => s.args.cmd?.monotonic_seq)).toEqual([1, 1]);
     await expect(page.locator(pause)).toBeEnabled();
@@ -324,11 +324,11 @@ test("host Sync to Host works from the host's own recorded command", async ({ pa
     await sync.click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(2);
     const sends = await invokes(page, "playback_send");
-    expect(sends[1].args.cmd?.action).toBe("seek");
-    expect(sends[1].args.cmd?.monotonic_seq).toBe(2);
+    expect(nth(sends, 1).args.cmd?.action).toBe("seek");
+    expect(nth(sends, 1).args.cmd?.monotonic_seq).toBe(2);
     // Projected from the PLAY at 5 s; well under a few seconds.
-    expect(sends[1].args.cmd?.media_position_ms).toBeGreaterThanOrEqual(5_000);
-    expect(sends[1].args.cmd?.media_position_ms).toBeLessThan(10_000);
+    expect(nth(sends, 1).args.cmd?.media_position_ms).toBeGreaterThanOrEqual(5_000);
+    expect(nth(sends, 1).args.cmd?.media_position_ms).toBeLessThan(10_000);
 });
 
 test("a host migration onto the local user turns the host UI on", async ({ page, locast }) => {
@@ -355,7 +355,7 @@ test("Permissions Apply replaces only the changed participants' cap sets", async
     await page.getByRole("button", { name: "Apply" }).click();
     await expect.poll(async () => (await invokes(page, "room_permission_set")).length).toBe(1);
     let sets = await invokes(page, "room_permission_set");
-    expect(sets[0].args).toEqual({
+    expect(nth(sets, 0).args).toEqual({
         targetUserId: VIEWER_ID,
         addCapSet: EDITOR_CAPS,
         removeCapSet: 0xffff_ffff,
@@ -377,7 +377,7 @@ test("Permissions Apply replaces only the changed participants' cap sets", async
     await page.getByRole("button", { name: "Apply" }).click();
     await expect.poll(async () => (await invokes(page, "room_permission_set")).length).toBe(2);
     sets = await invokes(page, "room_permission_set");
-    expect(sets[1].args).toEqual({
+    expect(nth(sets, 1).args).toEqual({
         targetUserId: VIEWER_ID,
         addCapSet: CHAT,
         removeCapSet: 0xffff_ffff,
@@ -414,14 +414,14 @@ test("a paused host's Sync to Host seeks to the frozen paused position, not an e
     await sync.click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(3);
     let sends = await invokes(page, "playback_send");
-    expect(sends[2].args.cmd?.action).toBe("seek");
+    expect(nth(sends, 2).args.cmd?.action).toBe("seek");
     // Exactly the paused position: 1.2 s of wall time did not leak in.
-    expect(sends[2].args.cmd?.media_position_ms).toBe(20_000);
+    expect(nth(sends, 2).args.cmd?.media_position_ms).toBe(20_000);
     // A SEEK keeps the room paused, so the next Sync stays frozen too.
     expect(await hostPaused()).toBe(true);
     await page.waitForTimeout(500);
     await sync.click();
     await expect.poll(async () => (await invokes(page, "playback_send")).length).toBe(4);
     sends = await invokes(page, "playback_send");
-    expect(sends[3].args.cmd?.media_position_ms).toBe(20_000);
+    expect(nth(sends, 3).args.cmd?.media_position_ms).toBe(20_000);
 });

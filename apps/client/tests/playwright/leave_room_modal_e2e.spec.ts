@@ -1,4 +1,4 @@
-import { test, expect, injectLocastShim } from "./fixtures/vite-app";
+import { test, expect, injectLocastShim, nth } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
 
 const ROOM_ID = "r-p6t06";
@@ -51,7 +51,7 @@ test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ p
     const log = await locast.readInvokeLog();
     const deletes = log.filter((e) => e.name === "delete_files_to_trash");
     expect(deletes).toHaveLength(1);
-    expect((deletes[0].args as { fileIds: string[] }).fileIds).toEqual(["dl-1", "dl-2", "dl-3"]);
+    expect((nth(deletes, 0).args as { fileIds: string[] }).fileIds).toEqual(["dl-1", "dl-2", "dl-3"]);
 });
 
 test("Keep: 3 temp files listed, mark_files_permanent IPC logged", async ({ page, locast }) => {
@@ -68,5 +68,5 @@ test("Keep: 3 temp files listed, mark_files_permanent IPC logged", async ({ page
     const log = await locast.readInvokeLog();
     const keeps = log.filter((e) => e.name === "mark_files_permanent");
     expect(keeps).toHaveLength(1);
-    expect((keeps[0].args as { fileIds: string[] }).fileIds).toEqual(["dl-k1", "dl-k2", "dl-k3"]);
+    expect((nth(keeps, 0).args as { fileIds: string[] }).fileIds).toEqual(["dl-k1", "dl-k2", "dl-k3"]);
 });

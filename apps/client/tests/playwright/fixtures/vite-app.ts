@@ -51,7 +51,9 @@ export type RoomSummaryIpc = {
     }>;
     host_disconnected: boolean;
     host_disconnect_deadline_ms: number | null;
-    you_cap_set?: number;
+    /** `undefined` is allowed explicitly: a spec passes it to mean "no
+     *  capability set", and JSON serialization drops the key. */
+    you_cap_set?: number | undefined;
     /** The local user's server-assigned id (P5-T04: the
      *  production source of RoomPage's `localUserId`). */
     you_user_id?: string | null;
@@ -561,6 +563,19 @@ const SHIM_SOURCE = `
         w.__locast = api;
     })();
 `;
+
+/**
+ * `items[index]`, failing with a readable message when it is missing. The
+ * test project uses `noUncheckedIndexedAccess`, and an assertion on a call
+ * log entry that never happened should say so rather than throw a TypeError.
+ */
+export function nth<T>(items: readonly T[], index: number): T {
+    const item = items[index];
+    if (item === undefined) {
+        throw new Error(`expected an entry at index ${index}, found ${items.length}`);
+    }
+    return item;
+}
 
 export async function injectLocastShim(page: Page): Promise<void> {
     await page.addInitScript({ content: SHIM_SOURCE });

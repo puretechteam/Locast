@@ -31,7 +31,7 @@
 // dedicated presence-event shape is a follow-on task
 // (see the final report's "deviations" section).
 
-import { test, expect, injectLocastShim } from "./fixtures/vite-app";
+import { test, expect, injectLocastShim, nth } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
 
 const HOST_ROOM = {
@@ -173,18 +173,17 @@ async function mountRoom(
     );
 }
 
-async function forceHostCommand(
-    page: Page,
-    payload: {
-        room_id: string;
-        media_position_ms: number;
-        server_ts_ms: number;
-    },
-): Promise<void> {
+interface HostCommandPayload {
+    room_id: string;
+    media_position_ms: number;
+    server_ts_ms: number;
+}
+
+async function forceHostCommand(page: Page, payload: HostCommandPayload): Promise<void> {
     await page.evaluate((p) => {
         const w = window as unknown as {
             __locastDrift?: {
-                forceHostCommandForTest: (p: typeof p) => void;
+                forceHostCommandForTest: (p: HostCommandPayload) => void;
             };
         };
         if (!w.__locastDrift) {
@@ -280,7 +279,7 @@ test("HOST clicking Sync locally seeks AND emits exactly one PLAYBACK_CMD with a
     const log = await readInvokeLog(page);
     const sends = log.filter((e) => e.name === "playback_send");
     expect(sends).toHaveLength(1);
-    const args = sends[0].args as {
+    const args = nth(sends, 0).args as {
         cmd?: { action?: string; monotonic_seq?: number; media_position_ms?: number };
     } | null;
     expect(args).not.toBeNull();
@@ -509,7 +508,7 @@ test("paused HOST clicking Sync emits a seek at the frozen paused position", asy
     await page.waitForTimeout(100);
     const sends = (await readInvokeLog(page)).filter((e) => e.name === "playback_send");
     expect(sends).toHaveLength(1);
-    const args = sends[0].args as {
+    const args = nth(sends, 0).args as {
         cmd?: { action?: string; media_position_ms?: number };
     } | null;
     expect(args?.cmd?.action).toBe("seek");

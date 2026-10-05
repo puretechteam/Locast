@@ -31,6 +31,6 @@ No failure was attributed to the browser or the CI environment.
 
 `chat_e2e` (8 tests) and `leave_room_modal_e2e` (2 tests) called
 `page.waitFunction`, which is not a Playwright API (`waitForFunction`). Fixing
-the name turned 5 of the chat failures green. `tests/playwright` is not covered
-by `pnpm typecheck`; running `tsc -p tests/playwright/tsconfig.json` reports
-about 30 further errors, so that project is not yet a gate.
+the name turned 5 of the chat failures green. A type check would have caught
+it, so `tests/playwright` is now part of `pnpm typecheck`
+(`tsc -p tests/playwright/tsconfig.json`).
