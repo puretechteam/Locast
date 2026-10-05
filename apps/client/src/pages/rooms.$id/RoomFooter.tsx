@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
+import { errorText } from "../../services/errors";
 import { leaveRoom } from "../../services/room";
 import { LeaveRoomModal } from "../../components/LeaveRoomModal";
 
@@ -44,7 +45,7 @@ export function RoomFooter({
             onLeft();
             navigate("/rooms");
         } catch (err) {
-            setError(err instanceof Error ? err.message : String(err));
+            setError(errorText(err));
             setLeaving(false);
         }
     }

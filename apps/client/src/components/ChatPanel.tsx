@@ -1,6 +1,7 @@
 import { useCallback, useRef, useEffect, useState } from "react";
 import { useCapabilityStore, CAP } from "../stores/useCapabilityStore";
 import { sendChatMessage } from "../services/chat";
+import { errorText } from "../services/errors";
 import type { ChatMessage } from "../services/chat";
 
 interface ChatPanelProps {
@@ -48,8 +49,7 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
             setText("");
             setReplyTo(null);
         } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            setError(`Send failed: ${msg}`);
+            setError(`Send failed: ${errorText(err)}`);
         } finally {
             setSending(false);
             inputRef.current?.focus();

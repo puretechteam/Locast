@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { errorText } from "../../services/errors";
 import { connectSignaling, joinRoom } from "../../services/room";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -64,7 +65,7 @@ export function JoinRoomPage(): JSX.Element {
             );
             navigate(`/rooms/${summary.id}`);
         } catch (err) {
-            setError(err instanceof Error ? err.message : String(err));
+            setError(errorText(err));
             setSubmitting(false);
         }
     }

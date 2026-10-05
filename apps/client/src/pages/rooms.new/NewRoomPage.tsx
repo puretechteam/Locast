@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { errorText } from "../../services/errors";
 import { connectSignaling, createRoom } from "../../services/room";
 
 export function NewRoomPage(): JSX.Element {
@@ -21,7 +22,7 @@ export function NewRoomPage(): JSX.Element {
             const summary = await createRoom(title.trim(), migrationEnabled);
             navigate(`/rooms/${summary.id}`);
         } catch (err) {
-            setError(err instanceof Error ? err.message : String(err));
+            setError(errorText(err));
             setSubmitting(false);
         }
     }

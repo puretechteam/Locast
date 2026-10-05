@@ -1,15 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { errorText } from "../../services/errors";
 import { getServerSettings, setServerUrl } from "../../services/settings";
 import type { ServerSettingsIpc } from "../../services/settings";
-
-function errorText(err: unknown): string {
-    if (err instanceof Error) return err.message;
-    if (typeof err === "object" && err !== null && "message" in err) {
-        return String((err as { message: unknown }).message);
-    }
-    return String(err);
-}
 
 export function SettingsPage(): JSX.Element {
     const [loaded, setLoaded] = useState<ServerSettingsIpc | null>(null);
