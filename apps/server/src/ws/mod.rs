@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -74,6 +74,35 @@ const BAD_MSG_WINDOW_MS: i64 = 60_000;
 /// How long to throttle inbound frames after a rate-limit hit
 /// (§20.8: "throttled for 1 s", do NOT disconnect).
 const RATE_THROTTLE_MS: i64 = 1_000;
+
+/// How long a single outbound write may block. A client that stops reading
+/// its socket (TCP still open) would otherwise park this connection's writer
+/// forever while the forwarder keeps queueing envelopes for it, and a host is
+/// exempt from the presence timeout, so nothing else would ever end it.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The largest frame accepted before authentication. HELLO, AUTH and
+/// AUTH_RESUME are a few hundred bytes; anything bigger here is not a
+/// handshake, and decoding it allocates a multiple of its size.
+const PRE_AUTH_MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Send `msg`, giving up after `limit`. `Err` means the peer is not draining
+/// its socket (or the socket is gone) and the connection should be closed.
+async fn send_bounded<S>(sender: &mut S, msg: Message, limit: Duration) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(limit, sender.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
+}
+
+/// A client-supplied string made safe for a log line: no control characters
+/// (so it cannot forge entries) and at most 32 characters.
+fn loggable(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(32).collect()
+}
 
 /// Rate-bucket state for a single connection.
 ///
@@ -289,7 +318,16 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         });
     }
 
-    loop {
+    // Closes a connection that never authenticates. The deadline is also
+    // checked inside the HELLO and AUTH handlers, but those only run when a
+    // frame arrives, so a client that connects and stays silent was never
+    // closed.
+    let handshake_timer = tokio::time::sleep(Duration::from_millis(
+        state.config.handshake_timeout_ms.max(0) as u64,
+    ));
+    tokio::pin!(handshake_timer);
+
+    'conn: loop {
         // Drain any pending outbound envelopes (broadcast
         // forwarder) before pulling the next inbound frame.
         // We bound the drain so a chatty forwarder cannot
@@ -299,9 +337,9 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             match outbound_rx.try_recv() {
                 Ok(env) => {
                     if let Ok(msg) = encode_envelope_message(&env) {
-                        if let Err(e) = sender.send(msg).await {
-                            debug!(request_id = %request_id, error = %e, "ws send failed");
-                            break;
+                        if send_bounded(&mut sender, msg, WRITE_TIMEOUT).await.is_err() {
+                            debug!(request_id = %request_id, "ws send failed or timed out");
+                            break 'conn;
                         }
                     }
                 }
@@ -323,6 +361,19 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 debug!(request_id = %request_id, "ws forwarder cancelled");
                 break;
             }
+            _ = &mut handshake_timer, if authed.is_none() => {
+                debug!(request_id = %request_id, "handshake timed out");
+                let _ = send_bounded(
+                    &mut sender,
+                    Message::Close(Some(CloseFrame {
+                        code: 1008,
+                        reason: "handshake_timeout".into(),
+                    })),
+                    WRITE_TIMEOUT,
+                )
+                .await;
+                break;
+            }
             res = receiver.next() => match res {
                 Some(Ok(f)) => f,
                 Some(Err(e)) => {
@@ -336,8 +387,8 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 // of re-polling a closed channel in a tight loop.
                 let Some(env) = env else { break };
                 if let Ok(msg) = encode_envelope_message(&env) {
-                    if let Err(e) = sender.send(msg).await {
-                        debug!(request_id = %request_id, error = %e, "ws send failed");
+                    if send_bounded(&mut sender, msg, WRITE_TIMEOUT).await.is_err() {
+                        debug!(request_id = %request_id, "ws send failed or timed out");
                         break;
                     }
                 }
@@ -415,6 +466,26 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             }
             Message::Pong(_) => continue,
         };
+
+        // Before authentication only a handshake frame is legitimate, and
+        // those are tiny. Refuse anything larger without decoding it.
+        if authed.is_none() && bytes.len() > PRE_AUTH_MAX_FRAME_BYTES {
+            warn!(
+                request_id = %request_id,
+                frame_bytes = bytes.len(),
+                "oversized frame before authentication; closing"
+            );
+            let _ = send_bounded(
+                &mut sender,
+                Message::Close(Some(CloseFrame {
+                    code: 1009,
+                    reason: "frame_too_large".into(),
+                })),
+                WRITE_TIMEOUT,
+            )
+            .await;
+            break;
+        }
 
         // Bytes-per-second enforcement. Order note (security
         // finding #5): the bytes bucket is checked AFTER
@@ -789,7 +860,7 @@ async fn dispatch(
             // the connection.
             warn!(
                 request_id = %request_id,
-                msg_type = %envelope.r#type.as_str(),
+                msg_type = %loggable(envelope.r#type.as_str()),
                 "ignored unknown handshake message"
             );
             DispatchOutcome::default()
@@ -1955,4 +2026,92 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    /// A sink whose peer never reads: it never becomes ready to accept a
+    /// message, like a socket whose send buffer is full.
+    struct NeverReady;
+
+    impl futures_util::Sink<Message> for NeverReady {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Pending
+        }
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), ()> {
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A sink that accepts everything and counts what it was given.
+    struct AlwaysReady(usize);
+
+    impl futures_util::Sink<Message> for AlwaysReady {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: Pin<&mut Self>, _item: Message) -> Result<(), ()> {
+            self.0 += 1;
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_peer_that_never_reads_gives_up() {
+        let started = Instant::now();
+        let res = send_bounded(
+            &mut NeverReady,
+            Message::Binary(vec![1, 2, 3]),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(res.is_err(), "the send must report that the peer is stuck");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and it must not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_to_a_healthy_peer_succeeds() {
+        let mut sink = AlwaysReady(0);
+        let res = send_bounded(
+            &mut sink,
+            Message::Binary(vec![1]),
+            Duration::from_millis(100),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert_eq!(sink.0, 1);
+    }
+
+    #[test]
+    fn loggable_strips_control_characters_and_truncates() {
+        assert_eq!(loggable("PRESENCE"), "PRESENCE");
+        assert_eq!(loggable("a\nb\r\u{1b}[31mc"), "ab[31mc");
+        let long = "x".repeat(1_000_000);
+        assert_eq!(loggable(&long).chars().count(), 32);
+        // 32 characters, not 32 bytes.
+        assert_eq!(loggable(&"\u{20AC}".repeat(100)).chars().count(), 32);
+    }
 }

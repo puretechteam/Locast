@@ -1138,6 +1138,117 @@ async fn test_unknown_message_type_in_handshake_skipped() {
     );
 }
 
+/// Read until the server closes the connection and return the close frame's
+/// code and reason (`None` if the stream ended without one). Fails if the
+/// server keeps the connection open for `within`.
+async fn expect_closed<S>(stream: &mut S, within: Duration) -> Option<(u16, String)>
+where
+    S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let read = async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    return frame.map(|f| (u16::from(f.code), f.reason.to_string()));
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return None,
+            }
+        }
+    };
+    tokio::time::timeout(within, read)
+        .await
+        .expect("the server should have closed this connection")
+}
+
+/// A connection that never says anything used to stay open forever: the
+/// handshake deadline was only checked when a frame arrived.
+#[tokio::test]
+async fn test_silent_connection_is_closed_at_the_handshake_timeout() {
+    let mut cfg = test_config(30_000, 1_048_576);
+    cfg.handshake_timeout_ms = 300;
+    let (addr, _h, _db) = spawn_server(cfg).await;
+    let mut ws = connect(addr).await;
+
+    let closed = expect_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(closed, Some((1008, "handshake_timeout".to_string())));
+}
+
+/// The timer only guards the handshake: once authenticated, a quiet
+/// connection (a viewer who is just watching) must stay open.
+#[tokio::test]
+async fn test_authenticated_connection_outlives_the_handshake_timeout() {
+    let mut cfg = test_config(30_000, 1_048_576);
+    cfg.handshake_timeout_ms = 400;
+    let (addr, _h, _db) = spawn_server(cfg).await;
+    let (kp, _pk) = fresh_keypair();
+    let mut ws = connect(addr).await;
+    ws.send(Message::Binary(encode(&hello_envelope())))
+        .await
+        .expect("send hello");
+    let _welcome = read_binary(&mut ws).await.expect("welcome");
+    let challenge_bytes = read_binary(&mut ws).await.expect("challenge");
+    let challenge: ChallengePayload =
+        serde_json::from_value(decode(&challenge_bytes).payload).expect("challenge payload");
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&challenge.nonce);
+    let auth = auth_envelope(kp.verifying_key().to_bytes(), kp.sign(&nonce).to_bytes());
+    ws.send(Message::Binary(encode(&auth)))
+        .await
+        .expect("send auth");
+    let ok = decode(&read_binary(&mut ws).await.expect("auth_ok"));
+    assert_eq!(ok.r#type.as_str(), "AUTH_OK");
+
+    // Well past the handshake deadline, with no traffic.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    ws.send(Message::Ping(b"still here".to_vec()))
+        .await
+        .expect("ping");
+    let pong = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Pong(p))) => return Some(p),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("pong in time");
+    assert_eq!(
+        pong.as_deref(),
+        Some(&b"still here"[..]),
+        "an authenticated connection must survive the handshake timeout"
+    );
+}
+
+/// Decoding a big frame allocates several times its size, and nothing
+/// before authentication is more than a few hundred bytes.
+#[tokio::test]
+async fn test_oversized_frame_before_authentication_closes_the_connection() {
+    let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
+    let mut ws = connect(addr).await;
+    ws.send(Message::Binary(vec![0u8; 9 * 1024]))
+        .await
+        .expect("send oversized");
+
+    let closed = expect_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(closed, Some((1009, "frame_too_large".to_string())));
+}
+
+/// A normal-sized handshake frame is still accepted (the cap is not a
+/// regression for real clients).
+#[tokio::test]
+async fn test_handshake_frame_under_the_cap_is_still_served() {
+    let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
+    let mut ws = connect(addr).await;
+    ws.send(Message::Binary(encode(&hello_envelope())))
+        .await
+        .expect("send hello");
+    assert!(read_binary(&mut ws).await.is_some(), "WELCOME expected");
+}
+
 #[tokio::test]
 async fn test_duplicate_hello_rejected() {
     // A second HELLO on the same connection must be rejected
