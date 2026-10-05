@@ -20,6 +20,8 @@ export type Cap = (typeof CAP)[keyof typeof CAP];
 interface CapabilityState {
     youCapSet: number | null;
     setYouCapSet: (capSet: number) => void;
+    /** Forget the capability set (the user is no longer in a room). */
+    clear: () => void;
     hasCap: (cap: number) => boolean;
 }
 
@@ -27,6 +29,8 @@ export const useCapabilityStore = create<CapabilityState>((set, get) => ({
     youCapSet: null,
 
     setYouCapSet: (capSet) => set({ youCapSet: capSet }),
+
+    clear: () => set({ youCapSet: null }),
 
     hasCap: (cap) => {
         const youCapSet = get().youCapSet;

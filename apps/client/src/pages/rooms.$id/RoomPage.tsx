@@ -7,6 +7,7 @@ import type { ConnectionState, RoomSummaryIpc } from "../../services/room";
 import type { ChatMessage } from "../../services/chat";
 import type { PositionReportEvent } from "../../bindings";
 import { useRoomStore } from "../../stores/useRoomStore";
+import { resetRoomScopedStores } from "../../stores/resetRoomScopedStores";
 import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { Player } from "../../components/Player";
 import { PlaybackControls } from "../../components/PlaybackControls";
@@ -35,7 +36,6 @@ export function RoomPage(): JSX.Element {
     const setSummary = useRoomStore((s) => s.setSummary);
     const setSignaling = useRoomStore((s) => s.setSignaling);
     const setLastKnownHostPositionMs = useRoomStore((s) => s.setLastKnownHostPositionMs);
-    const clear = useRoomStore((s) => s.clear);
     const [hydrated, setHydrated] = useState(false);
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [showPermissions, setShowPermissions] = useState(false);
@@ -43,22 +43,14 @@ export function RoomPage(): JSX.Element {
     const localMediaSrc = usePlaybackStore((s) => s.mediaSrc);
     const localMediaTitle = usePlaybackStore((s) => s.mediaTitle);
 
-    // P4-T02: on leave, reset BOTH the room store's
-    // `summary` AND the playback store's mediaSrc /
-    // mediaReady / parked event / server_seq counter.
-    // The bridge's `setRoomId` effect also clears the
-    // server_seq / pending / lastApplied fields when
-    // `roomId` changes to `null`, but the playback
-    // store's `clear` additionally resets
-    // `mediaReady` + `mediaSrc` + `suppressLocalEcho`
-    // so a re-join starts from a clean slate.
-const handleLeft = useCallback(() => {
-        usePlaybackStore.getState().clear();
-        // P4-T03: clear the per-viewer position cache
-        // on leave so a re-join starts fresh.
-        useViewerPositionStore.getState().clear();
-        clear();
-    }, [clear]);
+    // On leave, reset every room-scoped store (summary, playback media and
+    // sequence counters, per-viewer positions, capabilities, connection
+    // quality, shared media, downloads) so a re-join starts from a clean slate.
+    // A room that ENDS is handled by `RoomEndBridge`; leaving on purpose emits
+    // no event, so this runs from the leave paths.
+    const handleLeft = useCallback(() => {
+        resetRoomScopedStores();
+    }, []);
 
     // P4-T02 test seam: in Vite's test mode, expose
     // `useRoomStore.setSummary` on `window.__locastRoomStore`

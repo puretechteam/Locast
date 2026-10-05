@@ -5,6 +5,7 @@ import { PageShell } from "./components/PageShell";
 import { DownloadBlockingGuard } from "./components/DownloadBlockingGuard";
 import { DownloadProgressModal } from "./components/DownloadProgressModal";
 import { DownloadEventBridge } from "./hooks/useDownloadEventBridge";
+import { RoomEndBridge } from "./hooks/useRoomEndBridge";
 import { SharedMediaBridge } from "./hooks/useSharedMediaBridge";
 import { LibraryPage } from "./pages/library";
 import { NotFoundPage } from "./pages/not-found";
@@ -20,6 +21,7 @@ function App(): JSX.Element {
         <BrowserRouter>
             <DownloadEventBridge />
             <SharedMediaBridge />
+            <RoomEndBridge />
             <Routes>
                 <Route path="/" element={<Navigate to="/library" replace />} />
                 <Route path="/library" element={<PageShell title="Library"><LibraryPage /></PageShell>} />

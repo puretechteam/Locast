@@ -2,8 +2,8 @@ import { useState } from "react";
 import type { KeyboardEvent, MouseEvent } from "react";
 import { errorText } from "../services/errors";
 import { leaveRoom } from "../services/room";
+import { resetRoomScopedStores } from "../stores/resetRoomScopedStores";
 import { useDownloadStore } from "../stores/useDownloadStore";
-import { useSharedMediaStore } from "../stores/useSharedMediaStore";
 import type { DownloadProgressEvent, DownloadState } from "../services/downloads";
 import "./DownloadProgressModal.css";
 
@@ -73,9 +73,11 @@ export function DownloadProgressModal(): JSX.Element | null {
         setLeaveError(null);
         try {
             await leaveRoom();
-            // Stop the bridge's retry loop from raising this modal again.
-            useSharedMediaStore.getState().reset(null, false);
-            useDownloadStore.getState().clear();
+            // Leaving on purpose emits no room event, so reset the room's
+            // stores here. That also stops the shared-media bridge's retry
+            // loop from raising this dialog again, and drops the stale room
+            // summary the room page would otherwise show on the next visit.
+            resetRoomScopedStores();
         } catch (err) {
             setLeaveError(errorText(err));
         } finally {
