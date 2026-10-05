@@ -2660,7 +2660,9 @@ version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
  "locast-client",
+ "locast-manifest",
  "rmp-serde",
+ "serde_json",
  "tokio",
 ]
 

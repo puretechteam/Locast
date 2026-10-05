@@ -1,0 +1,100 @@
+# Dependabot version updates for Locast.
+#
+# Layout (one entry per manifest root):
+#   - cargo, /                          the main Cargo workspace (root Cargo.lock)
+#   - cargo, /apps/client/src-tauri/fuzz   the isolated cargo-fuzz crate (own Cargo.lock)
+#   - npm, /                            the single pnpm workspace (pnpm-lock.yaml)
+#   - github-actions, /                 the workflows under .github/workflows
+#
+# Policy (docs/ROADMAP.md): Dependabot runs on a schedule, and a new major
+# version bump requires an architecture review. So cargo and npm updates are
+# grouped minor+patch only, and major updates are ignored here and done by
+# hand after that review. GitHub Actions are tag-pinned (for example
+# actions/checkout@v4), so their majors DO arrive, as separate PRs.
+#
+# Docker is deliberately NOT covered. apps/server/Dockerfile pins a Rust
+# toolchain image (rust:1.82-bookworm); bumping it would change the project's
+# Rust version policy, which is an architecture decision, not a routine
+# dependency update.
+
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Majors need architecture review; do them by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "cargo"
+    directory: "/apps/client/src-tauri/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-fuzz-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Majors need architecture review; do them by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # Dependabot uses the "npm" ecosystem for pnpm workspaces too; it detects
+  # pnpm-lock.yaml and updates it.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    ignore:
+      # Majors need architecture review; do them by hand.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Majors are intentionally not ignored: for tag-pinned actions a major
+    # bump is how the pin moves. They arrive as separate, ungrouped PRs.

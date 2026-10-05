@@ -489,3 +489,129 @@ jobs:
       - name: pnpm build (client)
         working-directory: apps/client
         run: pnpm build
+
+  # Fuzz smoke test for the apps/client/src-tauri/fuzz cargo-fuzz crate
+  # (see its README.md). This is NOT a fuzzing campaign: every target gets a
+  # short, deterministic run (-runs=2000 -seed=1) over its committed corpus
+  # to prove the targets still build and that no seed regresses into a
+  # crash. Nothing depends on this job.
+  #
+  # Toolchain: cargo-fuzz needs a nightly (sanitizer flags). A dated nightly
+  # keeps runs reproducible; it is the one verified locally with
+  # cargo-fuzz 0.13.2. The repo-root rust-toolchain.toml pins stable and
+  # would otherwise win inside the checkout, so RUSTUP_TOOLCHAIN forces the
+  # dated nightly for every cargo/rustc call in this job.
+  #
+  # RUSTFLAGS: the workflow-level `-D warnings` is cleared here. cargo-fuzz
+  # appends its own sanitizer/coverage flags to RUSTFLAGS, and a nightly that
+  # differs from stable would turn new lints in the workspace crates into
+  # hard errors. Warnings are already gated by clippy on stable above.
+  fuzz-smoke:
+    name: fuzz smoke (ubuntu-latest)
+    runs-on: ubuntu-latest
+    # A cold ASAN build of the Tauri dependency tree is slow; later runs
+    # restore the cache.
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-10-01
+      RUSTFLAGS: ""
+      CARGO_FUZZ_VERSION: 0.13.2
+      # Every target in apps/client/src-tauri/fuzz/fuzz_targets. The check
+      # step below fails if `cargo fuzz list` and this list disagree, so a
+      # new target must be added here on purpose.
+      FUZZ_TARGETS: >-
+        wire_decode
+        path_validator
+        subtitle_srt
+        subtitle_vtt
+        subtitle_ass
+        transfer_frame
+        manifest_verify
+        protocol_url
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies (Tauri 2 webkit2gtk-4.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install Rust (dated nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-10-01
+
+      - name: Cache cargo (fuzz crate)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            apps/client/src-tauri/fuzz -> target
+          shared-key: fuzz-smoke
+          # cargo-fuzz is cached by its own step below; keep rust-cache
+          # away from ~/.cargo/bin, and keep the build cache on a failed
+          # run so a cold build is not repeated.
+          cache-bin: false
+          cache-on-failure: true
+
+      - name: Cache cargo-fuzz binary
+        id: cargo-fuzz-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ runner.os }}-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+
+      - name: Check every fuzz target is listed in this workflow
+        working-directory: apps/client/src-tauri
+        run: |
+          expected=$(printf '%s\n' $FUZZ_TARGETS | sort)
+          actual=$(cargo fuzz list | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error title=fuzz targets::FUZZ_TARGETS in ci.yml does not match 'cargo fuzz list'."
+            echo "--- FUZZ_TARGETS (ci.yml)"
+            echo "$expected"
+            echo "--- cargo fuzz list"
+            echo "$actual"
+            exit 1
+          fi
+
+      - name: Build all fuzz targets
+        working-directory: apps/client/src-tauri
+        run: cargo fuzz build
+
+      # Deterministic smoke: fixed seed and run count, no time limit. The
+      # parsers and decoders that take larger untrusted input get
+      # -max_len=65536; protocol_url uses 1024; wire_decode and
+      # path_validator keep libFuzzer's default (per the fuzz README).
+      - name: Smoke-run every fuzz target
+        working-directory: apps/client/src-tauri
+        run: |
+          for target in $FUZZ_TARGETS; do
+            case "$target" in
+              wire_decode|path_validator) max_len="" ;;
+              protocol_url) max_len="-max_len=1024" ;;
+              *) max_len="-max_len=65536" ;;
+            esac
+            echo "::group::fuzz smoke: $target"
+            cargo fuzz run "$target" -- -runs=2000 -seed=1 $max_len
+            echo "::endgroup::"
+          done
+
+      - name: Upload fuzz crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-smoke-failure
+          path: apps/client/src-tauri/fuzz/artifacts/
+          if-no-files-found: ignore
