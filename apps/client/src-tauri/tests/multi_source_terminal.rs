@@ -538,3 +538,41 @@ async fn a_chunk_that_runs_out_of_retries_on_silent_sources_fails_the_download()
     );
     assert_eq!(row_state(&f.store, &f.plan.download_id).await, "failed");
 }
+
+/// Progress counts bytes received so far: it never exceeds the total and ends
+/// at the total. It used to start from the total (the initial value was the
+/// bytes still REMAINING), so the modal showed a full bar from the first chunk
+/// and the reported bytes were larger than the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progress_never_exceeds_the_total_and_ends_at_it() {
+    let sink = sink();
+    let f = fixture("01234567-89ab-cdef-0123-456789abcf09").await;
+    let (handle, host_end) = source();
+    serve(&f, host_end);
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        run_multi_source(receiver(&f, vec![handle]), "fixture.bin".into()),
+    )
+    .await
+    .expect("must end");
+    assert!(matches!(res, Ok(DownloadState::Complete)), "got {res:?}");
+
+    let events: Vec<_> = sink
+        .progresses
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(e, _)| e.id == f.plan.download_id)
+        .map(|(e, _)| (e.transferred_bytes, e.total_bytes))
+        .collect();
+    assert!(!events.is_empty(), "a download reports progress");
+    let total = TOTAL_SIZE as u64;
+    for (done, of) in &events {
+        assert_eq!(*of, total);
+        assert!(
+            done <= of,
+            "progress {done} exceeds the total {of}: {events:?}"
+        );
+    }
+    assert_eq!(events.last().map(|e| e.0), Some(total), "{events:?}");
+}

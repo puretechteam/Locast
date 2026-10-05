@@ -796,8 +796,16 @@ async fn run_multi_source_inner(
     let total_chunks = plan.chunks.len() as u32;
 
     // Progress tracking locals.
-    let mut transferred_bytes: u64 = (plan.size_bytes
-        - have_set.len() as u64 * crate::transfer::CHUNK_SIZE_BYTES as u64)
+    // Bytes already on disk from verified chunks. (This used to compute the
+    // bytes still REMAINING, so a fresh download started at 100% and the
+    // first progress event exceeded the total; with every chunk done and a
+    // short last chunk the subtraction could also underflow.)
+    let mut transferred_bytes: u64 = plan
+        .chunks
+        .iter()
+        .filter(|c| have_set.contains(&c.index))
+        .map(|c| u64::from(c.length))
+        .sum::<u64>()
         .min(plan.size_bytes);
     let mut bytes_per_sec_ema: f64 = 0.0;
     let mut last_chunk_at: Instant = Instant::now();
@@ -1036,7 +1044,8 @@ async fn run_multi_source_inner(
                             EMA_ALPHA * instant_bps + (1.0 - EMA_ALPHA) * bytes_per_sec_ema;
                         last_chunk_at = now;
                         transferred_bytes = transferred_bytes
-                            .saturating_add(plan.chunks[index as usize].length as u64);
+                            .saturating_add(plan.chunks[index as usize].length as u64)
+                            .min(plan.size_bytes);
                         let eta_seconds =
                             if bytes_per_sec_ema > 0.0 && plan.size_bytes > transferred_bytes {
                                 let remaining = plan.size_bytes - transferred_bytes;
