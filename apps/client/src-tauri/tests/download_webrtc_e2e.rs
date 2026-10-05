@@ -578,3 +578,138 @@ async fn web_rtc_transport_satisfies_source_handle_transport_type() {
     expected_segmented.extend_from_slice(b"probe");
     assert_eq!(captured, vec![expected_segmented]);
 }
+
+/// One wire segment: `[2B total_segments][2B segment_index][payload]`.
+fn segment(total: u16, index: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(4 + payload.len());
+    v.extend_from_slice(&total.to_be_bytes());
+    v.extend_from_slice(&index.to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// A peer-controlled segment header must never panic the receive
+/// pump or leave state behind. Each hostile sequence below used to
+/// hit an `unwrap`/`assert_eq!` (continuation first, changed total)
+/// or grow memory without bound (total 0, repeated index, oversize
+/// totals). Now the transport reports an error, closes the channel,
+/// and then reports end of stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_rejects_hostile_segment_sequences() {
+    let cases: Vec<(&str, Vec<Vec<u8>>)> = vec![
+        ("continuation segment first", vec![segment(2, 1, b"x")]),
+        ("total_segments zero", vec![segment(0, 0, b"x")]),
+        (
+            "total_segments changes mid-frame",
+            vec![segment(3, 0, b"a"), segment(4, 1, b"b")],
+        ),
+        (
+            "repeated segment index",
+            vec![
+                segment(4, 0, b"a"),
+                segment(4, 1, b"b"),
+                segment(4, 1, b"b"),
+            ],
+        ),
+        (
+            "skipped segment index",
+            vec![segment(4, 0, b"a"), segment(4, 2, b"c")],
+        ),
+        (
+            "total_segments beyond the frame cap",
+            vec![segment(u16::MAX, 0, b"x")],
+        ),
+    ];
+    for (name, segments) in cases {
+        let (stub, transport) = make_stub_transport();
+        for seg in segments {
+            stub.inject_message(seg).await;
+        }
+        let first = transport.recv().await;
+        assert!(
+            matches!(first, Err(TransportError::Io(_))),
+            "{name}: expected a transport error, got {first:?}"
+        );
+        let after = transport.recv().await;
+        assert!(
+            matches!(after, Ok(None)),
+            "{name}: the stream must end after the violation, got {after:?}"
+        );
+    }
+}
+
+/// A frame whose segments add up to more than the wire frame cap is a
+/// violation even though every header is individually valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_rejects_a_reassembly_over_the_frame_cap() {
+    let (stub, transport) = make_stub_transport();
+    // 65 segments is the legal maximum, but 65 full segments is
+    // 16380 * 65 = 1064700 bytes, over 1 MiB + 4 = 1048580.
+    let full = vec![0u8; 16380];
+    for i in 0..65u16 {
+        stub.inject_message(segment(65, i, &full)).await;
+    }
+    let r = transport.recv().await;
+    assert!(
+        matches!(r, Err(TransportError::Io(_))),
+        "oversize reassembly must be an error, got {:?}",
+        r.map(|o| o.map(|v| v.len()))
+    );
+}
+
+/// An unfinished frame followed by a fresh index-0 segment (a sender
+/// that failed mid-frame) is dropped, and the next frame still arrives
+/// intact. Only the new frame's bytes are delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_recovers_from_an_abandoned_frame() {
+    let (stub, transport) = make_stub_transport();
+    stub.inject_message(segment(3, 0, b"stale")).await;
+    stub.inject_message(segment(2, 0, b"he")).await;
+    stub.inject_message(segment(2, 1, b"llo")).await;
+    let r = transport.recv().await.expect("recv ok").expect("frame");
+    assert_eq!(r, b"hello");
+}
+
+/// The inbound queue is bounded, so a reader that falls behind stalls
+/// the pump. Nothing may be lost or reordered meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_keeps_every_frame_when_the_reader_lags() {
+    let (stub, transport) = make_stub_transport();
+    let count = 200u32;
+    for n in 0..count {
+        stub.inject_message(segment(1, 0, &n.to_be_bytes())).await;
+    }
+    for n in 0..count {
+        let frame = transport.recv().await.expect("recv ok").expect("frame");
+        assert_eq!(frame, n.to_be_bytes(), "frame {n} out of order or lost");
+    }
+}
+
+/// The send side refuses a frame the receiver would have to reject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webrtc_transport_send_rejects_an_oversize_frame() {
+    let (stub, transport) = make_stub_transport();
+    let limit = 1024 * 1024 + 4;
+    let err = transport
+        .send(vec![0u8; limit + 1])
+        .await
+        .expect_err("oversize frame must be refused");
+    assert!(
+        matches!(err, TransportError::FrameTooLarge(..)),
+        "got {err:?}"
+    );
+    assert!(stub.take_sent().await.is_empty(), "nothing may be sent");
+
+    // The largest legal frame goes out as 65 segments and round-trips.
+    transport
+        .send(vec![7u8; limit])
+        .await
+        .expect("a frame at the cap is sent");
+    let sent = stub.take_sent().await;
+    assert_eq!(sent.len(), 65);
+    for seg in sent {
+        stub.inject_message(seg).await;
+    }
+    let back = transport.recv().await.expect("recv ok").expect("frame");
+    assert_eq!(back.len(), limit);
+}
