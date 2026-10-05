@@ -8,20 +8,22 @@ CI runs the Playwright suite as two jobs (`.github/workflows/ci.yml`):
   test in the run summary and as warning annotations, and uploads the report,
   traces and videos.
 
-When a failing spec below is fixed, add its file to `test:e2e:gate` (when the
-whole file is green) and delete its row here. `laser_e2e`, `leave_room_modal_e2e`,
-`permission_e2e` and `chat_e2e` are now fully green and in the gate.
-`host_disconnect_grace_e2e` is not, so it stays out of the gate.
+When a spec fails, add a row for it below (spec, test, class, evidence). When it
+is fixed, add its file to `test:e2e:gate` (when the whole file is green) and
+delete its row here.
 
-Nothing is skipped, deleted or loosened. Each row below is a failing test as of
-the baseline run (121 tests: 109 passed, 12 failed); 11 of the 12 have since
-been fixed and their rows removed (1 remains). The classification comes
-from reading the spec against the code; "unresolved" means the cause was not
-established.
+Nothing is skipped, deleted or loosened. The baseline run had 121 tests, 12 of
+which failed. All 12 have since been fixed and their rows removed, and every
+spec file is now in the gate, so no failing test is recorded.
 
 | Spec | Test | Class | Evidence |
 | --- | --- | --- | --- |
-| host_disconnect_grace_e2e:66 | grace banner; RoomClosed returns to empty state | stale harness (medium confidence) | The spec seeds the summary with `emitCapabilityUpdate`; `RoomTopBar` only sets `prevSummaryRef` from `roomState` events, so the "Room ended" toast never arms. |
+| (none) | | | |
+
+The last row to go was `host_disconnect_grace_e2e:66`. It was a product defect:
+`RoomTopBar` armed its "Room ended" toast only from `room://state` events seen
+after it mounted, so a room hydrated from the store never showed it, and its
+effect never unsubscribed from the event.
 
 No failure was attributed to the browser or the CI environment.
 

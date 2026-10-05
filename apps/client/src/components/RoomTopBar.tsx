@@ -22,27 +22,49 @@ export function RoomTopBar({ summary }: RoomTopBarProps): JSX.Element | null {
         summary?.host_disconnect_deadline_ms ?? null,
     );
     const [roomEnded, setRoomEnded] = useState(false);
-    const prevSummaryRef = useRef<RoomSummaryIpc | null>(null);
+    // True while the user is in a room, whether the summary arrived through
+    // this bar's own `room://state` listener or through the `summary` prop
+    // (hydration on mount, or another listener updating the store).
+    const inRoomRef = useRef(false);
+    const hasRoom = summary !== null;
 
     useEffect(() => {
-        const cancelled = false;
+        if (hasRoom) {
+            inRoomRef.current = true;
+            setRoomEnded(false);
+        }
+    }, [hasRoom]);
 
-        async function subscribe(): Promise<void> {
-            const unlisten = await events.roomState((next: RoomSummaryIpc | null) => {
+    useEffect(() => {
+        let cancelled = false;
+        let unlisten: (() => void) | undefined;
+
+        events
+            .roomState((next: RoomSummaryIpc | null) => {
                 if (cancelled) return;
-                if (next === null && prevSummaryRef.current !== null) {
+                if (next !== null) {
+                    inRoomRef.current = true;
+                } else if (inRoomRef.current) {
+                    inRoomRef.current = false;
                     setRoomEnded(true);
                 }
-                prevSummaryRef.current = next;
+            })
+            .then((u) => {
+                if (cancelled) {
+                    u();
+                } else {
+                    unlisten = u;
+                }
+            })
+            .catch((err: unknown) => {
+                const detail = err instanceof Error ? err.message : String(err);
+                console.error("RoomTopBar: failed to subscribe", detail);
             });
 
-            if (cancelled) {
-                unlisten();
-                return;
-            }
-        }
-
-        void subscribe();
+        return () => {
+            cancelled = true;
+            unlisten?.();
+        };
     }, []);
 
     return (
