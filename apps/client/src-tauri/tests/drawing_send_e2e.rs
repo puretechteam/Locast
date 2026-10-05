@@ -846,9 +846,21 @@ async fn draw(app: &App<'_>, stroke_id: &str) {
     send(app, end(stroke_id, 4)).await.expect("end");
 }
 
-/// No new events (of any kind) reach `c` beyond `expected` for a while.
-async fn assert_event_count_stays(c: &Client, expected: usize, what: &str) {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// Wait until the server has handled everything `c` sent so far. The server
+/// handles one connection's frames in order, so a round trip on `c`'s own
+/// connection returns only after it has processed the frames before it. This
+/// is an ordering barrier: a command's `send` returns once the frame is queued
+/// locally, and the server treats two connections independently, so without
+/// it a later message from another client (a grant) could be handled first.
+async fn server_has_handled_everything_from(c: &Client) {
+    c.room
+        .clock_skew_probe()
+        .await
+        .expect("barrier round trip on the connection");
+}
+
+/// `c` has seen exactly `expected` events (of any kind) so far.
+fn assert_event_count(c: &Client, expected: usize, what: &str) {
     assert_eq!(c.sink.count(), expected, "{what}");
 }
 
@@ -952,8 +964,9 @@ async fn undoing_another_users_stroke_needs_undo_any_and_refusal_changes_nothing
     // B holds undo_own only: the command queues the envelope, the server
     // refuses it silently. Nothing is broadcast, B stays in the room.
     send(&app_b, undo(&id)).await.expect("queued");
-    assert_event_count_stays(&a, 0, "A saw nothing").await;
-    assert_event_count_stays(&b, 4, "B saw nothing new").await;
+    server_has_handled_everything_from(&b).await;
+    assert_event_count(&a, 0, "A saw nothing");
+    assert_event_count(&b, 4, "B saw nothing new");
     assert!(b.room.state().await.is_some(), "B was not evicted");
 
     // Granted: the stroke is still there to undo.

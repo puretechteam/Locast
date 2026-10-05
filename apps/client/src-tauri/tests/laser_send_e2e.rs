@@ -328,9 +328,14 @@ async fn a_viewer_without_laser_is_silently_ignored_and_stays_in_the_room() {
     // `send` returns once the frame is queued locally, and the server
     // handles B's connection and A's PERMISSION_SET independently, so
     // granting right away could let the server see the grant before
-    // B's denied frames. Give them time to be processed (and refused)
-    // first, and check that nothing was relayed meanwhile.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // B's denied frames. The server handles one connection's frames in
+    // order, so a round trip on B's own connection returns only after
+    // it has processed (and refused) the two frames before it. That is
+    // an ordering barrier, where a fixed sleep only made the race rare.
+    b.room
+        .clock_skew_probe()
+        .await
+        .expect("barrier round trip on B's connection");
     assert_eq!(a.sink.count(), 0, "A: B's denied laser was not relayed");
     assert_eq!(c.sink.count(), 0, "C: B's denied laser was not relayed");
     grant(&a, b, locast_protocol::room::cap::LASER).await;
