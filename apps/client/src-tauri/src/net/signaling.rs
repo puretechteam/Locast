@@ -364,6 +364,29 @@ impl SignalingClient {
         self.inner.lock().await.bearer.is_some()
     }
 
+    /// **Test-only.** Put the client in the state of a WS that has a
+    /// bearer but whose connection is mid-reconnect (`phase`), with a
+    /// channel that records what is sent once a link is up.
+    #[cfg(test)]
+    pub async fn set_link_for_test(
+        &self,
+        phase: ConnPhase,
+        up: bool,
+    ) -> mpsc::UnboundedReceiver<Envelope> {
+        let (tx, rx) = mpsc::unbounded_channel::<Envelope>();
+        let mut g = self.inner.lock().await;
+        g.bearer = Some(BearerRecord {
+            user_id: Uuid::nil(),
+            pubkey: [0; 32],
+            token: [7; 32],
+            expires_ms: i64::MAX,
+        });
+        g.outbound_tx = up.then_some(tx);
+        g.state.connected = matches!(phase, ConnPhase::Authenticated);
+        g.state.phase = phase;
+        rx
+    }
+
     /// **Test-only.** Returns the current count of inbound
     /// subscribers registered on the signaling client. The
     /// P2-T05 spec asserts that `RoomClient::request` does

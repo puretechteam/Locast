@@ -1044,6 +1044,11 @@ pub struct RoomClient {
     /// envelope through the live `signaling.send_envelope`
     /// path.
     pending_outbound: StdMutex<Vec<Envelope>>,
+    /// A `ROOM_LEAVE` the user issued while the WS was down. It is kept
+    /// apart from `pending_outbound` because leaving forgets the room
+    /// session (which clears that buffer), yet the server still has to
+    /// hear about the leave once the connection is back.
+    pending_leave: StdMutex<Option<Envelope>>,
     /// P7-T01: the (code, display_name) of the most
     /// recent room the user was in. Used by
     /// `rejoin_active_room` to re-issue ROOM_JOIN_REQUEST
@@ -1074,6 +1079,7 @@ impl RoomClient {
             current_versions: StdMutex::new(HashMap::new()),
             local_user_id: Mutex::new(None),
             pending_outbound: StdMutex::new(Vec::new()),
+            pending_leave: StdMutex::new(None),
             active_room_code: StdMutex::new(None),
             host_media_selection: StdMutex::new(None),
         }
@@ -1310,8 +1316,27 @@ impl RoomClient {
         };
         let (code, display_name) = match creds {
             Some(c) => c,
-            None => return Ok(()),
+            None => {
+                // The user left while the WS was down: tell the server now.
+                let leave = self
+                    .pending_leave
+                    .lock()
+                    .expect("pending_leave lock")
+                    .take();
+                if let Some(env) = leave {
+                    self.signaling
+                        .send_envelope(env)
+                        .await
+                        .map_err(|e| RoomClientError::Signaling(e.to_string()))?;
+                }
+                return Ok(());
+            }
         };
+        // Rejoining supersedes a leave that was never delivered.
+        self.pending_leave
+            .lock()
+            .expect("pending_leave lock")
+            .take();
         let env = envelope(
             MessageKind::RoomJoinRequest,
             None,
@@ -1344,6 +1369,18 @@ impl RoomClient {
     pub async fn room_leave(&self) -> Result<(), RoomClientError> {
         let env = envelope(MessageKind::RoomLeave, None, RoomLeavePayload {});
         self.send_or_buffer(env).await?;
+        // If the leave was buffered (WS mid-reconnect), keep it past
+        // `forget_room_session`, which clears that buffer.
+        {
+            let mut buffered = self.pending_outbound.lock().expect("pending_outbound lock");
+            if let Some(i) = buffered
+                .iter()
+                .rposition(|e| e.r#type == MessageKind::RoomLeave)
+            {
+                let leave = buffered.remove(i);
+                *self.pending_leave.lock().expect("pending_leave lock") = Some(leave);
+            }
+        }
         // Drop the cached state; the server will send
         // ROOM_CLOSED and the inbound loop will clear
         // it.
@@ -3208,6 +3245,38 @@ mod tests {
         rc.pending_outbound.lock().expect("lock").push(stale());
         rc.forget_room_session();
         assert!(rc.pending_outbound.lock().expect("lock").is_empty());
+    }
+
+    /// Leaving while the WS is reconnecting buffers the `ROOM_LEAVE`;
+    /// leaving also clears the buffer, which used to drop the leave so
+    /// the server never heard it. It must go out after the next AUTH_OK.
+    #[tokio::test]
+    async fn a_leave_issued_while_reconnecting_is_sent_after_reauth() {
+        let rc = fresh_room_client().await;
+        let mut rx = rc
+            .signaling
+            .set_link_for_test(ConnPhase::Reconnecting, false)
+            .await;
+        *rc.active_room_code.lock().expect("lock") = Some(("ABC123".into(), "viewer".into()));
+
+        rc.room_leave().await.expect("leave buffers");
+        assert!(rx.try_recv().is_err(), "nothing can be sent while down");
+        assert!(rc.active_room_code.lock().expect("lock").is_none());
+
+        // Connection restored: the post-AUTH_OK hook runs the rejoin.
+        let rx_up = rc
+            .signaling
+            .set_link_for_test(ConnPhase::Authenticated, true)
+            .await;
+        let mut rx = rx_up;
+        rc.rejoin_active_room().await.expect("flushes the leave");
+        let sent = rx.try_recv().expect("ROOM_LEAVE was sent");
+        assert_eq!(sent.r#type, MessageKind::RoomLeave);
+        assert!(rx.try_recv().is_err(), "exactly one leave");
+
+        // And only once.
+        rc.rejoin_active_room().await.expect("no-op");
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
