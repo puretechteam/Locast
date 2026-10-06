@@ -252,6 +252,21 @@ impl From<RoomSummary> for RoomSummaryIpc {
     }
 }
 
+/// Broadcast events that describe the state of one specific room.
+fn is_room_scoped_event(kind: &MessageKind) -> bool {
+    matches!(
+        kind,
+        MessageKind::RoomState
+            | MessageKind::ParticipantJoined
+            | MessageKind::ParticipantLeft
+            | MessageKind::HostDisconnected
+            | MessageKind::HostReconnected
+            | MessageKind::HostMigrated
+            | MessageKind::CapabilityUpdate
+            | MessageKind::RoomClosed
+    )
+}
+
 /// Whether a ROOM_ERROR means the local user is no longer
 /// in the room. A payload that does not decode counts as
 /// ending it (the conservative, pre-existing behavior).
@@ -1827,6 +1842,25 @@ impl RoomClient {
     /// is straightforward to unit test in isolation
     /// (without the surrounding `mpsc::Receiver`).
     async fn handle_inbound(&self, env: Envelope) {
+        // 0) Room-scoped events that name a room other than the cached one
+        //    are not about this session. Applying them corrupted the roster
+        //    and host flags, and a ROOM_CLOSED for an old room cleared the
+        //    room the user had just joined. (Envelopes with no room id, and
+        //    anything while no room is cached, are handled as before.)
+        if is_room_scoped_event(&env.r#type) {
+            if let Some(event_room) = env.room_id {
+                let cached = self.state.lock().await.as_ref().map(|s| s.id.clone());
+                if let Some(cached) = cached {
+                    if cached != event_room.to_string() {
+                        debug!(
+                            kind = ?env.r#type,
+                            "dropping a room event for a room other than the current one"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         // 1) Dispatch any pending request-reply
         //    correlation. We do this BEFORE updating the
         //    cache so a request that completes in the
@@ -3298,6 +3332,40 @@ mod tests {
             "a restart must not drop live subscribers"
         );
         rc.signaling.shutdown().await;
+    }
+
+    /// A ROOM_CLOSED (or any room-scoped event) for a room the user is not
+    /// in must not touch the cached room.
+    #[tokio::test]
+    async fn room_events_for_another_room_leave_the_cached_room_alone() {
+        let host = Uuid::from_bytes([1u8; 16]);
+        let rc = fresh_room_client().await;
+        let summary = RoomSummaryIpc::from(sample_summary(host));
+        let room_id = Uuid::parse_str(&summary.id).unwrap();
+        *rc.state.lock().await = Some(summary);
+        let other_room = Uuid::now_v7();
+
+        let closed = |room: Uuid| {
+            let mut env = env_of(
+                MessageKind::RoomClosed,
+                serde_json::to_value(locast_protocol::room::RoomClosedPayload {
+                    reason: "host_left".into(),
+                })
+                .unwrap(),
+            );
+            env.room_id = Some(room);
+            env
+        };
+        rc.handle_inbound(closed(other_room)).await;
+        assert!(
+            rc.state().await.is_some(),
+            "a ROOM_CLOSED for another room must not clear this one"
+        );
+        rc.handle_inbound(closed(room_id)).await;
+        assert!(
+            rc.state().await.is_none(),
+            "its own room closing still clears it"
+        );
     }
 
     #[tokio::test]
