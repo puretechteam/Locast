@@ -32,9 +32,9 @@
 //! (any) --(connection Closed)-----------> Closed (dropped)
 //! ```
 //!
-//! The `on_room_left` call drops every entry and cancels the
-//! inbound loop. After `on_room_left`, `on_room_state_changed`
-//! for a new room is treated as a fresh manager.
+//! The `on_room_left` call drops every entry and stops the room's
+//! peer pumps; the inbound loop keeps running. After `on_room_left`,
+//! `on_room_state_changed` for a new room is treated as a fresh manager.
 //!
 //! ## Inbound loop
 //!
@@ -240,7 +240,13 @@ pub struct WebRtcManager {
     signaling: Arc<SignalingClient>,
     identity: Arc<IdentityService>,
     state: Arc<tokio::sync::Mutex<ManagerState>>,
+    /// Process-lifetime token: stops the inbound loop and parents the host
+    /// dispatcher's per-sender tokens. Leaving a room must NOT cancel it, or
+    /// the manager would never serve another room.
     cancel: CancellationToken,
+    /// Token for the current room's peer pumps. `on_room_left` cancels it and
+    /// installs a fresh one for the next room.
+    room_cancel: std::sync::Mutex<CancellationToken>,
     /// P3-T15: host-side sender dispatch. `None` on the
     /// viewer (no library to serve); `Some` on the host. The
     /// manager consults the dispatcher on every inbound
@@ -266,6 +272,7 @@ impl WebRtcManager {
             identity,
             state: Arc::new(tokio::sync::Mutex::new(ManagerState::new())),
             cancel: CancellationToken::new(),
+            room_cancel: std::sync::Mutex::new(CancellationToken::new()),
             host_dispatch: std::sync::Mutex::new(None),
         }
     }
@@ -402,10 +409,16 @@ impl WebRtcManager {
         }
     }
 
-    /// Tear down all peer connections and cancel the inbound
-    /// loop. Idempotent.
+    /// Tear down all peer connections and stop this room's peer pumps.
+    /// The inbound loop keeps running so a later room works. Idempotent.
     pub async fn on_room_left(&self) {
-        self.cancel.cancel();
+        // End this room's peer pumps and arm a fresh token for the next
+        // room. The manager-level token stays live.
+        let old = std::mem::replace(
+            &mut *self.room_cancel.lock().expect("room_cancel"),
+            CancellationToken::new(),
+        );
+        old.cancel();
         // P3-T15: clear the dispatch's room binding so a
         // follow-up `room_create` (in the same process) does
         // not serve chunks from the prior room's manifest.
@@ -515,13 +528,14 @@ impl WebRtcManager {
         // inside the manager, so this side-channel `mpsc` is
         // the only way for the handler to reach back. The
         // pump is cancelled by `on_room_left`, which cancels
-        // `self.cancel`; entry teardown reuses the same
+        // the current room token; entry teardown reuses the same
         // token.
+        let room_cancel = self.room_cancel.lock().expect("room_cancel").clone();
         tokio::spawn(peer_event_pump(
             Arc::clone(&self),
             remote_id,
             rx,
-            self.cancel.clone(),
+            room_cancel,
         ));
     }
 
