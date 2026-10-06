@@ -162,6 +162,13 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
         std::time::Duration::from_millis(500),
     );
 
+    for w in unsupported_config_warnings(
+        &config,
+        std::env::var_os("LOCAST_ROOM_DEFAULT_PASSWORD").is_some(),
+    ) {
+        tracing::warn!("{w}");
+    }
+
     // Move (not clone) the config into shared state: it owns the
     // `sensitive` secrets, which must exist exactly once.
     let bind_addr = config.bind_addr;
@@ -183,6 +190,44 @@ pub async fn serve(config: Config) -> Result<(), std::io::Error> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
+}
+
+/// Settings the operator supplied that this build accepts but does not
+/// act on. Each one is a false assurance (an encryption key that
+/// encrypts nothing, a room password nobody is asked for), so startup
+/// says so instead of staying silent.
+fn unsupported_config_warnings(config: &Config, room_password_set: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if config.sensitive.db_key.is_some() {
+        out.push("LOCAST_DB_KEY is set but database encryption is not implemented: the database is stored unencrypted");
+    }
+    if config.sensitive.turn_secret.is_some() {
+        out.push("LOCAST_TURN_SHARED_SECRET is set but TURN credential minting is not implemented: it is ignored");
+    }
+    if room_password_set {
+        out.push("LOCAST_ROOM_DEFAULT_PASSWORD is set but room passwords are not implemented: rooms are open to anyone with the code");
+    }
+    out
+}
+
+#[cfg(test)]
+mod unsupported_config_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_settings_are_reported_and_a_clean_config_is_silent() {
+        let get = |k: &str| match k {
+            "LOCAST_DB_KEY" | "LOCAST_TURN_SHARED_SECRET" => Ok("s3cret-value-xyz".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(get).expect("config");
+        let w = unsupported_config_warnings(&cfg, true);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w.iter().all(|m| !m.contains("s3cret-value-xyz")));
+
+        let clean = Config::from_lookup(|_| Err(std::env::VarError::NotPresent)).expect("config");
+        assert!(unsupported_config_warnings(&clean, false).is_empty());
+    }
 }
 
 /// P2-T05: at server startup, rehydrate the in-memory
