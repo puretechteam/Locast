@@ -210,26 +210,6 @@ fn unsupported_config_warnings(config: &Config, room_password_set: bool) -> Vec<
     out
 }
 
-#[cfg(test)]
-mod unsupported_config_tests {
-    use super::*;
-
-    #[test]
-    fn unsupported_settings_are_reported_and_a_clean_config_is_silent() {
-        let get = |k: &str| match k {
-            "LOCAST_DB_KEY" | "LOCAST_TURN_SHARED_SECRET" => Ok("s3cret-value-xyz".to_string()),
-            _ => Err(std::env::VarError::NotPresent),
-        };
-        let cfg = Config::from_lookup(get).expect("config");
-        let w = unsupported_config_warnings(&cfg, true);
-        assert_eq!(w.len(), 3, "{w:?}");
-        assert!(w.iter().all(|m| !m.contains("s3cret-value-xyz")));
-
-        let clean = Config::from_lookup(|_| Err(std::env::VarError::NotPresent)).expect("config");
-        assert!(unsupported_config_warnings(&clean, false).is_empty());
-    }
-}
-
 /// P2-T05: at server startup, rehydrate the in-memory
 /// `RoomRegistry` from the persisted SQLite rows. Closed
 /// rooms are skipped; non-host participants are marked
@@ -271,4 +251,24 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     info!("locast-server shutting down");
+}
+
+#[cfg(test)]
+mod unsupported_config_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_settings_are_reported_and_a_clean_config_is_silent() {
+        let get = |k: &str| match k {
+            "LOCAST_DB_KEY" | "LOCAST_TURN_SHARED_SECRET" => Ok("s3cret-value-xyz".to_string()),
+            _ => Err(std::env::VarError::NotPresent),
+        };
+        let cfg = Config::from_lookup(get).expect("config");
+        let w = unsupported_config_warnings(&cfg, true);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w.iter().all(|m| !m.contains("s3cret-value-xyz")));
+
+        let clean = Config::from_lookup(|_| Err(std::env::VarError::NotPresent)).expect("config");
+        assert!(unsupported_config_warnings(&clean, false).is_empty());
+    }
 }
