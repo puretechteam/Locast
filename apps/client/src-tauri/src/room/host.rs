@@ -73,6 +73,15 @@ pub enum HostError {
     /// `send_envelope` call.
     #[error("signaling: {0}")]
     Signaling(String),
+    /// The file on disk no longer matches the size recorded for it, so a
+    /// manifest built from it would contradict itself (hashes and chunk
+    /// count from the file, size from the database).
+    #[error("{filename} changed on disk: expected {expected} bytes, found {actual}")]
+    FileChanged {
+        filename: String,
+        expected: i64,
+        actual: u64,
+    },
     /// The chunk planner could not process a media file
     /// (file missing, IO error, empty file, etc.).
     #[error("chunk planning failed for {filename}: {source}")]
@@ -123,7 +132,7 @@ type MediaItemRow = (
     String,         // relative_path
     i64,            // size_bytes
     String,         // mime
-    i64,            // duration_ms
+    Option<i64>,    // duration_ms (NULL when ffprobe was unavailable or the row came from a scan)
     Option<i64>,    // width
     Option<i64>,    // height
     Option<String>, // video_codec
@@ -234,6 +243,13 @@ pub async fn build_manifest_for(
                     filename: filename.clone(),
                     source: e,
                 })?;
+        if size_bytes < 0 || plan.bytes_read != size_bytes as u64 {
+            return Err(HostError::FileChanged {
+                filename,
+                expected: size_bytes,
+                actual: plan.bytes_read,
+            });
+        }
 
         let dimensions = match (width, height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => Some(locast_manifest::Dimensions {
@@ -264,7 +280,7 @@ pub async fn build_manifest_for(
             blake3: full_blake,
             size_bytes: size_bytes as u64,
             mime,
-            duration_ms: duration_ms as u64,
+            duration_ms: duration_ms.unwrap_or(0).max(0) as u64,
             dimensions,
             codecs,
             sources: vec![Source {
@@ -568,6 +584,61 @@ mod tests {
         // peer_id is the canonical sha256(public_key) hex.
         assert_eq!(src.peer_id, derive_peer_id(TEST_PUBKEY));
         assert_eq!(src.peer_id.len(), 64);
+    }
+
+    /// `media_items.duration_ms` is nullable (an import without ffprobe, or a
+    /// row the scanner recovered, has none). The manifest query used to decode
+    /// it as a plain integer, so one such row made every publish fail.
+    #[tokio::test]
+    async fn a_row_without_a_duration_does_not_break_the_manifest() {
+        let dir = TempDir::new().expect("tempdir");
+        let rel_path = "library/ab/abcdef09/nodur.mp4";
+        let len = 2048;
+        write_temp_file(&dir, rel_path, len);
+        let storage = crate::storage::Storage::open(dir.path().join("index.sqlite"))
+            .await
+            .expect("storage with the real schema");
+        sqlx::query(
+            "INSERT INTO media_items (id, sha256, blake3, size_bytes, filename, relative_path,              mime, duration_ms, status, created_at, last_seen_at, provenance)              VALUES ('m1', ?1, ?2, ?3, 'nodur.mp4', ?4, 'video/mp4', NULL, 'permanent', 1, 1, '{}')",
+        )
+        .bind("00".repeat(32))
+        .bind("11".repeat(32))
+        .bind(len as i64)
+        .bind(rel_path)
+        .execute(&storage.pool())
+        .await
+        .expect("insert a row with NULL duration");
+
+        let m = build_manifest(&storage.pool(), dir.path(), Uuid::now_v7(), TEST_PUBKEY)
+            .await
+            .expect("a NULL duration must not fail the build");
+        assert_eq!(m.media.len(), 1);
+        assert_eq!(m.media[0].duration_ms, 0);
+    }
+
+    /// A file that no longer matches the size on record must not produce a
+    /// manifest whose entry contradicts its own chunks.
+    #[tokio::test]
+    async fn a_file_that_changed_since_it_was_recorded_is_refused() {
+        let dir = TempDir::new().expect("tempdir");
+        let rel_path = "library/ab/abcdef0a/grown.mp4";
+        write_temp_file(&dir, rel_path, 4096);
+        // The row says the file is 1024 bytes; the file on disk has 4096.
+        let pool = fresh_pool_with_row(
+            "grown.mp4",
+            rel_path,
+            1024,
+            "00".repeat(32).as_str(),
+            "11".repeat(32).as_str(),
+        )
+        .await;
+        let err = build_manifest(&pool, dir.path(), Uuid::now_v7(), TEST_PUBKEY)
+            .await
+            .expect_err("mismatching size must be refused");
+        assert!(
+            matches!(err, HostError::FileChanged { actual: 4096, .. }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

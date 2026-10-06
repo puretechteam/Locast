@@ -72,6 +72,10 @@ pub struct ChunkPlan {
     /// an empty file (we reject empty files; see
     /// [`ChunkPlanError::EmptyFile`]).
     pub per_chunk_sha256: Vec<String>,
+    /// Bytes actually read from the file while planning. Callers compare it
+    /// with the size they recorded: a file replaced, truncated or grown since
+    /// then gives different numbers.
+    pub bytes_read: u64,
 }
 
 impl ChunkPlan {
@@ -126,6 +130,7 @@ pub async fn plan_file(path: impl AsRef<Path>) -> Result<ChunkPlan, ChunkPlanErr
     let mut current_sha = Sha256::new();
     let mut bytes_into_current_chunk: usize = 0;
     let mut per_chunk: Vec<String> = Vec::new();
+    let mut bytes_read: u64 = 0;
 
     let mut buf = vec![0u8; READ_BUFFER];
     loop {
@@ -133,6 +138,7 @@ pub async fn plan_file(path: impl AsRef<Path>) -> Result<ChunkPlan, ChunkPlanErr
         if n == 0 {
             break;
         }
+        bytes_read += n as u64;
         let chunk = &buf[..n];
 
         // Update the full-file hashers on every byte. (BLAKE3
@@ -193,6 +199,7 @@ pub async fn plan_file(path: impl AsRef<Path>) -> Result<ChunkPlan, ChunkPlanErr
         full_sha256: full_sha.finalize_hex(),
         full_blake3: full_blake.finalize_hex(),
         per_chunk_sha256: per_chunk,
+        bytes_read,
     })
 }
 
