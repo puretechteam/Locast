@@ -407,6 +407,16 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a resume token so it cannot be presented again.
+    pub async fn delete_resume_token(&self, token_hash: &[u8; 32]) -> Result<(), sqlx::Error> {
+        let _g = self.write_lock.lock().await;
+        sqlx::query("DELETE FROM session_resume_tokens WHERE token_hash = ?1")
+            .bind(&token_hash[..])
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Purge all bearers that have already expired. The
     /// background task in [`spawn_bearer_cleanup`] calls this
     /// on an interval.

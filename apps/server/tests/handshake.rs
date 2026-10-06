@@ -1462,8 +1462,11 @@ async fn test_auth_resume_succeeds_with_the_prior_bearer_and_resume_token() {
     let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
     let (kp, _pk) = fresh_keypair();
     let (user_id, bearer, resume_token) = full_handshake_with_resume(addr, &kp).await;
-    let reply = try_resume(addr, &kp, user_id, bearer, resume_token).await;
+    let reply = try_resume(addr, &kp, user_id, bearer, resume_token.clone()).await;
     assert_eq!(reply, "AUTH_OK");
+    // A resume is single-use: the same bearer and token are now spent.
+    let replay = try_resume(addr, &kp, user_id, bearer, resume_token).await;
+    assert_ne!(replay, "AUTH_OK");
 }
 
 #[tokio::test]

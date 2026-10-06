@@ -1598,6 +1598,16 @@ async fn handle_auth_resume(
     let user_id = info.user_id;
     let pubkey = info.pubkey;
 
+    // A resume is single-use: retire the presented bearer and resume
+    // token so a replay of either is refused. Fresh ones are issued
+    // below.
+    if let Err(e) = state.db.revoke_bearer(&token_hash).await {
+        warn!(request_id = %request_id, error = %e, "revoke old bearer failed (resume)");
+    }
+    if let Err(e) = state.db.delete_resume_token(&stored_hash).await {
+        warn!(request_id = %request_id, error = %e, "delete old resume token failed (resume)");
+    }
+
     // Mint a fresh bearer bound to the SAME (user_id,
     // connection_epoch, None) so the resumed session
     // keeps its transport-layer binding. (A per-room
