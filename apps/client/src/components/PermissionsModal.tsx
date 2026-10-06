@@ -73,6 +73,9 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
         try {
             for (const p of summary.participants) {
                 if (p.is_host) continue;
+                // Someone who joined after the modal opened was never shown
+                // here; defaulting them to Viewer would overwrite their caps.
+                if (!(p.user_id in initialSelections)) continue;
                 const newPreset = selections[p.user_id] ?? "viewer";
                 if (newPreset === initialSelections[p.user_id]) continue;
                 // Replace, not add: moving someone down to Viewer

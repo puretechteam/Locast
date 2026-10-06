@@ -142,3 +142,31 @@ test("a failed Apply stays open with the error and a retry can finish the job", 
     const sent = await calls(page);
     expect(sent.slice(2).map((c) => c.targetUserId)).toEqual([V1_ID, V2_ID]);
 });
+
+test("Apply leaves someone who joined after the dialog opened untouched", async ({ page }) => {
+    await openAsHost(page);
+    const LATE_ID = "bbbb0000-0000-0000-0000-000000000003";
+    // A viewer joins while the dialog is open. They were never shown in it, so
+    // Apply must not "reset" them to Viewer.
+    await page.evaluate(
+        ([s]) => {
+            (window as unknown as { __locastRoomStore: { setSummary: (s: unknown) => void } })
+                .__locastRoomStore.setSummary(s);
+        },
+        [
+            {
+                ...hostSummary(),
+                participants: [
+                    ...hostSummary().participants,
+                    participant(LATE_ID, "latecomer", false),
+                ],
+            },
+        ],
+    );
+    await pickPreset(page, V1_ID, "editor");
+    await page.locator(".permissions-modal__apply").click();
+
+    await expect(page.locator(".permissions-modal__panel")).toHaveCount(0);
+    const sent = await calls(page);
+    expect(sent.map((c) => c.targetUserId)).toEqual([V1_ID]);
+});
