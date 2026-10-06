@@ -400,3 +400,50 @@ async fn unicode_named_files_import_play_and_delete() {
     }
     assert_eq!(f.row_count().await, 0);
 }
+
+/// FTS5's 'delete' needs the same values that were indexed. The triggers
+/// passed an empty label, so deleting or updating a row that carried a
+/// provenance label left its label tokens in the index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fts_forgets_the_label_when_a_labelled_row_is_deleted() {
+    let f = fixture().await;
+    let a = f.import("Labelled.mkv", 3).await;
+    let pool = f.storage.pool();
+    sqlx::query("UPDATE media_items SET provenance = '{\"label\":\"holiday\"}' WHERE id = ?1")
+        .bind(&a.id)
+        .execute(&pool)
+        .await
+        .expect("set label");
+    let hits = |q: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(&format!(
+                "SELECT rowid FROM media_items_fts WHERE media_items_fts MATCH '{q}'"
+            ))
+            .fetch_all(&pool)
+            .await
+            .expect("fts query")
+            .len()
+        }
+    };
+    assert_eq!(hits("holiday").await, 1, "the label is searchable");
+
+    // A status change re-indexes the row; the label must survive it once.
+    f.set_status(&a.id, "temporary").await;
+    assert_eq!(
+        hits("holiday").await,
+        1,
+        "still exactly one entry after an update"
+    );
+
+    sqlx::query("DELETE FROM media_items WHERE id = ?1")
+        .bind(&a.id)
+        .execute(&pool)
+        .await
+        .expect("delete");
+    assert_eq!(
+        hits("holiday").await,
+        0,
+        "no phantom entry after the row is gone"
+    );
+}
