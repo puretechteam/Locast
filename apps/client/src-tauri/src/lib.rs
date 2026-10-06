@@ -216,6 +216,21 @@ pub fn run() {
             // P7-T07: clone values needed for auto-republish callback
             let library_root_for_manifest = library_root.clone();
             let storage_for_manifest = storage_pool.clone();
+            {
+                // Startup purge of orphaned scratch bytes under tmp/.
+                let purge_storage = storage.clone();
+                let purge_root = library_root.clone();
+                tauri::async_runtime::spawn(async move {
+                    // Hold the library lock so an import staging at
+                    // launch is not purged mid-copy.
+                    let accountant = core::quota::QuotaAccountant::new(purge_storage.clone());
+                    let _guard = accountant.lock_for_library(&purge_root).await.ok();
+                    match library::purge::purge_stale_tmp(&purge_storage, &purge_root).await {
+                        Ok(r) => tracing::info!(?r, "startup tmp purge"),
+                        Err(e) => tracing::warn!(error = %e, "startup tmp purge failed"),
+                    }
+                });
+            }
             app.manage(storage.clone());
             app.manage(accountant);
             app.manage(protocol_handler);

@@ -11,6 +11,7 @@
 pub mod dedup;
 pub mod fs;
 pub mod protocol;
+pub mod purge;
 pub mod scan;
 
 pub use dedup::{dedup_on_download, exists_at_canonical_path, DedupError, DedupOutcome};
