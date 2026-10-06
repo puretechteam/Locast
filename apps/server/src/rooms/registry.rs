@@ -947,6 +947,11 @@ impl RoomRegistry {
             .participants
             .retain(|p| !(p.user_id == user_id && p.status == ParticipantStatus::Left));
         state.participants.push(rec);
+        // A (re)join starts the client's playback command counter over at 1,
+        // so forget the old one. Left in place, every command the returning
+        // user sent would be rejected as a replay until they passed the old
+        // high-water mark. Room-wide `server_seq` still blocks real replays.
+        state.playback.last_acked_seq.remove(&user_id);
 
         let summary = state.snapshot();
         let self_view = state
@@ -2765,6 +2770,38 @@ mod tests {
             tokio::time::timeout(std::time::Duration::from_secs(2), r.touch(uid(1), 5_000)).await;
         assert!(touched.is_ok(), "touch blocked on an unrelated room");
         let _ = a;
+    }
+
+    /// Someone who leaves and joins again starts their playback command
+    /// counter over, so the server must not keep their old high-water mark.
+    #[tokio::test]
+    async fn rejoining_resets_the_playback_command_counter() {
+        let r = RoomRegistry::new(cfg());
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), true, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        r.join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
+            .await
+            .expect("join");
+        let handle = r.get_by_id(summary.id).await.expect("room");
+        handle
+            .write()
+            .await
+            .playback
+            .last_acked_seq
+            .insert(uid(2), 7);
+
+        r.leave(&store(), uid(2), true, 2_000).await.expect("leave");
+        r.join(&store(), &code, uid(2), keypair(2), "B".into(), 2_500)
+            .await
+            .expect("rejoin");
+        assert_eq!(
+            handle.read().await.playback.last_acked_seq.get(&uid(2)),
+            None,
+            "a fresh join starts from seq 1 again"
+        );
     }
 
     #[tokio::test]
