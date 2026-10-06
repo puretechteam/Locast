@@ -582,6 +582,48 @@ struct InboundFrame {
     frame: Frame,
 }
 
+/// Frames buffered between the per-source recv tasks and the orchestrator.
+const INBOUND_FRAME_QUEUE: usize = 64;
+
+/// Drain one source's transport into the orchestrator's channel until the
+/// source closes, is cancelled, or the orchestrator is gone. Undecodable
+/// frames are skipped. `tx.send(..).await` applies backpressure.
+async fn pump_source_frames(
+    transport: Arc<dyn Transport>,
+    peer_id: String,
+    source_cancel: CancellationToken,
+    tx: mpsc::Sender<InboundFrame>,
+) {
+    loop {
+        let bytes = tokio::select! {
+            biased;
+            _ = source_cancel.cancelled() => break,
+            res = transport.recv() => match res {
+                Ok(Some(b)) => b,
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        };
+        let parsed = match codec::decode(&bytes) {
+            Ok((f, _used)) => f,
+            Err(_) => continue,
+        };
+        let item = InboundFrame {
+            peer_id: peer_id.clone(),
+            frame: parsed,
+        };
+        tokio::select! {
+            biased;
+            _ = source_cancel.cancelled() => break,
+            sent = tx.send(item) => {
+                if sent.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Run the multi-source download to completion. Mirrors
 /// `ReceiverSession::run` (Pending -> Connecting ->
 /// Transferring -> Verifying -> Complete | Failed).
@@ -747,42 +789,20 @@ async fn run_multi_source_inner(
         }
     }
 
-    // Per-source recv tasks: drain frames into a single
-    // mpsc::unbounded_channel<InboundFrame>.
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<InboundFrame>();
+    // Per-source recv tasks: drain frames into a single bounded channel.
+    // It is bounded so a peer that streams frames faster than the
+    // orchestrator can handle them stalls its own pump (and, through the
+    // transport's bounded queue, its own sends) instead of growing memory.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(INBOUND_FRAME_QUEUE);
     {
         let sources_g = sources.lock().await;
         for h in sources_g.iter() {
-            let transport = Arc::clone(&h.transport);
-            let peer_id = h.peer_id.clone();
-            let source_cancel = h.cancel.clone();
-            let tx = inbound_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    let bytes = tokio::select! {
-                        biased;
-                        _ = source_cancel.cancelled() => break,
-                        res = transport.recv() => match res {
-                            Ok(Some(b)) => b,
-                            Ok(None) => break,
-                            Err(_) => break,
-                        }
-                    };
-                    let parsed = match codec::decode(&bytes) {
-                        Ok((f, _used)) => f,
-                        Err(_) => continue,
-                    };
-                    if tx
-                        .send(InboundFrame {
-                            peer_id: peer_id.clone(),
-                            frame: parsed,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+            tokio::spawn(pump_source_frames(
+                Arc::clone(&h.transport),
+                h.peer_id.clone(),
+                h.cancel.clone(),
+                inbound_tx.clone(),
+            ));
         }
     }
     drop(inbound_tx);
@@ -1695,6 +1715,54 @@ mod tests {
             cancel,
             rtt_samples: VecDeque::new(),
         }
+    }
+
+    /// A peer that streams frames faster than the orchestrator drains them
+    /// must stall at the bounded queue, not grow it. With the consumer not
+    /// reading at all, at most `INBOUND_FRAME_QUEUE` frames may be queued.
+    #[tokio::test]
+    async fn a_flooding_peer_cannot_grow_the_inbound_queue() {
+        let (peer_side, our_side) = loopback_pair(0, 0);
+        let (tx, mut rx) = mpsc::channel::<InboundFrame>(INBOUND_FRAME_QUEUE);
+        let cancel = CancellationToken::new();
+        let pump = tokio::spawn(pump_source_frames(
+            Arc::new(our_side) as Arc<dyn Transport>,
+            derive_peer_id([1u8; 32]),
+            cancel.clone(),
+            tx,
+        ));
+
+        let mut bytes = Vec::new();
+        codec::encode(
+            &Frame::Request(RequestFrame {
+                download_id: "01234567-89ab-cdef-0123-456789abcd04".into(),
+                chunk_index: 0,
+            }),
+            &mut bytes,
+        )
+        .expect("encode");
+        let flood = tokio::spawn(async move {
+            for _ in 0..(INBOUND_FRAME_QUEUE * 20) {
+                if peer_side.send(bytes.clone()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Let the flood run into the bound, then count what is queued.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut queued = 0;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert!(
+            queued <= INBOUND_FRAME_QUEUE,
+            "queued {queued} frames, bound is {INBOUND_FRAME_QUEUE}"
+        );
+        assert!(queued > 0, "the pump should have delivered some frames");
+        cancel.cancel();
+        let _ = pump.await;
+        flood.abort();
     }
 
     #[test]
