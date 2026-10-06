@@ -317,7 +317,16 @@ impl<'a> SenderSession<'a> {
 
         // 3. Loop: read Request, send Chunk; on Ack/Nak,
         // track progress; on Error, bail.
-        let mut have: HashSet<u32> = hello.have_chunks.iter().copied().collect();
+        // Indices outside the plan are ignored: they could never name a real
+        // chunk, but counted here they would make a hostile receiver look
+        // complete (and grow this set without bound via `Ack`).
+        let total_chunks = plan.source_meta.total_chunks;
+        let mut have: HashSet<u32> = hello
+            .have_chunks
+            .iter()
+            .copied()
+            .filter(|i| *i < total_chunks)
+            .collect();
         let loop_result: Result<(), SessionError> = async {
             loop {
                 let frame = match await_frame(&transport, &cancel, "request").await {
@@ -360,6 +369,12 @@ impl<'a> SenderSession<'a> {
                         send_frame(&transport, &frame, &cancel).await?;
                     }
                     Frame::Ack(ack) => {
+                        if ack.chunk_index >= total_chunks {
+                            return Err(SessionError::ChunkOutOfRange {
+                                index: ack.chunk_index,
+                                total: total_chunks,
+                            });
+                        }
                         have.insert(ack.chunk_index);
                         debug!(
                             download_id = %plan.download_id,
@@ -1338,6 +1353,64 @@ mod tests {
             verify_offer_against_plan(&offer, &plan),
             Err(SessionError::TotalChunksMismatch { .. })
         ));
+    }
+
+    /// An `Ack` for a chunk the plan does not have used to be recorded, so a
+    /// hostile receiver could grow the sender's `have` set without bound and
+    /// make the session look complete. It is a protocol violation.
+    #[tokio::test]
+    async fn sender_rejects_an_ack_for_a_chunk_outside_the_plan() {
+        use crate::transfer::transport::{loopback_pair, Transport};
+        let mut plan = fake_plan();
+        plan.download_id = "01234567-89ab-cdef-0123-456789abcd04".into();
+        let (sender_side, receiver_side) = loopback_pair(0, 0);
+        let hello = HelloFrame {
+            peer_id: plan.source.peer_id.clone(),
+            download_id: plan.download_id.clone(),
+            media_id: plan.media_id.clone(),
+            manifest_version: plan.manifest_version,
+            have_chunks: vec![],
+        };
+        let sender_transport: Arc<dyn Transport> = Arc::new(sender_side);
+        let sender = tokio::spawn({
+            let plan = plan.clone();
+            async move {
+                SenderSession::run_after_hello(
+                    &plan,
+                    sender_transport,
+                    PathBuf::from("does-not-matter"),
+                    hello,
+                    "movie.mp4".into(),
+                    CancellationToken::new(),
+                )
+                .await
+            }
+        });
+
+        // Read the Offer, then ack a chunk that does not exist.
+        let _offer = receiver_side.recv().await.expect("offer");
+        let mut bytes = Vec::new();
+        codec::encode(
+            &Frame::Ack(AckFrame {
+                download_id: plan.download_id.clone(),
+                chunk_index: u32::MAX,
+            }),
+            &mut bytes,
+        )
+        .expect("encode");
+        receiver_side.send(bytes).await.expect("send ack");
+
+        let res = sender.await.expect("sender task");
+        assert!(
+            matches!(
+                res,
+                Err(SessionError::ChunkOutOfRange {
+                    index: u32::MAX,
+                    ..
+                })
+            ),
+            "got {res:?}"
+        );
     }
 
     fn fake_plan() -> DownloadPlan {
