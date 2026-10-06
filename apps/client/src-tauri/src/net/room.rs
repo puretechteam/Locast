@@ -958,7 +958,10 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `PRESENCE` envelope while the user is in a room. The
 /// server uses this to refresh `last_seen` so the
 /// stale-participant cleanup does not remove us.
-const PRESENCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+///
+/// Defined once in `room::heartbeat`, whose test checks it against the
+/// server's disconnect window; this is the value the loop really uses.
+const PRESENCE_INTERVAL: std::time::Duration = crate::room::heartbeat::PRESENCE_INTERVAL;
 
 /// The room-lifecycle client. Holds a reference to the
 /// underlying `SignalingClient`, the cached state, and the
