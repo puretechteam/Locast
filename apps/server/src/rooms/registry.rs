@@ -1101,9 +1101,12 @@ impl RoomRegistry {
             }));
         }
 
-        // Persist BEFORE the in-memory state is committed
-        // (i.e. before any of the in-memory mutations are
-        // observable to a reader). For the `host transport
+        // Persist the transition. The in-memory state above is already
+        // mutated, so a store error must not abort here: returning `Err`
+        // would skip the publish and `remove_room`, leaving an `Ended`
+        // room (or a `Left` participant nobody was told about) stuck in
+        // memory. The error is logged instead and the leave completes.
+        // For the `host transport
         // loss + migration on` case we only set the
         // deadline; for the others we either end the room
         // or add a new host participant row.
@@ -1113,7 +1116,7 @@ impl RoomRegistry {
                 store
                     .end_room(room_id, now_ms)
                     .await
-                    .map_err(|e| RoomError::Internal(format!("end_room: {e}")))?;
+                    .unwrap_or_else(|e| persist_failed("end_room", &e));
             } else {
                 // New host was elected: persist the new
                 // host flag for the new host, and demote
@@ -1130,7 +1133,7 @@ impl RoomRegistry {
                             new_host_cap_set,
                         )
                         .await
-                        .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+                        .unwrap_or_else(|e| persist_failed("add_room_participant", &e));
                 }
                 store
                     .add_room_participant(
@@ -1143,7 +1146,7 @@ impl RoomRegistry {
                         demoted_cap_set,
                     )
                     .await
-                    .map_err(|e| RoomError::Internal(format!("add_room_participant: {e}")))?;
+                    .unwrap_or_else(|e| persist_failed("add_room_participant", &e));
             }
         } else if was_host && !state.host_migration_enabled {
             // Room ends; persist end_room (host row update
@@ -1154,7 +1157,7 @@ impl RoomRegistry {
             store
                 .end_room(room_id, now_ms)
                 .await
-                .map_err(|e| RoomError::Internal(format!("end_room: {e}")))?;
+                .unwrap_or_else(|e| persist_failed("end_room", &e));
         } else if was_host {
             // Migration ON, transport loss: set the
             // deadline; the host's row stays at
@@ -1162,7 +1165,7 @@ impl RoomRegistry {
             store
                 .set_host_disconnect_deadline(room_id, state.host_disconnect_deadline_ms)
                 .await
-                .map_err(|e| RoomError::Internal(format!("set_host_disconnect_deadline: {e}")))?;
+                .unwrap_or_else(|e| persist_failed("set_host_disconnect_deadline", &e));
         }
         // Non-host (or host row): update participant
         // status to "left".
@@ -1177,7 +1180,7 @@ impl RoomRegistry {
             store
                 .update_participant_status(room_id, user_id, "left", now_ms)
                 .await
-                .map_err(|e| RoomError::Internal(format!("update_participant_status: {e}")))?;
+                .unwrap_or_else(|e| persist_failed("update_participant_status", &e));
         }
 
         let publish_items: Vec<BroadcastItem> = events
@@ -1955,6 +1958,12 @@ fn event_to_broadcast_item(
     }
 }
 
+/// A store write failed after `leave_room` had already changed the
+/// in-memory room. Log it; the leave itself still completes.
+fn persist_failed(what: &str, err: &str) {
+    tracing::error!(error = %err, what, "leave_room: persisting the transition failed; completing the leave in memory");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2288,6 +2297,99 @@ mod tests {
             e,
             RoomEvent::RoomClosed(p) if p.reason == "host_left"
         )));
+        assert!(r.get_by_code(&code).await.is_none());
+    }
+
+    /// A store whose writes all fail, as when the database is unavailable.
+    struct BrokenStore;
+
+    #[async_trait::async_trait]
+    impl super::super::RoomStore for BrokenStore {
+        async fn insert_room(
+            &self,
+            _: Uuid,
+            _: &str,
+            _: &str,
+            _: Uuid,
+            _: &[u8; 32],
+            _: bool,
+            _: i64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn add_room_participant(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: &[u8; 32],
+            _: &str,
+            _: bool,
+            _: i64,
+            _: u32,
+        ) -> Result<(), String> {
+            Err("db down".into())
+        }
+        async fn update_participant_status(
+            &self,
+            _: Uuid,
+            _: Uuid,
+            _: &str,
+            _: i64,
+        ) -> Result<(), String> {
+            Err("db down".into())
+        }
+        async fn update_participant_cap_set(&self, _: Uuid, _: Uuid, _: u32) -> Result<(), String> {
+            Err("db down".into())
+        }
+        async fn end_room(&self, _: Uuid, _: i64) -> Result<(), String> {
+            Err("db down".into())
+        }
+        async fn set_host_disconnect_deadline(
+            &self,
+            _: Uuid,
+            _: Option<i64>,
+        ) -> Result<(), String> {
+            Err("db down".into())
+        }
+        async fn room_code_taken(&self, _: &str) -> Result<bool, String> {
+            Ok(false)
+        }
+        async fn purge_stale_participants(&self, _: Uuid, _: i64) -> Result<(), String> {
+            Err("db down".into())
+        }
+    }
+
+    /// A store error during a leave used to return `Err` after the room
+    /// had already been marked `Ended` in memory, skipping the
+    /// `ROOM_CLOSED` broadcast and `remove_room`: the room stayed stuck
+    /// and nobody could leave it. The leave must complete regardless.
+    #[tokio::test]
+    async fn a_store_failure_does_not_strand_a_room_that_is_being_left() {
+        let r = RoomRegistry::new(cfg());
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        r.join(&store(), &code, uid(2), keypair(2), "B".into(), 1_500)
+            .await
+            .expect("join");
+
+        // A viewer leaving: the `ParticipantLeft` still goes out.
+        let (events, _) = r
+            .leave(&BrokenStore, uid(2), true, 1_800)
+            .await
+            .expect("viewer leave completes despite the store error");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, RoomEvent::ParticipantLeft(_))));
+
+        // The host leaving ends the room, in memory too.
+        let (events, _) = r
+            .leave(&BrokenStore, uid(1), true, 2_000)
+            .await
+            .expect("host leave completes despite the store error");
+        assert!(events.iter().any(|e| matches!(e, RoomEvent::RoomClosed(_))));
         assert!(r.get_by_code(&code).await.is_none());
     }
 
