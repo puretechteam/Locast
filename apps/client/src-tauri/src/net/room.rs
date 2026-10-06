@@ -3279,6 +3279,24 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// `signaling_disconnect` then `signaling_connect` restarts the
+    /// connection loop. It used to clear every subscriber, so the room
+    /// client's (and WebRTC manager's) inbound loops saw their channel
+    /// close and exited for good.
+    #[tokio::test]
+    async fn restarting_the_signaling_client_keeps_its_subscribers() {
+        let rc = fresh_room_client().await;
+        assert_eq!(rc.signaling.subscribers_count_for_test().await, 1);
+        rc.signaling.shutdown().await;
+        rc.signaling.start().await.expect("restart");
+        assert_eq!(
+            rc.signaling.subscribers_count_for_test().await,
+            1,
+            "a restart must not drop live subscribers"
+        );
+        rc.signaling.shutdown().await;
+    }
+
     #[tokio::test]
     async fn room_state_replaces_cache() {
         let rc = fresh_room_client().await;

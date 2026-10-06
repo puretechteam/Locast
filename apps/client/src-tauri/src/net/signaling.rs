@@ -296,7 +296,10 @@ impl SignalingClient {
             g.resume_token = None;
             g.state.session_id = None;
             g.state.user_id = None;
-            g.subscribers.clear();
+            // Keep live subscribers: the room client and the WebRTC manager
+            // subscribe once at startup, and a disconnect then connect must
+            // not orphan them. Only drop ones whose receiver is gone.
+            g.subscribers.retain(|t| !t.is_closed());
         }
 
         let config = Arc::clone(&self.config);
@@ -1102,7 +1105,8 @@ async fn idle_until_disconnect(
                 match frame {
                     Ok(Some(env)) => {
                         let subs: Vec<mpsc::UnboundedSender<Envelope>> = {
-                            let g = inner.lock().await;
+                            let mut g = inner.lock().await;
+                            g.subscribers.retain(|t| !t.is_closed());
                             g.subscribers.clone()
                         };
                         for tx in subs {
