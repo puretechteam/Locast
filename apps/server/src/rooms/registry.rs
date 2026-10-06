@@ -706,6 +706,16 @@ impl RoomRegistry {
                 if state.host_disconnect_deadline_ms.is_some() {
                     continue;
                 }
+                // Forget participants who left a while ago. Their record is
+                // only kept briefly so a quick rejoin finds it; without this
+                // every distinct identity that ever joined and left stays in
+                // the list (and in every membership scan) until the room ends.
+                let stale_after = self.config.participant_stale_after_ms;
+                state.participants.retain(|p| {
+                    p.is_host
+                        || p.status != ParticipantStatus::Left
+                        || now_ms.saturating_sub(p.last_seen_ms) < stale_after
+                });
                 let stale: Vec<usize> = state
                     .participants
                     .iter()
@@ -2656,6 +2666,42 @@ mod tests {
         }
         let handle = r.get_by_id(summary.id).await.expect("room");
         assert_eq!(handle.read().await.participants.len(), 2);
+    }
+
+    /// Participants who left are forgotten once they have been gone for the
+    /// stale window, so a long-lived room does not accumulate a record for
+    /// every identity that ever passed through it.
+    #[tokio::test]
+    async fn left_participants_are_reaped_after_the_stale_window() {
+        let r = RoomRegistry::new(RoomRegistryConfig {
+            max_participants: 8,
+            host_disconnect_grace_ms: 200,
+            participant_stale_after_ms: 1_000,
+            participant_disconnect_after_ms: 15_000,
+        });
+        let (summary, _) = r
+            .create(&store(), "X".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create");
+        let code = summary.code.clone();
+        for i in 2..12u8 {
+            r.join(&store(), &code, uid(i), keypair(i), "V".into(), 1_100)
+                .await
+                .expect("join");
+            r.leave(&store(), uid(i), true, 1_200).await.expect("leave");
+        }
+        let handle = r.get_by_id(summary.id).await.expect("room");
+        assert_eq!(handle.read().await.participants.len(), 11);
+
+        // Still inside the window: kept (a quick rejoin finds its record).
+        r.tick_stale_participants(&store(), 1_900).await;
+        assert_eq!(handle.read().await.participants.len(), 11);
+
+        // Past it: only the host remains, and no event is emitted for people
+        // who had already left.
+        let events = r.tick_stale_participants(&store(), 2_300).await;
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(handle.read().await.participants.len(), 1);
     }
 
     #[tokio::test]
