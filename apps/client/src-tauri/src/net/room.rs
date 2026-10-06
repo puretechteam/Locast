@@ -105,6 +105,9 @@ pub trait RoomEventSink: Send + Sync {
     /// P5-T04: emit `laser://off` when the server relays another
     /// participant's LASER_OFF.
     fn emit_laser_off(&self, _ev: &LaserOffEvent) {}
+    /// P6-T03: emit `chat://message` when the server broadcasts a
+    /// CHAT_MESSAGE (the local user's own message included).
+    fn emit_chat_message(&self, _ev: &ChatMessageEvent) {}
 }
 
 /// A no-op sink. Used by the unit tests so the lib test
@@ -189,6 +192,9 @@ mod tauri_sink {
         }
         fn emit_laser_off(&self, ev: &LaserOffEvent) {
             let _ = self.handle.emit(LASER_OFF_EVENT, ev.clone());
+        }
+        fn emit_chat_message(&self, ev: &ChatMessageEvent) {
+            let _ = self.handle.emit(CHAT_MESSAGE_EVENT, ev.clone());
         }
     }
 }
@@ -515,6 +521,10 @@ pub const LASER_MOVE_EVENT: &str = "laser://move";
 /// P5-T04: Tauri event name emitted when the server relays another
 /// participant's LASER_OFF.
 pub const LASER_OFF_EVENT: &str = "laser://off";
+
+/// P6-T03: Tauri event name emitted when the server broadcasts a
+/// CHAT_MESSAGE.
+pub const CHAT_MESSAGE_EVENT: &str = "chat://message";
 
 /// P4-T02: the IPC-safe playback event payload. Mirrors
 /// `locast_protocol::room::PlaybackAcceptedEvent` with
@@ -917,6 +927,19 @@ pub struct LaserMoveEvent {
     pub sender_id: String,
     pub x: f32,
     pub y: f32,
+}
+
+/// P6-T03: IPC-safe chat message payload, emitted as `chat://message`.
+/// `sender_id` is the server-stamped originator; `sender_name` is
+/// resolved from the room roster (the wire payload carries no name).
+#[derive(Serialize, Type, Clone, Debug)]
+pub struct ChatMessageEvent {
+    pub room_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub reply_to: Option<String>,
+    pub ts_ms: i64,
 }
 
 /// P5-T04: IPC-safe laser release event payload. Emitted as
@@ -2178,6 +2201,37 @@ impl RoomClient {
             // P5-T04: another participant's laser moved. The server
             // relays it to everyone but the sender, stamped with the
             // authenticated sender; the payload has no identity.
+            // P6-T03: a chat message the server broadcast. The
+            // sender's own message arrives here too: it is how the
+            // sender's panel shows it.
+            MessageKind::ChatMessage => {
+                let current = self.state.lock().await.clone();
+                if let (Some(room_id), Some(summary)) = (env.room_id, current) {
+                    if summary.id == room_id.to_string() {
+                        if let Ok(p) = decode_payload::<locast_protocol::room::ChatPayload>(&env) {
+                            let sender_id = p.sender_id.to_string();
+                            let sender_name = summary
+                                .participants
+                                .iter()
+                                .find(|u| u.user_id == sender_id)
+                                .map(|u| u.display_name.clone())
+                                .unwrap_or_else(|| sender_id.chars().take(8).collect());
+                            let ipc = ChatMessageEvent {
+                                room_id: room_id.to_string(),
+                                sender_id,
+                                sender_name,
+                                text: p.text,
+                                reply_to: p.reply_to.map(|u| u.to_string()),
+                                ts_ms: p.sent_ms,
+                            };
+                            let g = self.sink.lock().await;
+                            if let Some(s) = g.as_ref() {
+                                s.emit_chat_message(&ipc);
+                            }
+                        }
+                    }
+                }
+            }
             MessageKind::LaserMove => {
                 if let Some((room_id, sender_id)) = self.laser_origin(&env).await {
                     if let Ok(payload) =
@@ -2580,6 +2634,63 @@ mod tests {
             sig: Vec::new(),
         });
         env
+    }
+
+    /// P6-T03: records the chat events `handle_inbound` emits.
+    #[derive(Default)]
+    struct ChatSink {
+        msgs: std::sync::Mutex<Vec<ChatMessageEvent>>,
+    }
+    impl RoomEventSink for ChatSink {
+        fn emit_state(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_event(&self, _summary: &RoomSummaryIpc) {}
+        fn emit_state_cleared(&self) {}
+        fn emit_chat_message(&self, ev: &ChatMessageEvent) {
+            self.msgs.lock().unwrap().push(ev.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_chat_message_reaches_the_sink_with_the_roster_name() {
+        let me = Uuid::now_v7();
+        let rc = fresh_room_client().await;
+        // `me` is the host (named "host" in the sample roster).
+        let summary = RoomSummaryIpc::from(sample_summary(me));
+        let room_id = Uuid::parse_str(&summary.id).unwrap();
+        *rc.state.lock().await = Some(summary);
+        *rc.local_user_id.lock().await = Some(me);
+        let sink = Arc::new(ChatSink::default());
+        rc.install_event_sink(sink.clone()).await;
+
+        let stranger = Uuid::now_v7();
+        let reply = Uuid::now_v7();
+        let chat = |sender: Uuid, text: &str, room: Uuid| {
+            let mut env = env_of(
+                MessageKind::ChatMessage,
+                serde_json::json!({
+                    "sender_id": sender, "text": text, "reply_to": reply, "sent_ms": 42
+                }),
+            );
+            env.room_id = Some(room);
+            env
+        };
+        // The local user's own echo is delivered: it is how the
+        // sender's panel shows the message.
+        rc.handle_inbound(chat(me, "mine", room_id)).await;
+        rc.handle_inbound(chat(stranger, "theirs", room_id)).await;
+        // A message for some other room is dropped.
+        rc.handle_inbound(chat(stranger, "elsewhere", Uuid::now_v7()))
+            .await;
+
+        let msgs = sink.msgs.lock().unwrap().clone();
+        assert_eq!(msgs.len(), 2, "got {msgs:?}");
+        assert_eq!(msgs[0].sender_name, "host");
+        assert_eq!(msgs[0].text, "mine");
+        assert_eq!(msgs[0].room_id, room_id.to_string());
+        assert_eq!(msgs[0].reply_to, Some(reply.to_string()));
+        assert_eq!(msgs[0].ts_ms, 42);
+        assert_eq!(msgs[1].sender_id, stranger.to_string());
+        assert_eq!(msgs[1].sender_name, stranger.to_string()[..8]);
     }
 
     #[tokio::test]
