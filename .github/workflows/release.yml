@@ -353,14 +353,14 @@ jobs:
       subjects: ${{ steps.hash.outputs.subjects }}
     steps:
       - name: Download installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ${{ env.SIGNED == 'true' && 'installers-*' || 'UNSIGNED-installers-*' }}
           path: subjects
           merge-multiple: true
 
       - name: Download SBOMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom
           path: subjects
@@ -394,20 +394,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: ${{ env.SIGNED == 'true' && 'installers-*' || 'UNSIGNED-installers-*' }}
           path: dist
           merge-multiple: true
 
       - name: Download SBOMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom
           path: dist
 
       - name: Download provenance
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.provenance.outputs.provenance-name }}
           path: dist
@@ -439,20 +439,20 @@ jobs:
       contents: write
     steps:
       - name: Download signed installers
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: installers-*
           path: dist
           merge-multiple: true
 
       - name: Download SBOMs
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom
           path: dist
 
       - name: Download provenance
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ needs.provenance.outputs.provenance-name }}
           path: dist
