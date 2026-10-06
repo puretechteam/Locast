@@ -190,6 +190,24 @@ interface PlaybackStoreState {
 }
 
 /**
+ * The event to apply when a gap-filling event `filler` arrives and drains the
+ * parked successor `drained`. Only one event reaches the player, so a parked
+ * SEEK would swallow a PLAY or PAUSE that came first (a SEEK never changes
+ * the play state, and the viewer would keep playing while the host is paused).
+ * A SEEK that follows a PLAY or PAUSE is therefore applied as that PLAY or
+ * PAUSE at the SEEK's position. Any other successor already carries the final
+ * play state and wins as is.
+ */
+function mergeGapFill(filler: PlaybackStateEvent, drained: PlaybackStateEvent): PlaybackStateEvent {
+    if (drained === filler) return drained;
+    const server_seq = Math.max(filler.server_seq, drained.server_seq);
+    if (drained.kind === "seek" && filler.kind !== "seek") {
+        return { ...drained, kind: filler.kind, server_seq };
+    }
+    return { ...drained, server_seq };
+}
+
+/**
  * P4-T02 client-side playback state. The server is
  * authoritative: this store only mirrors the latest
  * accepted server event and applies `server_seq`
@@ -311,7 +329,7 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             dedup.decision.kind === "apply" &&
             "drain" in dedup.decision &&
             dedup.decision.drain !== undefined
-                ? dedup.decision.drain.event
+                ? mergeGapFill(event, dedup.decision.drain.event)
                 : event;
         // Track the host's play/pause state across the
         // accepted stream (including a drained successor),
@@ -433,21 +451,21 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
             set({ dedupState: next });
             return 0;
         }
-        // The first expired event is the one to apply
-        // (the buffer is a single slot per sender). If
-        // multiple senders had parked events expire in
-        // the same tick, apply each in deterministic
-        // sender-id order so the test assertions can
-        // predict the result.
-        expired.sort((a, b) => a.senderId.localeCompare(b.senderId));
-        const applied = expired[0];
+        // Several senders can have a parked event expire in one tick (around a
+        // host migration: the old host's last event and the new host's first).
+        // Replay them all in server order so the play state reflects every
+        // one, and the newest is what the player applies.
+        expired.sort((a, b) => a.event.server_seq - b.event.server_seq);
+        let hostPaused = state.hostPaused;
+        for (const e of expired) hostPaused = nextHostPaused(hostPaused, e.event.kind);
+        const applied = expired[expired.length - 1];
         if (applied === undefined) {
             set({ dedupState: next });
             return 0;
         }
         set({
             dedupState: next,
-            hostPaused: nextHostPaused(state.hostPaused, applied.event.kind),
+            hostPaused,
             lastApplied: state.mediaReady ? applied.event : state.lastApplied,
             pending: state.mediaReady
                 ? state.pending

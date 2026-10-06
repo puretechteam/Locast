@@ -341,6 +341,44 @@ test("a gap (seq=3 after seq=1) is buffered, then the missing seq=2 fills it and
     .toBe(null);
 });
 
+test("a PAUSE that fills the gap in front of a parked SEEK is not swallowed", async ({
+    page,
+    locast,
+}) => {
+    await mountRoomWithPlayer(page, ROOM_A);
+    const ev = (server_seq: number, monotonic_seq: number, kind: "play" | "pause" | "seek", pos: number) =>
+        makePlaybackEvent({
+            room_id: ROOM_A.id,
+            server_seq,
+            monotonic_seq,
+            sender_id: HOST_ID,
+            kind,
+            media_position_ms: pos,
+            server_ts_ms: 1_700_000_000_000 + server_seq,
+        });
+    await locast.emitPlaybackState(ev(1, 1, "play", 0));
+    // The SEEK (seq 3) arrives before the PAUSE (seq 2) it follows.
+    await locast.emitPlaybackState(ev(2, 3, "seek", 30_000));
+    await locast.emitPlaybackState(ev(3, 2, "pause", 10_000));
+
+    // The player must end up paused at the SEEK's position, not playing.
+    await expect
+        .poll(
+            async () =>
+                await page.evaluate(() => {
+                    const w = window as unknown as {
+                        __locastStore?: {
+                            getLastApplied: () => { kind: string; media_position_ms: number } | null;
+                        };
+                    };
+                    const a = w.__locastStore?.getLastApplied();
+                    return a ? `${a.kind}@${a.media_position_ms}` : null;
+                }),
+            { timeout: 2_000 },
+        )
+        .toBe("pause@30000");
+});
+
 test("an out-of-order SEEK (replayed seq=3 after seq=5 parked) is dropped", async ({
     page,
     locast,
@@ -476,6 +514,37 @@ test("a parked event whose gap never fills is force-applied after the 5 s timeou
         { timeout: 1_000 },
     )
     .toBe(5);
+});
+
+test("when parked events from two senders expire together the newest one is applied", async ({
+    page,
+    locast,
+}) => {
+    await mountRoomWithPlayer(page, ROOM_A);
+    const ev = (sender_id: string, server_seq: number, monotonic_seq: number, pos: number) =>
+        makePlaybackEvent({
+            room_id: ROOM_A.id,
+            server_seq,
+            monotonic_seq,
+            sender_id,
+            kind: "seek",
+            media_position_ms: pos,
+            server_ts_ms: 1_700_000_000_000 + server_seq,
+        });
+    // Each sender's first event we see has seq > 1, so each one parks (as at a
+    // host migration). The later one, by server order, belongs to the sender
+    // that sorts last by id, which the old code discarded.
+    await locast.emitPlaybackState(ev(HOST_ID, 1, 4, 10_000));
+    await locast.emitPlaybackState(ev(VIEWER_ID, 2, 4, 20_000));
+    const applied = await tickDedup(page, Date.now() + 10_000);
+    expect(applied).toBe(2);
+    const last = await page.evaluate(() => {
+        const w = window as unknown as {
+            __locastStore?: { getLastApplied: () => { media_position_ms: number } | null };
+        };
+        return w.__locastStore?.getLastApplied()?.media_position_ms ?? null;
+    });
+    expect(last).toBe(20_000);
 });
 
 test("per-sender independence: a duplicate from one sender does not affect another", async ({
