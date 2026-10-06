@@ -15,7 +15,6 @@
 #![warn(rust_2018_idioms)]
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -110,14 +109,16 @@ impl Storage {
             }
         }
 
-        let connect_url = format!("sqlite://{}", path.display());
         // `SqliteConnectOptions::pragma` is the documented per-connection
         // PRAGMA setter in sqlx 0.8. The builder applies each `pragma`
         // call to every new connection the pool opens. The value must
         // stringify into a `Cow<'static, str>`, so numeric PRAGMAs are
         // formatted here.
-        let options = SqliteConnectOptions::from_str(&connect_url)
-            .map_err(StorageError::Options)?
+        // `filename` takes the path as is. Building a `sqlite://` URL from it
+        // made `?`, `#` and `%` in a profile directory part of the URL syntax,
+        // so the database opened at a different path.
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)

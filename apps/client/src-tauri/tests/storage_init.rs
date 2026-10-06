@@ -102,3 +102,27 @@ async fn storage_init_creates_schema() {
         .get(0);
     assert_eq!(applied, 1, "_sqlx_migrations must record 0001_init");
 }
+
+/// A directory name with URL syntax characters must not redirect the
+/// database to a different file. The path used to be spliced into a
+/// `sqlite://` URL, where `?`, `#` and `%` are not part of the file name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_opens_at_the_exact_path_even_with_url_characters_in_it() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("a#b%20c d");
+    let path = dir.join("index.sqlite");
+    let storage = locast_client_lib::storage::Storage::open(&path)
+        .await
+        .expect("storage opens");
+    assert!(path.is_file(), "the database file must be at {path:?}");
+    drop(storage);
+    let entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        entries.iter().all(|n| n.starts_with("index.sqlite")),
+        "nothing else may be created beside it: {entries:?}"
+    );
+}
