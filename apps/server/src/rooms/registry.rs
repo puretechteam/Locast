@@ -1526,6 +1526,28 @@ impl RoomRegistry {
         None
     }
 
+    /// `true` if the user holds a participant record that has not been
+    /// closed with `Left` in a room that is still running. Unlike
+    /// [`Self::get_user_room`] this includes `Disconnected` records:
+    /// PRESENCE has to be accepted from those, because it is what
+    /// revives them (see [`Self::touch`]).
+    pub async fn has_live_participant_record(&self, user_id: Uuid) -> bool {
+        let by_id = self.by_id.read().await;
+        for h in by_id.values() {
+            let s = h.read().await;
+            if s.state == RoomLifecycle::Ended {
+                continue;
+            }
+            if s.participants
+                .iter()
+                .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// `true` if the user is currently a participant in the
     /// named room (status is Connected or Reconnecting).
     /// Used by the WS layer to filter stale broadcast events

@@ -300,7 +300,9 @@ pub async fn check_capability(
         Command::Presence => {
             let member = match room_id {
                 Some(rid) => registry.is_user_in_room(user_id, rid).await,
-                None => registry.get_user_room(user_id).await.is_some(),
+                // A `Disconnected` record counts: PRESENCE is what revives
+                // it, so refusing it here made the timeout permanent.
+                None => registry.has_live_participant_record(user_id).await,
             };
             return if member {
                 Ok(())
@@ -427,6 +429,44 @@ mod tests {
         .await
         .expect("viewer joins");
         (room.id, uid(1))
+    }
+
+    /// A participant the presence timeout marked `Disconnected` must be able
+    /// to come back by sending PRESENCE. The capability gate used to demand a
+    /// Connected/Reconnecting record, which `touch` (the reviver) never saw.
+    #[tokio::test]
+    async fn presence_from_a_timed_out_participant_is_allowed_and_revives_them() {
+        use locast_protocol::room::ParticipantStatus;
+        let (reg, clock) = fresh_registry();
+        let (room_id, _) = setup_room_with_host_and_viewer(&reg, &clock).await;
+        let now = clock.now_ms();
+        reg.tick_presence_timeout(now + 60_000).await;
+        async fn status_of_viewer(reg: &RoomRegistry, room_id: Uuid) -> Option<ParticipantStatus> {
+            let h = reg.get_by_id(room_id).await.expect("room");
+            let g = h.read().await;
+            g.participants
+                .iter()
+                .find(|p| p.user_id == uid(2))
+                .map(|p| p.status)
+        }
+        assert_eq!(
+            status_of_viewer(&reg, room_id).await,
+            Some(ParticipantStatus::Disconnected)
+        );
+
+        check_capability(&reg, uid(2), None, Command::Presence)
+            .await
+            .expect("presence from a Disconnected record passes the gate");
+        reg.touch(uid(2), now + 60_001).await;
+        assert_eq!(
+            status_of_viewer(&reg, room_id).await,
+            Some(ParticipantStatus::Connected)
+        );
+
+        // A stranger is still refused.
+        assert!(check_capability(&reg, uid(9), None, Command::Presence)
+            .await
+            .is_err());
     }
 
     // --- can() tests ---
