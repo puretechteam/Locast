@@ -31,6 +31,18 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
 /// Room page already limits titles to this.
 pub const MAX_ROOM_TITLE_CHARS: usize = 80;
 
+/// Characters that change how neighbouring text is displayed, or show
+/// nothing at all: bidi embeddings/overrides/isolates and marks, zero-width
+/// space, word joiner and the byte-order mark. They let a name or title
+/// render reversed or empty in other participants' UIs. (ZWJ and ZWNJ are
+/// left alone: emoji sequences and several scripts need them.)
+fn is_deceptive_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x061C | 0x200B | 0x200E | 0x200F | 0x202A..=0x202E | 0x2060 | 0x2066..=0x2069 | 0xFEFF
+    )
+}
+
 /// Validate a room title: at most [`MAX_ROOM_TITLE_CHARS`] scalar values
 /// and no C0 / C1 control characters. Without a limit a title could be as
 /// large as the frame cap (about 1 MiB); it is stored in the database,
@@ -43,7 +55,7 @@ pub fn validate_room_title(title: &str) -> Result<&str, RoomError> {
     }
     for c in title.chars() {
         let cu = c as u32;
-        if cu < 0x20 || (0x7F..=0x9F).contains(&cu) {
+        if cu < 0x20 || (0x7F..=0x9F).contains(&cu) || is_deceptive_format_char(c) {
             return Err(RoomError::InvalidState);
         }
     }
@@ -104,7 +116,7 @@ pub fn validate_display_name(name: &str) -> Result<&str, RoomError> {
     }
     for c in cleaned.chars() {
         let cu = c as u32;
-        if cu < 0x20 || (0x7F..=0x9F).contains(&cu) {
+        if cu < 0x20 || (0x7F..=0x9F).contains(&cu) || is_deceptive_format_char(c) {
             return Err(RoomError::InvalidState);
         }
     }
@@ -114,6 +126,24 @@ pub fn validate_display_name(name: &str) -> Result<&str, RoomError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_and_titles_reject_bidi_overrides_and_invisible_characters() {
+        for bad in [
+            "a\u{202E}b",
+            "\u{200B}",
+            "x\u{2066}y",
+            "\u{FEFF}Bob",
+            "a\u{200F}",
+        ] {
+            assert!(validate_display_name(bad).is_err(), "name {bad:?}");
+            assert!(validate_room_title(bad).is_err(), "title {bad:?}");
+        }
+        // Emoji ZWJ sequences stay valid.
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert!(validate_display_name(family).is_ok());
+        assert!(validate_room_title(family).is_ok());
+    }
 
     #[test]
     fn room_title_accepts_ordinary_titles() {
