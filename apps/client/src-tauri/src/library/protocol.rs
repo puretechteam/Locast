@@ -583,10 +583,11 @@ pub fn parse_single_range(header: &str, total_size: u64) -> Result<(u64, u64), S
             if n == 0 {
                 return Err("zero-length suffix range".into());
             }
-            if n > total_size {
-                return Err("suffix range larger than file".into());
+            if total_size == 0 {
+                return Err("suffix range of an empty file".into());
             }
-            let start = total_size - n;
+            // RFC 9110: a suffix longer than the file selects the whole file.
+            let start = total_size - n.min(total_size);
             return Ok((start, total_size - 1));
         }
         let start: u64 = start_s
@@ -775,6 +776,12 @@ mod tests {
     #[test]
     fn range_open_end() {
         assert_eq!(parse_single_range("bytes=100-", 4096).unwrap(), (100, 4095));
+    }
+
+    #[test]
+    fn range_suffix_longer_than_the_file_selects_all_of_it() {
+        assert_eq!(parse_single_range("bytes=-1000", 10).unwrap(), (0, 9));
+        assert!(parse_single_range("bytes=-5", 0).is_err());
     }
 
     #[test]
