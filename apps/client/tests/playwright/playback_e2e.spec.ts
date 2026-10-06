@@ -335,3 +335,47 @@ test("event for an unrelated room is ignored", async ({ page, locast }) => {
     const la = await readLastApplied(page);
     expect(la).toBeNull();
 });
+
+// After a file switch the media is not ready for a moment; an event that
+// arrives then is parked. It used to be dropped once the new media was ready,
+// because a viewer that had already applied an event never drained the slot.
+test("an event parked while new media loads is applied once it is ready", async ({
+    page,
+    locast,
+}) => {
+    await mountRoomWithPlayer(page, ROOM);
+    const host = "11111111-1111-1111-1111-111111111111";
+    const t0 = Date.now();
+    await locast.emitPlaybackState({
+        room_id: ROOM.id,
+        server_seq: 1,
+        server_ts_ms: t0,
+        sender_id: host,
+        monotonic_seq: 1,
+        kind: "play",
+        media_position_ms: 0,
+    });
+    await expect.poll(async () => (await readLastApplied(page))?.kind, { timeout: 1_000 }).toBe("play");
+
+    // The media element reloads: not ready, then a command arrives.
+    await page.evaluate(() => {
+        (window as unknown as { __locastStore: { setMediaReady: (r: boolean) => void } })
+            .__locastStore.setMediaReady(false);
+    });
+    await locast.emitPlaybackState({
+        room_id: ROOM.id,
+        server_seq: 2,
+        server_ts_ms: t0 + 10,
+        sender_id: host,
+        monotonic_seq: 2,
+        kind: "seek",
+        media_position_ms: 42_000,
+    });
+    await page.evaluate(() => {
+        (window as unknown as { __locastStore: { setMediaReady: (r: boolean) => void } })
+            .__locastStore.setMediaReady(true);
+    });
+    await expect
+        .poll(async () => (await readLastApplied(page))?.media_position_ms, { timeout: 2_000 })
+        .toBe(42_000);
+});

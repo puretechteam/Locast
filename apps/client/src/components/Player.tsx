@@ -85,6 +85,9 @@ export function Player({
     usePlayerRoomEvents();
 
     const lastApplied = usePlaybackStore((s) => s.lastApplied);
+    // The last event the apply effect handled, so a re-run caused by something
+    // other than a new event (a host change) does not apply it a second time.
+    const handledEventRef = useRef<typeof lastApplied>(null);
     const mediaReady = usePlaybackStore((s) => s.mediaReady);
     const mediaSrc = usePlaybackStore((s) => s.mediaSrc);
     const setMediaReady = usePlaybackStore((s) => s.setMediaReady);
@@ -122,8 +125,15 @@ export function Player({
     // effect does is map the event into a DOM call.
     useEffect(() => {
         if (!lastApplied) return;
+        // This effect also re-runs when only `isHost` or `localUserId`
+        // changes (a host migration). The event it would apply then was
+        // already handled; applying it again would seek the video back to a
+        // stale position (the echo guard below no longer matches once the
+        // local user is no longer the host).
+        if (handledEventRef.current === lastApplied) return;
         const v = ref.current;
         if (!v) return;
+        handledEventRef.current = lastApplied;
         if (isHost && localUserId && lastApplied.sender_id === localUserId) {
             // The host's own command, recorded by
             // `sendHostPlaybackCommand` after it applied
@@ -150,7 +160,16 @@ export function Player({
         if (!mediaReady) return;
         const state = usePlaybackStore.getState();
         if (state.pending === null) return;
-        if (state.lastApplied !== null) return;
+        // A parked event newer than what was applied still has to land: after
+        // a file switch `lastApplied` is non-null, and the old guard dropped
+        // the event parked while the new media loaded. An older one is stale.
+        if (
+            state.lastApplied !== null &&
+            state.pending.event.server_seq <= state.lastApplied.server_seq
+        ) {
+            usePlaybackStore.setState({ pending: null });
+            return;
+        }
         // Promote the parked event to `lastApplied`
         // AND clear the parked slot. Without the
         // clear, `pending` lingers forever in the
