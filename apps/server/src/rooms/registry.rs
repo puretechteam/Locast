@@ -1157,6 +1157,13 @@ impl RoomRegistry {
                     )
                     .await
                     .unwrap_or_else(|e| persist_failed("add_room_participant", &e));
+                // The upsert above marks the row `connected`; this host has
+                // left, so close it. Otherwise a restart brings the departed
+                // host back as a Disconnected seat that `rejoin` would re-seat.
+                store
+                    .update_participant_status(room_id, user_id, "left", now_ms)
+                    .await
+                    .unwrap_or_else(|e| persist_failed("update_participant_status", &e));
             }
         } else if was_host && !state.host_migration_enabled {
             // Room ends; persist end_room (host row update
@@ -3206,6 +3213,38 @@ mod tests {
             let parts = db.list_room_participants(row.id).await.expect("parts");
             assert_eq!(parts.len(), 1);
             assert!(parts[0].is_host);
+        }
+
+        /// A host who leaves with migration on is persisted as `left`: a
+        /// restart must not bring them back as a seat, and the new host is the
+        /// one rehydrated as host.
+        #[tokio::test]
+        async fn migrated_away_host_is_persisted_as_left() {
+            let r = RoomRegistry::new(cfg());
+            let db = fresh_db().await;
+            let host = ensure_user(&db, pubkey(1)).await;
+            let viewer = ensure_user(&db, pubkey(2)).await;
+            let s = crate::rooms::DbRoomStore::new(db.clone());
+            let (summary, _) = r
+                .create(&s, "T".into(), host, pubkey(1), true, 1_000)
+                .await
+                .expect("create");
+            r.join(&s, &summary.code, viewer, pubkey(2), "B".into(), 1_500)
+                .await
+                .expect("join");
+            r.leave(&s, host, true, 2_000).await.expect("host leaves");
+
+            let parts = db.list_room_participants(summary.id).await.expect("parts");
+            // Rehydrate reads this listing, which omits `left` rows.
+            assert!(
+                parts.iter().all(|p| p.user_id != host),
+                "the departed host must not be rehydrated: {parts:?}"
+            );
+            let new = parts
+                .iter()
+                .find(|p| p.user_id == viewer)
+                .expect("new host row");
+            assert!(new.is_host);
         }
 
         #[tokio::test]
