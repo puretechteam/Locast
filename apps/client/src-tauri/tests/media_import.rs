@@ -428,3 +428,88 @@ async fn import_one_with_cloned_storage() {
         .expect("second import ok");
     assert_eq!(r1.id, r2.id, "cloned storage: dedup still applies");
 }
+
+/// A download's placeholder row (status `temporary`, bytes not on disk
+/// yet) is not a dedup hit: importing the same bytes must write the file
+/// and make the row permanent, not return "success" with nothing stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_over_a_placeholder_row_writes_the_file_and_keeps_it() {
+    let lib_root = make_library_root();
+    let storage_holder = TempDir::new().expect("storage tempdir");
+    let storage = open_storage(&storage_holder).await;
+    let accountant = open_accountant(&storage);
+    let src_dir = TempDir::new().expect("src tempdir");
+    let payload: Vec<u8> = (0u32..4096).map(|i| (i & 0xFF) as u8).collect();
+    let src = write_source(src_dir.path(), "Clip.mkv", &payload);
+
+    let first = import_one(&accountant, &lib_root, &storage, &src, "Clip.mkv")
+        .await
+        .expect("first import");
+    // Turn the row into what `download_open` leaves behind: temporary,
+    // with nothing at its path yet.
+    std::fs::remove_file(lib_root.join(&first.relative_path)).expect("remove bytes");
+    sqlx::query("UPDATE media_items SET status = 'temporary' WHERE id = ?1")
+        .bind(&first.id)
+        .execute(&storage.pool())
+        .await
+        .expect("make placeholder");
+
+    let again = import_one(&accountant, &lib_root, &storage, &src, "Clip.mkv")
+        .await
+        .expect("import over placeholder");
+    assert_eq!(again.id, first.id, "the placeholder row is adopted");
+    assert!(
+        lib_root.join(&again.relative_path).is_file(),
+        "the imported bytes must exist at {}",
+        again.relative_path
+    );
+    let (status, rows): (String, i64) = (
+        sqlx::query("SELECT status FROM media_items WHERE id = ?1")
+            .bind(&again.id)
+            .fetch_one(&storage.pool())
+            .await
+            .expect("status")
+            .get("status"),
+        sqlx::query("SELECT COUNT(*) AS c FROM media_items")
+            .fetch_one(&storage.pool())
+            .await
+            .expect("count")
+            .get("c"),
+    );
+    assert_eq!(status, "permanent");
+    assert_eq!(rows, 1);
+}
+
+/// A `temporary` row whose bytes are already in the library is promoted
+/// by an explicit import, so it is not offered for deletion on leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_of_a_temporary_download_promotes_it() {
+    let lib_root = make_library_root();
+    let storage_holder = TempDir::new().expect("storage tempdir");
+    let storage = open_storage(&storage_holder).await;
+    let accountant = open_accountant(&storage);
+    let src_dir = TempDir::new().expect("src tempdir");
+    let payload: Vec<u8> = (0u32..4096).map(|i| (i & 0xFF) as u8).collect();
+    let src = write_source(src_dir.path(), "Clip.mkv", &payload);
+
+    let first = import_one(&accountant, &lib_root, &storage, &src, "Clip.mkv")
+        .await
+        .expect("first import");
+    sqlx::query("UPDATE media_items SET status = 'temporary' WHERE id = ?1")
+        .bind(&first.id)
+        .execute(&storage.pool())
+        .await
+        .expect("make temporary");
+
+    let again = import_one(&accountant, &lib_root, &storage, &src, "Clip.mkv")
+        .await
+        .expect("re-import");
+    assert_eq!(again.id, first.id);
+    let status: String = sqlx::query("SELECT status FROM media_items WHERE id = ?1")
+        .bind(&again.id)
+        .fetch_one(&storage.pool())
+        .await
+        .expect("status")
+        .get("status");
+    assert_eq!(status, "permanent");
+}

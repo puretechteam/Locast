@@ -239,17 +239,32 @@ pub async fn import_one(
     //           the dedup hit. The P0-T05 schema has a UNIQUE index
     //           on `relative_path` (NOCASE), so a second import of
     //           identical bytes must NOT attempt a second INSERT.
-    if let Some(existing) = lookup_by_sha(storage, &sha256).await? {
-        return Ok(existing);
+    //           A row only counts as a dedup hit when its bytes are
+    //           really in the library. A download's placeholder row
+    //           (status `temporary`, no file yet) is not: returning it
+    //           would report success with nothing on disk. A
+    //           `temporary` row whose file is present is promoted,
+    //           because the user has now explicitly kept it.
+    let mut adopt_row: Option<String> = None;
+    if let Some((existing, status)) = lookup_by_sha(storage, &sha256).await? {
+        if status == "permanent" {
+            return Ok(existing);
+        }
+        if file_present(library_root, &existing.relative_path, size_bytes).await {
+            promote_to_permanent(storage, &existing.id).await?;
+            return Ok(existing);
+        }
+        adopt_row = Some(existing.id);
     }
 
     // ----- 6. Quota check. Runs only on a dedup MISS so that a
     //           duplicate import is not refused for quota. The
     //           `used` and `cap` are computed inside the critical
     //           section so they reflect the current state.
+    //           An adopted placeholder row already counts toward `used`.
     let used = accountant.compute_used_bytes(&canonical_root).await?;
     let cap = accountant.cap_bytes().await?;
-    if used.saturating_add(size_bytes) > cap {
+    if adopt_row.is_none() && used.saturating_add(size_bytes) > cap {
         return Err(AppError::QuotaExceeded {
             used,
             cap,
@@ -317,6 +332,25 @@ pub async fn import_one(
     let now_ms = unix_millis_now();
     let id = Uuid::new_v4().to_string();
     let provenance = r#"{"source":"user-import"}"#;
+
+    if let Some(row_id) = adopt_row {
+        sqlx::query(
+            "UPDATE media_items SET status = 'permanent', filename = ?2,              relative_path = ?3, last_room_id = NULL WHERE id = ?1",
+        )
+        .bind(&row_id)
+        .bind(&sanitized)
+        .bind(&relative_path)
+        .execute(&storage.pool())
+        .await?;
+        return Ok(ImportedMedia {
+            id: row_id,
+            sha256,
+            blake3,
+            size_bytes,
+            filename: sanitized,
+            relative_path,
+        });
+    }
 
     insert_media_item(
         storage,
@@ -454,24 +488,56 @@ async fn copy_and_verify(
 /// `ImportedMedia`. Returns `None` when no row exists. The `blake3`
 /// and `size_bytes` returned here are the values stored in the
 /// original row; the duplicate import returns them as-is.
-async fn lookup_by_sha(storage: &Storage, sha: &str) -> Result<Option<ImportedMedia>, AppError> {
-    let row = sqlx::query_as::<_, (String, String, String, i64, String, String)>(
-        "SELECT id, sha256, blake3, size_bytes, filename, relative_path \
-         FROM media_items WHERE sha256 = ?1",
+async fn lookup_by_sha(
+    storage: &Storage,
+    sha: &str,
+) -> Result<Option<(ImportedMedia, String)>, AppError> {
+    let row = sqlx::query_as::<_, (String, String, String, i64, String, String, String)>(
+        "SELECT id, sha256, blake3, size_bytes, filename, relative_path, status          FROM media_items WHERE sha256 = ?1",
     )
     .bind(sha)
     .fetch_optional(&storage.pool())
     .await?;
     Ok(row.map(
-        |(id, sha256, blake3, size_bytes, filename, relative_path)| ImportedMedia {
-            id,
-            sha256,
-            blake3,
-            size_bytes,
-            filename,
-            relative_path,
+        |(id, sha256, blake3, size_bytes, filename, relative_path, status)| {
+            (
+                ImportedMedia {
+                    id,
+                    sha256,
+                    blake3,
+                    size_bytes,
+                    filename,
+                    relative_path,
+                },
+                status,
+            )
         },
     ))
+}
+
+/// True when `<library_root>/<relative_path>` is a regular file of
+/// exactly `size_bytes`. A row with a traversal component is never
+/// trusted.
+async fn file_present(library_root: &Path, relative_path: &str, size_bytes: i64) -> bool {
+    let mut path = library_root.to_path_buf();
+    for c in relative_path.split('/') {
+        if c.is_empty() || c == "." || c == ".." {
+            return false;
+        }
+        path.push(c);
+    }
+    match tokio_fs::metadata(&path).await {
+        Ok(m) => m.is_file() && m.len() as i64 == size_bytes,
+        Err(_) => false,
+    }
+}
+
+async fn promote_to_permanent(storage: &Storage, id: &str) -> Result<(), AppError> {
+    sqlx::query("UPDATE media_items SET status = 'permanent', last_room_id = NULL WHERE id = ?1")
+        .bind(id)
+        .execute(&storage.pool())
+        .await?;
+    Ok(())
 }
 
 /// Insert a `media_items` row. All fields are bound individually so a
