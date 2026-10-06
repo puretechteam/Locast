@@ -2391,10 +2391,20 @@ impl RoomClient {
         // for the envelope's own kind first, then fall
         // back to the first sender across all kinds.
         let mut pending = self.pending.lock().await;
-        if let Some(senders) = pending.get_mut(&env.r#type) {
-            if !senders.is_empty() {
+        // Hand the reply to the first waiter that is still listening. A
+        // waiter whose request was dropped or timed out leaves a closed
+        // sender behind; delivering into it would swallow the reply.
+        let deliver = |senders: &mut Vec<oneshot::Sender<Envelope>>| -> bool {
+            while !senders.is_empty() {
                 let tx = senders.remove(0);
-                let _ = tx.send(env.clone());
+                if tx.send(env.clone()).is_ok() {
+                    return true;
+                }
+            }
+            false
+        };
+        if let Some(senders) = pending.get_mut(&env.r#type) {
+            if deliver(senders) {
                 return Some(env.r#type.clone());
             }
         }
@@ -2402,9 +2412,7 @@ impl RoomClient {
             // Route the error to the first pending
             // request of any kind.
             for (kind, senders) in pending.iter_mut() {
-                if !senders.is_empty() {
-                    let tx = senders.remove(0);
-                    let _ = tx.send(env.clone());
+                if deliver(senders) {
                     return Some(kind.clone());
                 }
             }
@@ -2433,12 +2441,12 @@ impl RoomClient {
         // next AUTH_OK) instead of failing fast.
         if let Err(e) = self.send_or_buffer(env).await {
             // Roll back the registration so a future
-            // request doesn't pick up our sender.
+            // request doesn't pick up our sender. Close our receiver first
+            // so the prune below removes OUR sender, not another request's.
+            drop(rx);
             let mut pending = self.pending.lock().await;
             if let Some(senders) = pending.get_mut(&expected) {
-                if !senders.is_empty() {
-                    senders.remove(0);
-                }
+                senders.retain(|t| !t.is_closed());
             }
             return Err(e);
         }
@@ -2448,9 +2456,7 @@ impl RoomClient {
             Ok(Err(_)) => {
                 let mut pending = self.pending.lock().await;
                 if let Some(senders) = pending.get_mut(&expected) {
-                    if !senders.is_empty() {
-                        senders.remove(0);
-                    }
+                    senders.retain(|t| !t.is_closed());
                 }
                 Err(RoomClientError::NotConnected)
             }
@@ -2458,11 +2464,12 @@ impl RoomClient {
                 // Timeout: the sender is dropped when
                 // its receiver dies; clean it up so the
                 // queue does not grow.
+                // The timed-out future (and our receiver) is already
+                // dropped, so our sender is the closed one; other live
+                // requests of this kind keep theirs.
                 let mut pending = self.pending.lock().await;
                 if let Some(senders) = pending.get_mut(&expected) {
-                    if !senders.is_empty() {
-                        senders.remove(0);
-                    }
+                    senders.retain(|t| !t.is_closed());
                 }
                 Err(RoomClientError::Unexpected("request timeout".into()))
             }
@@ -3366,6 +3373,29 @@ mod tests {
             rc.state().await.is_none(),
             "its own room closing still clears it"
         );
+    }
+
+    /// A request that gave up (timed out or was dropped) leaves a closed
+    /// sender at the front of the queue. A reply must go to the next waiter
+    /// that is still listening, not into the dead one.
+    #[tokio::test]
+    async fn a_reply_skips_waiters_that_gave_up() {
+        let rc = fresh_room_client().await;
+        let (dead_tx, dead_rx) = oneshot::channel();
+        let (live_tx, live_rx) = oneshot::channel();
+        {
+            let mut pending = rc.pending.lock().await;
+            let q = pending.entry(MessageKind::RoomJoined).or_default();
+            q.push(dead_tx);
+            q.push(live_tx);
+        }
+        drop(dead_rx);
+        let env = env_of(MessageKind::RoomJoined, serde_json::json!({}));
+        assert_eq!(
+            rc.deliver_to_pending(&env).await,
+            Some(MessageKind::RoomJoined)
+        );
+        assert!(live_rx.await.is_ok(), "the live waiter got the reply");
     }
 
     #[tokio::test]
