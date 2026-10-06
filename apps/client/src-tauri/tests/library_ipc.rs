@@ -47,6 +47,9 @@ fn harness() -> Harness {
     let app = tauri::test::mock_builder()
         .manage(storage)
         .manage(accountant)
+        .manage(std::sync::Arc::new(
+            locast_client_lib::transfer::TransferRegistry::new(),
+        ))
         .invoke_handler(tauri::generate_handler![
             locast_client_lib::commands::import::media_import,
             locast_client_lib::commands::library::library_list,
