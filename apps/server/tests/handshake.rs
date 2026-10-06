@@ -1390,3 +1390,88 @@ async fn test_user_id_is_server_assigned() {
         "different pubkey should yield different user_id"
     );
 }
+
+/// Full handshake returning (user_id, bearer, resume_token).
+async fn full_handshake_with_resume(
+    addr: SocketAddr,
+    kp: &SigningKey,
+) -> (Uuid, [u8; 32], Vec<u8>) {
+    let mut ws = connect(addr).await;
+    ws.send(Message::Binary(encode(&hello_envelope())))
+        .await
+        .expect("hello");
+    let _w = read_binary(&mut ws).await.expect("welcome");
+    let c = read_binary(&mut ws).await.expect("challenge");
+    let challenge: ChallengePayload =
+        serde_json::from_value(decode(&c).payload).expect("challenge payload");
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&challenge.nonce);
+    let auth = auth_envelope(kp.verifying_key().to_bytes(), kp.sign(&nonce).to_bytes());
+    ws.send(Message::Binary(encode(&auth))).await.expect("auth");
+    let ok_env = decode(&read_binary(&mut ws).await.expect("auth ok"));
+    let ok: AuthOkPayload = serde_json::from_value(ok_env.payload).expect("ok payload");
+    let mut bearer = [0u8; 32];
+    bearer.copy_from_slice(&ok.bearer.token);
+    (ok.user_id, bearer, ok.resume_token.expect("resume token"))
+}
+
+/// HELLO carrying `resume_token`, then AUTH_RESUME with `bearer`.
+/// Returns the type of the server's reply.
+async fn try_resume(
+    addr: SocketAddr,
+    kp: &SigningKey,
+    user_id: Uuid,
+    bearer: [u8; 32],
+    resume_token: Vec<u8>,
+) -> String {
+    let mut ws = connect(addr).await;
+    let mut hello = hello_envelope();
+    hello.payload["resume_token"] = json!(resume_token);
+    ws.send(Message::Binary(encode(&hello)))
+        .await
+        .expect("hello");
+    let _w = read_binary(&mut ws).await.expect("welcome");
+    let c = read_binary(&mut ws).await.expect("challenge");
+    let challenge: ChallengePayload =
+        serde_json::from_value(decode(&c).payload).expect("challenge payload");
+    let mut nonce = [0u8; 32];
+    nonce.copy_from_slice(&challenge.nonce);
+    let resume = Envelope {
+        v: 1,
+        r#type: MessageKind::AuthResume,
+        id: Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: 0,
+        seq: 0,
+        payload: json!({
+            "user_id": user_id,
+            "bearer": bearer.to_vec(),
+            "signed_nonce": kp.sign(&nonce).to_bytes().to_vec(),
+        }),
+    };
+    ws.send(Message::Binary(encode(&resume)))
+        .await
+        .expect("resume");
+    let reply = read_binary(&mut ws).await.expect("resume reply");
+    decode(&reply).r#type.as_str().to_string()
+}
+
+#[tokio::test]
+async fn test_auth_resume_succeeds_with_the_prior_bearer_and_resume_token() {
+    let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
+    let (kp, _pk) = fresh_keypair();
+    let (user_id, bearer, resume_token) = full_handshake_with_resume(addr, &kp).await;
+    let reply = try_resume(addr, &kp, user_id, bearer, resume_token).await;
+    assert_eq!(reply, "AUTH_OK");
+}
+
+#[tokio::test]
+async fn test_auth_resume_rejects_a_bearer_paired_with_another_connections_resume_token() {
+    let (addr, _h, _db) = spawn_server(test_config(30_000, 1_048_576)).await;
+    let (kp, _pk) = fresh_keypair();
+    let (user_id, bearer, _own_resume) = full_handshake_with_resume(addr, &kp).await;
+    let (_u2, _b2, other_resume) = full_handshake_with_resume(addr, &kp).await;
+    let reply = try_resume(addr, &kp, user_id, bearer, other_resume).await;
+    assert_eq!(reply, "AUTH_FAIL");
+}

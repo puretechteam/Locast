@@ -1508,7 +1508,7 @@ async fn handle_auth_resume(
     }
     // No resume_token_hash means the HELLO did not
     // advertise a valid one; AUTH_RESUME is invalid here.
-    let _stored_hash = match resume_token_hash {
+    let stored_hash = match resume_token_hash {
         Some(h) => h,
         None => {
             record_auth_failure(&auth_failures).await;
@@ -1537,23 +1537,41 @@ async fn handle_auth_resume(
         warn!(request_id = %request_id, "AUTH_RESUME bearer user_id mismatch");
         return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
     }
-    // P7-T01 review-fix: triple-bind assertion. The bearer
-    // row carries the (user_id, connection_epoch, room_id)
-    // it was minted for; reject any bearer presented against
-    // a different connection_epoch (stolen-bearer replay
-    // across a newer connection) or a different room_id.
+    // Triple-bind assertion. The bearer and the resume token were
+    // both minted on the PREVIOUS connection, so they must carry the
+    // same (user_id, connection_epoch, room_id). The current
+    // connection's epoch is always newer and is never compared: a
+    // bearer paired with a resume token from a different connection
+    // (or user, or room) is rejected.
+    let resume_info = match state.db.validate_resume_token(&stored_hash).await {
+        Ok(Some(i)) => i,
+        Ok(None) => {
+            record_auth_failure(&auth_failures).await;
+            warn!(request_id = %request_id, "AUTH_RESUME resume_token expired");
+            return DispatchOutcome::auth_fail(AuthFailReason::Expired);
+        }
+        Err(e) => {
+            warn!(request_id = %request_id, error = %e, "resume_token lookup failed");
+            return DispatchOutcome::close("internal");
+        }
+    };
     let binding = BearerBinding {
         user_id: info.user_id,
         connection_epoch: info.connection_epoch,
         room_id: info.room_id,
     };
-    if !binding.matches(resume.user_id, connection_epoch, None) {
+    if !binding.matches(
+        resume.user_id,
+        resume_info.connection_epoch,
+        resume_info.room_id,
+    ) || resume_info.user_id != resume.user_id
+    {
         record_auth_failure(&auth_failures).await;
         warn!(
             request_id = %request_id,
             bearer_epoch = info.connection_epoch,
-            conn_epoch = connection_epoch,
-            "AUTH_RESUME bearer epoch/room mismatch",
+            token_epoch = resume_info.connection_epoch,
+            "AUTH_RESUME bearer does not match the resume token binding",
         );
         return DispatchOutcome::auth_fail(AuthFailReason::BadSig);
     }
