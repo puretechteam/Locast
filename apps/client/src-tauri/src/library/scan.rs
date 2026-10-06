@@ -540,10 +540,13 @@ async fn mark_missing_files(storage: &Storage, visited: &[String]) -> Result<u64
         sqlx::query_as("SELECT id, relative_path FROM media_items")
             .fetch_all(&storage.pool())
             .await?;
+    // A set, not a list: `visited.iter().any(..)` per row made this
+    // O(rows x files), minutes on a large library.
+    let visited: std::collections::HashSet<&str> = visited.iter().map(String::as_str).collect();
     let missing_ids: Vec<String> = all_rows
         .into_iter()
         .filter_map(|(id, rel)| {
-            if visited.iter().any(|v| v == &rel) {
+            if visited.contains(rel.as_str()) {
                 None
             } else {
                 Some(id)
@@ -551,15 +554,12 @@ async fn mark_missing_files(storage: &Storage, visited: &[String]) -> Result<u64
         })
         .collect();
     let missing = missing_ids.len() as u64;
-    if !missing_ids.is_empty() {
-        // SQLite's `IN (?, ?, ?)` is bounded by SQLITE_MAX_VARIABLE_NUMBER
-        // (default 32766 since SQLite 3.32). For typical libraries this is
-        // a non-issue; chunking would be a future optimization for very
-        // large libraries (>32k missing rows). The single-statement
-        // approach is correct for the acceptance test (50 files) and
-        // for any reasonable real-world library.
-        let placeholders = std::iter::repeat("?")
-            .take(missing_ids.len())
+    // Batches keep each statement under SQLite's bound-variable limit
+    // (SQLITE_MAX_VARIABLE_NUMBER); one `IN (...)` over every missing id
+    // failed outright once more than ~32k rows were missing.
+    for batch in missing_ids.chunks(500) {
+        let placeholders = (0..batch.len())
+            .map(|i| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -567,7 +567,7 @@ async fn mark_missing_files(storage: &Storage, visited: &[String]) -> Result<u64
             placeholders
         );
         let mut q = sqlx::query(&sql).bind(now_ms);
-        for id in &missing_ids {
+        for id in batch {
             q = q.bind(id);
         }
         q.execute(&storage.pool()).await?;

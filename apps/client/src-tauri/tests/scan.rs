@@ -525,6 +525,41 @@ async fn scan_marks_missing_files_with_updated_last_seen_at() {
     assert_eq!(status, "permanent", "status is unchanged");
 }
 
+/// More missing rows than SQLite allows bound variables in one statement
+/// (32766). The pass used a single `IN (...)` over all of them and failed the
+/// whole scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_marks_a_very_large_number_of_missing_files() {
+    let (storage, lib_root_dir) = open_storage().await;
+    let accountant = open_accountant(&storage);
+    let lib_root = make_library_root(&lib_root_dir);
+
+    const ROWS: i64 = 33_000;
+    sqlx::query(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)          INSERT INTO media_items (            id, sha256, blake3, size_bytes, filename, relative_path, mime,             status, created_at, last_seen_at, provenance         ) SELECT 'id-' || i, printf('%064d', i), 'b', 0, 'f' || i || '.mkv',             'library/x/x/' || i || '/f.mkv', 'application/octet-stream',             'permanent', 1, 1, '{}' FROM n",
+    )
+    .bind(ROWS)
+    .execute(&storage.pool())
+    .await
+    .expect("insert rows");
+
+    let result = library_scan_test(&storage, &accountant, &lib_root).await;
+    assert_eq!(result.files_missing, ROWS as u64);
+    let bumped: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE last_seen_at > 1")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("count");
+    let sample: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE last_seen_at <= 1 LIMIT 5")
+            .fetch_all(&storage.pool())
+            .await
+            .expect("sample");
+    assert_eq!(
+        bumped, ROWS,
+        "every missing row had last_seen_at bumped; e.g. {sample:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 10. unicode filenames
 // ---------------------------------------------------------------------------
