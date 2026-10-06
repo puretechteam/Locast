@@ -230,6 +230,22 @@ process.stdout.write("multi-sender independence\n");
     );
 }
 
+// ----- a sender that rejoined restarts at seq 1 -----
+process.stdout.write("sender counter reset\n");
+{
+    let st = initialDedupState<Ev>();
+    for (let q = 1; q <= 5; q++) {
+        const r = evaluateDedup(st, { sender_id: "co", monotonic_seq: q, tag: `a${q}` }, 1000 + q);
+        st = r.next;
+    }
+    const again = evaluateDedup(st, { sender_id: "co", monotonic_seq: 1, tag: "after-rejoin" }, 2000);
+    check("seq 1 after seq 5 is a reset -> apply", again.decision.kind === "apply");
+    const second = evaluateDedup(again.next, { sender_id: "co", monotonic_seq: 2, tag: "next" }, 2001);
+    check("seq 2 after the reset applies", second.decision.kind === "apply");
+    const dup = evaluateDedup(second.next, { sender_id: "co", monotonic_seq: 2, tag: "dup" }, 2002);
+    check("a real duplicate is still dropped", dup.decision.kind === "drop");
+}
+
 // ----- clearDedupState empties the map -----
 process.stdout.write("clearDedupState\n");
 {

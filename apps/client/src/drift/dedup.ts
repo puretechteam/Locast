@@ -203,6 +203,21 @@ export function evaluateDedup<T extends { sender_id: string; monotonic_seq: numb
         };
     }
 
+    // A sender that leaves and rejoins restarts its counter at 1 (the server
+    // forgets its old high-water mark on a fresh join). Without this their
+    // commands 1..N would all drop as duplicates. Only seq 1 is a reset: the
+    // room-wide `server_seq` check still rejects real replays.
+    if (seq === 1 && sender.lastAppliedSeq > 1) {
+        next.bySender.set(event.sender_id, {
+            lastAppliedSeq: 1,
+            pending: null,
+        });
+        return {
+            decision: { kind: "apply", event, seq: 1, senderId: event.sender_id },
+            next,
+        };
+    }
+
     // Existing sender. Duplicate detection (strict `<=`).
     if (seq <= sender.lastAppliedSeq) {
         return {
