@@ -247,9 +247,19 @@ pub async fn validate_library_path(
             "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
             "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
         ];
-        // Check with and without extension
-        let base = upper.split('.').next().unwrap_or("");
-        if reserved.contains(&base) {
+        // Check with and without extension. Trailing spaces are dropped
+        // first: Windows strips them, so `CON .txt` still names the device.
+        let base = upper.split('.').next().unwrap_or("").trim_end();
+        if reserved.contains(&base) || matches!(base, "CONIN$" | "CONOUT$") {
+            return Err(LibraryPathError::ReservedName(seg.to_string()));
+        }
+
+        // The importer never stores these: `:` is replaced (on Windows it
+        // opens an NTFS alternate data stream) and trailing dots/spaces are
+        // stripped (Windows would silently drop them, so the name on disk
+        // would differ from the row's). A path carrying either did not come
+        // from the importer, so refuse it.
+        if seg.contains(':') || seg.ends_with('.') || seg.ends_with(' ') {
             return Err(LibraryPathError::ReservedName(seg.to_string()));
         }
 
@@ -802,6 +812,21 @@ mod tests {
         let tmp = lib_fixture();
         for rel in ["library//ab", "library/ab/", "library/ab/cd/Movie.mkv/"] {
             check(tmp.path(), rel, LibraryPathError::AbsolutePath).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn vlp_rejects_streams_and_names_windows_would_rewrite() {
+        let tmp = lib_fixture();
+        for rel in [
+            "library/ab/cd/Movie.mkv:Zone.Identifier",
+            "library/ab/cd/Movie.mkv.",
+            "library/ab/cd/Movie.mkv ",
+            "library/ab/cd/CON .txt",
+            "library/ab/cd/CONIN$",
+        ] {
+            let seg = rel.rsplit('/').next().unwrap().to_string();
+            check(tmp.path(), rel, LibraryPathError::ReservedName(seg)).await;
         }
     }
 
