@@ -385,6 +385,58 @@ async fn missing_path_creates_download_row_in_pending_state() {
     assert!(pending > 0, "expected pending chunks, got {pending}");
 }
 
+/// A manifest entry that does not fit under the quota is refused
+/// before the placeholder `media_items` row is inserted, so the
+/// rejection leaves no ghost row counting against the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_quota_download_is_refused_and_leaves_no_row() {
+    let (storage, lib_root_dir) = open_storage().await;
+    let lib_root = make_library_root(&lib_root_dir);
+    seed_user(&storage.pool(), "u-test").await;
+
+    let room_id = Uuid::new_v4();
+    let host_peer_id = canonical_peer_id(0xAA);
+    seed_room(&storage.pool(), room_id, &host_peer_id).await;
+    let entry = make_entry(64 * 1024);
+    let manifest = make_manifest(room_id, 1, vec![entry.clone()]);
+    locast_client_lib::core::quota::QuotaAccountant::new(storage.clone())
+        .set_cap_bytes(1024)
+        .await
+        .expect("set cap");
+
+    let err = open_download_inner(
+        manifest,
+        room_id,
+        &host_peer_id,
+        "u-test",
+        &storage,
+        &lib_root,
+        &entry.id,
+        &Uuid::new_v4().to_string(),
+        &make_webrtc_manager(&storage),
+        &make_transfer_registry(),
+        make_identity(&storage).await,
+    )
+    .await
+    .expect_err("over-quota open must be refused");
+    assert!(
+        matches!(
+            err,
+            locast_client_lib::commands::error::AppError::QuotaExceeded { .. }
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+        .fetch_one(&storage.pool())
+        .await
+        .expect("count");
+    assert_eq!(
+        rows, 0,
+        "a refused download must not leave a placeholder row"
+    );
+}
+
 /// Static proof that the `download_open` command source does
 /// not import `transfer::session` (the per-peer
 /// single-source `ReceiverSession`). P3-T13 legitimately

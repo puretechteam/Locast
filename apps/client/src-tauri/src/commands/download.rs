@@ -227,10 +227,38 @@ pub async fn open_download_inner(
         .ok_or_else(|| AppError::other(format!("media_id {media_id} not in verified manifest")))?
         .clone();
 
+    // 1b. Quota gate. A manifest entry with no local row would add
+    //     `size_bytes` to the library, so refuse it BEFORE the
+    //     placeholder row below is inserted: a rejected download then
+    //     leaves nothing behind that keeps counting against the cap.
+    //     An entry that already has a row is already counted in the
+    //     SUM, so it needs no extra room. The per-library-root lock is
+    //     held through the upsert so concurrent opens cannot both pass
+    //     the check on the same free space.
+    let accountant = crate::core::quota::QuotaAccountant::new(storage.clone());
+    let (quota_guard, canonical_root) = accountant.lock_for_library(library_root).await?;
+    if entry.size_bytes > 0 {
+        let known: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM media_items WHERE sha256 = ?1")
+                .bind(&entry.sha256)
+                .fetch_optional(&storage.pool())
+                .await
+                .map_err(|e| AppError::other(format!("media_items SELECT: {e}")))?;
+        if known.is_none() {
+            let needed = entry.size_bytes as i64;
+            let used = accountant.compute_used_bytes(&canonical_root).await?;
+            let cap = accountant.cap_bytes().await?;
+            if used.saturating_add(needed) > cap {
+                return Err(AppError::QuotaExceeded { used, cap, needed });
+            }
+        }
+    }
+
     // 2. Idempotently seed the media_items row from the
     //    verified manifest. If a row already exists, return
     //    its id unchanged.
     let resolved_media_id = upsert_media_item_from_manifest(storage, &entry).await?;
+    drop(quota_guard);
 
     // 3. The dedup check. THIS IS THE PIVOT: it runs BEFORE
     //    any transfer session creation.
