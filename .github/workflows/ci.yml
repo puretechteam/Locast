@@ -216,7 +216,7 @@ jobs:
 
       - name: Upload Playwright report, traces and videos
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-gate-failure
           path: |
@@ -271,7 +271,7 @@ jobs:
 
       - name: Upload Playwright report, traces and videos
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-baseline
           path: |
@@ -391,7 +391,7 @@ jobs:
 
       - name: Upload perf results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-results
           path: perf-results.json
@@ -437,7 +437,7 @@ jobs:
 
       - name: Upload trace artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: webview-perf-trace
           path: apps/client/perf-results/
@@ -617,7 +617,7 @@ jobs:
 
       - name: Upload fuzz crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-smoke-failure
           path: apps/client/src-tauri/fuzz/artifacts/
