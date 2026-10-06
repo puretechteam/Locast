@@ -317,6 +317,7 @@ pub async fn open_download_inner(
                 room_host_user_id,
                 manifest_version,
                 &chunk_hashes,
+                true,
             )
             .await?;
             store
@@ -359,6 +360,7 @@ pub async fn open_download_inner(
                 room_host_user_id,
                 manifest_version,
                 &chunk_hashes,
+                true,
             )
             .await?;
             store
@@ -413,6 +415,7 @@ pub async fn open_download_inner(
                 &pick_primary_source_peer(&entry),
                 manifest_version,
                 &chunk_hashes,
+                false,
             )
             .await?;
             // A retry (or a duplicate call) for a row whose
@@ -708,16 +711,25 @@ async fn find_or_create_download_row(
     source_peer_id: &str,
     manifest_version: i64,
     chunk_hashes: &[(u32, String)],
+    reuse_complete: bool,
 ) -> Result<(String, bool), AppError> {
     let room_key = room_id.unwrap_or("");
+    // `failed` and `cancelled` are terminal: nothing leaves them, so
+    // reusing such a row would strand the user on a dead download. The
+    // partial UNIQUE index lets a fresh row coexist with them. A
+    // `complete` row is reused only where the caller knows the content
+    // is still local.
     let existing: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM downloads \
          WHERE media_id = ?1 AND COALESCE(room_id, '') = ?2 AND user_id = ?3 \
+           AND (state IN ('pending','connecting','transferring','verifying','paused') \
+                OR (?4 AND state = 'complete')) \
          ORDER BY started_at DESC LIMIT 1",
     )
     .bind(media_id)
     .bind(room_key)
     .bind(user_id)
+    .bind(reuse_complete)
     .fetch_optional(store.pool())
     .await
     .map_err(|e| AppError::other(format!("downloads SELECT: {e}")))?;
@@ -791,7 +803,7 @@ async fn find_or_create_download_row(
             let existing: Option<(String,)> = sqlx::query_as(
                 "SELECT id FROM downloads
                  WHERE media_id = ?1 AND COALESCE(room_id, '') = ?2 AND user_id = ?3
-                   AND state IN ('pending','connecting','transferring','verifying','paused','complete','failed','cancelled')
+                   AND state IN ('pending','connecting','transferring','verifying','paused')
                  ORDER BY started_at DESC LIMIT 1",
             )
             .bind(media_id)

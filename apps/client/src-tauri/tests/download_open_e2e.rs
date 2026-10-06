@@ -437,6 +437,50 @@ async fn over_quota_download_is_refused_and_leaves_no_row() {
     );
 }
 
+/// A failed download is terminal. Opening the same media again must
+/// start a fresh download row instead of reusing the dead one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopening_after_a_failed_download_starts_a_fresh_row() {
+    let (storage, lib_root_dir) = open_storage().await;
+    let lib_root = make_library_root(&lib_root_dir);
+    seed_user(&storage.pool(), "u-test").await;
+    let room_id = Uuid::new_v4();
+    let host_peer_id = canonical_peer_id(0xAA);
+    seed_room(&storage.pool(), room_id, &host_peer_id).await;
+    let entry = make_entry(64 * 1024);
+
+    let mut ids = Vec::new();
+    for round in 0..2 {
+        let download_id = Uuid::new_v4().to_string();
+        let result = open_download_inner(
+            make_manifest(room_id, 1, vec![entry.clone()]),
+            room_id,
+            &host_peer_id,
+            "u-test",
+            &storage,
+            &lib_root,
+            &entry.id,
+            &download_id,
+            &make_webrtc_manager(&storage),
+            &make_transfer_registry(),
+            make_identity(&storage).await,
+        )
+        .await
+        .expect("open");
+        assert_eq!(result.download_id, download_id, "round {round}");
+        assert_eq!(result.state, "pending", "round {round}");
+        if round == 0 {
+            sqlx::query("UPDATE downloads SET state = 'failed' WHERE id = ?1")
+                .bind(&download_id)
+                .execute(&storage.pool())
+                .await
+                .expect("fail the first download");
+        }
+        ids.push(download_id);
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
 /// Static proof that the `download_open` command source does
 /// not import `transfer::session` (the per-peer
 /// single-source `ReceiverSession`). P3-T13 legitimately
