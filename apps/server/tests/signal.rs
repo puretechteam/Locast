@@ -392,7 +392,7 @@ async fn signal_forwarded_to_recipient() {
     // Subscribe the viewer's outbound channel BEFORE
     // dispatching, so we can verify the relay delivered
     // the envelope.
-    let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let (b_tx, mut b_rx) = tokio::sync::mpsc::channel::<Envelope>(64);
     relay.register(viewer_uid, b_tx).await;
     assert!(relay.is_registered(viewer_uid).await);
 
@@ -452,7 +452,7 @@ async fn signal_forwarded_to_recipient_carries_no_bearer() {
     };
     let (host_sk, host_uid, host_pk, room_id, viewer_uid, _viewer_pk) =
         build_room_with_two_users(&db, &rooms, &clock).await;
-    let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let (b_tx, mut b_rx) = tokio::sync::mpsc::channel::<Envelope>(64);
     relay.register(viewer_uid, b_tx).await;
 
     let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
@@ -546,4 +546,31 @@ async fn signal_oversized_returns_invalid_state() {
     assert_eq!(out.to_caller.len(), 1);
     let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
     assert_eq!(p.code, RoomErrorCode::InvalidState);
+}
+
+/// A recipient that is not reading must not make the server queue signals
+/// without bound: once its outbound queue is full the relay drops, and
+/// reports, the signal instead.
+#[tokio::test]
+async fn relay_refuses_signals_for_a_recipient_that_is_not_reading() {
+    use locast_server::rooms::signal::SendError;
+    let relay = locast_server::rooms::SignalRelay::new();
+    let user = uuid::Uuid::now_v7();
+    let (tx, _rx_never_read) = tokio::sync::mpsc::channel::<locast_protocol::envelope::Envelope>(2);
+    relay.register(user, tx).await;
+
+    let env = || locast_protocol::envelope::Envelope {
+        v: 1,
+        r#type: locast_protocol::envelope::MessageKind::Signal,
+        id: uuid::Uuid::now_v7(),
+        room_id: None,
+        sender: None,
+        ts_ms: 0,
+        seq: 0,
+        payload: serde_json::json!({}),
+    };
+    relay.send(user, env()).await.expect("first fits");
+    relay.send(user, env()).await.expect("second fits");
+    let third = relay.send(user, env()).await;
+    assert!(matches!(third, Err(SendError::Congested)), "{third:?}");
 }

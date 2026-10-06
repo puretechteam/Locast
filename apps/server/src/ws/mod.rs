@@ -81,6 +81,11 @@ const RATE_THROTTLE_MS: i64 = 1_000;
 /// exempt from the presence timeout, so nothing else would ever end it.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Envelopes queued for one connection's socket. Large enough that a healthy
+/// client never notices, small enough that a stalled reader costs bounded
+/// memory.
+const OUTBOUND_QUEUE_CAP: usize = 1024;
+
 /// The largest frame accepted before authentication. HELLO, AUTH and
 /// AUTH_RESUME are a few hundred bytes; anything bigger here is not a
 /// handshake, and decoding it allocates a multiple of its size.
@@ -297,7 +302,10 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
         Arc::new(tokio::sync::Mutex::new(None));
     // mpsc::Sender the forwarder pushes outbound envelopes
     // into. The main loop drains it on every iteration.
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    // Bounded: a client that reads slowly must not make the server queue
+    // without limit. The forwarder awaits space (so the room broadcast
+    // channel lags and DRAW_SYNC recovery applies); signals are dropped.
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Envelope>(OUTBOUND_QUEUE_CAP);
 
     debug!(request_id = %request_id, "ws connection open");
 
@@ -1974,7 +1982,7 @@ async fn sync_room_subscription(
 async fn room_bcast_forwarder(
     state: AppState,
     mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<RoomSubscription>,
-    outbound_tx: tokio::sync::mpsc::UnboundedSender<Envelope>,
+    outbound_tx: tokio::sync::mpsc::Sender<Envelope>,
     cancel: Arc<tokio::sync::Notify>,
     self_user_id: Arc<tokio::sync::Mutex<Option<Uuid>>>,
 ) {
@@ -2027,7 +2035,7 @@ async fn room_bcast_forwarder(
                             payload: serde_json::to_value(&snapshot)
                                 .unwrap_or(serde_json::json!({})),
                         };
-                        if outbound_tx.send(env).is_err() {
+                        if outbound_tx.send(env).await.is_err() {
                             return;
                         }
                     }
@@ -2082,7 +2090,7 @@ async fn room_bcast_forwarder(
             seq: item.seq,
             payload: item.payload,
         };
-        if outbound_tx.send(env).is_err() {
+        if outbound_tx.send(env).await.is_err() {
             return;
         }
     }

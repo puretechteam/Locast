@@ -28,7 +28,7 @@ use super::registry::RoomRegistry;
 use crate::time::Clock;
 
 /// One user's slot: the owning connection's token and its outbound channel.
-type RelaySlot = (u64, mpsc::UnboundedSender<Envelope>);
+type RelaySlot = (u64, mpsc::Sender<Envelope>);
 
 /// Per-user outbound channel registry. Keyed by `user_id`
 /// because each authenticated user owns at most one active
@@ -53,6 +53,10 @@ pub struct SignalRelay {
 pub enum SendError {
     #[error("recipient has no active connection")]
     NoRecipient,
+    /// The recipient's outbound queue is full: it is not reading. The signal
+    /// is dropped rather than queued without bound.
+    #[error("recipient is not keeping up")]
+    Congested,
 }
 
 impl SignalRelay {
@@ -67,7 +71,7 @@ impl SignalRelay {
     /// keeps running until its own transport fails, and its token no
     /// longer matches, so [`unregister`](Self::unregister) tells it that
     /// it is stale.
-    pub async fn register(&self, user_id: Uuid, tx: mpsc::UnboundedSender<Envelope>) -> u64 {
+    pub async fn register(&self, user_id: Uuid, tx: mpsc::Sender<Envelope>) -> u64 {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let mut g = self.inner.write().await;
         g.insert(user_id, (token, tx));
@@ -100,7 +104,10 @@ impl SignalRelay {
     pub async fn send(&self, target_user_id: Uuid, envelope: Envelope) -> Result<(), SendError> {
         let g = self.inner.read().await;
         match g.get(&target_user_id) {
-            Some((_, tx)) => tx.send(envelope).map_err(|_| SendError::NoRecipient),
+            Some((_, tx)) => tx.try_send(envelope).map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => SendError::Congested,
+                mpsc::error::TrySendError::Closed(_) => SendError::NoRecipient,
+            }),
             None => Err(SendError::NoRecipient),
         }
     }
@@ -253,7 +260,7 @@ pub async fn handle_signal(
     }
     match relay.send(payload.to_user_id, envelope).await {
         Ok(()) => SignalOutcome::default(),
-        Err(SendError::NoRecipient) => {
+        Err(SendError::NoRecipient) | Err(SendError::Congested) => {
             // Recipient has no active connection (disconnected
             // between our membership check and the relay send).
             // Surface as RecipientNotInRoom because the recipient

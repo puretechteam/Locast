@@ -3984,8 +3984,8 @@ async fn lasers_in_flight_after_leaving_do_not_cost_the_connection() {
 async fn relay_unregister_only_removes_the_current_connection() {
     let relay = locast_server::SignalRelay::new();
     let user = Uuid::now_v7();
-    let (tx_old, mut rx_old) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
-    let (tx_new, mut rx_new) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+    let (tx_old, mut rx_old) = tokio::sync::mpsc::channel::<Envelope>(64);
+    let (tx_new, mut rx_new) = tokio::sync::mpsc::channel::<Envelope>(64);
     let old = relay.register(user, tx_old).await;
     let new = relay.register(user, tx_new).await;
     assert_ne!(old, new);
