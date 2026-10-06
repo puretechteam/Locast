@@ -88,6 +88,13 @@ jobs:
       - name: cargo test (workspace)
         run: cargo test --workspace
 
+      # The only automated host-to-viewer run over real WebRTC. It is
+      # #[ignore]d so a plain `cargo test` stays fast and hermetic, which
+      # also meant nothing ever ran it.
+      - name: host-to-viewer smoke (real WebRTC transfer)
+        if: runner.os == 'Linux'
+        run: cargo test -p locast-client --test smoke_host_viewer -- --ignored
+
       # The tauri-specta bindings auto-regeneration step is intentionally
       # disabled. tauri-specta 2.0.0-rc.25 (a) panics on any i64/u64
       # field by default (mitigated per-field via
