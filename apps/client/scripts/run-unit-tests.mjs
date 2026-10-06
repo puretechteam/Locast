@@ -9,7 +9,7 @@
 // Requires Node 22.6+ (`--experimental-strip-types`).
 
 import { spawnSync } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -54,6 +54,20 @@ for (const file of files) {
     );
     if (result.status !== 0) {
         failed.push(`${name} (${result.status ?? result.signal})`);
+    }
+}
+
+// Every Playwright spec must be in the `test:e2e:gate` script. The gate lists
+// files by hand, so a spec that is added but not listed would never block CI.
+{
+    const pkg = JSON.parse(readFileSync(join(clientRoot, "package.json"), "utf8"));
+    const gate = (pkg.scripts?.["test:e2e:gate"] ?? "").split(/\s+/);
+    const specs = readdirSync(join(clientRoot, "tests", "playwright")).filter((f) =>
+        f.endsWith(".spec.ts"),
+    );
+    const unlisted = specs.filter((f) => !gate.includes(f));
+    if (unlisted.length > 0) {
+        failed.push(`test:e2e:gate does not list: ${unlisted.join(", ")}`);
     }
 }
 
