@@ -234,6 +234,32 @@ pub async fn delete_item(storage: &Storage, library_root: &Path, id: &str) -> Re
     Ok(())
 }
 
+/// [`delete_item`], but refused while a transfer for the item is actually
+/// running in this process: deleting the row would cascade the `downloads`
+/// row away while the worker keeps writing, and it would finalize a file
+/// with no row behind it. A `downloads` row with no live worker (left by a
+/// crash) does not block the delete.
+pub async fn delete_item_guarded(
+    storage: &Storage,
+    library_root: &Path,
+    registry: &crate::transfer::TransferRegistry,
+    id: &str,
+) -> Result<(), AppError> {
+    let download_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM downloads WHERE media_id = ?1")
+            .bind(id)
+            .fetch_all(&storage.pool())
+            .await?;
+    for d in &download_ids {
+        if registry.is_active(d).await {
+            return Err(AppError::other(
+                "this item is being downloaded; wait for the download to finish before deleting it",
+            ));
+        }
+    }
+    delete_item(storage, library_root, id).await
+}
+
 /// Tauri command: list or search the library.
 #[tauri::command]
 #[specta::specta]
@@ -259,7 +285,11 @@ pub async fn library_make_permanent(
 /// Tauri command: "Delete from library" for one library item.
 #[tauri::command]
 #[specta::specta]
-pub async fn library_delete(storage: TauriState<'_, Storage>, id: String) -> Result<(), AppError> {
+pub async fn library_delete(
+    storage: TauriState<'_, Storage>,
+    registry: TauriState<'_, std::sync::Arc<crate::transfer::TransferRegistry>>,
+    id: String,
+) -> Result<(), AppError> {
     let data_dir = storage
         .path()
         .parent()
@@ -268,7 +298,7 @@ pub async fn library_delete(storage: TauriState<'_, Storage>, id: String) -> Res
             message: "storage path has no parent".to_string(),
         })?
         .to_path_buf();
-    delete_item(storage.inner(), &data_dir, &id).await
+    delete_item_guarded(storage.inner(), &data_dir, registry.inner(), &id).await
 }
 
 #[cfg(test)]

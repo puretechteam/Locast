@@ -250,6 +250,49 @@ async fn delete_moves_the_file_to_trash_and_removes_the_row_and_search_entry() {
     assert!(searched.is_empty(), "FTS entry was removed with the row");
 }
 
+/// Deleting a row whose transfer is still running would cascade the
+/// download away while the worker keeps writing. It must be refused and
+/// leave the row and file alone; a `downloads` row with no live worker
+/// (left by a crash) must not block the delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_is_refused_while_a_transfer_is_running() {
+    use locast_client_lib::commands::library::delete_item_guarded;
+    use locast_client_lib::transfer::TransferRegistry;
+
+    let f = fixture().await;
+    let a = f.import("Clip.mkv", 3).await;
+    sqlx::query(
+        "INSERT INTO user_identities (id, public_key, display_name, created_at, last_seen)          VALUES ('u1', 'pk', 'tester', 0, 0)",
+    )
+    .execute(&f.storage.pool())
+    .await
+    .expect("seed user");
+    sqlx::query(
+        "INSERT INTO downloads (id, media_id, user_id, state, total_bytes)          VALUES ('d1', ?1, 'u1', 'transferring', 2048)",
+    )
+    .bind(&a.id)
+    .execute(&f.storage.pool())
+    .await
+    .expect("seed download");
+
+    let registry = TransferRegistry::new();
+    let _guard = registry
+        .register("d1".into(), tokio_util::sync::CancellationToken::new())
+        .await;
+    delete_item_guarded(&f.storage, &f.root, &registry, &a.id)
+        .await
+        .expect_err("a running transfer blocks the delete");
+    assert_eq!(f.row_count().await, 1);
+    assert!(f.root.join(&a.relative_path).is_file());
+
+    // The worker is gone (finished or crashed): the delete goes through.
+    registry.unregister("d1").await;
+    delete_item_guarded(&f.storage, &f.root, &registry, &a.id)
+        .await
+        .expect("delete without a live worker");
+    assert_eq!(f.row_count().await, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleted_media_can_be_imported_again() {
     let f = fixture().await;
