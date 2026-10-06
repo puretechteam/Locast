@@ -22,7 +22,11 @@ function hostDisplayNameOf(summary: RoomSummaryIpc): string {
 }
 
 function roleOf(summary: RoomSummaryIpc, localUserId: string): RecentRoomRole {
-    return summary.host_user_id === localUserId ? "host" : "guest";
+    // `you_user_id` is the server-assigned id that `host_user_id` is in. The
+    // identity id passed as `localUserId` is a different id, so comparing it
+    // with `host_user_id` recorded every host as a guest.
+    const me = summary.you_user_id ?? localUserId;
+    return summary.host_user_id === me ? "host" : "guest";
 }
 
 function formatRelative(ms: number, now: number): string {
