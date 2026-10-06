@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::core::hashing::Blake3Hasher;
+use crate::core::hashing::{Blake3Hasher, Sha256Hasher};
 use crate::core::paths;
 use crate::library::fs as library_fs;
 use crate::transfer::verify::{verify_full_blake3, ChunkVerifyError};
@@ -77,6 +77,11 @@ pub enum AssembleError {
     PathEscapesLibrary(String),
     #[error("full-file BLAKE3 mismatch")]
     Blake3Mismatch,
+    /// The assembled bytes do not hash to the SHA-256 the manifest names.
+    /// That digest picks the library path, so committing mismatching bytes
+    /// would let a host squat on (or poison) another file's slot.
+    #[error("full-file SHA-256 mismatch")]
+    Sha256Mismatch,
     #[error("atomic completion failed: {0}")]
     Completion(String),
 }
@@ -136,6 +141,7 @@ pub async fn assemble_and_finalize(
     // with BLAKE3.
     let mut out = tokio::fs::File::create(&staging).await?;
     let mut blake3 = Blake3Hasher::new();
+    let mut sha256_hasher = Sha256Hasher::new();
     let mut scratch = vec![0u8; IO_SCRATCH];
     let mut bytes_written: u64 = 0;
     for &(index, expected_len) in chunk_lengths {
@@ -163,6 +169,7 @@ pub async fn assemble_and_finalize(
             }
             out.write_all(&scratch[..n]).await?;
             blake3.update(&scratch[..n]);
+            sha256_hasher.update(&scratch[..n]);
             bytes_written += n as u64;
         }
     }
@@ -174,6 +181,13 @@ pub async fn assemble_and_finalize(
         return Err(AssembleError::Io(format!(
             "staging partial size {bytes_written} != total_bytes {total_bytes}"
         )));
+    }
+
+    // The SHA-256 names the library path, so it must be the real digest of
+    // what was assembled, not just the string the manifest carried.
+    if sha256_hasher.finalize_hex() != sha256 {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(AssembleError::Sha256Mismatch);
     }
 
     // Compare BLAKE3 against the manifest. Re-read the
@@ -344,6 +358,63 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, AssembleError::Path(_)));
+    }
+
+    /// Valid chunks and a matching BLAKE3 but a SHA-256 that is not the
+    /// content's: nothing may be committed under that (squatted) path.
+    #[tokio::test]
+    async fn assemble_rejects_a_sha256_that_is_not_the_content_digest() {
+        let tmp = scratch_dir();
+        let root = tmp.path();
+        let id = "01234567-89ab-cdef-0123-456789abcdef";
+        let data = b"hello world".to_vec();
+        let chunk_path = paths::incomplete_chunk_path(root, id, 0).expect("chunk path");
+        tokio::fs::create_dir_all(chunk_path.parent().unwrap())
+            .await
+            .expect("mkdir");
+        tokio::fs::write(&chunk_path, &data)
+            .await
+            .expect("write chunk");
+        let mut b3 = Blake3Hasher::new();
+        b3.update(&data);
+        let real_blake3 = b3.finalize_hex();
+        let mut s = Sha256Hasher::new();
+        s.update(&data);
+        let real_sha = s.finalize_hex();
+        let chunks = vec![(0u32, data.len() as u32)];
+
+        let lie = "b".repeat(64);
+        assert_ne!(lie, real_sha);
+        let err = assemble_and_finalize(
+            root,
+            id,
+            &lie,
+            "movie.mp4",
+            &real_blake3,
+            &chunks,
+            data.len() as u64,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AssembleError::Sha256Mismatch), "{err:?}");
+        assert!(
+            !root.join("library").exists(),
+            "nothing may be written to the library for a mismatching digest"
+        );
+
+        // The honest digest goes through.
+        let ok = assemble_and_finalize(
+            root,
+            id,
+            &real_sha,
+            "movie.mp4",
+            &real_blake3,
+            &chunks,
+            data.len() as u64,
+        )
+        .await
+        .expect("honest digest assembles");
+        assert!(ok.final_path.is_file());
     }
 
     #[tokio::test]
