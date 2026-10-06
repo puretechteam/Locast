@@ -51,6 +51,10 @@ export function SharedMediaBridge(): null {
         };
 
         const acquire = async (roomId: string, mediaId: string, attempt: number) => {
+            // A retry timer can outlive the room: a deliberate leave only
+            // resets the store, it never reaches `clearTimers`. Re-check the
+            // room before issuing the IPC call, not just after it.
+            if (cancelled || store().roomId !== roomId) return;
             const cur = store().items[mediaId];
             if (attempt === 0 && cur !== undefined && cur.kind !== "error") return;
             if (inflight.has(mediaId)) return;

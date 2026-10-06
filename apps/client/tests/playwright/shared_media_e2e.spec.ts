@@ -339,6 +339,41 @@ test("viewer without the media: waits for a source, downloads behind the modal, 
     expect((await calls(page, "download_open")).length).toBe(2);
 });
 
+test("leaving while waiting for a source stops the retry loop", async ({ page }) => {
+    const shared = libItem("host-a", "Alpha.mp4", "aa11");
+    const pending = {
+        download_id: "dl-1",
+        media_id: "host-a",
+        state: "pending",
+        dedup_hit: false,
+        total_bytes: shared.size_bytes,
+        transferred_bytes: 0,
+        on_disk_path: null,
+        transfer_started: false,
+    };
+    // A fake clock so the 1 s retry delay is driven, not waited for.
+    await page.clock.install();
+    await setup(page, {
+        summary: summary(VIEWER_ID),
+        library: [],
+        downloadReplies: [
+            { reply: pending, emit: { id: "dl-1", media_id: "host-a", state: "pending" } },
+            { reply: pending, emit: { id: "dl-1", media_id: "host-a", state: "pending" } },
+        ],
+    });
+    await page.goto(`/rooms/${ROOM_ID}`);
+    await hostShares(page, shared);
+    await expect(page.getByTestId("dlm-waiting")).toBeVisible();
+    expect((await calls(page, "download_open")).length).toBe(1);
+
+    // Leave from the waiting dialog, then let every retry delay elapse. A
+    // retry timer that outlived the room used to call `download_open` again.
+    await page.getByTestId("dlm-leave").click();
+    await expect(page.locator(DLG)).toHaveCount(0);
+    await page.clock.fastForward(30_000);
+    expect((await calls(page, "download_open")).length).toBe(1);
+});
+
 test("a manifest Rust rejects as untrusted is never downloaded", async ({ page }) => {
     await setup(page, {
         summary: summary(VIEWER_ID),
