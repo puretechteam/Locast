@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { errorText } from "../../services/errors";
 import { connectSignaling, createRoom } from "../../services/room";
+import { resetRoomScopedStores } from "../../stores/resetRoomScopedStores";
+import { useRoomStore } from "../../stores/useRoomStore";
 
 export function NewRoomPage(): JSX.Element {
     const navigate = useNavigate();
@@ -18,6 +20,9 @@ export function NewRoomPage(): JSX.Element {
         setSubmitting(true);
         setError(null);
         try {
+            // Not in a room: drop leftovers (e.g. a file played locally from
+            // the library) so they do not open inside the new room.
+            if (useRoomStore.getState().summary === null) resetRoomScopedStores();
             await connectSignaling();
             const summary = await createRoom(title.trim(), migrationEnabled);
             navigate(`/rooms/${summary.id}`);

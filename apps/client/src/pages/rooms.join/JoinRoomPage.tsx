@@ -2,6 +2,8 @@ import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { errorText } from "../../services/errors";
 import { connectSignaling, joinRoom } from "../../services/room";
+import { resetRoomScopedStores } from "../../stores/resetRoomScopedStores";
+import { useRoomStore } from "../../stores/useRoomStore";
 
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -56,6 +58,9 @@ export function JoinRoomPage(): JSX.Element {
         setSubmitting(true);
         setError(null);
         try {
+            // Not in a room: drop leftovers (e.g. a file played locally from
+            // the library) so they do not open inside the new room.
+            if (useRoomStore.getState().summary === null) resetRoomScopedStores();
             await connectSignaling();
             const inviteUrl = invite.trim();
             const summary = await joinRoom(

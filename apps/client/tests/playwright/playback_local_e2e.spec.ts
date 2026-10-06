@@ -262,3 +262,25 @@ test("an item that cannot be resolved shows an error and stays on the library", 
     await expect(page.getByRole("alert")).toContainText("Could not play File 8.mp4");
     await expect(page).toHaveURL(/\/library$/);
 });
+
+// Playing from the library while not in a room leaves the file in the playback
+// store. Creating a room used to open with that unrelated file still loaded.
+test("starting a new room drops the file that was playing locally", async ({ page }) => {
+    const it = item(5);
+    await openLibrary(page, [it]);
+    await page.getByRole("button", { name: "Play File 5.mp4" }).click();
+    await expect(page.getByTestId("room-local")).toContainText("File 5.mp4");
+
+    const goTo = (to: string) =>
+        page.evaluate((target) => {
+            window.history.pushState({}, "", target);
+            window.dispatchEvent(new PopStateEvent("popstate"));
+        }, to);
+    await goTo("/rooms/new");
+    await page.getByRole("textbox").first().fill("Movie night");
+    await page.getByRole("button", { name: /create/i }).click();
+
+    // Back on the local page: the earlier file must be gone.
+    await goTo("/rooms/local");
+    await expect(page.getByTestId("room-local")).toHaveCount(0);
+});
