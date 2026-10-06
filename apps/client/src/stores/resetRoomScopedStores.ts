@@ -14,6 +14,7 @@ import { useChatStore } from "./useChatStore";
 import { useClockSkewStore } from "./useClockSkewStore";
 import { useConnectionQualityStore } from "./useConnectionQualityStore";
 import { useDownloadStore } from "./useDownloadStore";
+import { useDrawingStore } from "./useDrawingStore";
 import { usePlaybackStore } from "./usePlaybackStore";
 import { useRoomStore } from "./useRoomStore";
 import { useSharedMediaStore } from "./useSharedMediaStore";
@@ -29,6 +30,10 @@ export function resetRoomScopedStores(): void {
     useChatStore.getState().clear();
     useConnectionQualityStore.getState().clear();
     useClockSkewStore.getState().clear();
+    // Strokes, the active-stroke map and the sequence counter belong to the
+    // room. Without this a re-join of the same room id kept the old strokes
+    // and `lastSeq`, because `setRoomId` is a no-op for an unchanged id.
+    useDrawingStore.getState().setRoomId(null);
     // Stops the shared-media bridge's retry loop for the old room.
     useSharedMediaStore.getState().reset(null, false);
     // Leaving cancels this room's transfers, so their rows no longer describe
