@@ -156,7 +156,13 @@ pub fn sanitize(name: &str) -> Result<String, InvalidFilename> {
         bytes += char_bytes;
     }
 
-    if out.is_empty() {
+    // Truncation can end the name on a `.` or space, which Windows silently
+    // drops (so the on-disk name would differ from the stored one), or leave
+    // a reserved device name. Re-apply those two checks to the cut result.
+    let trimmed_len = out.trim_end_matches(['.', ' ']).len();
+    out.truncate(trimmed_len);
+
+    if out.is_empty() || is_reserved_name(&out) {
         return Err(InvalidFilename);
     }
 
@@ -505,6 +511,22 @@ mod tests {
         let out = sanitize(&s).expect("255 a's should be ok");
         assert_eq!(out.len(), 255);
         assert_eq!(out.chars().count(), 255);
+    }
+
+    #[test]
+    fn truncation_never_leaves_a_trailing_dot_or_space() {
+        // The cut at 255 bytes lands right after the dot.
+        let name = format!("{}. .mkv", "a".repeat(253));
+        let out = sanitize(&name).expect("still usable");
+        assert!(out.len() <= 255);
+        assert!(
+            !out.ends_with('.') && !out.ends_with(' '),
+            "trailing dot or space in {out:?}"
+        );
+        // A name that is nothing but a cut-off run of dots and spaces after
+        // truncation is refused rather than returned empty.
+        let all_dots = format!("a{}", ".".repeat(300));
+        assert_eq!(sanitize(&all_dots).as_deref(), Ok("a"));
     }
 
     #[test]
