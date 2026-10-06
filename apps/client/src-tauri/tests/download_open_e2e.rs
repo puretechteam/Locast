@@ -437,6 +437,52 @@ async fn over_quota_download_is_refused_and_leaves_no_row() {
     );
 }
 
+/// A host can sign a manifest whose digests are not 64 lowercase hex.
+/// `download_open` must refuse it with an error instead of panicking
+/// while it derives the library path from the digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_manifest_digest_is_refused_without_panic() {
+    for bad in [
+        "",
+        "ab",
+        "\u{e9}\u{e9}\u{e9}",
+        &"A".repeat(64),
+        &"a".repeat(65),
+    ] {
+        let (storage, lib_root_dir) = open_storage().await;
+        let lib_root = make_library_root(&lib_root_dir);
+        seed_user(&storage.pool(), "u-test").await;
+        let room_id = Uuid::new_v4();
+        let host_peer_id = canonical_peer_id(0xAA);
+        seed_room(&storage.pool(), room_id, &host_peer_id).await;
+        let mut entry = make_entry(1024);
+        entry.sha256 = bad.to_string();
+        let manifest = make_manifest(room_id, 1, vec![entry.clone()]);
+
+        let res = open_download_inner(
+            manifest,
+            room_id,
+            &host_peer_id,
+            "u-test",
+            &storage,
+            &lib_root,
+            &entry.id,
+            &Uuid::new_v4().to_string(),
+            &make_webrtc_manager(&storage),
+            &make_transfer_registry(),
+            make_identity(&storage).await,
+        )
+        .await;
+        assert!(res.is_err(), "digest {bad:?} must be refused");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+            .fetch_one(&storage.pool())
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "a refused digest must leave no row");
+    }
+}
+
 /// A failed download is terminal. Opening the same media again must
 /// start a fresh download row instead of reusing the dead one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

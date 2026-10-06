@@ -227,6 +227,22 @@ pub async fn open_download_inner(
         .ok_or_else(|| AppError::other(format!("media_id {media_id} not in verified manifest")))?
         .clone();
 
+    // 1a. The manifest signature does not constrain field shapes, and
+    //     `upsert_media_item_from_manifest` slices `sha256` by byte
+    //     offset, so a malformed host-supplied digest would panic the
+    //     command. Reject it before anything touches the database.
+    for (field, value) in [("sha256", &entry.sha256), ("blake3", &entry.blake3)] {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(AppError::other(format!(
+                "manifest entry {media_id} has a malformed {field} digest"
+            )));
+        }
+    }
+
     // 1b. Quota gate. A manifest entry with no local row would add
     //     `size_bytes` to the library, so refuse it BEFORE the
     //     placeholder row below is inserted: a rejected download then
