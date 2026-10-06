@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { onPlaybackState } from "../services/playback";
+import { startDedupTicker } from "../drift/dedupTicker";
 import { usePlaybackStore } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 
@@ -47,6 +48,13 @@ export function usePlaybackEventBridge(): null {
             }
         };
     }, []);
+
+    // Force-apply a parked event once its grace window has passed. Without
+    // this a viewer that joined mid-session never applies any playback state.
+    useEffect(
+        () => startDedupTicker((now) => usePlaybackStore.getState().tickDedup(now)),
+        [],
+    );
 
     // P4-T02 test seam: in Vite's test mode, expose the
     // playback store mutators + a getter for `lastApplied`
