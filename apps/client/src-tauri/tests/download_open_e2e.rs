@@ -385,6 +385,64 @@ async fn missing_path_creates_download_row_in_pending_state() {
     assert!(pending > 0, "expected pending chunks, got {pending}");
 }
 
+/// A panic inside the transfer body must be caught at the panic
+/// boundary, which then marks the row failed and frees the registry
+/// slot. Before the fix the unwind escaped the spawned task and left
+/// the row stuck in its active state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_in_transfer_body_marks_the_download_failed() {
+    type BoxedUnit = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+    let (storage, lib_root_dir) = open_storage().await;
+    let lib_root = make_library_root(&lib_root_dir);
+    seed_user(&storage.pool(), "u-test").await;
+    let room_id = Uuid::new_v4();
+    let host_peer_id = canonical_peer_id(0xAA);
+    seed_room(&storage.pool(), room_id, &host_peer_id).await;
+    let entry = make_entry(64 * 1024);
+    let manifest = make_manifest(room_id, 1, vec![entry.clone()]);
+    let download_id = Uuid::new_v4().to_string();
+    let registry = make_transfer_registry();
+
+    open_download_inner(
+        manifest,
+        room_id,
+        &host_peer_id,
+        "u-test",
+        &storage,
+        &lib_root,
+        &entry.id,
+        &download_id,
+        &make_webrtc_manager(&storage),
+        &registry,
+        make_identity(&storage).await,
+    )
+    .await
+    .expect("open");
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _guard = registry.register(download_id.clone(), cancel.clone()).await;
+    let res = locast_client_lib::transfer::panic_boundary::spawn_panic_safe(
+        download_id.clone(),
+        entry.id.clone(),
+        Arc::new(storage.clone()),
+        Some(registry.clone()),
+        Some(cancel.clone()),
+        None::<Box<dyn FnOnce() -> BoxedUnit + Send>>,
+        || -> BoxedUnit { Box::pin(async { panic!("boom in transfer body") }) },
+    )
+    .await;
+    assert!(res.is_err(), "the panic must surface as PanicError");
+
+    let state: String = sqlx::query_scalar("SELECT state FROM downloads WHERE id = ?1")
+        .bind(&download_id)
+        .fetch_one(&storage.pool())
+        .await
+        .expect("download state");
+    assert_eq!(state, "failed");
+    assert!(cancel.is_cancelled());
+    assert!(!registry.is_active(&download_id).await);
+}
+
 /// A manifest entry that does not fit under the quota is refused
 /// before the placeholder `media_items` row is inserted, so the
 /// rejection leaves no ghost row counting against the cap.

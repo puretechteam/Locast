@@ -8,9 +8,10 @@
 #![warn(rust_2018_idioms)]
 
 use std::future::Future;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
@@ -74,15 +75,15 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let store = DownloadStore::new(storage.pool().clone());
-    // catch_unwind doesn't return a future, we need to handle the closure properly
-    let result = panic::catch_unwind(AssertUnwindSafe(fut));
+    // The body is async, so the panic fires while the future is polled,
+    // not while the closure builds it. Catch it on the poll as well as on
+    // the construction.
+    let result = AssertUnwindSafe(async move { fut().await })
+        .catch_unwind()
+        .await;
 
     match result {
-        Ok(inner_fut) => {
-            // No panic - await the inner future
-            inner_fut.await;
-            Ok(())
-        }
+        Ok(()) => Ok(()),
         Err(payload) => {
             let panic_msg = sanitize_panic(&payload);
             let sanitized = format!("internal: panic: {}", panic_msg);
