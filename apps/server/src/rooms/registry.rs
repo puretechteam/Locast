@@ -1464,6 +1464,17 @@ impl RoomRegistry {
     pub async fn touch(&self, user_id: Uuid, now_ms: i64) {
         let by_id = self.by_id.read().await;
         for h in by_id.values() {
+            // Scan under a read lock: a write lock per room scanned stalled
+            // unrelated rooms on every PRESENCE.
+            if !h
+                .read()
+                .await
+                .participants
+                .iter()
+                .any(|p| p.user_id == user_id)
+            {
+                continue;
+            }
             let mut state = h.write().await;
             if let Some(p) = state.participants.iter_mut().find(|p| p.user_id == user_id) {
                 p.last_seen_ms = now_ms;
@@ -2731,6 +2742,29 @@ mod tests {
         let events = r.tick_stale_participants(&store(), 2_300).await;
         assert!(events.is_empty(), "{events:?}");
         assert_eq!(handle.read().await.participants.len(), 1);
+    }
+
+    /// PRESENCE for a user in room A must not wait on room B. `touch` used
+    /// to take a write lock on every room it scanned.
+    #[tokio::test]
+    async fn touch_does_not_block_on_an_unrelated_room() {
+        let r = RoomRegistry::new(cfg());
+        let (a, _) = r
+            .create(&store(), "A".into(), uid(1), keypair(1), false, 1_000)
+            .await
+            .expect("create a");
+        let (b, _) = r
+            .create(&store(), "B".into(), uid(2), keypair(2), false, 1_000)
+            .await
+            .expect("create b");
+        let room_b = r.get_by_id(b.id).await.expect("room b");
+        // Another task is reading room B (for example a broadcast being
+        // built). A write lock on B would wait for it.
+        let _held = room_b.read().await;
+        let touched =
+            tokio::time::timeout(std::time::Duration::from_secs(2), r.touch(uid(1), 5_000)).await;
+        assert!(touched.is_ok(), "touch blocked on an unrelated room");
+        let _ = a;
     }
 
     #[tokio::test]
