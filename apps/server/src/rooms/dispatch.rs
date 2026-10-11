@@ -354,7 +354,7 @@ async fn handle_room_join_request(
         .join(store, &code, user_id, pubkey, display_name, now_ms)
         .await
     {
-        Ok((joined, evt)) => {
+        Ok((joined, _evt)) => {
             let env = envelope_with_payload(
                 MessageKind::RoomJoined,
                 Some(joined.room.id),
@@ -362,7 +362,11 @@ async fn handle_room_join_request(
                 now_ms,
             );
             out.to_caller.push(env);
-            out.events.push(evt);
+            // `registry.join` has already published PARTICIPANT_JOINED to the
+            // joined room. Returning it in `events` as well made the WS layer
+            // republish it into whatever room the envelope's own `room_id`
+            // named, so a member of room A could announce a made-up join in A
+            // by sending ROOM_JOIN_REQUEST for another code with room_id = A.
         }
         Err(e) => {
             let msg = e.to_string();

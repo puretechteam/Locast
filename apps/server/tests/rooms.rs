@@ -724,6 +724,61 @@ async fn intentional_leave_migration_on_immediate_handoff() {
     let _env = expect_envelope(&mut ws_b, MessageKind::ParticipantLeft).await;
 }
 
+// A member of room A who sends ROOM_JOIN_REQUEST for another code while naming
+// room A as the envelope's room used to have the resulting PARTICIPANT_JOINED
+// republished into A, with a display name of their choosing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_request_naming_the_callers_room_does_not_announce_into_that_room() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let (kp_v, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let mut ws_v = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    let v = complete_handshake(&mut ws_v, &kp_v).await;
+
+    send_envelope(&mut ws_a, &room_create_envelope(a.token, "A", true)).await;
+    let ra = serde_json::from_value::<RoomCreatedPayload>(
+        expect_envelope(&mut ws_a, MessageKind::RoomCreated)
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room;
+    send_envelope(&mut ws_c, &room_create_envelope(c.token, "C", true)).await;
+    let rc_code = serde_json::from_value::<RoomCreatedPayload>(
+        expect_envelope(&mut ws_c, MessageKind::RoomCreated)
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room
+    .code;
+
+    send_envelope(&mut ws_v, &room_join_envelope(v.token, &ra.code, "viewer")).await;
+    let _ = expect_envelope(&mut ws_v, MessageKind::RoomJoined).await;
+    let _ = expect_envelope(&mut ws_a, MessageKind::ParticipantJoined).await;
+
+    // V, a member of A, asks to join C but names A as the envelope's room.
+    let mut join_c = room_join_envelope(v.token, &rc_code, "totally-the-host");
+    join_c.room_id = Some(ra.id);
+    send_envelope(&mut ws_v, &join_c).await;
+    let _ = expect_envelope(&mut ws_v, MessageKind::RoomJoined).await;
+    // C's host hears about it (the real join).
+    let _ = expect_envelope(&mut ws_c, MessageKind::ParticipantJoined).await;
+
+    // A's room must hear nothing: no fake join announcement.
+    let stray = tokio::time::timeout(Duration::from_millis(500), read_binary(&mut ws_a)).await;
+    assert!(
+        stray.is_err(),
+        "room A received a frame it should not have: {:?}",
+        stray.ok().flatten().map(|b| decode(&b).r#type)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8. Intentional leave with migration OFF: room ends.
 // ---------------------------------------------------------------------------
