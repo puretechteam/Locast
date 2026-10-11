@@ -1244,25 +1244,57 @@ impl RoomRegistry {
         user_id: Uuid,
         now_ms: i64,
     ) -> Result<Vec<RoomEvent>, RoomError> {
-        let handle = {
-            let by_id = self.by_id.read().await;
-            let mut found = None;
-            for h in by_id.values() {
-                let s = h.read().await;
-                if s.participants
-                    .iter()
-                    .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
-                {
-                    found = Some(h.clone());
-                    break;
+        // A user can be in several rooms (create and join only refuse the
+        // same room twice), so a lost transport affects every one of them.
+        // Handling just the first room found left the others untouched, and
+        // a hosted room whose host was gone never started its grace period.
+        let rooms = self.rooms_of_user(user_id).await;
+        if rooms.is_empty() {
+            return Err(RoomError::NotJoined);
+        }
+        let mut events = Vec::new();
+        let mut first_err = None;
+        for (room_id, handle) in rooms {
+            match self
+                .connection_lost_in_room(store, user_id, room_id, &handle, now_ms)
+                .await
+            {
+                Ok(mut e) => events.append(&mut e),
+                Err(e) => {
+                    first_err.get_or_insert(e);
                 }
             }
-            found
-        };
-        let handle = match handle {
-            Some(h) => h,
-            None => return Err(RoomError::NotJoined),
-        };
+        }
+        match first_err {
+            Some(e) if events.is_empty() => Err(e),
+            _ => Ok(events),
+        }
+    }
+
+    /// Every room the user holds a not-`Left` participant record in.
+    async fn rooms_of_user(&self, user_id: Uuid) -> Vec<(Uuid, RoomHandle)> {
+        let by_id = self.by_id.read().await;
+        let mut out = Vec::new();
+        for (rid, h) in by_id.iter() {
+            let s = h.read().await;
+            if s.participants
+                .iter()
+                .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
+            {
+                out.push((*rid, h.clone()));
+            }
+        }
+        out
+    }
+
+    async fn connection_lost_in_room(
+        &self,
+        store: &dyn RoomStore,
+        user_id: Uuid,
+        room_id: Uuid,
+        handle: &RoomHandle,
+        now_ms: i64,
+    ) -> Result<Vec<RoomEvent>, RoomError> {
         let is_host = {
             let s = handle.read().await;
             s.host().map(|h| h.user_id == user_id).unwrap_or(false)
@@ -1270,22 +1302,6 @@ impl RoomRegistry {
         if !is_host {
             // Persist the disconnected status before
             // mutating memory.
-            let room_id = {
-                let by_id = self.by_id.read().await;
-                let mut found = None;
-                for (rid, h) in by_id.iter() {
-                    let s = h.read().await;
-                    if s.participants
-                        .iter()
-                        .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
-                    {
-                        found = Some(*rid);
-                        break;
-                    }
-                }
-                found
-            };
-            let room_id = room_id.ok_or(RoomError::NotJoined)?;
             store
                 .update_participant_status(room_id, user_id, "disconnected", now_ms)
                 .await
@@ -1303,8 +1319,10 @@ impl RoomRegistry {
             }
             return Ok(vec![]);
         }
-        // Host transport loss. Treat as `leave(_, false)`.
-        let (events, _summary) = self.leave(store, user_id, false, now_ms).await?;
+        // Host transport loss. Treat as `leave(_, false)` for THIS room.
+        let (events, _summary) = self
+            .leave_room(store, user_id, Some(room_id), false, now_ms)
+            .await?;
         Ok(events)
     }
 
@@ -1320,40 +1338,41 @@ impl RoomRegistry {
         pubkey: [u8; 32],
         now_ms: i64,
     ) -> Result<Option<Vec<RoomEvent>>, RoomError> {
-        let handle = {
-            let by_id = self.by_id.read().await;
-            let mut found = None;
-            for h in by_id.values() {
-                let s = h.read().await;
-                if s.participants
-                    .iter()
-                    .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
-                {
-                    found = Some(h.clone());
-                    break;
+        // Every room the user is in, not just the first one found: a user
+        // who hosts one room and sits in another must get both re-attached,
+        // or the one that was skipped keeps its host in the grace period.
+        let rooms = self.rooms_of_user(user_id).await;
+        if rooms.is_empty() {
+            return Ok(None);
+        }
+        let mut events = Vec::new();
+        let mut first_err = None;
+        for (room_id, handle) in rooms {
+            match self
+                .rejoin_in_room(store, user_id, pubkey, room_id, &handle, now_ms)
+                .await
+            {
+                Ok(mut e) => events.append(&mut e),
+                Err(e) => {
+                    first_err.get_or_insert(e);
                 }
             }
-            found
-        };
-        let handle = match handle {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-        let room_id = {
-            let by_id = self.by_id.read().await;
-            let mut found = None;
-            for (rid, h) in by_id.iter() {
-                let s = h.read().await;
-                if s.participants
-                    .iter()
-                    .any(|p| p.user_id == user_id && p.status != ParticipantStatus::Left)
-                {
-                    found = Some(*rid);
-                    break;
-                }
-            }
-            found.ok_or(RoomError::NotJoined)?
-        };
+        }
+        match first_err {
+            Some(e) if events.is_empty() => Err(e),
+            _ => Ok(Some(events)),
+        }
+    }
+
+    async fn rejoin_in_room(
+        &self,
+        store: &dyn RoomStore,
+        user_id: Uuid,
+        pubkey: [u8; 32],
+        room_id: Uuid,
+        handle: &RoomHandle,
+        now_ms: i64,
+    ) -> Result<Vec<RoomEvent>, RoomError> {
         let is_host = {
             let s = handle.read().await;
             s.host().map(|h| h.user_id == user_id).unwrap_or(false)
@@ -1399,7 +1418,7 @@ impl RoomRegistry {
             let item = event_to_broadcast_item(&event, room_id, Some(user_id));
             drop(state);
             self.publish(room_id, item);
-            return Ok(Some(vec![event]));
+            return Ok(vec![event]);
         }
         // Non-host rejoin: restore Connected status.
         // Persist FIRST.
@@ -1413,7 +1432,7 @@ impl RoomRegistry {
             p.last_seen_ms = now_ms;
             p.pubkey = pubkey;
         }
-        Ok(Some(vec![]))
+        Ok(vec![])
     }
 
     /// The room-state snapshot for a user. Returns `None` if
@@ -2802,6 +2821,85 @@ mod tests {
             None,
             "a fresh join starts from seq 1 again"
         );
+    }
+
+    /// A user can host one room and sit in another. A lost transport must be
+    /// applied to both: handling only the first room found (hash-map order)
+    /// left the hosted room's host "connected" with no grace period running.
+    #[tokio::test]
+    async fn a_lost_connection_is_applied_to_every_room_the_user_is_in() {
+        for round in 0..20u8 {
+            let r = RoomRegistry::new(cfg());
+            let (hosted, _) = r
+                .create(&store(), "mine".into(), uid(1), keypair(1), true, 1_000)
+                .await
+                .expect("create hosted");
+            let (other, _) = r
+                .create(&store(), "theirs".into(), uid(2), keypair(2), true, 1_000)
+                .await
+                .expect("create other");
+            r.join(
+                &store(),
+                &other.code,
+                uid(1),
+                keypair(1),
+                "me".into(),
+                1_100,
+            )
+            .await
+            .expect("join other");
+            // A second member so the hosted room has someone to promote.
+            r.join(
+                &store(),
+                &hosted.code,
+                uid(3),
+                keypair(3),
+                "v".into(),
+                1_100,
+            )
+            .await
+            .expect("join hosted");
+
+            r.on_connection_lost(&store(), uid(1), 2_000)
+                .await
+                .expect("connection lost");
+
+            let hosted_h = r.get_by_id(hosted.id).await.expect("hosted room");
+            assert!(
+                hosted_h.read().await.host_disconnect_deadline_ms.is_some(),
+                "round {round}: the hosted room's grace period must have started"
+            );
+            let other_h = r.get_by_id(other.id).await.expect("other room");
+            let status = other_h
+                .read()
+                .await
+                .participants
+                .iter()
+                .find(|p| p.user_id == uid(1))
+                .map(|p| p.status);
+            assert_eq!(
+                status,
+                Some(ParticipantStatus::Disconnected),
+                "round {round}: the other room must see the user as disconnected"
+            );
+
+            // And coming back re-attaches both.
+            r.rejoin(&store(), uid(1), keypair(1), 3_000)
+                .await
+                .expect("rejoin");
+            assert!(
+                hosted_h.read().await.host_disconnect_deadline_ms.is_none(),
+                "round {round}: the hosted room's grace period must be cleared"
+            );
+            let status = other_h
+                .read()
+                .await
+                .participants
+                .iter()
+                .find(|p| p.user_id == uid(1))
+                .map(|p| p.status);
+            assert_eq!(status, Some(ParticipantStatus::Connected), "round {round}");
+        }
     }
 
     #[tokio::test]
