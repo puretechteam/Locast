@@ -49,9 +49,39 @@ pub async fn library_scan(
     storage: TauriState<'_, Storage>,
     _accountant: TauriState<'_, QuotaAccountant>,
 ) -> Result<ScanResult, AppError> {
+    // One scan at a time: two overlapping runs hash the whole library twice
+    // and race their upserts. A second request is refused, not queued.
+    let Some(_slot) = try_begin_scan() else {
+        return Err(AppError::other("a library scan is already running"));
+    };
     let library_root = resolve_library_root(storage.inner()).await?;
     let result = scan::scan(storage.inner(), &library_root).await?;
     Ok(result)
+}
+
+static SCAN_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held for the duration of a scan; dropping it lets the next one start.
+#[derive(Debug)]
+pub struct ScanSlot(());
+
+impl Drop for ScanSlot {
+    fn drop(&mut self) {
+        SCAN_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Claim the single scan slot, or `None` while another scan holds it.
+pub fn try_begin_scan() -> Option<ScanSlot> {
+    SCAN_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .ok()
+        .map(|_| ScanSlot(()))
 }
 
 /// Resolve the library root for the Tauri command. The library
@@ -74,4 +104,20 @@ async fn resolve_library_root(storage: &Storage) -> Result<PathBuf, AppError> {
             message: e.to_string(),
         })?;
     Ok(data_dir.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_one_scan_can_run_at_a_time() {
+        let first = try_begin_scan().expect("the slot is free");
+        assert!(try_begin_scan().is_none(), "a second scan must be refused");
+        drop(first);
+        assert!(
+            try_begin_scan().is_some(),
+            "the slot is free again after the scan ends"
+        );
+    }
 }
