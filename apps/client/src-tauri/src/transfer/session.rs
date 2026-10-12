@@ -733,7 +733,13 @@ impl<'a> ReceiverSession<'a> {
 
             let frame = match await_frame(&transport, &cancel, "chunk").await {
                 Ok(f) => f,
+                // `ChannelClosed` is the peer's end of the transport going
+                // away while we wait (the sender task ended or aborted).
+                // The sender loop and `send_frame` already treat it like
+                // `Closed`; left unmapped here it escaped as a raw error
+                // with the row still `transferring`.
                 Err(SessionError::Transport(TransportError::Closed))
+                | Err(SessionError::Transport(TransportError::ChannelClosed))
                 | Err(SessionError::Transport(TransportError::Cancelled))
                 | Err(SessionError::Cancelled) => {
                     let _ = store

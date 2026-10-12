@@ -433,12 +433,155 @@ async fn e2e_transfer_50mib_with_loss_and_jitter() {
     );
 }
 
-/// Bad-chunk-hash rejection: a sender that returns the wrong
-/// sha256 for one chunk must cause the receiver to send a
-/// Nak and re-queue. We force a single mismatch by patching
-/// the source bytes on disk before the host side runs.
+/// Read `downloads.last_error` for one row.
+async fn download_last_error(store: &DownloadStore, download_id: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT last_error FROM downloads WHERE id = ?")
+        .bind(download_id)
+        .fetch_one(store.pool())
+        .await
+        .expect("read last_error")
+}
+
+/// Bad-chunk-hash rejection: when the bytes a sender delivers
+/// for one chunk do not match the receiver's expected sha256,
+/// the receiver must Nak and re-queue that chunk, give up after
+/// `MAX_CHUNK_RETRIES`, and end the download in `Failed`.
+///
+/// The mismatch is injected on the RECEIVER's side: its plan
+/// expects a different hash for chunk 7 than the host's plan
+/// (and file) carries. The host therefore passes its own
+/// self-verify and really sends chunk 7, so the receiver's
+/// verify / Nak / retry path is what is exercised. Corrupting
+/// the host's file instead never reaches the receiver: the
+/// sender refuses to send it (see
+/// `e2e_corrupt_host_source_is_never_delivered`).
+///
+/// Every actor that decides the outcome is alive for the whole
+/// run (the sender only stops after the receiver cancels), so
+/// the result does not depend on scheduling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_bad_chunk_hash_is_rejected() {
+    let host_tmp = tempfile::tempdir().expect("host tmpdir");
+    let recv_tmp = tempfile::tempdir().expect("recv tmpdir");
+    let host_lib_root: PathBuf = host_tmp.path().to_path_buf();
+    let recv_lib_root: PathBuf = recv_tmp.path().to_path_buf();
+
+    let fixture_staging = host_lib_root.join("staging-fixture.bin");
+    write_fixture(&fixture_staging).await;
+    let (sender_plan, _expected_blake3, _chunk_hashes) =
+        build_plan("01234567-89ab-cdef-0123-456789abcdb3", &fixture_staging).await;
+    let host_source = host_lib_root.join(&sender_plan.sha256);
+    tokio::fs::rename(&fixture_staging, &host_source)
+        .await
+        .expect("rename fixture to host source");
+
+    // The receiver expects a hash for chunk 7 that the host's
+    // (clean) bytes cannot match.
+    let mut receiver_plan = sender_plan.clone();
+    let bad = receiver_plan
+        .chunks
+        .iter_mut()
+        .find(|c| c.index == 7)
+        .expect("chunk 7 in plan");
+    assert_ne!(bad.sha256, "0".repeat(64));
+    bad.sha256 = "0".repeat(64);
+
+    let storage = open_storage_in(&recv_lib_root).await;
+    let store = DownloadStore::new(storage.pool().clone());
+    seed_fk_deps(&store, "u-1", "media-uuid").await;
+    create_download(&store, &receiver_plan).await;
+
+    let (host_side, recv_side) = loopback_pair(0, 0);
+    let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
+    let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
+    let sender_source = host_source.clone();
+    let recv_store = store.clone();
+    let recv_lib_root_for_run = recv_lib_root.clone();
+    let receiver_plan_for_run = receiver_plan.clone();
+
+    let sender_handle = tokio::spawn(async move {
+        let session = SenderSession::new(&sender_plan, host_transport, sender_source);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.run("fixture.bin".to_string()),
+        )
+        .await
+    });
+    let receiver_handle = tokio::spawn(async move {
+        let session = ReceiverSession::new(
+            &receiver_plan_for_run,
+            recv_transport,
+            recv_store,
+            recv_lib_root_for_run,
+            VIEWER_PUBKEY,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.run("fixture.bin".to_string()),
+        )
+        .await
+    });
+    let sender_res = sender_handle
+        .await
+        .expect("sender join")
+        .expect("sender ok");
+    let recv_res = receiver_handle.await.expect("recv join").expect("recv ok");
+
+    assert!(
+        matches!(recv_res, Ok(DownloadState::Failed)),
+        "expected Failed, got {recv_res:?}"
+    );
+    // The receiver's cancel ends the sender cleanly; the sender
+    // never saw anything wrong with its own data.
+    assert!(sender_res.is_ok(), "sender result: {sender_res:?}");
+
+    // The failure was the retry cap on chunk 7 (the Nak path),
+    // and the row says so.
+    let row = store.fetch(&receiver_plan.download_id).await.expect("row");
+    assert_eq!(row.state, DownloadState::Failed);
+    let last_error = download_last_error(&store, &receiver_plan.download_id)
+        .await
+        .expect("last_error recorded");
+    assert!(
+        last_error.contains("chunk 7") && last_error.contains("max retries"),
+        "unexpected last_error: {last_error}"
+    );
+    let verified = store
+        .completed_chunk_indices(&receiver_plan.download_id)
+        .await
+        .expect("completed chunks");
+    assert!(
+        !verified.contains(&7),
+        "chunk 7 must never be accepted: {verified:?}"
+    );
+
+    // No permanent file should exist.
+    let final_path = locast_client_lib::core::paths::content_addressed_path(
+        &recv_lib_root,
+        &receiver_plan.sha256,
+        "fixture.bin",
+    )
+    .expect("content path");
+    assert!(!final_path.exists());
+}
+
+/// A host whose source file is corrupt must never deliver the
+/// bad bytes. The sender self-verifies each chunk against the
+/// plan and aborts with an `Io("host self-verify ...")` error
+/// before anything reaches the receiver, so no Nak is involved
+/// here. The sender sends no explicit failure frame; it just
+/// stops, which the receiver observes as the peer going away.
+///
+/// Depending on where the receiver first notices that (an Ack
+/// send, which ends in `Failed` through the generic
+/// session-error path; or a window-refill send or the wait for
+/// a chunk, which end in `Cancelled`), the run ends in one of
+/// those two recorded terminal states. Both are legitimate;
+/// what must hold either way is that the outcome is recorded in
+/// the store, matches the returned result, never completes, and
+/// leaves no library file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_corrupt_host_source_is_never_delivered() {
     let host_tmp = tempfile::tempdir().expect("host tmpdir");
     let recv_tmp = tempfile::tempdir().expect("recv tmpdir");
     let host_lib_root: PathBuf = host_tmp.path().to_path_buf();
@@ -492,15 +635,14 @@ async fn e2e_bad_chunk_hash_is_rejected() {
     let recv_lib_root_for_run = recv_lib_root.clone();
 
     // Run with a forced timeout so the test does not hang if
-    // the loopback does not cleanly resolve. We assert the
-    // final state is Failed.
+    // the loopback does not cleanly resolve.
     let sender_handle = tokio::spawn(async move {
         let session = SenderSession::new(&sender_plan, host_transport, sender_source);
-        let _ = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(30),
             session.run("fixture.bin".to_string()),
         )
-        .await;
+        .await
     });
     let receiver_handle = tokio::spawn(async move {
         let session = ReceiverSession::new(
@@ -516,14 +658,33 @@ async fn e2e_bad_chunk_hash_is_rejected() {
         )
         .await
     });
-    let _ = sender_handle.await;
+    let sender_res = sender_handle
+        .await
+        .expect("sender join")
+        .expect("sender ok");
     let recv_res = receiver_handle.await.expect("recv join").expect("recv ok");
-    // The session should NOT complete because at least one
-    // chunk fails to verify after MAX_CHUNK_RETRIES.
-    assert!(
-        matches!(recv_res, Ok(DownloadState::Failed)),
-        "expected Failed, got {recv_res:?}"
-    );
+
+    // The host refused to send the corrupt chunk.
+    match &sender_res {
+        Err(SessionError::Io(msg)) => assert!(
+            msg.contains("host self-verify"),
+            "unexpected sender error: {msg}"
+        ),
+        other => panic!("expected sender host self-verify error, got {other:?}"),
+    }
+
+    // The receiver must land in a recorded terminal state that
+    // agrees with what it returned. A raw transport error (for
+    // example `ChannelClosed`) or a row left in `transferring`
+    // is a failure.
+    let expected_state = match &recv_res {
+        Ok(DownloadState::Failed) => DownloadState::Failed,
+        Err(SessionError::Cancelled) => DownloadState::Cancelled,
+        other => panic!("expected Failed or Cancelled, got {other:?}"),
+    };
+    let row = store.fetch(&plan.download_id).await.expect("row");
+    assert_eq!(row.state, expected_state);
+
     // No permanent file should exist.
     let final_path = locast_client_lib::core::paths::content_addressed_path(
         &recv_lib_root,
@@ -532,6 +693,111 @@ async fn e2e_bad_chunk_hash_is_rejected() {
     )
     .expect("content path");
     assert!(!final_path.exists());
+}
+
+/// Regression for the intermittent `Err(Transport(ChannelClosed))`
+/// seen in CI: if the peer's end of the transport goes away while
+/// the receiver is waiting for a chunk, the receiver must record
+/// the download as cancelled ("peer disappeared") and return
+/// `Cancelled`, exactly as it does for `Closed`. It used to return
+/// the raw `ChannelClosed` error and leave the row `transferring`.
+///
+/// Fully deterministic: the test plays the host by hand, takes the
+/// receiver's whole initial window of Requests (so all of the
+/// receiver's sends have succeeded), then drops its transport. The
+/// receiver can only then wait for a chunk that will never arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_peer_vanishing_while_waiting_for_chunk_is_cancelled() {
+    use locast_client_lib::transfer::{wire_codec, Frame, OfferFrame};
+
+    let host_tmp = tempfile::tempdir().expect("host tmpdir");
+    let recv_tmp = tempfile::tempdir().expect("recv tmpdir");
+    let host_lib_root: PathBuf = host_tmp.path().to_path_buf();
+    let recv_lib_root: PathBuf = recv_tmp.path().to_path_buf();
+
+    // Only the plan is needed; the hand-driven host never reads it.
+    let fixture = host_lib_root.join("fixture.bin");
+    write_fixture(&fixture).await;
+    let (plan, _expected_blake3, _chunk_hashes) =
+        build_plan("01234567-89ab-cdef-0123-456789abcdb4", &fixture).await;
+
+    let storage = open_storage_in(&recv_lib_root).await;
+    let store = DownloadStore::new(storage.pool().clone());
+    seed_fk_deps(&store, "u-1", "media-uuid").await;
+    create_download(&store, &plan).await;
+
+    let (host_side, recv_side) = loopback_pair(0, 0);
+    let host_transport = Arc::new(host_side) as Arc<dyn Transport>;
+    let recv_transport = Arc::new(recv_side) as Arc<dyn Transport>;
+    let receiver_plan = plan.clone();
+    let recv_store = store.clone();
+    let recv_lib_root_for_run = recv_lib_root.clone();
+    let receiver_handle = tokio::spawn(async move {
+        let session = ReceiverSession::new(
+            &receiver_plan,
+            recv_transport,
+            recv_store,
+            recv_lib_root_for_run,
+            VIEWER_PUBKEY,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            session.run("fixture.bin".to_string()),
+        )
+        .await
+    });
+
+    let next_frame = |t: Arc<dyn Transport>| async move {
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(10), t.recv())
+            .await
+            .expect("host recv timed out")
+            .expect("host recv")
+            .expect("receiver closed early");
+        wire_codec::decode(&bytes).expect("decode").0
+    };
+
+    assert!(matches!(
+        next_frame(Arc::clone(&host_transport)).await,
+        Frame::Hello(_)
+    ));
+    let offer = Frame::Offer(OfferFrame {
+        peer_id: plan.source.peer_id.clone(),
+        download_id: plan.download_id.clone(),
+        media_id: plan.media_id.clone(),
+        manifest_version: plan.manifest_version,
+        total_bytes: plan.size_bytes,
+        chunk_size_bytes: CHUNK_SIZE as u32,
+        total_chunks: plan.source_meta.total_chunks,
+        sha256: plan.sha256.clone(),
+        blake3: plan.blake3.clone(),
+        filename: "fixture.bin".to_string(),
+    });
+    let mut bytes = Vec::new();
+    wire_codec::encode(&offer, &mut bytes).expect("encode offer");
+    host_transport.send(bytes).await.expect("send offer");
+    for _ in 0..WINDOW_SIZE {
+        assert!(matches!(
+            next_frame(Arc::clone(&host_transport)).await,
+            Frame::Request(_)
+        ));
+    }
+
+    // The host vanishes without sending anything further.
+    drop(host_transport);
+
+    let recv_res = receiver_handle.await.expect("recv join").expect("recv ok");
+    assert!(
+        matches!(recv_res, Err(SessionError::Cancelled)),
+        "expected Cancelled, got {recv_res:?}"
+    );
+    let row = store.fetch(&plan.download_id).await.expect("row");
+    assert_eq!(row.state, DownloadState::Cancelled);
+    assert_eq!(
+        download_last_error(&store, &plan.download_id)
+            .await
+            .as_deref(),
+        Some("peer disappeared mid-transfer")
+    );
 }
 
 /// Cancellation path: a user-initiated cancel must transition
