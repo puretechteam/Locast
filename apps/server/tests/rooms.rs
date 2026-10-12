@@ -30,7 +30,7 @@ use locast_protocol::room::{
     HostDisconnectedPayload, HostMigratedPayload, HostReconnectedPayload, ParticipantJoinedPayload,
     ParticipantLeftPayload, RoomClosedPayload, RoomCreatePayload, RoomCreatedPayload,
     RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomJoinedPayload, RoomLeavePayload,
-    RoomSummary,
+    RoomStatePayload, RoomSummary,
 };
 use locast_server::time::MockClock;
 use locast_server::{AppState, Clock, Config, Db, Metrics, RoomRegistry, RoomRegistryConfig};
@@ -1452,6 +1452,83 @@ async fn a_late_joiner_receives_the_playback_state_in_room_joined() {
     assert_eq!(
         (ev.server_seq, ev.monotonic_seq),
         (snap.server_seq + 1, snap.monotonic_seq + 1)
+    );
+}
+
+/// A member whose connection dropped and came back missed whatever happened
+/// in between: playback commands, people joining and leaving. It is still in
+/// the room (the server keeps it for the grace period), so nothing re-joins
+/// it and nothing used to tell it the current state. The server now pushes it
+/// a ROOM_STATE straight after AUTH_OK, with the playback snapshot, so it can
+/// catch up without waiting for the host's next command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnecting_member_is_sent_the_current_room_state() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b1 = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b1, &kp_b).await;
+
+    send_envelope(&mut ws_a, &room_create_envelope(a.token, "Rejoin", false)).await;
+    let created: RoomCreatedPayload = serde_json::from_value(
+        expect_envelope(&mut ws_a, MessageKind::RoomCreated)
+            .await
+            .payload,
+    )
+    .unwrap();
+    let room_id = created.room.id;
+    send_envelope(
+        &mut ws_b1,
+        &room_join_envelope(b.token, &created.room.code, "B"),
+    )
+    .await;
+    next_of_kind(&mut ws_b1, MessageKind::RoomJoined, "B join").await;
+
+    // B's connection goes away; the host plays and then pauses while it is gone.
+    drop(ws_b1);
+    send_envelope(
+        &mut ws_a,
+        &playback_cmd(a.token, room_id, PlaybackAction::Play, 1, 20_000),
+    )
+    .await;
+    send_envelope(
+        &mut ws_a,
+        &playback_cmd(a.token, room_id, PlaybackAction::Pause, 2, 27_000),
+    )
+    .await;
+    // (Wait until the server has applied both.)
+    for _ in 0..200 {
+        let reg = harness.rooms.get_by_id(room_id).await.expect("room");
+        if reg.read().await.playback.server_seq == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // B comes back on a new connection with the same identity.
+    let mut ws_b2 = connect(harness.addr).await;
+    let b2 = complete_handshake(&mut ws_b2, &kp_b).await;
+    assert_eq!(b2.user_id, b.user_id, "same identity");
+
+    let env = next_of_kind(&mut ws_b2, MessageKind::RoomState, "state after reconnect").await;
+    let state: RoomStatePayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(state.room.id, room_id);
+    let snap = state
+        .room
+        .playback
+        .expect("the reconnecting member is told where playback stands");
+    assert!(snap.paused);
+    assert_eq!(snap.media_position_ms, 27_000);
+    assert_eq!((snap.server_seq, snap.monotonic_seq), (2, 2));
+    assert!(
+        state
+            .room
+            .participants
+            .iter()
+            .any(|p| p.user_id == b.user_id),
+        "B is still a participant"
     );
 }
 

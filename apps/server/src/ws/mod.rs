@@ -1451,6 +1451,12 @@ async fn handle_auth(
             }
         }
     }
+    // Whatever happened while the connection was away (playback commands,
+    // people joining or leaving) was not delivered to it. Send the room as it
+    // is now, so the client catches up without waiting for the next event.
+    if let Some(action) = room_state_action(state, user_id).await {
+        out.actions.push(action);
+    }
     out
 }
 
@@ -1735,7 +1741,30 @@ async fn handle_auth_resume(
             }
         }
     }
+    // Same catch-up as the AUTH handler: a resumed connection missed
+    // whatever happened while it was away.
+    if let Some(action) = room_state_action(state, user_id).await {
+        out.actions.push(action);
+    }
     out
+}
+
+/// A `ROOM_STATE` for the room `user_id` is in, addressed to their (new)
+/// connection, or `None` when they are in no room. Sent after a reconnect,
+/// see the callers.
+async fn room_state_action(state: &AppState, user_id: Uuid) -> Option<Action> {
+    let snapshot = state.rooms.list_snapshot(user_id).await?;
+    let env = Envelope {
+        v: 1,
+        r#type: MessageKind::RoomState,
+        id: Uuid::now_v7(),
+        room_id: Some(snapshot.room.id),
+        sender: None,
+        ts_ms: now_ms(),
+        seq: 0,
+        payload: serde_json::to_value(&snapshot).ok()?,
+    };
+    encode_envelope_message(&env).ok().map(Action::Send)
 }
 
 /// P7-T01: AUTH-failure tracking. Mirrors
