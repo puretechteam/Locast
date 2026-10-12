@@ -1104,12 +1104,13 @@ pub struct RoomClient {
     /// `rejoin_active_room` to re-issue ROOM_JOIN_REQUEST
     /// after a WS reconnect.
     active_room_code: StdMutex<Option<(String, String)>>,
-    /// The library item ids the host explicitly chose to share
-    /// with `manifest_publish`. `None` means "all permanent
-    /// items" (the pre-selection behaviour). Kept so the
-    /// post-reconnect auto-republish re-shares the same media
-    /// instead of silently widening the selection.
-    host_media_selection: StdMutex<Option<Vec<String>>>,
+    /// What the host has shared in this room with `manifest_publish`.
+    /// Outer `None`: nothing yet. `Some(None)`: "all permanent items"
+    /// (the pre-selection behaviour). `Some(Some(ids))`: exactly those
+    /// library items. Kept so the post-reconnect auto-republish re-shares
+    /// the same media, and does not publish anything at all (let alone the
+    /// whole library) for a host who never shared.
+    host_media_selection: StdMutex<Option<Option<Vec<String>>>>,
 }
 
 impl RoomClient {
@@ -1179,17 +1180,27 @@ impl RoomClient {
             .expect("expected_host_pubkey lock") = None;
     }
 
-    /// Remember the media ids the host chose to share (see
-    /// [`RoomClient::host_media_selection`]).
+    /// Remember what the host just shared (see
+    /// [`RoomClient::host_media_selection`]). Call it after a successful
+    /// publish: `None` records "all permanent items".
     pub fn set_host_media_selection(&self, selection: Option<Vec<String>>) {
         *self
             .host_media_selection
             .lock()
-            .expect("host_media_selection lock") = selection;
+            .expect("host_media_selection lock") = Some(selection);
     }
 
-    /// The media ids the host last chose to share, if any.
-    pub fn host_media_selection(&self) -> Option<Vec<String>> {
+    /// Forget what was shared (a new room starts with nothing shared).
+    pub fn clear_host_media_selection(&self) {
+        *self
+            .host_media_selection
+            .lock()
+            .expect("host_media_selection lock") = None;
+    }
+
+    /// What the host last shared in this room: `None` if nothing, else the
+    /// selection it published with (`Some(None)` = all permanent items).
+    pub fn host_media_selection(&self) -> Option<Option<Vec<String>>> {
         self.host_media_selection
             .lock()
             .expect("host_media_selection lock")
@@ -1466,7 +1477,7 @@ impl RoomClient {
         if let Ok(mut g) = self.pending_outbound.lock() {
             g.clear();
         }
-        self.set_host_media_selection(None);
+        self.clear_host_media_selection();
     }
 
     /// P7-T01: send an envelope, buffering it if the

@@ -56,7 +56,7 @@ pub async fn room_create(
     // previous room must not leak into this one. The host
     // installs its own key on its first publish.
     room.clear_expected_host_pubkey();
-    room.set_host_media_selection(None);
+    room.clear_host_media_selection();
     room.room_create(title, migration_enabled)
         .await
         .map_err(room_err_to_app)

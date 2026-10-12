@@ -310,20 +310,20 @@ pub fn run() {
                                         rc.local_user_id().await,
                                     ) {
                                         if host_uid == local_uid {
-                                            tracing::info!(room_id = %rid, "host reconnect detected; republishing manifest");
-                                            // Re-share the media the host chose, not
-                                            // the whole permanent library.
-                                            let selection = rc.host_media_selection();
-                                            if let Err(e) = crate::room::host::build_sign_and_publish_selected(
+                                            // Re-share what the host chose, and nothing
+                                            // at all if it never shared: never the whole
+                                            // permanent library by default.
+                                            match crate::room::host::republish_after_reconnect(
                                                 identity.clone(),
                                                 signaling.clone(),
                                                 rc.clone(),
                                                 storage.clone(),
                                                 library_root.clone(),
                                                 rid,
-                                                selection,
                                             ).await {
-                                                tracing::warn!(error = %e, "auto-republish manifest failed");
+                                                Ok(true) => tracing::info!(room_id = %rid, "host reconnect detected; republished manifest"),
+                                                Ok(false) => tracing::debug!(room_id = %rid, "host reconnect detected; nothing was shared, nothing to republish"),
+                                                Err(e) => tracing::warn!(error = %e, "auto-republish manifest failed"),
                                             }
                                         }
                                     }

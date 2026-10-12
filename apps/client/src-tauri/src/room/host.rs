@@ -483,6 +483,36 @@ pub async fn build_sign_and_publish_selected(
     Ok(())
 }
 
+/// After the host's signaling connection came back and the room was
+/// rejoined, re-share what the host had shared. Returns whether anything was
+/// published: a host who never shared in this room publishes nothing (a
+/// reconnect must not hash and expose the whole library), and one who shared
+/// a selection re-shares exactly that selection.
+#[allow(clippy::too_many_arguments)]
+pub async fn republish_after_reconnect(
+    identity: Arc<IdentityService>,
+    signaling: Arc<SignalingClient>,
+    room_client: Arc<RoomClient>,
+    storage_pool: SqlitePool,
+    library_root: std::path::PathBuf,
+    room_id: Uuid,
+) -> Result<bool, HostError> {
+    let Some(selection) = room_client.host_media_selection() else {
+        return Ok(false);
+    };
+    build_sign_and_publish_selected(
+        identity,
+        signaling,
+        room_client,
+        storage_pool,
+        library_root,
+        room_id,
+        selection,
+    )
+    .await?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
