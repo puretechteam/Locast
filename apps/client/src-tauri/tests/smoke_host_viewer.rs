@@ -336,7 +336,59 @@ async fn build_rig(
 /// content-addressed path and insert a `permanent`
 /// `media_items` row. Returns
 /// `(sha256_hex, blake3_hex, size_bytes, media_id)`.
-async fn seed_fixture(rig: &ClientRig) -> Result<(String, String, u64, String), String> {
+/// `LOCAST_SMOKE_MEDIA=<path>` swaps the 1 MiB synthetic fixture for a real
+/// media file (for example a three hour film) that is imported through the
+/// production importer, so ffprobe fills in its real duration. The rest of
+/// the flow is unchanged, which makes this the whole host-to-viewer journey
+/// for a long video: import, manifest, join, WebRTC transfer, install, and
+/// `locast://` range reads.
+fn media_override() -> Option<PathBuf> {
+    std::env::var("LOCAST_SMOKE_MEDIA")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Import `source` into the host's library the way the UI does. Returns
+/// `(sha256, blake3, size, media_id, filename)`.
+async fn import_real_media(
+    rig: &ClientRig,
+    source: &std::path::Path,
+) -> Result<(String, String, u64, String, String), String> {
+    let accountant = locast_client_lib::core::quota::QuotaAccountant::new(rig.storage.clone());
+    let display = source
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or("media path has no file name")?;
+    let t = Instant::now();
+    let imported = locast_client_lib::commands::import::import_one(
+        &accountant,
+        &rig.library_root,
+        &rig.storage,
+        source,
+        &display,
+    )
+    .await
+    .map_err(|e| format!("import_one: {e}"))?;
+    eprintln!(
+        "smoke: imported {} ({} bytes) in {:?}",
+        imported.filename,
+        imported.size_bytes,
+        t.elapsed()
+    );
+    Ok((
+        imported.sha256,
+        imported.blake3,
+        imported.size_bytes as u64,
+        imported.id,
+        imported.filename,
+    ))
+}
+
+async fn seed_fixture(rig: &ClientRig) -> Result<(String, String, u64, String, String), String> {
+    if let Some(path) = media_override() {
+        return import_real_media(rig, &path).await;
+    }
     // Deterministic pseudo-random bytes from FIXTURE_SEED
     // (xorshift32 for reproducibility without pulling in
     // a `rand` dep here).
@@ -406,7 +458,13 @@ async fn seed_fixture(rig: &ClientRig) -> Result<(String, String, u64, String), 
     .execute(&rig.storage.pool())
     .await
     .map_err(|e| format!("insert media_items: {e}"))?;
-    Ok((sha_hex, blake_hex, FIXTURE_SIZE as u64, media_id))
+    Ok((
+        sha_hex,
+        blake_hex,
+        FIXTURE_SIZE as u64,
+        media_id,
+        FILENAME.to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +475,13 @@ async fn seed_fixture(rig: &ClientRig) -> Result<(String, String, u64, String), 
 #[ignore = "manual end-to-end smoke test; run with --ignored"]
 async fn smoke_host_to_viewer_full_webrtc_transfer() {
     let overall_start = Instant::now();
+    // `RUST_LOG=locast_client_lib=debug` shows the transfer's own reasons.
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
     // The smoke temp dir holds any artifacts we want to
     // preserve past the test run. It is created OUTSIDE the
     // test's TempDir so its lifetime is independent of the
@@ -529,7 +594,7 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
 
     // 4. HOST seeds the fixture + media row, then creates
     //    the room.
-    let (sha_hex, blake_hex, source_size, media_id) = match seed_fixture(&host).await {
+    let (sha_hex, blake_hex, source_size, media_id, filename) = match seed_fixture(&host).await {
         Ok(t) => t,
         Err(e) => {
             finalize_failure(
@@ -676,6 +741,30 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         return;
     }
     result.stages_passed.push("wait_for_manifest".to_string());
+    if media_override().is_some() {
+        let entry = &verified_manifest.media[0];
+        eprintln!(
+            "smoke: manifest carries {} bytes, {} chunks, duration_ms={}",
+            entry.size_bytes,
+            entry
+                .sources
+                .first()
+                .map(|s| s.chunk_hashes.len())
+                .unwrap_or(0),
+            entry.duration_ms
+        );
+        if let Err(e) = check_manifest_duration(entry.duration_ms, entry.size_bytes, source_size) {
+            finalize_failure(
+                &mut result,
+                "manifest_duration",
+                e,
+                overall_start,
+                Some(server_cancel.clone()),
+            );
+            return;
+        }
+        result.stages_passed.push("manifest_duration".to_string());
+    }
 
     // 7b. The viewer's RoomClient mirrored the ROOM_JOINED
     //     snapshot: the room row, and the host as a participant
@@ -785,8 +874,19 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     //    under 8 seconds; the budget exists to surface
     //    stalls quickly.
     let store = DownloadStore::new(viewer.storage.pool());
-    let final_record = match wait_for_complete(&store, &download_id, Duration::from_secs(15)).await
-    {
+    // A real (long) media file gets a budget sized for its bytes.
+    let transfer_budget = if media_override().is_some() {
+        Duration::from_secs(
+            std::env::var("LOCAST_SMOKE_TRANSFER_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1800),
+        )
+    } else {
+        Duration::from_secs(15)
+    };
+    let transfer_started = Instant::now();
+    let final_record = match wait_for_complete(&store, &download_id, transfer_budget).await {
         Ok(r) => r,
         Err(e) => {
             // Transfer did not complete in the budget.
@@ -821,10 +921,19 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         }
     };
     result.stages_passed.push("wait_for_complete".to_string());
+    if media_override().is_some() {
+        let secs = transfer_started.elapsed().as_secs_f64().max(0.001);
+        eprintln!(
+            "smoke: transferred {} bytes in {:.1} s ({:.1} MiB/s)",
+            source_size,
+            secs,
+            source_size as f64 / 1_048_576.0 / secs
+        );
+    }
 
     // 10. Hash the on-disk file and compare against the
     //     source.
-    let on_disk = paths::content_addressed_path(&viewer.library_root, &sha_hex, FILENAME).unwrap();
+    let on_disk = paths::content_addressed_path(&viewer.library_root, &sha_hex, &filename).unwrap();
     if let Err(e) = verify_on_disk(&on_disk, &sha_hex, &blake_hex, source_size).await {
         finalize_failure(
             &mut result,
@@ -910,6 +1019,27 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
     }
     result.stages_passed.push("playback".to_string());
 
+    // 10e. A real, long media file: the installed copy is a valid media
+    //      file of the expected duration, and the `locast://` handler
+    //      serves exactly the right bytes from the start, the middle,
+    //      the very end and past it.
+    if media_override().is_some() {
+        let url = resolve_media_url(&viewer.storage, &ipc.media_id)
+            .await
+            .expect("resolve the viewer's media url");
+        if let Err(e) = long_media_checks(&handler, &url, &on_disk, source_size).await {
+            finalize_failure(
+                &mut result,
+                "long_media",
+                e,
+                overall_start,
+                Some(server_cancel.clone()),
+            );
+            return;
+        }
+        result.stages_passed.push("long_media".to_string());
+    }
+
     // 11. Final invariants.
     if host.user_id == viewer.user_id {
         finalize_failure(
@@ -966,6 +1096,198 @@ async fn smoke_host_to_viewer_full_webrtc_transfer() {
         result.elapsed_ms, host.user_id, viewer.user_id, room_code, source_size
     );
     server_cancel.cancel();
+}
+
+/// `LOCAST_SMOKE_EXPECT_DURATION_MS` (optional): the duration the media is
+/// known to have. The manifest must carry it to within a second.
+fn expected_duration_ms() -> Option<u64> {
+    std::env::var("LOCAST_SMOKE_EXPECT_DURATION_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
+/// The duration and size the signed manifest carries for the real media.
+fn check_manifest_duration(
+    duration_ms: u64,
+    manifest_size: u64,
+    source_size: u64,
+) -> Result<(), String> {
+    if manifest_size != source_size {
+        return Err(format!(
+            "manifest size {manifest_size} != imported size {source_size}"
+        ));
+    }
+    if duration_ms == 0 {
+        return Err("the manifest carries no duration for the media".into());
+    }
+    if let Some(want) = expected_duration_ms() {
+        if duration_ms.abs_diff(want) > 1_000 {
+            return Err(format!(
+                "manifest duration {duration_ms} ms, expected about {want} ms"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `ffprobe` the file independently of the app and return its duration.
+fn ffprobe_duration_ms(path: &std::path::Path) -> Result<u64, String> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("could not run ffprobe: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffprobe rejected the installed file: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let secs: f64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| format!("ffprobe printed no duration: {e}"))?;
+    Ok((secs * 1000.0).round() as u64)
+}
+
+/// One `locast://` request, checked against the file on disk. `expect` is the
+/// inclusive byte range the response must cover, or `None` for a 416.
+async fn range_case(
+    handler: &ProtocolHandler,
+    url: &str,
+    on_disk: &std::path::Path,
+    size: u64,
+    header: Option<&str>,
+    expect: Option<(u64, u64)>,
+) -> Result<(), String> {
+    use locast_client_lib::library::protocol::{stream_range, ResponseBody};
+    use std::io::{Read, Seek, SeekFrom};
+    let label = header.unwrap_or("(no Range header)");
+    let resp = handler
+        .handle(url, "GET", header)
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+    let hdr = |name: &str| {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    };
+    let Some((start, end)) = expect else {
+        if resp.status != 416 {
+            return Err(format!("{label}: expected 416, got {}", resp.status));
+        }
+        if hdr("Content-Range").as_deref() != Some(format!("bytes */{size}").as_str()) {
+            return Err(format!(
+                "{label}: bad 416 Content-Range {:?}",
+                hdr("Content-Range")
+            ));
+        }
+        return Ok(());
+    };
+    if resp.status != 206 {
+        return Err(format!("{label}: expected 206, got {}", resp.status));
+    }
+    let want_range = format!("bytes {start}-{end}/{size}");
+    if hdr("Content-Range").as_deref() != Some(want_range.as_str()) {
+        return Err(format!(
+            "{label}: Content-Range {:?}, expected {want_range}",
+            hdr("Content-Range")
+        ));
+    }
+    let len = end - start + 1;
+    if hdr("Content-Length").as_deref() != Some(len.to_string().as_str()) {
+        return Err(format!(
+            "{label}: Content-Length {:?}, expected {len}",
+            hdr("Content-Length")
+        ));
+    }
+    let ResponseBody::Range {
+        path,
+        start: s,
+        length,
+    } = resp.body
+    else {
+        return Err(format!("{label}: expected a range body"));
+    };
+    if (s, length) != (start, len) {
+        return Err(format!(
+            "{label}: body covers {s}+{length}, expected {start}+{len}"
+        ));
+    }
+    // The bytes the adapter would send are the file's bytes at that offset.
+    let mut got = std::io::Cursor::new(Vec::<u8>::new());
+    stream_range(&path, s, length, &mut got)
+        .await
+        .map_err(|e| format!("{label}: stream_range: {e}"))?;
+    let mut want = vec![0u8; len as usize];
+    let mut f = std::fs::File::open(on_disk).map_err(|e| format!("open source: {e}"))?;
+    f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    f.read_exact(&mut want)
+        .map_err(|e| format!("{label}: read source: {e}"))?;
+    if got.into_inner() != want {
+        return Err(format!(
+            "{label}: served bytes differ from the file at {start}+{len}"
+        ));
+    }
+    Ok(())
+}
+
+/// What playing a long film needs from the viewer's installed copy: it is a
+/// valid media file of the right duration, and `locast://` serves exactly
+/// the right bytes at the start, middle and very end (what a seek to those
+/// positions asks for), refusing what lies beyond.
+async fn long_media_checks(
+    handler: &ProtocolHandler,
+    url: &str,
+    on_disk: &std::path::Path,
+    size: u64,
+) -> Result<(), String> {
+    use locast_client_lib::library::protocol::MAX_RANGE_BYTES;
+    let dur = ffprobe_duration_ms(on_disk)?;
+    eprintln!("smoke: installed copy probes as {dur} ms");
+    if let Some(want) = expected_duration_ms() {
+        if dur.abs_diff(want) > 1_000 {
+            return Err(format!(
+                "installed file is {dur} ms, expected about {want} ms"
+            ));
+        }
+    }
+    let w = MAX_RANGE_BYTES;
+    let mid = size / 2;
+    // (Range header, inclusive byte range expected back or None for 416)
+    type Case = (Option<String>, Option<(u64, u64)>);
+    let cases: Vec<Case> = vec![
+        (Some("bytes=0-1023".into()), Some((0, 1023))),
+        (Some("bytes=0-".into()), Some((0, (size - 1).min(w - 1)))),
+        (None, Some((0, (size - 1).min(w - 1)))),
+        (
+            Some(format!("bytes={mid}-")),
+            Some((mid, (size - 1).min(mid + w - 1))),
+        ),
+        (Some("bytes=-4096".into()), Some((size - 4096, size - 1))),
+        (
+            Some(format!("bytes={}-", size - 1)),
+            Some((size - 1, size - 1)),
+        ),
+        (
+            Some(format!("bytes={}-{}", size - 100, size + 5000)),
+            Some((size - 100, size - 1)),
+        ),
+        (Some(format!("bytes={size}-")), None),
+        (Some("bytes=0-0,5-9".into()), None),
+    ];
+    for (header, expect) in cases {
+        range_case(handler, url, on_disk, size, header.as_deref(), expect).await?;
+    }
+    Ok(())
 }
 
 fn spawn_inbound(room: Arc<RoomClient>) {
@@ -1034,6 +1356,17 @@ async fn wait_for_complete(
             Ok(rec) => {
                 if rec.state == DownloadState::Complete {
                     return Ok(rec);
+                }
+                // A terminal failure is final: waiting out the budget for a
+                // download that has already ended only hides the reason.
+                if matches!(rec.state, DownloadState::Failed | DownloadState::Cancelled) {
+                    return Err(format!(
+                        "download ended as {:?} after {:?}; transferred={}/{}",
+                        rec.state,
+                        start.elapsed(),
+                        rec.transferred_bytes,
+                        rec.total_bytes
+                    ));
                 }
             }
             Err(e) => {
