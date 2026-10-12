@@ -133,6 +133,17 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
         }
     }, [roomId]);
 
+    // The callers pass fresh inline functions on every render. Reading them
+    // through refs keeps the sampling timer below from being torn down and
+    // restarted by every render of the page: with renders more frequent than
+    // the 1 s period (peer position reports, chat) it never got to fire.
+    const getLocalMsRef = useRef(getLocalMs);
+    const getLocalPlayingRef = useRef(getLocalPlaying);
+    useEffect(() => {
+        getLocalMsRef.current = getLocalMs;
+        getLocalPlayingRef.current = getLocalPlaying;
+    });
+
     useEffect(() => {
         if (roomId === null) return;
         let stopped = false;
@@ -142,8 +153,8 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
             // The store is the source of truth for the
             // host's last accepted PLAYBACK_CMD (per
             // P4-T01/P4-T02).
-            const localMs = getLocalMs();
-            const playing = getLocalPlaying();
+            const localMs = getLocalMsRef.current();
+            const playing = getLocalPlayingRef.current();
             const hostEvent: PlaybackStateEvent | null =
                 usePlaybackStore.getState().lastApplied;
             const hostCommand =
@@ -192,7 +203,7 @@ export function useDriftSmoother(opts: UseDriftSmootherOptions): DriftSmootherRe
             stopped = true;
             window.clearInterval(id);
         };
-    }, [roomId, getLocalMs, getLocalPlaying, skewMs]);
+    }, [roomId, skewMs]);
 
     // Compute the room median (and the local-vs-median
     // drift) from the current remote participants + local
