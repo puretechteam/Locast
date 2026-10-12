@@ -101,7 +101,7 @@ async function setupRoom(page: Page): Promise<void> {
 
 test.beforeEach(async ({ page }) => {
     await injectLocastShim(page);
-    await page.goto("http://127.0.0.1:1420/");
+    await page.goto("/");
     await page.waitForLoadState("domcontentloaded");
     await setupRoom(page);
     await page.waitForFunction(

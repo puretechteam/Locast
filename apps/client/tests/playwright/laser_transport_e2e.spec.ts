@@ -159,7 +159,7 @@ async function laserSends(
 test.describe("as the host (production localUserId from you_user_id)", () => {
     test.beforeEach(async ({ page, locast }) => {
         await injectLocastShim(page);
-        await page.goto("http://127.0.0.1:1420/");
+        await page.goto("/");
         await page.waitForLoadState("domcontentloaded");
         await setupRoom(page, HOST_ID, ALL_CAPS);
         await locast.waitForLaserBridge();
@@ -392,7 +392,7 @@ test.describe("as the host (production localUserId from you_user_id)", () => {
 test.describe("as a viewer", () => {
     test("a viewer without LASER sends nothing; with LASER it sends", async ({ page, locast }) => {
         await injectLocastShim(page);
-        await page.goto("http://127.0.0.1:1420/");
+        await page.goto("/");
         await page.waitForLoadState("domcontentloaded");
         // CHAT only (the default viewer cap set).
         await setupRoom(page, VIEWER_ID, 0x80);
