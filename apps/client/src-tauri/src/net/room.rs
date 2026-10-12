@@ -1373,6 +1373,17 @@ impl RoomClient {
         Ok(summary)
     }
 
+    /// The room is gone as far as this client is concerned: forget the
+    /// cached summary, the identity bound to it and the rejoin credentials,
+    /// stop the presence loop, and tell the webview.
+    async fn drop_room_session(&self) {
+        *self.state.lock().await = None;
+        *self.local_user_id.lock().await = None;
+        self.forget_room_session();
+        self.emit_state_cleared().await;
+        self.abort_presence_loop().await;
+    }
+
     /// P7-T01: re-issue ROOM_JOIN_REQUEST for the room
     /// the user was in before the WS reconnect. Called
     /// from the signaling client's post-AUTH_OK hook.
@@ -1412,12 +1423,43 @@ impl RoomClient {
             None,
             RoomJoinRequestPayload { code, display_name },
         );
-        let reply = self.request(env, MessageKind::RoomJoined).await?;
-        let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
-        let mut summary = RoomSummaryIpc::from(joined.room);
-        summary.you_cap_set = Some(joined.you.cap_set);
-        *self.state.lock().await = Some(summary.clone());
-        self.emit_state(&summary).await;
+        match self.request(env, MessageKind::RoomJoined).await {
+            Ok(reply) => {
+                let joined: locast_protocol::room::RoomJoinedPayload = decode_payload(&reply)?;
+                let mut summary = RoomSummaryIpc::from(joined.room);
+                summary.you_cap_set = Some(joined.you.cap_set);
+                *self.state.lock().await = Some(summary.clone());
+                self.emit_state(&summary).await;
+            }
+            // After a dropped connection the server still has us in the room
+            // (it keeps members through the grace period and re-attaches the
+            // identity on AUTH), so asking to join again is refused. That is
+            // the normal case, not a failure: we are in the room. The server
+            // sends the current ROOM_STATE on reconnect, which refreshes the
+            // cached summary; what is left to do here is deliver what was
+            // buffered while the connection was down.
+            Err(RoomClientError::Server {
+                code: RoomErrorCodeIpc::AlreadyJoined,
+                ..
+            }) => {}
+            // The room ended (or no longer exists, or no longer knows us)
+            // while we were away: that is the one case where the session is
+            // really over.
+            Err(
+                e @ RoomClientError::Server {
+                    code:
+                        RoomErrorCodeIpc::RoomNotFound
+                        | RoomErrorCodeIpc::RoomClosed
+                        | RoomErrorCodeIpc::NotJoined
+                        | RoomErrorCodeIpc::Unauthorized,
+                    ..
+                },
+            ) => {
+                self.drop_room_session().await;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
         // Drain any pending outbound envelopes that
         // accumulated during the WS outage.
         let pending: Vec<Envelope> = {
@@ -2101,12 +2143,24 @@ impl RoomClient {
             MessageKind::RoomError if resolved.is_none() && !room_error_ends_membership(&env) => {
                 tracing::warn!("ROOM_ERROR rejected a command; room state kept");
             }
+            // A ROOM_ERROR that answers a join or create request belongs to
+            // the caller of that request, which gets it as an `Err`. It must
+            // not tear down a session that already exists: after a dropped
+            // connection the re-join is refused as ALREADY_JOINED while the
+            // server still holds us in the room, and clearing the cached
+            // room there threw the viewer out of a room they were still in.
+            // (`rejoin_active_room` drops the session itself when the error
+            // says the room is really gone.)
+            MessageKind::RoomError
+                if matches!(
+                    resolved,
+                    Some(MessageKind::RoomJoined | MessageKind::RoomCreated)
+                ) =>
+            {
+                tracing::debug!("ROOM_ERROR answered a join/create request; room state kept");
+            }
             MessageKind::RoomClosed | MessageKind::RoomError => {
-                *self.state.lock().await = None;
-                *self.local_user_id.lock().await = None;
-                self.forget_room_session();
-                self.emit_state_cleared().await;
-                self.abort_presence_loop().await;
+                self.drop_room_session().await;
             }
             MessageKind::ManifestPublished => {
                 self.handle_manifest_published(&env).await;
@@ -2505,6 +2559,21 @@ impl RoomClient {
         }
         let res = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
         match res {
+            // The server answers a refused request with ROOM_ERROR, which is
+            // delivered to the waiter whatever kind it asked for. Callers
+            // decode the reply as the success payload, so an error reply used
+            // to surface as "decode: missing field `room`" (a wrong room
+            // code, a full room, an already-joined member...). Say what the
+            // server said.
+            Ok(Ok(env))
+                if env.r#type == MessageKind::RoomError && expected != MessageKind::RoomError =>
+            {
+                let p: RoomErrorPayload = decode_payload(&env)?;
+                Err(RoomClientError::Server {
+                    code: p.code.into(),
+                    message: p.message,
+                })
+            }
             Ok(Ok(env)) => Ok(env),
             Ok(Err(_)) => {
                 let mut pending = self.pending.lock().await;
