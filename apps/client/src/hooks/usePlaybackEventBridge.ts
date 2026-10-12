@@ -116,3 +116,16 @@ export function usePlaybackEventBridge(): null {
 
     return null;
 }
+
+/**
+ * Mounts the playback bridge for as long as the app is open. The room page
+ * used to own it, so it was gone whenever that page was unmounted - above all
+ * while a download runs, when the blocking guard hides the page. A viewer who
+ * was fetching the shared file therefore never saw the host press Play, and
+ * had no playback state when the download finished. Mounted at the app level
+ * next to `ChatBridge`. Renders nothing.
+ */
+export function PlaybackBridge(): null {
+    usePlaybackEventBridge();
+    return null;
+}

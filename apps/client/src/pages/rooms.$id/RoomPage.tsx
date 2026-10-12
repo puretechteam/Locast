@@ -19,7 +19,6 @@ import { useDriftSmoother } from "../../drift/useDriftSmoother";
 import { useManualSync } from "../../drift/useManualSync";
 import { useClockSkew } from "../../drift/useClockSkew";
 import { probeClockSkewOnce } from "../../drift/clockSkewProbe";
-import { usePlaybackEventBridge } from "../../hooks/usePlaybackEventBridge";
 import { usePositionReportBridge } from "../../hooks/usePositionReportBridge";
 import { useViewerPositionStore } from "../../stores/useViewerPositionStore";
 import { useClockSkewStore } from "../../stores/useClockSkewStore";
@@ -83,10 +82,9 @@ export function RoomPage(): JSX.Element {
         };
     }, [setSummary]);
 
-    // P4-T02: bridge playback://state events into the
-    // playback store and mirror the current room id
-    // into it. The hook returns `null` (no JSX).
-    usePlaybackEventBridge();
+    // The playback://state bridge is mounted at the app level
+    // (`PlaybackBridge` in main.tsx), not here: this page is
+    // unmounted while a download runs and would miss events.
 
     // P4-T03: bridge position://report events into the
     // per-viewer position store. The hook returns
