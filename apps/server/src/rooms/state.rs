@@ -5,7 +5,9 @@
 
 #![forbid(unsafe_code)]
 
-use locast_protocol::room::{Participant, ParticipantSelf, ParticipantStatus, RoomSummary};
+use locast_protocol::room::{
+    Participant, ParticipantSelf, ParticipantStatus, PlaybackSnapshot, RoomSummary,
+};
 use std::collections::{HashMap, VecDeque};
 use uuid::Uuid;
 
@@ -486,6 +488,14 @@ pub struct PlaybackBookkeeping {
     /// authoritative playback position). `0` until the
     /// first PLAY or SEEK is accepted.
     pub last_position_ms: u64,
+    /// Server wall clock (unix ms) when the last command was
+    /// accepted. With `last_position_ms` and the lifecycle it
+    /// tells a late joiner where the host is now.
+    pub last_server_ts_ms: i64,
+    /// Who sent the last accepted command, and that sender's
+    /// `monotonic_seq` for it. `None` until the first command.
+    pub last_sender: Option<Uuid>,
+    pub last_monotonic_seq: u64,
 }
 
 /// The room lifecycle. v1 had only `Open`/`Ended`; P4-T01
@@ -584,7 +594,28 @@ impl RoomState {
                 .collect(),
             host_disconnected: self.host_disconnected(),
             host_disconnect_deadline_ms: self.host_disconnect_deadline_ms,
+            playback: self.playback_snapshot(),
         }
+    }
+
+    /// The room's playback state for a client that was not there for
+    /// the commands. `None` before the first accepted command (the
+    /// `Open` lifecycle) and when the room has ended.
+    pub fn playback_snapshot(&self) -> Option<PlaybackSnapshot> {
+        let paused = match self.state {
+            RoomLifecycle::Playing => false,
+            RoomLifecycle::Paused => true,
+            RoomLifecycle::Open | RoomLifecycle::Ended => return None,
+        };
+        let sender_id = self.playback.last_sender?;
+        Some(PlaybackSnapshot {
+            paused,
+            media_position_ms: self.playback.last_position_ms,
+            server_ts_ms: self.playback.last_server_ts_ms,
+            server_seq: self.playback.server_seq,
+            sender_id,
+            monotonic_seq: self.playback.last_monotonic_seq,
+        })
     }
 
     /// View of the caller's own participant record, for

@@ -36,9 +36,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_protocol::envelope::{Envelope, MessageKind};
 use locast_protocol::room::{
-    HostMigratedPayload, Participant, ParticipantStatus, PresencePayload, RoomCreatePayload,
-    RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomLeavePayload, RoomStatePayload,
-    RoomSummary,
+    HostMigratedPayload, Participant, ParticipantStatus, PlaybackSnapshot, PresencePayload,
+    RoomCreatePayload, RoomErrorCode, RoomErrorPayload, RoomJoinRequestPayload, RoomLeavePayload,
+    RoomStatePayload, RoomSummary,
 };
 use serde::Serialize;
 use specta::Type;
@@ -232,6 +232,34 @@ pub struct RoomSummaryIpc {
     /// (`you_user_id == host_user_id`). Display only: the
     /// server enforces every host-only action.
     pub you_user_id: Option<String>,
+    /// Where the room's playback stands, so a late joiner (or a client that
+    /// missed commands) can start in step. `None` before the first PLAY.
+    pub playback: Option<PlaybackSnapshotIpc>,
+}
+
+/// IPC view of [`PlaybackSnapshot`]: ids as strings, like the rest of the
+/// webview surface.
+#[derive(Debug, Clone, Serialize, Type)]
+pub struct PlaybackSnapshotIpc {
+    pub paused: bool,
+    pub media_position_ms: u64,
+    pub server_ts_ms: i64,
+    pub server_seq: u64,
+    pub sender_id: String,
+    pub monotonic_seq: u64,
+}
+
+impl From<PlaybackSnapshot> for PlaybackSnapshotIpc {
+    fn from(p: PlaybackSnapshot) -> Self {
+        Self {
+            paused: p.paused,
+            media_position_ms: p.media_position_ms,
+            server_ts_ms: p.server_ts_ms,
+            server_seq: p.server_seq,
+            sender_id: p.sender_id.to_string(),
+            monotonic_seq: p.monotonic_seq,
+        }
+    }
 }
 
 impl From<RoomSummary> for RoomSummaryIpc {
@@ -248,6 +276,7 @@ impl From<RoomSummary> for RoomSummaryIpc {
             host_disconnect_deadline_ms: s.host_disconnect_deadline_ms,
             you_cap_set: None,
             you_user_id: None,
+            playback: s.playback.map(Into::into),
         }
     }
 }
@@ -2943,6 +2972,46 @@ mod tests {
         assert_eq!(wire, serde_json::json!({ "stroke_id": stroke }));
     }
 
+    #[test]
+    fn the_playback_snapshot_reaches_the_webview_summary() {
+        let host = Uuid::now_v7();
+        let mut s = sample_summary(host);
+        s.playback = Some(PlaybackSnapshot {
+            paused: true,
+            media_position_ms: 10_795_000,
+            server_ts_ms: 1_700_000_123_456,
+            server_seq: 42,
+            sender_id: host,
+            monotonic_seq: 17,
+        });
+        let ipc = RoomSummaryIpc::from(s);
+        let wire = serde_json::to_value(&ipc).unwrap();
+        assert_eq!(
+            wire["playback"],
+            serde_json::json!({
+                "paused": true,
+                "media_position_ms": 10_795_000,
+                "server_ts_ms": 1_700_000_123_456i64,
+                "server_seq": 42,
+                "sender_id": host.to_string(),
+                "monotonic_seq": 17,
+            }),
+        );
+        // No snapshot (before the first PLAY) is an explicit null, not a
+        // missing key the webview would have to guess about.
+        let none = serde_json::to_value(RoomSummaryIpc::from(sample_summary(host))).unwrap();
+        assert_eq!(none["playback"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_server_that_predates_the_snapshot_still_decodes() {
+        // The wire form of a RoomSummary from a server without `playback`.
+        let mut v = serde_json::to_value(sample_summary(Uuid::now_v7())).unwrap();
+        v.as_object_mut().unwrap().remove("playback");
+        let decoded: RoomSummary = serde_json::from_value(v).unwrap();
+        assert!(decoded.playback.is_none());
+    }
+
     fn sample_summary(host: Uuid) -> RoomSummary {
         RoomSummary {
             id: Uuid::now_v7(),
@@ -2962,6 +3031,7 @@ mod tests {
             }],
             host_disconnected: false,
             host_disconnect_deadline_ms: None,
+            playback: None,
         }
     }
 
@@ -3052,6 +3122,7 @@ mod tests {
             ],
             host_disconnected: false,
             host_disconnect_deadline_ms: None,
+            playback: None,
         };
         let payload = HostMigratedPayload {
             previous_host_user_id: host_a,

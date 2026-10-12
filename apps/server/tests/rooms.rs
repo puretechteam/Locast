@@ -1371,6 +1371,90 @@ async fn playback_room(
     created.room.id
 }
 
+/// A viewer who joins after the host has started the film gets the playback
+/// state in the ROOM_JOINED summary, so it can start in step instead of
+/// knowing nothing until the host's next command. Before the first PLAY there
+/// is nothing to report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_joiner_receives_the_playback_state_in_room_joined() {
+    let harness = spawn_test_server().await;
+    let (kp_a, _) = fresh_keypair();
+    let (kp_b, _) = fresh_keypair();
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_a = connect(harness.addr).await;
+    let mut ws_b = connect(harness.addr).await;
+    let mut ws_c = connect(harness.addr).await;
+    let a = complete_handshake(&mut ws_a, &kp_a).await;
+    let b = complete_handshake(&mut ws_b, &kp_b).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+
+    send_envelope(&mut ws_a, &room_create_envelope(a.token, "Late", false)).await;
+    let created: RoomCreatedPayload = serde_json::from_value(
+        expect_envelope(&mut ws_a, MessageKind::RoomCreated)
+            .await
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        created.room.playback.is_none(),
+        "a new room has no playback"
+    );
+    let room_id = created.room.id;
+    let code = created.room.code.clone();
+
+    send_envelope(&mut ws_b, &room_join_envelope(b.token, &code, "B")).await;
+    let joined: RoomJoinedPayload = serde_json::from_value(
+        next_of_kind(&mut ws_b, MessageKind::RoomJoined, "B join")
+            .await
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        joined.room.playback.is_none(),
+        "nothing to catch up on before the first PLAY"
+    );
+
+    // The host plays from 20 s, then pauses at 27 s and seeks to 10 minutes.
+    for (seq, action, pos) in [
+        (1u64, PlaybackAction::Play, 20_000u64),
+        (2, PlaybackAction::Pause, 27_000),
+        (3, PlaybackAction::Seek, 600_000),
+    ] {
+        send_envelope(&mut ws_a, &playback_cmd(a.token, room_id, action, seq, pos)).await;
+        let ev = next_playback(&mut ws_b, "B sees the command").await;
+        assert_eq!(ev.server_seq, seq);
+    }
+
+    send_envelope(&mut ws_c, &room_join_envelope(c.token, &code, "C")).await;
+    let joined: RoomJoinedPayload = serde_json::from_value(
+        next_of_kind(&mut ws_c, MessageKind::RoomJoined, "C join")
+            .await
+            .payload,
+    )
+    .unwrap();
+    let snap = joined
+        .room
+        .playback
+        .expect("a late joiner gets the playback state");
+    assert!(snap.paused, "the SEEK left the room paused");
+    assert_eq!(snap.media_position_ms, 600_000);
+    assert_eq!((snap.server_seq, snap.monotonic_seq), (3, 3));
+    assert_eq!(snap.sender_id, a.user_id);
+    assert!(snap.server_ts_ms > 0);
+
+    // The host's next command is exactly what the joiner expects next.
+    send_envelope(
+        &mut ws_a,
+        &playback_cmd(a.token, room_id, PlaybackAction::Play, 4, 600_000),
+    )
+    .await;
+    let ev = next_playback(&mut ws_c, "C sees the next command").await;
+    assert_eq!(
+        (ev.server_seq, ev.monotonic_seq),
+        (snap.server_seq + 1, snap.monotonic_seq + 1)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn playback_non_host_is_forbidden_and_host_commands_broadcast_in_order() {
     let harness = spawn_test_server().await;

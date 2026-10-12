@@ -253,6 +253,10 @@ pub async fn handle_playback_cmd(
 
     let server_seq = state.playback.server_seq;
     let server_ts_ms = clock.now_ms();
+    // What a client that joins later needs to catch up (RoomSummary.playback).
+    state.playback.last_server_ts_ms = server_ts_ms;
+    state.playback.last_sender = Some(user_id);
+    state.playback.last_monotonic_seq = payload.monotonic_seq;
 
     match payload.action {
         PlaybackAction::Play => state.state = RoomLifecycle::Playing,
@@ -489,6 +493,113 @@ mod tests {
             );
             assert_eq!(st.playback.last_position_ms, pos);
         }
+    }
+
+    async fn playback_of(
+        reg: &crate::rooms::RoomRegistry,
+        room_id: Uuid,
+    ) -> Option<locast_protocol::room::PlaybackSnapshot> {
+        let st = room_state_snapshot(reg, room_id).await;
+        let st = st.read().await;
+        st.snapshot().playback
+    }
+
+    /// A client that joins after the host has pressed Play was not there for
+    /// the commands. The room summary it receives must carry where playback
+    /// stands: whether it is paused (a SEEK must not change that), the
+    /// position at the command's server time, and the sender's sequence so
+    /// the joiner can carry on without a gap.
+    #[tokio::test]
+    async fn the_room_summary_carries_the_playback_state_for_a_late_joiner() {
+        let clock = fresh_clock();
+        let reg = fresh_registry();
+        let (room_id, host_pk, host_uid) = make_room_with_host_viewer(&reg, &clock).await;
+
+        assert_eq!(
+            playback_of(&reg, room_id).await,
+            None,
+            "nothing to catch up on yet"
+        );
+
+        let mut seq = 0u64;
+        let mut send = |action, pos| {
+            seq += 1;
+            envelope(room_id, host_uid, host_pk, action, seq, pos)
+        };
+
+        let t_play = clock.now_ms();
+        handle_playback_cmd(
+            &send(PlaybackAction::Play, 20_000),
+            &reg,
+            &clock,
+            host_uid,
+            host_pk,
+        )
+        .await
+        .expect("play");
+        let s = playback_of(&reg, room_id)
+            .await
+            .expect("playing room has a snapshot");
+        assert!(!s.paused);
+        assert_eq!(s.media_position_ms, 20_000);
+        assert_eq!(s.server_ts_ms, t_play);
+        assert_eq!(
+            (s.server_seq, s.monotonic_seq, s.sender_id),
+            (1, 1, host_uid)
+        );
+
+        clock.advance(7_000);
+        handle_playback_cmd(
+            &send(PlaybackAction::Pause, 27_000),
+            &reg,
+            &clock,
+            host_uid,
+            host_pk,
+        )
+        .await
+        .expect("pause");
+        let s = playback_of(&reg, room_id).await.expect("snapshot");
+        assert!(s.paused);
+        assert_eq!(s.media_position_ms, 27_000);
+        assert_eq!(s.server_ts_ms, t_play + 7_000);
+        assert_eq!((s.server_seq, s.monotonic_seq), (2, 2));
+
+        clock.advance(3_000);
+        handle_playback_cmd(
+            &send(PlaybackAction::Seek, 600_000),
+            &reg,
+            &clock,
+            host_uid,
+            host_pk,
+        )
+        .await
+        .expect("seek");
+        let s = playback_of(&reg, room_id).await.expect("snapshot");
+        assert!(s.paused, "a SEEK must not unpause the room");
+        assert_eq!(s.media_position_ms, 600_000);
+        assert_eq!((s.server_seq, s.monotonic_seq), (3, 3));
+
+        // A rejected command (a gap in the host's sequence) changes nothing.
+        let bad = envelope(room_id, host_uid, host_pk, PlaybackAction::Play, 9, 1);
+        handle_playback_cmd(&bad, &reg, &clock, host_uid, host_pk)
+            .await
+            .expect_err("gap is rejected");
+        assert_eq!(playback_of(&reg, room_id).await, Some(s));
+
+        // A three hour film: positions near the end survive intact.
+        let near_end = 3 * 60 * 60 * 1000 - 5_000;
+        handle_playback_cmd(
+            &send(PlaybackAction::Play, near_end),
+            &reg,
+            &clock,
+            host_uid,
+            host_pk,
+        )
+        .await
+        .expect("play near the end");
+        let s = playback_of(&reg, room_id).await.expect("snapshot");
+        assert!(!s.paused);
+        assert_eq!(s.media_position_ms, near_end);
     }
 
     #[tokio::test]

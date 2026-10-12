@@ -416,6 +416,18 @@ export type RoomSummaryIpc = {
   host_disconnect_deadline_ms: number | null;
   you_cap_set?: number;
   you_user_id?: string | null;
+  /** Where the room's playback stands (null/absent before the first PLAY).
+   *  Lets a late joiner start in step with the host. */
+  playback?: PlaybackSnapshotIpc | null;
+};
+
+export type PlaybackSnapshotIpc = {
+  paused: boolean;
+  media_position_ms: number;
+  server_ts_ms: number;
+  server_seq: number;
+  sender_id: string;
+  monotonic_seq: number;
 };
 
 export type ParticipantIpc = {

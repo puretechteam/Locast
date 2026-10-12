@@ -221,6 +221,7 @@ mod tests {
             participants,
             host_disconnected: false,
             host_disconnect_deadline_ms: None,
+            playback: None,
         }
     }
 

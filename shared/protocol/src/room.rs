@@ -143,6 +143,35 @@ pub struct RoomSummary {
     pub participants: Vec<Participant>,
     pub host_disconnected: bool,
     pub host_disconnect_deadline_ms: Option<i64>,
+    /// Where the room's playback stands, so a client that joins (or
+    /// rejoins) after the host has already pressed Play can start in
+    /// step instead of waiting for the next command. Absent until the
+    /// first PLAY is accepted, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub playback: Option<PlaybackSnapshot>,
+}
+
+/// The authoritative playback state of a room at its last accepted
+/// command: enough for a late joiner to compute where the host is NOW
+/// (`media_position_ms` advances from `server_ts_ms` unless `paused`),
+/// and to continue the per-sender sequence without a gap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "ts/index.ts")]
+pub struct PlaybackSnapshot {
+    /// The room is paused. A SEEK does not change this, so a paused
+    /// room that was then sought stays `true`.
+    pub paused: bool,
+    /// The position at `server_ts_ms`.
+    pub media_position_ms: u64,
+    /// Server wall clock when the last command was accepted, unix ms.
+    pub server_ts_ms: i64,
+    /// The room-level sequence of that command.
+    pub server_seq: u64,
+    /// The user whose command it was (the host at the time).
+    pub sender_id: Uuid,
+    /// That sender's `monotonic_seq` for the command.
+    pub monotonic_seq: u64,
 }
 
 /// The view of a single participant published to other
