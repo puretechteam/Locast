@@ -23,7 +23,7 @@ use super::error::RoomError;
 use super::laser::laser_event;
 use super::manifest::{handle_manifest_fetch, handle_manifest_publish};
 use super::permissions::handle_permission_set;
-use super::playback::handle_playback_cmd;
+use super::playback::{handle_playback_cmd, PlaybackError};
 use super::presence::handle_position_report;
 use super::registry::{RoomEvent, RoomRegistry};
 use super::signal::{handle_signal, SignalOutcome, SignalRelay};
@@ -481,13 +481,25 @@ async fn handle_playback_cmd_dispatch(
     match handle_playback_cmd(&envelope, registry, clock, user_id, pubkey).await {
         Ok(_published) => {}
         Err(e) => {
+            // Tell the sender where its sequence stands: a command lost in
+            // flight leaves every later one numbered past a gap, and without
+            // this the sender can never find its way back.
+            let expected_seq = match &e {
+                PlaybackError::StaleCommand { expected, .. } => Some(*expected),
+                PlaybackError::DuplicateCommand { last, .. } => Some(last.saturating_add(1)),
+                _ => None,
+            };
             let code: RoomErrorCode = RoomError::from(e).into();
-            out.to_caller.push(err_envelope(
+            let mut reply = err_envelope(
                 MessageKind::RoomError,
                 code,
                 format!("playback rejected: {}", code_for_message(code)),
                 clock.now_ms(),
-            ));
+            );
+            if let Some(seq) = expected_seq {
+                reply.payload["expected_seq"] = serde_json::json!(seq);
+            }
+            out.to_caller.push(reply);
         }
     }
     out
@@ -857,7 +869,16 @@ impl RoomDispatchOutcome {
 }
 
 fn err_envelope(kind: MessageKind, code: RoomErrorCode, message: String, now_ms: i64) -> Envelope {
-    envelope_with_payload(kind, None, &RoomErrorPayload { code, message }, now_ms)
+    envelope_with_payload(
+        kind,
+        None,
+        &RoomErrorPayload {
+            code,
+            message,
+            expected_seq: None,
+        },
+        now_ms,
+    )
 }
 
 fn envelope_with_payload<T: serde::Serialize>(
@@ -1600,7 +1621,25 @@ mod tests {
         assert_eq!(out.to_caller[0].r#type, MessageKind::RoomError);
         let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
         assert_eq!(p.code, RoomErrorCode::StaleCommand);
+        // The reply tells the sender where its sequence stands, so a client
+        // whose command was lost in flight can find its way back.
+        assert_eq!(p.expected_seq, Some(2), "the next seq the server accepts");
         assert!(out.events.is_empty());
+        // A replay of an already-accepted number gets the same guidance.
+        let env = playback_envelope(
+            room_id,
+            host_uid,
+            host_pk,
+            locast_protocol::room::PlaybackAction::Play,
+            1,
+            0,
+        );
+        let out =
+            dispatch_room_message(env, &ctx(&reg, &s, &db, &clock, &relay), host_uid, host_pk)
+                .await;
+        let p: RoomErrorPayload = serde_json::from_value(out.to_caller[0].payload.clone()).unwrap();
+        assert_eq!(p.code, RoomErrorCode::StaleCommand);
+        assert_eq!(p.expected_seq, Some(2));
         // Authoritative server_seq must still be 1 (gap
         // command did not advance).
         let handle = reg.get_by_id(room_id).await.expect("room");

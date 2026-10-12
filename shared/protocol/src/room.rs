@@ -286,6 +286,13 @@ pub struct RoomErrorPayload {
     #[ts(inline)]
     pub code: RoomErrorCode,
     pub message: String,
+    /// For a rejected PLAYBACK_CMD (`StaleCommand`): the `monotonic_seq` the
+    /// server will accept next from this sender. A client whose command was
+    /// lost in flight (the connection dropped as it was sent) has numbered
+    /// every later command past a gap; this is how it finds its place again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub expected_seq: Option<u64>,
 }
 
 /// The closed set of room-error codes. The wire representation
@@ -1137,6 +1144,7 @@ mod tests {
         let p = RoomErrorPayload {
             code: RoomErrorCode::RoomNotFound,
             message: "no room with code XXXXXX".into(),
+            expected_seq: None,
         };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
         assert_eq!(v["code"], json!("RoomNotFound"));

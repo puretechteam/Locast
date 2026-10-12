@@ -464,6 +464,7 @@ fn err_outcome(envelope: &Envelope, message: String) -> RoomDispatchOutcome {
     let payload = locast_protocol::room::RoomErrorPayload {
         code: locast_protocol::room::RoomErrorCode::InvalidState,
         message,
+        expected_seq: None,
     };
     let mut to_caller = Vec::new();
     if let Ok(env) = envelope_with_payload(

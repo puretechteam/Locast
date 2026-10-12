@@ -1680,6 +1680,7 @@ impl RoomRegistry {
         RoomErrorPayload {
             code,
             message: message.into(),
+            expected_seq: None,
         }
     }
 

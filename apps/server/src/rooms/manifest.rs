@@ -396,6 +396,7 @@ pub fn error_envelope(code: RoomErrorCode, message: impl Into<String>) -> RoomEr
     RoomErrorPayload {
         code,
         message: message.into(),
+        expected_seq: None,
     }
 }
 

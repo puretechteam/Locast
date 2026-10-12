@@ -293,6 +293,7 @@ fn error_outcome(err: SignalError, now_ms: i64) -> SignalOutcome {
         payload: serde_json::to_value(locast_protocol::room::RoomErrorPayload {
             code,
             message: err.to_string(),
+            expected_seq: None,
         })
         .unwrap_or(serde_json::json!({})),
     };
