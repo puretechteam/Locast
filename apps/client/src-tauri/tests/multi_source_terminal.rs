@@ -371,6 +371,54 @@ async fn a_failed_download_leaves_no_scratch_files() {
     assert!(!staging.exists(), "tmp/staging/<id> must be removed");
 }
 
+/// A peer that reports a protocol error must end the download as `failed`,
+/// carrying the (sanitized) reason for the modal and releasing the scratch
+/// bytes. The Error frame takes its own match arm in the orchestrator rather
+/// than the cancel or all-sources-gone routes, so it needs its own coverage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_error_frame_fails_the_download_with_its_reason() {
+    use locast_client_lib::transfer::{wire_codec, ErrorFrame, Frame};
+
+    let sink = sink();
+    let f = fixture("01234567-89ab-cdef-0123-456789abcf07").await;
+    let (incomplete, staging) = leave_scratch(&f.lib_root, &f.plan.download_id);
+    let (handle, host_end) = source();
+    let frame = Frame::Error(ErrorFrame {
+        download_id: f.plan.download_id.clone(),
+        reason: "host could not read the source".into(),
+    });
+    let mut bytes = Vec::new();
+    wire_codec::encode(&frame, &mut bytes).expect("encode");
+    // Keep the host end alive so the failure cannot be mistaken for a lost
+    // source: the Error frame itself must end the download.
+    host_end.send(bytes).await.expect("send error frame");
+
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_multi_source(receiver(&f, vec![handle]), "fixture.bin".into()),
+    )
+    .await
+    .expect("an error frame must end the download, not hang");
+    assert!(
+        matches!(&res, Err(MultiSourceError::Io(m)) if m.contains("peer error")),
+        "got {res:?}"
+    );
+
+    assert_eq!(row_state(&f.store, &f.plan.download_id).await, "failed");
+    let states = states_for(&sink, &f.plan.download_id);
+    let (last, message) = states.last().cloned().expect("some state");
+    assert_eq!(last, "failed", "got {states:?}");
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|m| m.contains("host could not read the source")),
+        "the modal must be able to show the peer's reason, got {states:?}"
+    );
+    assert!(!incomplete.exists(), "tmp/incomplete/<id> must be removed");
+    assert!(!staging.exists(), "tmp/staging/<id> must be removed");
+    drop(host_end);
+}
+
 /// A host transport that damages the payload of every Chunk frame it sends,
 /// keeping the frame (and the base64 length) intact so only the content check
 /// can notice: `replace_with` overwrites the first base64 character.
