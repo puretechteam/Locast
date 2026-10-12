@@ -392,3 +392,176 @@ async fn a_refused_join_reports_the_servers_reason_and_keeps_the_current_room() 
     let still = viewer.room.state().await.expect("still in the first room");
     assert_eq!(still.id, created.id);
 }
+
+// ---------------------------------------------------------------------------
+// soak: many drops, both sides, commands flowing the whole time
+// ---------------------------------------------------------------------------
+
+/// Deterministic xorshift, so a failing run can be repeated.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// Long-session churn. Both clients sit behind proxies that this test cuts at
+/// random, in random order, many times, while the host keeps sending playback
+/// commands through the real `RoomClient::send_playback`. Commands sent just
+/// before a cut can be lost in flight; after every outage the viewer must still
+/// be in the same room and the host must still be able to control it: a
+/// fresh command from the host has to reach the viewer.
+///
+/// `LOCAST_SOAK_CYCLES` (default 6) sets the length; `LOCAST_SOAK_SEED` the seed.
+/// Run: `cargo test -j 1 -p locast-client --test viewer_reconnect -- --ignored soak --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "long-running soak; run with --ignored"]
+async fn soak_repeated_drops_never_lose_the_room_or_the_command_sequence() {
+    let cycles: u32 = std::env::var("LOCAST_SOAK_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let mut rng = Rng(std::env::var("LOCAST_SOAK_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0x9E37_79B9_7F4A_7C15));
+
+    let server = start_server().await;
+    let host_proxy = Proxy::start(server).await;
+    let viewer_proxy = Proxy::start(server).await;
+    let host = client(format!("ws://{}/ws", host_proxy.addr), "host").await;
+    let viewer = client(format!("ws://{}/ws", viewer_proxy.addr), "viewer").await;
+    until("both authenticated", 15, || async {
+        host.signaling.snapshot().await.phase == ConnPhase::Authenticated
+            && viewer.signaling.snapshot().await.phase == ConnPhase::Authenticated
+    })
+    .await;
+    // Host migration on: the UI default, and the path with a reconnect grace.
+    let created = host
+        .room
+        .room_create("soak".into(), true)
+        .await
+        .expect("create");
+    viewer
+        .room
+        .room_join(created.code.clone(), "viewer".into())
+        .await
+        .expect("join");
+
+    let mut refused_locally = 0u32;
+    let started = Instant::now();
+    // Positions are unique per command so that "the viewer got THIS command"
+    // is unambiguous.
+    let mut next_pos = 1_000u64;
+    let mut pos_rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut fresh_pos = || {
+        next_pos += 1_000 + pos_rng.below(997);
+        next_pos
+    };
+    let mut first = true;
+
+    for cycle in 1..=cycles {
+        // Host: a few commands while everything is up.
+        for _ in 0..3 {
+            let action = if first {
+                PlaybackAction::Play
+            } else {
+                PlaybackAction::Seek
+            };
+            first = false;
+            let _ = host.room.send_playback(action, fresh_pos()).await;
+        }
+
+        // Cut one side (or both) the instant the commands were queued, so the
+        // last of them can be lost in flight.
+        let which = rng.below(3); // 0 viewer, 1 host, 2 both
+        if which != 1 {
+            viewer_proxy.sever();
+        }
+        if which != 0 {
+            host_proxy.sever();
+        }
+        until("the dropped side notices", 10, || async {
+            (which == 1 || viewer.signaling.snapshot().await.phase != ConnPhase::Authenticated)
+                && (which == 0 || host.signaling.snapshot().await.phase != ConnPhase::Authenticated)
+        })
+        .await;
+        // The host keeps commanding through the outage.
+        if host
+            .room
+            .send_playback(PlaybackAction::Seek, fresh_pos())
+            .await
+            .is_err()
+        {
+            refused_locally += 1; // host is down: refused locally, no number used
+        }
+        viewer_proxy.restore();
+        host_proxy.restore();
+        until("both reconnect", 40, || async {
+            host.signaling.snapshot().await.phase == ConnPhase::Authenticated
+                && viewer.signaling.snapshot().await.phase == ConnPhase::Authenticated
+        })
+        .await;
+
+        // The room is intact...
+        let s = viewer.room.state().await.expect("viewer still in the room");
+        assert_eq!(s.id, created.id, "cycle {cycle}: same room");
+        assert!(
+            host.room.state().await.is_some(),
+            "cycle {cycle}: host still in the room"
+        );
+
+        // ...and the host is still in control: a fresh command reaches the
+        // viewer (if an earlier one was lost in flight the client re-syncs
+        // its numbering and re-sends).
+        let probe = fresh_pos();
+        host.room
+            .send_playback(PlaybackAction::Seek, probe)
+            .await
+            .expect("the host is connected again");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let got = viewer
+                .recorder
+                .playback
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.media_position_ms == probe);
+            if got {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cycle {cycle} (dropped {}): the host's command (position {probe}) never reached                  the viewer; viewer saw {:?}",
+                ["viewer", "host", "both"][which as usize],
+                viewer
+                    .recorder
+                    .playback
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|e| (e.server_seq, e.monotonic_seq, e.media_position_ms))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            viewer.room.state().await.unwrap().participants.len(),
+            2,
+            "cycle {cycle}: nobody dropped out of the participant list"
+        );
+        eprintln!(
+            "soak: cycle {cycle}/{cycles} ok (dropped {}, {:.0}s elapsed)",
+            ["viewer", "host", "both"][which as usize],
+            started.elapsed().as_secs_f64()
+        );
+    }
+    eprintln!("soak: {cycles} cycles passed; {refused_locally} sends refused locally while the host was down");
+}

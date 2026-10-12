@@ -1007,6 +1007,41 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// server's disconnect window; this is the value the loop really uses.
 const PRESENCE_INTERVAL: std::time::Duration = crate::room::heartbeat::PRESENCE_INTERVAL;
 
+/// What the host last sent as a playback command, kept so it can be re-sent
+/// once if the server turns out to be waiting for an earlier number.
+#[derive(Debug, Clone, Copy)]
+struct SentPlayback {
+    seq: u64,
+    action: locast_protocol::room::PlaybackAction,
+    media_position_ms: u64,
+}
+
+/// The numbering of this client's playback commands.
+///
+/// The server accepts exactly `last_acked + 1` from a sender and rejects
+/// anything else. The webview used to pick the numbers, which works until a
+/// command is lost in flight (the connection drops as it is sent): the next
+/// command carries a number past the gap, is rejected, and so is every one
+/// after it, silently, for the rest of the session. The client therefore
+/// numbers the commands itself and, when the server answers a rejection with
+/// the number it expects, goes back to that number and re-sends the rejected
+/// command once (a gap), or just carries on from there (a duplicate).
+#[derive(Debug)]
+struct PlaybackSeq {
+    /// The number the next command will carry.
+    next: u64,
+    last: Option<SentPlayback>,
+}
+
+impl PlaybackSeq {
+    fn new() -> Self {
+        Self {
+            next: 1,
+            last: None,
+        }
+    }
+}
+
 /// The room-lifecycle client. Holds a reference to the
 /// underlying `SignalingClient`, the cached state, and the
 /// pending request-reply correlations.
@@ -1099,6 +1134,8 @@ pub struct RoomClient {
     /// session (which clears that buffer), yet the server still has to
     /// hear about the leave once the connection is back.
     pending_leave: StdMutex<Option<Envelope>>,
+    /// The host's playback command numbering (see [`PlaybackSeq`]).
+    playback_seq: StdMutex<PlaybackSeq>,
     /// P7-T01: the (code, display_name) of the most
     /// recent room the user was in. Used by
     /// `rejoin_active_room` to re-issue ROOM_JOIN_REQUEST
@@ -1132,6 +1169,7 @@ impl RoomClient {
             local_user_id: Mutex::new(None),
             pending_outbound: StdMutex::new(Vec::new()),
             pending_leave: StdMutex::new(None),
+            playback_seq: StdMutex::new(PlaybackSeq::new()),
             active_room_code: StdMutex::new(None),
             host_media_selection: StdMutex::new(None),
         }
@@ -1329,6 +1367,8 @@ impl RoomClient {
         let mut summary = RoomSummaryIpc::from(created.room);
         summary.you_cap_set = Some(created.you.cap_set);
         *self.state.lock().await = Some(summary.clone());
+        // A new room: the server counts this sender's commands from 1.
+        self.reset_playback_seq();
         // The room create is a "to caller" event; we
         // emit a `room://state` so the React side
         // observing via the event stream sees the
@@ -1360,6 +1400,8 @@ impl RoomClient {
         let mut summary = RoomSummaryIpc::from(joined.room);
         summary.you_cap_set = Some(joined.you.cap_set);
         *self.state.lock().await = Some(summary.clone());
+        // A fresh join: the server counts this sender's commands from 1.
+        self.reset_playback_seq();
         self.emit_state(&summary).await;
         self.spawn_presence_loop();
         // P7-T01: remember the join credentials so a
@@ -1371,6 +1413,106 @@ impl RoomClient {
             // Lock poisoned; fall through silently.
         }
         Ok(summary)
+    }
+
+    /// Number and send one host playback command. Returns the `monotonic_seq`
+    /// it carried. See [`PlaybackSeq`] for why the client, not the webview,
+    /// owns the numbering.
+    pub async fn send_playback(
+        &self,
+        action: locast_protocol::room::PlaybackAction,
+        media_position_ms: u64,
+    ) -> Result<u64, RoomClientError> {
+        let room_id = self
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| Uuid::parse_str(&s.id).ok())
+            .ok_or_else(|| RoomClientError::Unexpected("not in a room".into()))?;
+        let seq = {
+            let mut g = self.playback_seq.lock().expect("playback_seq lock");
+            let seq = g.next;
+            g.next = seq + 1;
+            g.last = Some(SentPlayback {
+                seq,
+                action,
+                media_position_ms,
+            });
+            seq
+        };
+        if let Err(e) = self
+            .signaling
+            .send_envelope(playback_envelope(room_id, action, seq, media_position_ms))
+            .await
+        {
+            // It never reached the wire: give the number back so the next
+            // command does not open a gap.
+            let mut g = self.playback_seq.lock().expect("playback_seq lock");
+            if g.next == seq + 1 {
+                g.next = seq;
+                g.last = None;
+            }
+            return Err(RoomClientError::Signaling(e.to_string()));
+        }
+        Ok(seq)
+    }
+
+    /// Start the playback numbering over (a new room, or none).
+    fn reset_playback_seq(&self) {
+        *self.playback_seq.lock().expect("playback_seq lock") = PlaybackSeq::new();
+    }
+
+    /// The server rejected a playback command and said which number it
+    /// expects (`StaleCommand`). If our last command was numbered past it, a
+    /// command was lost in flight: go back to the expected number and send
+    /// that last command again, once. If the server is already ahead of us
+    /// (a replay), just carry on from its number.
+    async fn resync_playback_seq(&self, expected: u64) {
+        let resend = {
+            let mut g = self.playback_seq.lock().expect("playback_seq lock");
+            match g.last {
+                Some(l) if l.seq > expected => {
+                    let again = SentPlayback { seq: expected, ..l };
+                    g.next = expected + 1;
+                    g.last = Some(again);
+                    Some(again)
+                }
+                // Already re-sent under this number (a second rejection of
+                // the same gap arrives after the first fixed it).
+                Some(l) if l.seq == expected => None,
+                _ => {
+                    g.next = expected;
+                    None
+                }
+            }
+        };
+        if let Some(l) = resend {
+            let room_id = self
+                .state
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|s| Uuid::parse_str(&s.id).ok());
+            if let Some(room_id) = room_id {
+                warn!(
+                    expected,
+                    "playback command was numbered past a gap; re-sending it as the server expects"
+                );
+                if let Err(e) = self
+                    .signaling
+                    .send_envelope(playback_envelope(
+                        room_id,
+                        l.action,
+                        l.seq,
+                        l.media_position_ms,
+                    ))
+                    .await
+                {
+                    warn!(error = %e, "re-send of the rejected playback command failed");
+                }
+            }
+        }
     }
 
     /// The room is gone as far as this client is concerned: forget the
@@ -1520,6 +1662,7 @@ impl RoomClient {
             g.clear();
         }
         self.clear_host_media_selection();
+        self.reset_playback_seq();
     }
 
     /// P7-T01: send an envelope, buffering it if the
@@ -2142,6 +2285,12 @@ impl RoomClient {
             // only a code saying the membership is gone does.
             MessageKind::RoomError if resolved.is_none() && !room_error_ends_membership(&env) => {
                 tracing::warn!("ROOM_ERROR rejected a command; room state kept");
+                if let Ok(p) = decode_payload::<RoomErrorPayload>(&env) {
+                    if let (RoomErrorCode::StaleCommand, Some(expected)) = (p.code, p.expected_seq)
+                    {
+                        self.resync_playback_seq(expected).await;
+                    }
+                }
             }
             // A ROOM_ERROR that answers a join or create request belongs to
             // the caller of that request, which gets it as an `Err`. It must
@@ -2732,6 +2881,33 @@ fn laser_unit_ok(n: f32) -> bool {
     n.is_finite() && (0.0..=1.0).contains(&n)
 }
 
+/// A `PLAYBACK_CMD` envelope.
+fn playback_envelope(
+    room_id: Uuid,
+    action: locast_protocol::room::PlaybackAction,
+    monotonic_seq: u64,
+    media_position_ms: u64,
+) -> Envelope {
+    let payload = locast_protocol::room::PlaybackCommandPayload {
+        action,
+        monotonic_seq,
+        media_position_ms,
+        client_ts_ms: now_ms(),
+    };
+    Envelope {
+        v: 1,
+        r#type: MessageKind::PlaybackCmd,
+        id: Uuid::now_v7(),
+        room_id: Some(room_id),
+        // The server uses the bearer-derived identity, not the envelope
+        // `sender`.
+        sender: None,
+        ts_ms: payload.client_ts_ms,
+        seq: monotonic_seq,
+        payload: serde_json::to_value(payload).unwrap_or_default(),
+    }
+}
+
 fn decode_payload<T: serde::de::DeserializeOwned>(env: &Envelope) -> Result<T, RoomClientError> {
     serde_json::from_value(env.payload.clone())
         .map_err(|e| RoomClientError::Unexpected(format!("decode: {e}")))
@@ -3063,6 +3239,86 @@ mod tests {
             serde_json::to_value(locast_protocol::room::StrokeUndoPayload { stroke_id: stroke })
                 .unwrap();
         assert_eq!(wire, serde_json::json!({ "stroke_id": stroke }));
+    }
+
+    /// A client with a cached room, so playback commands can name one.
+    async fn client_in_a_room() -> RoomClient {
+        let rc = fresh_room_client().await;
+        *rc.state.lock().await = Some(RoomSummaryIpc::from(sample_summary(Uuid::now_v7())));
+        rc
+    }
+
+    fn playback_seq_of(rc: &RoomClient) -> (u64, Option<(u64, u64)>) {
+        let g = rc.playback_seq.lock().unwrap();
+        (g.next, g.last.map(|l| (l.seq, l.media_position_ms)))
+    }
+
+    fn sent(seq: u64, pos: u64) -> Option<SentPlayback> {
+        Some(SentPlayback {
+            seq,
+            action: locast_protocol::room::PlaybackAction::Seek,
+            media_position_ms: pos,
+        })
+    }
+
+    /// A command the server saw as numbered past a gap (a command before it
+    /// was lost in flight) is renumbered to what the server expects, and the
+    /// numbering continues from there.
+    #[tokio::test]
+    async fn a_gap_rejection_renumbers_the_last_command() {
+        let rc = client_in_a_room().await;
+        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
+            next: 8,
+            last: sent(7, 42_000),
+        };
+        // The server expected 5 (6 and 7 never arrived or were refused).
+        rc.resync_playback_seq(5).await;
+        assert_eq!(playback_seq_of(&rc), (6, Some((5, 42_000))));
+        // The second rejection of the same gap arrives after the first fixed
+        // it: nothing changes, nothing is sent again.
+        rc.resync_playback_seq(5).await;
+        assert_eq!(playback_seq_of(&rc), (6, Some((5, 42_000))));
+    }
+
+    /// A replay (the server already has our number) just moves us forward.
+    #[tokio::test]
+    async fn a_duplicate_rejection_moves_the_numbering_forward() {
+        let rc = client_in_a_room().await;
+        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
+            next: 4,
+            last: sent(3, 9_000),
+        };
+        rc.resync_playback_seq(9).await;
+        assert_eq!(playback_seq_of(&rc), (9, Some((3, 9_000))));
+    }
+
+    /// A command that never reaches the wire gives its number back, so the
+    /// next one does not open a gap; and a new room starts again at 1.
+    #[tokio::test]
+    async fn an_unsent_command_gives_its_number_back_and_a_new_room_restarts_at_one() {
+        let rc = client_in_a_room().await;
+        let err = rc
+            .send_playback(locast_protocol::room::PlaybackAction::Play, 0)
+            .await;
+        assert!(err.is_err(), "no connection, so nothing is sent");
+        assert_eq!(playback_seq_of(&rc), (1, None), "the number was returned");
+
+        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
+            next: 40,
+            last: sent(39, 1),
+        };
+        rc.reset_playback_seq();
+        assert_eq!(playback_seq_of(&rc), (1, None));
+    }
+
+    #[tokio::test]
+    async fn sending_without_a_room_fails_without_using_a_number() {
+        let rc = fresh_room_client().await;
+        assert!(rc
+            .send_playback(locast_protocol::room::PlaybackAction::Pause, 0)
+            .await
+            .is_err());
+        assert_eq!(playback_seq_of(&rc), (1, None));
     }
 
     #[test]
@@ -3598,6 +3854,7 @@ mod tests {
                 serde_json::to_value(RoomErrorPayload {
                     code,
                     message: "gone".into(),
+                    expected_seq: None,
                 })
                 .unwrap(),
             );
@@ -3625,6 +3882,7 @@ mod tests {
                 serde_json::to_value(RoomErrorPayload {
                     code,
                     message: "playback rejected".into(),
+                    expected_seq: None,
                 })
                 .unwrap(),
             );
@@ -3650,6 +3908,7 @@ mod tests {
             serde_json::to_value(RoomErrorPayload {
                 code: RoomErrorCode::InvalidState,
                 message: "no manifest".into(),
+                expected_seq: None,
             })
             .unwrap(),
         );
@@ -3697,6 +3956,7 @@ mod tests {
             serde_json::to_value(RoomErrorPayload {
                 code: RoomErrorCode::Internal,
                 message: "x".into(),
+                expected_seq: None,
             })
             .unwrap(),
         );
