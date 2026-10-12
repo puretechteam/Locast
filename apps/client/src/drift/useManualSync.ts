@@ -244,17 +244,21 @@ export function useManualSync(args: {
         // ran" without reading the DOM. The helper is a
         // no-op in production (gated on `MODE === "test"`).
         bumpLocalSeekTick();
-        // If the host is currently PLAYING and the
-        // local media was paused, restore the playing
-        // state so the user resumes in sync. This is
-        // the local-equivalent of the architecture's
-        // §13 SEEK semantics: "resume previous
-        // play/pause state". We only call play() when
-        // the host's last event says play (a host
-        // authoritative SEEK after PAUSE is a "seek
-        // while paused" in the host's UI, so the
-        // viewer should stay paused after sync).
-        if (kind === "play" && v.paused) {
+        // Align the play/pause state with the room, not just
+        // the position. `paused` is the store's `hostPaused`,
+        // which a SEEK preserves, so a SEEK after PLAY still
+        // reads as playing and a SEEK after PAUSE as paused
+        // (the architecture's §13 "resume previous play/pause
+        // state"). A viewer still playing is paused when the
+        // room is paused (otherwise it would run past the
+        // frozen position); a paused viewer is resumed when
+        // the room is playing. The host's own element keeps
+        // the original rule (resume only after a PLAY) and is
+        // never paused here: its play state is driven by its
+        // own PLAY/PAUSE commands.
+        if (paused) {
+            if (!isHost && !v.paused) v.pause();
+        } else if (v.paused && (isHost ? kind === "play" : kind !== "pause")) {
             const res = v.play();
             if (res && typeof (res as Promise<void>).then === "function") {
                 (res as Promise<void>).catch((err: unknown) => {
@@ -263,7 +267,7 @@ export function useManualSync(args: {
             }
         }
         return true;
-    }, [roomId, getVideo, skewMs]);
+    }, [roomId, isHost, getVideo, skewMs]);
 
     const authoritativeSeek = useCallback(async (): Promise<boolean> => {
         // Step 1: local seek (same as the viewer branch):

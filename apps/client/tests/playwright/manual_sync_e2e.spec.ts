@@ -33,6 +33,7 @@
 
 import { test, expect, injectLocastShim, nth } from "./fixtures/vite-app";
 import type { Page } from "@playwright/test";
+import type { PlaybackStateEvent } from "./fixtures/vite-app";
 
 const HOST_ROOM = {
     id: "r-p4t05-host",
@@ -513,4 +514,161 @@ test("paused HOST clicking Sync emits a seek at the frozen paused position", asy
     } | null;
     expect(args?.cmd?.action).toBe("seek");
     expect(args?.cmd?.media_position_ms).toBe(12_000);
+});
+
+// ---------------------------------------------------------------
+// Sync to Host aligns the viewer's play/pause state with the room,
+// not just its position. The harness cannot load media, so the
+// <video> instance gets a controllable `paused` flag and recording
+// play()/pause() stubs AFTER the room events have been applied;
+// the click then runs the real `localSeek`.
+// ---------------------------------------------------------------
+
+interface VideoCalls {
+    play: number;
+    pause: number;
+    paused: boolean;
+}
+
+async function stubVideo(page: Page, initiallyPaused: boolean): Promise<void> {
+    await page.evaluate((startPaused) => {
+        const v = document.querySelector<HTMLVideoElement>(
+            '[data-testid="locast-player-video"]',
+        );
+        if (!v) throw new Error("player video element not present");
+        const calls = { play: 0, pause: 0, paused: startPaused };
+        Object.defineProperty(v, "paused", {
+            configurable: true,
+            get: () => calls.paused,
+        });
+        v.play = () => {
+            calls.play += 1;
+            calls.paused = false;
+            return Promise.resolve();
+        };
+        v.pause = () => {
+            calls.pause += 1;
+            calls.paused = true;
+        };
+        (window as unknown as { __videoCalls?: VideoCalls }).__videoCalls = calls;
+    }, initiallyPaused);
+}
+
+async function readVideoCalls(page: Page): Promise<VideoCalls> {
+    return await page.evaluate(() => {
+        const c = (window as unknown as { __videoCalls?: VideoCalls }).__videoCalls;
+        if (!c) throw new Error("video stub not installed");
+        return { play: c.play, pause: c.pause, paused: c.paused };
+    });
+}
+
+async function emitRoomEvent(
+    page: Page,
+    locast: { emitPlaybackState: (p: PlaybackStateEvent) => Promise<void> },
+    seq: number,
+    kind: "play" | "pause" | "seek",
+    pos: number,
+): Promise<void> {
+    await locast.emitPlaybackState({
+        room_id: VIEWER_ROOM.id,
+        server_seq: seq,
+        server_ts_ms: Date.now(),
+        sender_id: REMOTE_HOST_ID,
+        monotonic_seq: seq,
+        kind,
+        media_position_ms: pos,
+    });
+    await page.waitForFunction(
+        (s) => {
+            const w = window as unknown as {
+                __locastStore?: { getLastApplied: () => { server_seq?: number } | null };
+            };
+            return w.__locastStore?.getLastApplied()?.server_seq === s;
+        },
+        seq,
+        { timeout: 5_000 },
+    );
+    // Let the Player's effect that applies the event to the
+    // <video> settle (two frames) before the stub is installed.
+    await page.evaluate(
+        () =>
+            new Promise<void>((r) =>
+                requestAnimationFrame(() => requestAnimationFrame(() => r())),
+            ),
+    );
+}
+
+async function clickSyncAndWaitForSeek(page: Page): Promise<void> {
+    const btn = page.locator('[data-testid="sync-button"]');
+    await expect(btn).toBeEnabled();
+    await resetLocalSeekTick(page);
+    await btn.click();
+    await expect.poll(() => readLocalSeekTick(page)).toBe(1);
+}
+
+test("VIEWER Sync to a PAUSED room pauses a viewer that is still playing", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await emitRoomEvent(page, locast, 1, "play", 10_000);
+    await emitRoomEvent(page, locast, 2, "pause", 15_000);
+    await expect.poll(() => readHostPaused(page)).toBe(true);
+    await stubVideo(page, false);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 0, pause: 1, paused: true });
+});
+
+test("VIEWER Sync to a PAUSED room (PAUSE then SEEK) pauses a playing viewer", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await emitRoomEvent(page, locast, 1, "play", 10_000);
+    await emitRoomEvent(page, locast, 2, "pause", 15_000);
+    await emitRoomEvent(page, locast, 3, "seek", 20_000);
+    await expect.poll(() => readHostPaused(page)).toBe(true);
+    await stubVideo(page, false);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 0, pause: 1, paused: true });
+});
+
+test("VIEWER Sync to a PLAYING room resumes a paused viewer", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await emitRoomEvent(page, locast, 1, "play", 10_000);
+    await expect.poll(() => readHostPaused(page)).toBe(false);
+    await stubVideo(page, true);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 1, pause: 0, paused: false });
+});
+
+test("VIEWER Sync after PLAY then SEEK resumes a paused viewer", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await emitRoomEvent(page, locast, 1, "play", 10_000);
+    await emitRoomEvent(page, locast, 2, "seek", 30_000);
+    await expect.poll(() => readHostPaused(page)).toBe(false);
+    await stubVideo(page, true);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 1, pause: 0, paused: false });
+});
+
+test("VIEWER Sync leaves an already-matching play state alone", async ({
+    page,
+    locast,
+}) => {
+    await mountRoom(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await emitRoomEvent(page, locast, 1, "play", 10_000);
+    await stubVideo(page, false);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 0, pause: 0, paused: false });
+    await emitRoomEvent(page, locast, 2, "pause", 12_000);
+    await stubVideo(page, true);
+    await clickSyncAndWaitForSeek(page);
+    expect(await readVideoCalls(page)).toEqual({ play: 0, pause: 0, paused: true });
 });
