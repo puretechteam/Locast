@@ -652,3 +652,61 @@ async fn leaving_a_room_carries_nothing_over_to_the_next() {
         "numbering restarted for the new room"
     );
 }
+
+/// A command sent while the connection is down must be refused, not queued.
+/// The queue used to survive the reconnect carrying the OLD bearer; the server
+/// closes a connection that presents a bearer it does not recognise, so the
+/// replay killed the freshly re-established connection, and a command sent in
+/// that window was lost in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_sent_during_an_outage_is_refused_and_does_not_cost_the_new_connection() {
+    let server = start_server().await;
+    let proxy = Proxy::start(server).await;
+    let host = client(format!("ws://{}/ws", proxy.addr), "host").await;
+    until("authenticated", 15, || async {
+        host.signaling.snapshot().await.phase == ConnPhase::Authenticated
+    })
+    .await;
+    host.room
+        .room_create("outage".into(), true)
+        .await
+        .expect("create");
+
+    proxy.sever();
+    until("the host notices", 10, || async {
+        host.signaling.snapshot().await.phase != ConnPhase::Authenticated
+    })
+    .await;
+
+    // Refused (not queued), and the number is given back.
+    let refused = host.room.send_playback(PlaybackAction::Play, 1_000).await;
+    assert!(
+        refused.is_err(),
+        "a send during the outage must fail, got {refused:?}"
+    );
+
+    proxy.restore();
+    until("the host reconnects", 40, || async {
+        host.signaling.snapshot().await.phase == ConnPhase::Authenticated
+    })
+    .await;
+
+    // Nothing stale is replayed: the new connection stays up.
+    let steady = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < steady {
+        assert_eq!(
+            host.signaling.snapshot().await.phase,
+            ConnPhase::Authenticated,
+            "the reconnected connection was dropped (a stale envelope was replayed)"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // And the next command is number 1, accepted.
+    let seq = host
+        .room
+        .send_playback(PlaybackAction::Play, 2_000)
+        .await
+        .expect("send after the outage");
+    assert_eq!(seq, 1, "the refused command did not use a number");
+}

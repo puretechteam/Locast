@@ -489,6 +489,19 @@ impl SignalingClient {
                 .bearer
                 .as_ref()
                 .ok_or(SignalingError::IdentityNotInitialized)?;
+            // Only while the handshake is complete. The bearer outlives a
+            // dropped connection (it is kept for the resume attempt), so
+            // without this check an envelope sent during the outage was
+            // queued with the OLD bearer and replayed after the reconnect,
+            // where the server refuses an unrecognised bearer by closing
+            // the new connection: a command sent in the outage cost the
+            // fresh connection, and one sent in that window was lost.
+            if g.state.phase != ConnPhase::Authenticated {
+                return Err(SignalingError::Protocol {
+                    message: "signaling not authenticated (the connection is being re-established)"
+                        .into(),
+                });
+            }
             let tx = g.outbound_tx.clone().ok_or(SignalingError::Protocol {
                 message: "signaling not connected".into(),
             })?;
@@ -591,6 +604,13 @@ async fn connection_loop(
         }
         // Phase: Connecting.
         set_phase(&inner, ConnPhase::Connecting, None).await;
+
+        // Whatever is still queued was addressed to the connection that just
+        // ended and carries its bearer. The server closes a connection that
+        // presents a bearer it does not recognise, so replaying the backlog
+        // on the new connection would drop it again. (Such messages were in
+        // flight when the connection died; their senders resync.)
+        while outbound_rx.try_recv().is_ok() {}
 
         let open = tokio::time::timeout(
             config.handshake_timeout,
