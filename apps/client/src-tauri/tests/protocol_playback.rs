@@ -103,6 +103,42 @@ async fn resolve_encodes_awkward_file_names_and_the_handler_serves_them() {
     assert_eq!(header(&resp, "Content-Length"), Some("2048"));
 }
 
+/// A request without a `Range` header for a file larger than one window must
+/// not make the adapter read the whole file into memory (a multi-GB movie
+/// would mean a multi-GB allocation, and a failed read an empty body under a
+/// full-size Content-Length). It gets the first window as a self-describing
+/// 206, the same answer an open-ended `bytes=0-` gets. Small files keep the
+/// plain 200 (see the tests above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_file_without_a_range_header_gets_a_bounded_first_window() {
+    let f = fixture().await;
+    let total = MAX_RANGE_BYTES + 1000;
+    let bytes: Vec<u8> = (0..total).map(|i| (i % 253) as u8).collect();
+    let (id, _) = add_media(&f, "Long Movie.mp4", &bytes).await;
+    let url = resolve_media_url(&f.storage, &id).await.expect("resolve");
+
+    for method in ["GET", "HEAD"] {
+        let resp = f.handler.handle(&url, method, None).await.expect("serve");
+        assert_eq!(resp.status, 206, "{method}");
+        assert_eq!(
+            header(&resp, "Content-Range"),
+            Some(format!("bytes 0-{}/{total}", MAX_RANGE_BYTES - 1).as_str()),
+            "{method}"
+        );
+        assert_eq!(
+            header(&resp, "Content-Length"),
+            Some(MAX_RANGE_BYTES.to_string().as_str()),
+            "{method}"
+        );
+        match resp.body {
+            ResponseBody::Range { start, length, .. } => {
+                assert_eq!((start, length), (0, MAX_RANGE_BYTES), "{method}");
+            }
+            other => panic!("{method}: expected a bounded range body, got {other:?}"),
+        }
+    }
+}
+
 /// A `..` inside a file name is legal (the sanitizer keeps it), so the
 /// resolved URL for such a file must parse and be served. The URL layer
 /// used to refuse any segment containing `..`, so these files could be

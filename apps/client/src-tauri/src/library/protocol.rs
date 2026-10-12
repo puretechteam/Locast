@@ -505,6 +505,12 @@ impl ProtocolHandler {
         // range (`bytes=START-END` or `bytes=START-` or
         // `bytes=-SUFFIX`). Multi-range is rejected with 416.
         let range = match range_header {
+            // No Range header. The adapter has to hold the whole response in
+            // memory, so a file larger than one window is answered with its
+            // first window as a 206 (what `bytes=0-` gets) instead of a 200
+            // that would read a multi-GB movie into a Vec. Media elements
+            // follow up with Range requests; small files keep the plain 200.
+            None if total_size > MAX_RANGE_BYTES => Some((0, total_size - 1)),
             None => None,
             Some(s) => match parse_single_range(s, total_size) {
                 Ok(r) => Some(r),
