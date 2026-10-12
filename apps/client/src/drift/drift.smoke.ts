@@ -26,6 +26,7 @@ import {
     computeRoomMedian,
     computeSyncTarget,
     deriveDriftSample,
+    appliedPositionMs,
     expectedPositionMs,
     initialDriftState,
     nextHostPaused,
@@ -543,6 +544,33 @@ process.stdout.write("deriveDriftSample + jitter (P4-T06)\n");
         "7500ms smoothed, high jitter (250) => severe (widened 7s)",
         deriveDriftSample(stateWithSmoothed(7500), 250).severeVisible === true,
     );
+}
+
+// ----- appliedPositionMs (a viewer applying a remote command late) -----
+process.stdout.write("appliedPositionMs\n");
+{
+    const S = 1_000_000;
+    const play = { kind: "play" as const, media_position_ms: 20_000, server_ts_ms: S };
+    check("PLAY applied 30 s late lands 30 s ahead", appliedPositionMs(play, false, S + 30_000, 0) === 50_000);
+    check("the clock skew is honoured", appliedPositionMs(play, false, S + 30_000, 2_000) === 52_000);
+    check("an event from the future never moves back", appliedPositionMs(play, false, S - 5_000, 0) === 20_000);
+    check(
+        "PAUSE is frozen however late it is applied",
+        appliedPositionMs({ ...play, kind: "pause" }, true, S + 600_000, 0) === 20_000,
+    );
+    check("SEEK while playing advances", appliedPositionMs({ ...play, kind: "seek" }, false, S + 4_000, 0) === 24_000);
+    check(
+        "SEEK while the room is paused stays put",
+        appliedPositionMs({ ...play, kind: "seek" }, true, S + 4_000, 0) === 20_000,
+    );
+    check(
+        "skew not measured yet => the raw position, never a guess",
+        appliedPositionMs(play, false, S + 30_000, null) === 20_000,
+    );
+    // A three-hour film: late application near the end must not wrap or lose precision.
+    const H3 = 3 * 60 * 60 * 1000;
+    const late = { kind: "play" as const, media_position_ms: H3 - 90_000, server_ts_ms: S };
+    check("near the end of a 3 h film", appliedPositionMs(late, false, S + 60_000, 0) === H3 - 30_000);
 }
 
 if (failures > 0) {

@@ -9,6 +9,8 @@ import {
     sendHostPlaybackCommand,
 } from "../services/hostPlayback";
 import { attachNativeControlBroadcast } from "../services/hostNativeControls";
+import { useClockSkewStore } from "../stores/useClockSkewStore";
+import { appliedPositionMs } from "../drift/drift";
 import { usePlayerRoomEvents } from "../hooks/usePlayerRoomEvents";
 import { DrawingLayer } from "./DrawingLayer";
 
@@ -151,7 +153,16 @@ export function Player({
             return;
         }
         const kind: PlaybackKind = lastApplied.kind as PlaybackKind;
-        applyPlaybackToVideo(v, kind, lastApplied.media_position_ms, (err) => {
+        // Move to where the host is NOW, not where it was when it sent this:
+        // an event applied late (media still downloading, a late join) would
+        // otherwise leave the viewer behind until they pressed Sync.
+        const targetMs = appliedPositionMs(
+            lastApplied,
+            usePlaybackStore.getState().hostPaused,
+            Date.now(),
+            useClockSkewStore.getState().skewMs,
+        );
+        applyPlaybackToVideo(v, kind, targetMs, (err) => {
             setErrorMessage(
                 err instanceof Error
                     ? `local play() rejected: ${err.message}`

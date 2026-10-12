@@ -211,6 +211,39 @@ export function expectedPositionMs(
     return hostCommand.mediaPositionMs + elapsed;
 }
 
+/** The position a viewer should move its <video> to when it applies a remote
+ *  command NOW. A command carries the position at the moment the server
+ *  accepted it; a viewer that applies it later (media still downloading, the
+ *  page remounted, a late join) would otherwise start behind by the command's
+ *  age and stay there until the user pressed Sync.
+ *
+ *  - PAUSE is frozen at its position, and so is a SEEK while the room is
+ *    paused (`hostPaused`).
+ *  - PLAY, and a SEEK while playing, advance by the time since the server
+ *    stamped them.
+ *  - `skewMs` is null until the first clock probe lands. Without it the
+ *    elapsed time is unknowable, so the raw position is used (never guess:
+ *    a wrong clock could throw the viewer minutes off). */
+export function appliedPositionMs(
+    event: { kind: "play" | "pause" | "seek"; media_position_ms: number; server_ts_ms: number },
+    hostPaused: boolean,
+    nowMs: number,
+    skewMs: number | null,
+): number {
+    if (skewMs === null) return event.media_position_ms;
+    const paused = event.kind === "pause" || (event.kind === "seek" && hostPaused);
+    const projected = expectedPositionMs(
+        {
+            mediaPositionMs: event.media_position_ms,
+            serverTsMs: event.server_ts_ms,
+            paused,
+        },
+        nowMs,
+        skewMs,
+    );
+    return projected ?? event.media_position_ms;
+}
+
 /** Compute the raw drift for one sample, or null when the
  *  sample cannot produce a meaningful drift (no host
  *  command yet, or local time is before the command was

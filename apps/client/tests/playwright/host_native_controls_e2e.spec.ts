@@ -12,132 +12,16 @@
 // API directly: the app's code only marks its own moves (via
 // services/hostNativeControls), so an unmarked event is what a user produces.
 
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 import { test, expect, injectLocastShim } from "./fixtures/vite-app";
-import { serveMedia } from "./fixtures/media-route";
-import type { Page } from "@playwright/test";
-
-const CLIP = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "clip_10s.webm");
-const HOST_ID = "11111111-1111-1111-1111-111111111111";
-
-const HOST_ROOM = {
-    id: "r-native-controls",
-    code: "NATV01",
-    title: "native controls",
-    host_user_id: HOST_ID,
-    host_migration_enabled: true,
-    created_ms: 1_700_000_000_000,
-    participants: [
-        {
-            user_id: HOST_ID,
-            display_name: "host",
-            joined_ms: 1_700_000_000_000,
-            status: "Connected" as const,
-            last_seen_ms: 1_700_000_000_000,
-            is_host: true,
-        },
-    ],
-    host_disconnected: false,
-    host_disconnect_deadline_ms: null,
-};
-
-const VIEWER_ROOM = {
-    ...HOST_ROOM,
-    id: "r-native-controls-viewer",
-    host_user_id: "33333333-3333-3333-3333-333333333333",
-    participants: [
-        { ...HOST_ROOM.participants[0]!, user_id: "33333333-3333-3333-3333-333333333333" },
-        {
-            user_id: "22222222-2222-2222-2222-222222222222",
-            display_name: "viewer",
-            joined_ms: 1_700_000_000_500,
-            status: "Connected" as const,
-            last_seen_ms: 1_700_000_000_500,
-            is_host: false,
-        },
-    ],
-};
-
-type Sent = { action: string; media_position_ms: number; monotonic_seq: number };
-
-async function spaNavigate(page: Page, path: string): Promise<void> {
-    await page.evaluate((to) => {
-        window.history.pushState({}, "", to);
-        window.dispatchEvent(new PopStateEvent("popstate"));
-    }, path);
-}
-
-async function mountRoomWithRealVideo(
-    page: Page,
-    room: typeof HOST_ROOM,
-    localUserId: string,
-): Promise<void> {
-    await serveMedia(page, "**/test/clip.webm", CLIP, "video/webm");
-    await spaNavigate(page, `/rooms/${room.id}`);
-    await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
-    await page.waitForFunction(
-        () => (window as { __locastRoomStore?: unknown }).__locastRoomStore !== undefined,
-        undefined,
-        { timeout: 5_000 },
-    );
-    await page.evaluate(
-        ({ s, lid }) => {
-            const w = window as unknown as {
-                __locastRoomStore: {
-                    setSummary: (s: unknown) => void;
-                    setLocalUserId: (id: string | null) => void;
-                };
-            };
-            w.__locastRoomStore.setLocalUserId(lid);
-            w.__locastRoomStore.setSummary(s);
-        },
-        { s: room, lid: localUserId },
-    );
-    await page.waitForSelector('[data-testid="locast-player"]', { timeout: 5_000 });
-    await page.waitForFunction(
-        () => (window as { __locastStore?: unknown }).__locastStore !== undefined,
-        undefined,
-        { timeout: 5_000 },
-    );
-    await page.evaluate(() => {
-        const w = window as unknown as { __locastStore: { setMediaSrc: (s: string) => void } };
-        w.__locastStore.setMediaSrc("/test/clip.webm");
-    });
-    // The real element must have decoded the clip's metadata.
-    await page.waitForFunction(
-        () => {
-            const v = document.querySelector<HTMLVideoElement>('[data-testid="locast-player-video"]');
-            return v !== null && v.readyState >= 1 && Number.isFinite(v.duration);
-        },
-        undefined,
-        { timeout: 10_000 },
-    );
-}
-
-async function sent(page: Page): Promise<Sent[]> {
-    return await page.evaluate(() => {
-        const w = window as unknown as {
-            __locast_invoke_log?: Array<{ name: string; args: { cmd: Sent } }>;
-        };
-        return (w.__locast_invoke_log ?? [])
-            .filter((e) => e.name === "playback_send")
-            .map((e) => ({
-                action: e.args.cmd.action,
-                media_position_ms: e.args.cmd.media_position_ms,
-                monotonic_seq: e.args.cmd.monotonic_seq,
-            }));
-    });
-}
-
-/** A user gesture on the native controls: the element's own API, unmarked. */
-async function userGesture(page: Page, body: string): Promise<void> {
-    await page.evaluate(async (code) => {
-        const v = document.querySelector<HTMLVideoElement>('[data-testid="locast-player-video"]')!;
-        const run = new Function("v", `return (async () => { ${code} })();`);
-        await run(v);
-    }, body);
-}
+import {
+    HOST_ID,
+    HOST_ROOM,
+    VIEWER_ID,
+    VIEWER_ROOM,
+    mountRoomWithRealVideo,
+    sentCommands as sent,
+    userGesture,
+} from "./fixtures/real-video-room";
 
 test.beforeEach(async ({ page, locast }) => {
     await injectLocastShim(page);
@@ -239,7 +123,7 @@ test("a native pause or scrub before any room command is not sent", async ({ pag
 });
 
 test("a viewer's native controls stay local and send nothing", async ({ page }) => {
-    await mountRoomWithRealVideo(page, VIEWER_ROOM, "22222222-2222-2222-2222-222222222222");
+    await mountRoomWithRealVideo(page, VIEWER_ROOM, VIEWER_ID);
     await userGesture(page, "await v.play(); v.currentTime = 5; v.pause();");
     await userGesture(page, "await new Promise((r) => requestAnimationFrame(() => r(null)));");
     expect(await sent(page)).toEqual([]);
