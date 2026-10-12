@@ -19,6 +19,11 @@
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useClockSkewStore } from "../stores/useClockSkewStore";
 import { sendPlaybackCommand } from "./playback";
+import {
+    pauseProgrammatically,
+    playProgrammatically,
+    seekProgrammatically,
+} from "./hostNativeControls";
 
 /** Apply one playback command to a <video> element: move to
  *  `mediaPositionMs` when it is more than 10 ms away, then
@@ -31,20 +36,16 @@ export function applyPlaybackToVideo(
     mediaPositionMs: number,
     onPlayRejected?: (err: unknown) => void,
 ): void {
-    // The wire unit is milliseconds; the DOM unit is seconds.
-    const targetSec = mediaPositionMs / 1000;
-    if (Math.abs(v.currentTime - targetSec) > 0.01) {
-        v.currentTime = targetSec;
-    }
+    // The wire unit is milliseconds; the DOM unit is seconds. The moves go
+    // through the marking helpers so the host's native-control broadcast does
+    // not mistake them for the user's own gestures.
+    seekProgrammatically(v, mediaPositionMs / 1000);
     if (kind === "play") {
-        const res = v.play();
-        if (res && typeof (res as Promise<void>).then === "function") {
-            (res as Promise<void>).catch((err: unknown) => {
-                onPlayRejected?.(err);
-            });
-        }
+        playProgrammatically(v)?.catch((err: unknown) => {
+            onPlayRejected?.(err);
+        });
     } else if (kind === "pause") {
-        v.pause();
+        pauseProgrammatically(v);
     }
 }
 

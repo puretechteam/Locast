@@ -77,6 +77,11 @@ import { useCallback } from "react";
 import { usePlaybackStore, type PlaybackStateEvent } from "../stores/usePlaybackStore";
 import { sendHostPlaybackCommand } from "../services/hostPlayback";
 import {
+    pauseProgrammatically,
+    playProgrammatically,
+    seekProgrammatically,
+} from "../services/hostNativeControls";
+import {
     computeSyncTarget,
     expectedPositionMs,
     type ManualSyncTarget,
@@ -233,9 +238,9 @@ export function useManualSync(args: {
         // zero-duration asset (rare) does not block
         // the user's manual sync.
         const targetSec = targetMs / 1000;
-        if (Math.abs(v.currentTime - targetSec) > 0.001) {
-            v.currentTime = targetSec;
-        }
+        // Marked as the app's own move so the host's native-control
+        // broadcast does not report it as a second SEEK.
+        seekProgrammatically(v, targetSec, 0.001);
         // P4-T05 test seam: the Vite harness cannot observe
         // the actual `<video>.currentTime` write (Chromium
         // ignores `currentTime` assignments on a video whose
@@ -257,14 +262,11 @@ export function useManualSync(args: {
         // never paused here: its play state is driven by its
         // own PLAY/PAUSE commands.
         if (paused) {
-            if (!isHost && !v.paused) v.pause();
+            if (!isHost && !v.paused) pauseProgrammatically(v);
         } else if (v.paused && (isHost ? kind === "play" : kind !== "pause")) {
-            const res = v.play();
-            if (res && typeof (res as Promise<void>).then === "function") {
-                (res as Promise<void>).catch((err: unknown) => {
-                    console.warn("local play() after sync rejected", err);
-                });
-            }
+            playProgrammatically(v)?.catch((err: unknown) => {
+                console.warn("local play() after sync rejected", err);
+            });
         }
         return true;
     }, [roomId, isHost, getVideo, skewMs]);

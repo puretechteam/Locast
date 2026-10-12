@@ -88,10 +88,11 @@ export function PlaybackControls({
         send("pause");
     }, [send]);
     // SEEK to 60 s is the literal P4-T02 acceptance
-    // test target. The host can also use the
-    // <video> element's native scrubber to seek; the
-    // scrubber is NOT wired to send PLAYBACK_CMD (only
-    // these buttons and the Sync button send).
+    // test target. The host can also seek with the
+    // <video> element's native scrubber, and press its
+    // native play/pause: the Player reports those
+    // gestures (`attachNativeControlBroadcast`) through
+    // the same `sendHostPlaybackCommand` path.
     const onSeek60 = useCallback(() => {
         send("seek", 60_000);
     }, [send]);

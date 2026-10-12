@@ -3,7 +3,12 @@ import { Link } from "react-router-dom";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import { sendPositionReport } from "../services/playback";
-import { applyPlaybackToVideo } from "../services/hostPlayback";
+import {
+    applyPlaybackToVideo,
+    hostCommandAllowed,
+    sendHostPlaybackCommand,
+} from "../services/hostPlayback";
+import { attachNativeControlBroadcast } from "../services/hostNativeControls";
 import { usePlayerRoomEvents } from "../hooks/usePlayerRoomEvents";
 import { DrawingLayer } from "./DrawingLayer";
 
@@ -38,12 +43,15 @@ import { DrawingLayer } from "./DrawingLayer";
  *
  * Feedback-loop prevention
  * ------------------------
- * The `<video>` element's `play` / `pause` / `seeked`
- * DOM event handlers MUST NOT bubble into a new
- * `PLAYBACK_CMD` envelope. This component does NOT
- * install any such handler. The host's UI controls
- * (see `PlaybackControls.tsx`) are the only legitimate
- * path that calls `sendPlaybackCommand`.
+ * Only the host sends `PLAYBACK_CMD`, and only for what the
+ * host's USER did: the buttons in `PlaybackControls.tsx`, the
+ * Sync button, or a gesture on the `<video>`'s own controls
+ * (seek bar, play/pause), which `attachNativeControlBroadcast`
+ * reports. Every move the app itself makes to the element goes
+ * through `services/hostNativeControls` helpers that mark the
+ * resulting DOM event as the app's own, so a viewer-bound
+ * command applied locally is never sent a second time.
+ * Viewers install no such handler.
  *
  * Host echo suppression
  * ---------------------
@@ -193,6 +201,29 @@ export function Player({
     // the position://report event); only the local
     // lifecycle + timer drive outbound reports.
     const summaryId = useRoomStore((s) => s.summary?.id ?? null);
+
+    // The host can drive the room with the <video>'s own controls: a scrub
+    // is a SEEK, the native play/pause button a PLAY/PAUSE, both at the
+    // position the element is at. Without this only the three buttons in
+    // `PlaybackControls` reached the viewers.
+    useEffect(() => {
+        if (!isHost || summaryId === null || mediaSrc === null) return;
+        const v = ref.current;
+        if (!v) return;
+        const roomId = summaryId;
+        return attachNativeControlBroadcast(v, (kind, mediaPositionMs) => {
+            if (!hostCommandAllowed(kind, roomId)) return;
+            void sendHostPlaybackCommand({
+                roomId,
+                localUserId,
+                kind,
+                mediaPositionMs,
+                video: null,
+            });
+        });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
+    }, [isHost, summaryId, mediaSrc, localUserId]);
+
     useEffect(() => {
         if (!mediaReady) return;
         if (summaryId === null) return;
