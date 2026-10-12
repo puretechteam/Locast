@@ -131,7 +131,8 @@ pub enum SignalingError {
     #[error("protocol error: {message}")]
     Protocol { message: String },
 
-    /// An inbound frame was larger than the configured cap.
+    /// A frame was larger than the configured cap: an inbound one, or an
+    /// outbound envelope refused before it was sent.
     #[error("oversized frame: {bytes} bytes (cap {cap})")]
     OversizedFrame { bytes: usize, cap: usize },
 }
@@ -511,6 +512,21 @@ impl SignalingClient {
             seq: env.seq,
             payload: serde_json::Value::Object(payload),
         };
+        // The server drops a connection that sends a frame over its cap, and
+        // the connection loop would then reconnect and (for a host) republish
+        // the same message. Measure with the encoder the wire uses and refuse
+        // here instead, leaving the healthy connection alone.
+        let encoded_len = rmp_serde::to_vec_named(&env)
+            .map(|b| b.len())
+            .map_err(|e| SignalingError::Protocol {
+                message: format!("could not encode envelope: {e}"),
+            })?;
+        if encoded_len > self.config.max_frame_bytes {
+            return Err(SignalingError::OversizedFrame {
+                bytes: encoded_len,
+                cap: self.config.max_frame_bytes,
+            });
+        }
         tx.send(env).map_err(|_| SignalingError::Protocol {
             message: "ws send queue closed".into(),
         })?;

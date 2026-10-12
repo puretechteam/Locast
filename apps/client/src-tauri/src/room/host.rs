@@ -73,6 +73,14 @@ pub enum HostError {
     /// `send_envelope` call.
     #[error("signaling: {0}")]
     Signaling(String),
+    /// The signed manifest is larger than the signaling connection's frame
+    /// cap, so the server would drop the connection. It carries one hash per
+    /// 256 KiB chunk, so very large selections do not fit.
+    #[error(
+        "this selection is too large to share: its manifest is {bytes} bytes and the \
+         signaling limit is {cap} bytes; share fewer or smaller files"
+    )]
+    ManifestTooLarge { bytes: usize, cap: usize },
     /// The file on disk no longer matches the size recorded for it, so a
     /// manifest built from it would contradict itself (hashes and chunk
     /// count from the file, size from the database).
@@ -110,7 +118,14 @@ impl From<IdentityServiceError> for HostError {
 
 impl From<SignalingError> for HostError {
     fn from(e: SignalingError) -> Self {
-        HostError::Signaling(e.to_string())
+        match e {
+            // The manifest lists a hash per 256 KiB chunk, so its size grows
+            // with the files. Say so, rather than a bare transport error.
+            SignalingError::OversizedFrame { bytes, cap } => {
+                HostError::ManifestTooLarge { bytes, cap }
+            }
+            other => HostError::Signaling(other.to_string()),
+        }
     }
 }
 
@@ -472,6 +487,29 @@ mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn an_oversized_manifest_send_becomes_a_clear_host_error() {
+        let e = HostError::from(SignalingError::OversizedFrame {
+            bytes: 2_000_000,
+            cap: 1_048_576,
+        });
+        assert!(matches!(
+            e,
+            HostError::ManifestTooLarge {
+                bytes: 2_000_000,
+                cap: 1_048_576
+            }
+        ));
+        let msg = e.to_string();
+        assert!(msg.contains("too large to share"), "{msg}");
+        assert!(msg.contains("2000000") && msg.contains("1048576"), "{msg}");
+        // Other signaling failures keep their generic wrapper.
+        assert!(matches!(
+            HostError::from(SignalingError::IdentityNotInitialized),
+            HostError::Signaling(_)
+        ));
+    }
 
     /// Create an in-memory `media_items` table with the
     /// real schema (minus optional columns) and insert one

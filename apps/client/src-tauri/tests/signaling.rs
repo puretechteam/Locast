@@ -510,6 +510,45 @@ async fn successful_handshake_stores_bearer() {
     client.shutdown().await;
 }
 
+/// An envelope larger than the frame cap used to be queued and sent anyway;
+/// the server then closed the socket (close code 1009). For a host sharing a
+/// big movie that meant a dropped connection, a reconnect, and an automatic
+/// re-hash and republish of the same too-large manifest, round and round.
+/// The send now fails up front with a clear error, and the healthy connection
+/// is left alone.
+#[tokio::test]
+async fn an_envelope_over_the_frame_cap_is_refused_before_it_is_sent() {
+    let (addr, _state, _h) = start_fake(FakeServerConfig::default()).await;
+    let (_dir, storage) = open_storage().await;
+    let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
+    let client = make_client(ws_url(addr), keyring, storage).await;
+    client.start().await.expect("start");
+    wait_for_phase(&client, ConnPhase::Authenticated, Duration::from_secs(5)).await;
+
+    let big = Envelope {
+        v: 1,
+        r#type: MessageKind::ManifestPublish,
+        id: Uuid::now_v7(),
+        room_id: Some(Uuid::now_v7()),
+        sender: None,
+        ts_ms: 0,
+        seq: 0,
+        payload: serde_json::json!({ "filler": "x".repeat(1024 * 1024 + 1024) }),
+    };
+    match client.send_envelope(big).await {
+        Err(SignalingError::OversizedFrame { bytes, cap }) => {
+            assert_eq!(cap, 1024 * 1024);
+            assert!(bytes > cap, "{bytes} should exceed {cap}");
+        }
+        other => panic!("expected OversizedFrame, got {other:?}"),
+    }
+    assert!(
+        client.snapshot().await.connected,
+        "refusing a message must not drop the connection"
+    );
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn auth_ok_pubkey_matches_local_pubkey() {
     let (addr, state, _h) = start_fake(FakeServerConfig::default()).await;
