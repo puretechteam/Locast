@@ -520,9 +520,12 @@ async fn soak_repeated_drops_never_lose_the_room_or_the_command_sequence() {
         // ...and the host is still in control: a fresh command reaches the
         // viewer (if an earlier one was lost in flight the client re-syncs
         // its numbering and re-sends).
+        // (A PLAY, which the server accepts in any room state: if the very
+        // first command of the room was lost, the room is still waiting for
+        // its first PLAY and would refuse a SEEK or PAUSE as invalid.)
         let probe = fresh_pos();
         host.room
-            .send_playback(PlaybackAction::Seek, probe)
+            .send_playback(PlaybackAction::Play, probe)
             .await
             .expect("the host is connected again");
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -564,4 +567,88 @@ async fn soak_repeated_drops_never_lose_the_room_or_the_command_sequence() {
         );
     }
     eprintln!("soak: {cycles} cycles passed; {refused_locally} sends refused locally while the host was down");
+}
+
+// ---------------------------------------------------------------------------
+// leaving a room leaves nothing behind for the next one
+// ---------------------------------------------------------------------------
+
+/// Watch a film, leave, and start or join another room: nothing of the first
+/// room may leak. The host's command numbering starts at 1 again (the server
+/// counts a new room's first command as 1, so a carried-over number would be
+/// rejected as a gap), and the viewer is not handed the old room's playback
+/// state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_a_room_carries_nothing_over_to_the_next() {
+    let server = start_server().await;
+    let host = client(format!("ws://{server}/ws"), "host").await;
+    let viewer = client(format!("ws://{server}/ws"), "viewer").await;
+    until("both authenticated", 15, || async {
+        host.signaling.snapshot().await.phase == ConnPhase::Authenticated
+            && viewer.signaling.snapshot().await.phase == ConnPhase::Authenticated
+    })
+    .await;
+
+    // Room A: the host plays, pauses and seeks; the viewer watches it all.
+    let a = host.room.room_create("A".into(), true).await.expect("A");
+    viewer
+        .room
+        .room_join(a.code.clone(), "viewer".into())
+        .await
+        .expect("join A");
+    for (action, pos) in [
+        (PlaybackAction::Play, 1_000),
+        (PlaybackAction::Pause, 2_000),
+        (PlaybackAction::Seek, 9_999_000),
+    ] {
+        host.room.send_playback(action, pos).await.expect("send");
+    }
+    until("viewer saw all three", 10, || async {
+        viewer.recorder.playback.lock().unwrap().len() == 3
+    })
+    .await;
+
+    // Both leave room A.
+    viewer.room.room_leave().await.expect("viewer leaves");
+    host.room.room_leave().await.expect("host leaves");
+    assert!(viewer.room.state().await.is_none());
+    assert!(host.room.state().await.is_none());
+
+    // Room B, hosted by the same user: its first command must be accepted,
+    // which it only is if the numbering started again at 1.
+    let before = viewer.recorder.playback.lock().unwrap().len();
+    let b = host.room.room_create("B".into(), true).await.expect("B");
+    assert_ne!(a.id, b.id);
+    let joined = viewer
+        .room
+        .room_join(b.code.clone(), "viewer".into())
+        .await
+        .expect("join B");
+    assert!(
+        joined.playback.is_none(),
+        "the new room starts with no playback state, not room A's: {:?}",
+        joined.playback
+    );
+    host.room
+        .send_playback(PlaybackAction::Play, 5_000)
+        .await
+        .expect("the first command of a new room");
+    until("viewer hears room B's first command", 10, || async {
+        let events = viewer.recorder.playback.lock().unwrap();
+        events.len() == before + 1 && events.last().is_some_and(|e| e.server_seq == 1)
+    })
+    .await;
+    let last = viewer
+        .recorder
+        .playback
+        .lock()
+        .unwrap()
+        .last()
+        .cloned()
+        .unwrap();
+    assert_eq!(last.room_id, b.id, "the event is room B's");
+    assert_eq!(
+        last.monotonic_seq, 1,
+        "numbering restarted for the new room"
+    );
 }
