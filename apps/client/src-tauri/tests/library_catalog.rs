@@ -350,7 +350,9 @@ async fn delete_refuses_a_row_whose_path_escapes_the_library() {
 /// (NFC-normalized); the library path validator must accept it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unicode_named_files_import_play_and_delete() {
-    use locast_client_lib::library::protocol::{resolve_media_url, ProtocolHandler};
+    use locast_client_lib::library::protocol::{
+        resolve_media_url, stream_range, ProtocolHandler, ResponseBody,
+    };
 
     let f = fixture().await;
     let handler = ProtocolHandler::new(f.storage.clone(), f.root.clone());
@@ -384,6 +386,60 @@ async fn unicode_named_files_import_play_and_delete() {
             .await
             .unwrap_or_else(|e| panic!("{stored_name:?} must play: {e:?}"));
         assert_eq!(resp.status, 200, "{stored_name:?}");
+
+        // Seeking: a bounded Range request must be honored for the same
+        // Unicode-named media, with the bytes taken from the right offset.
+        // `import` writes `(i * seed + seed) as u8` at offset `i`, 2048 bytes.
+        let expected: Vec<u8> = (0..2048u32)
+            .map(|i| (i as u8).wrapping_mul(seed).wrapping_add(seed))
+            .collect();
+        for (spec, start, end) in [("bytes=0-99", 0u64, 99u64), ("bytes=100-199", 100, 199)] {
+            let ranged = handler
+                .handle(&url, "GET", Some(spec))
+                .await
+                .unwrap_or_else(|e| panic!("{stored_name:?} {spec} must serve: {e:?}"));
+            assert_eq!(ranged.status, 206, "{stored_name:?} {spec}");
+            let len = end - start + 1;
+            let header = |name: &str| {
+                ranged
+                    .headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            };
+            assert_eq!(
+                header("Content-Range"),
+                Some(format!("bytes {start}-{end}/2048").as_str()),
+                "{stored_name:?} {spec}"
+            );
+            assert_eq!(
+                header("Content-Length"),
+                Some(len.to_string().as_str()),
+                "{stored_name:?} {spec}"
+            );
+            let (path, body_start, body_len) = match &ranged.body {
+                ResponseBody::Range {
+                    path,
+                    start,
+                    length,
+                } => (path.clone(), *start, *length),
+                other => panic!("{stored_name:?} {spec}: expected a Range body, got {other:?}"),
+            };
+            assert_eq!(
+                (body_start, body_len),
+                (start, len),
+                "{stored_name:?} {spec}"
+            );
+            let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+            stream_range(&path, body_start, body_len, &mut cursor)
+                .await
+                .unwrap_or_else(|e| panic!("{stored_name:?} {spec} stream_range: {e:?}"));
+            assert_eq!(
+                cursor.into_inner(),
+                expected[start as usize..=end as usize],
+                "{stored_name:?} {spec} body bytes"
+            );
+        }
 
         delete_item(&f.storage, &f.root, &imported.id)
             .await
