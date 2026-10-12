@@ -95,7 +95,7 @@ use std::sync::Arc;
 use sqlx::Row;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 use webrtc::data_channel::{DataChannel, RTCDataChannelState};
 
@@ -108,6 +108,10 @@ use super::webrtc_transport::WebRtcTransport;
 use crate::core::paths;
 use crate::room::peer_id::derive_peer_id;
 use crate::storage::Storage;
+
+/// How often a channel that is waiting for the host to share media checks that
+/// it is still open. The wait itself ends on a signal, not on this timer.
+const MANIFEST_WAIT_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Per-sender bookkeeping. The cancel token is what the
 /// dispatch fires to tear down a sender that is somehow
@@ -167,6 +171,8 @@ impl HostDispatchContext {
     /// verified manifest the dispatcher will trust.
     pub async fn set_room(&self, room_id: Uuid) {
         *self.bound_room.lock().await = Some(room_id);
+        // A channel may be waiting for the room to be bound.
+        self.room_client.manifest_changed().notify_waiters();
     }
 
     /// Clear the room binding. The master cancel token will
@@ -288,31 +294,55 @@ impl HostSenderDispatcher {
             }
         }
 
-        // 3. Look up the verified manifest for the current
-        //    room. If the room is not bound (we are not in a
-        //    room yet, or already left) there is nothing to
-        //    serve.
-        let room_id = match self.ctx.current_room().await {
-            Some(r) => r,
-            None => {
-                warn!(
-                    remote = %peer_user_id,
-                    "host dispatch: no room bound; dropping inbound files DC"
-                );
+        // 3. Wait for the verified manifest of the current room. The
+        //    data channel opens when a viewer connects, which is usually
+        //    BEFORE the host has picked, hashed and published a film (a
+        //    three hour file takes many seconds to hash). Dropping the
+        //    channel here, as this used to, left that viewer with a channel
+        //    nobody served and a download that could only fail. Wait
+        //    instead, for as long as the channel is open and this sender is
+        //    not cancelled; the wait ends the moment a manifest is cached
+        //    or the room is bound.
+        let mut announced = false;
+        let manifest = loop {
+            // Arm the wake-up BEFORE checking, so a manifest accepted
+            // between the check and the wait is not missed.
+            let notified = self.ctx.room_client.manifest_changed().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(room_id) = self.ctx.current_room().await {
+                if let Some(m) = self.ctx.room_client.verified_manifest(room_id) {
+                    break m;
+                }
+            }
+            if sender_cancel.is_cancelled() {
                 return;
             }
-        };
-        let manifest = match self.ctx.room_client.verified_manifest(room_id) {
-            Some(m) => m,
-            None => {
-                warn!(
+            if !announced {
+                announced = true;
+                info!(
                     remote = %peer_user_id,
-                    room_id = %room_id,
-                    "host dispatch: no verified manifest for room; dropping"
+                    "host dispatch: no verified manifest yet; holding the channel until the host shares media"
                 );
-                return;
+            }
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = sender_cancel.cancelled() => return,
+                _ = tokio::time::sleep(MANIFEST_WAIT_RECHECK) => {
+                    // Nothing to wake for: make sure the channel is still there.
+                    if !matches!(dc.ready_state().await, Ok(RTCDataChannelState::Open)) {
+                        debug!(
+                            remote = %peer_user_id,
+                            "host dispatch: channel closed while waiting for a manifest"
+                        );
+                        return;
+                    }
+                }
             }
         };
+        // The wait may have been long; another sender may have been
+        // attached for this peer in the meantime (checked again below
+        // under the lock).
 
         // 4. Wrap the DC in a Transport. The cancellation
         //    token is per-sender; the transport's recv pump
@@ -383,6 +413,12 @@ impl HostSenderDispatcher {
             let mut g = dispatcher.live.lock().await;
             g.remove(&peer_user_id);
         });
+    }
+
+    /// How many viewers currently have a sender attached. For tests and
+    /// diagnostics.
+    pub async fn live_sender_count(&self) -> usize {
+        self.live.lock().await.len()
     }
 
     /// Cancel every live sender. The master cancel token

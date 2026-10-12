@@ -1053,6 +1053,9 @@ pub struct RoomClient {
     /// `verified_at_ms` is the server's `published_at_ms`
     /// from the broadcast envelope.
     verified_manifests: StdMutex<HashMap<Uuid, locast_manifest::MediaManifest>>,
+    /// Woken whenever a manifest is accepted into the cache above (or the
+    /// host dispatcher is bound to a room), so a waiter does not have to poll.
+    manifest_changed: tokio::sync::Notify,
     /// P3-T04 prerequisite 2: the trusted host public
     /// key, set by [`Self::set_expected_host_pubkey`] from
     /// the parsed invite URL. `None` until the invite
@@ -1121,6 +1124,7 @@ impl RoomClient {
             sink: Mutex::new(None),
             presence_task: StdMutex::new(None),
             verified_manifests: StdMutex::new(HashMap::new()),
+            manifest_changed: tokio::sync::Notify::new(),
             expected_host_pubkey: StdMutex::new(None),
             pool: StdMutex::new(None),
             current_versions: StdMutex::new(HashMap::new()),
@@ -1224,6 +1228,14 @@ impl RoomClient {
             .expected_host_pubkey
             .lock()
             .expect("expected_host_pubkey lock")
+    }
+
+    /// Signal raised whenever a verified manifest is cached (see
+    /// [`Self::verified_manifest`]). Wait on it with the usual pattern: create
+    /// and `enable()` the `Notified` future, THEN check the condition, so a
+    /// manifest accepted in between is not missed.
+    pub fn manifest_changed(&self) -> &tokio::sync::Notify {
+        &self.manifest_changed
     }
 
     /// P3-T03: read the verified manifest for a given
@@ -1712,6 +1724,7 @@ impl RoomClient {
                 .expect("verified_manifests lock");
             cache.insert(room_uuid, manifest.clone());
         }
+        self.manifest_changed.notify_waiters();
         // Step 7: persist.
         let _ = source;
         {

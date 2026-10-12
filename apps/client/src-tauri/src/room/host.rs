@@ -329,17 +329,19 @@ pub async fn sign_and_publish(
     identity: &IdentityService,
     signaling: &SignalingClient,
     manifest: &MediaManifest,
-) -> Result<(), HostError> {
+) -> Result<MediaManifest, HostError> {
     let signed = identity.sign_manifest(manifest).await?;
     let room_uuid = Uuid::parse_str(&signed.room_id)
         .map_err(|e| HostError::Signing(format!("bad room_id uuid: {e}")))?;
     let env = envelope(
         MessageKind::ManifestPublish,
         room_uuid,
-        &ManifestPublishPayload { manifest: signed },
+        &ManifestPublishPayload {
+            manifest: signed.clone(),
+        },
     );
     signaling.send_envelope(env).await?;
-    Ok(())
+    Ok(signed)
 }
 
 /// Build the host's invite URL of the form:
@@ -460,7 +462,7 @@ pub async fn build_sign_and_publish_selected(
         selection.as_deref(),
     )
     .await?;
-    sign_and_publish(&identity, &signaling, &manifest).await?;
+    let signed = sign_and_publish(&identity, &signaling, &manifest).await?;
     room_client.set_host_media_selection(selection);
     // P3-T15: the host is its own trust anchor. Install
     // the local pubkey as the expected host pubkey, then
@@ -470,7 +472,7 @@ pub async fn build_sign_and_publish_selected(
     // and the sender cannot serve chunks.
     room_client.set_expected_host_pubkey(host_pubkey);
     if let Err(e) = room_client
-        .accept_manifest(manifest.clone(), 1, manifest.created_at, "LOCAL_PUBLISH")
+        .accept_manifest(signed.clone(), 1, signed.created_at, "LOCAL_PUBLISH")
         .await
     {
         warn!(
