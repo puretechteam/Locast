@@ -5,7 +5,7 @@
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import type { Page } from "@playwright/test";
-import { serveMedia } from "./media-route";
+import { serveMedia, type MediaRouteStats } from "./media-route";
 
 export const FIXTURES_DIR = dirname(fileURLToPath(import.meta.url));
 /** A tiny 10 s VP8 clip, small enough to be tracked in git. */
@@ -80,10 +80,10 @@ export async function mountRoomWithRealVideo(
     room: RoomFixture,
     localUserId: string,
     media: { path?: string; contentType?: string; urlPath?: string } = {},
-): Promise<void> {
+): Promise<MediaRouteStats> {
     const path = media.path ?? CLIP_10S;
     const urlPath = media.urlPath ?? "/test/clip.webm";
-    await serveMedia(page, `**${urlPath}`, path, media.contentType ?? "video/webm");
+    const stats = await serveMedia(page, `**${urlPath}`, path, media.contentType ?? "video/webm");
     await spaNavigate(page, `/rooms/${room.id}`);
     await page.waitForSelector('[data-testid="room-empty"]', { timeout: 5_000 });
     await page.waitForFunction(
@@ -122,6 +122,7 @@ export async function mountRoomWithRealVideo(
         undefined,
         { timeout: 15_000 },
     );
+    return stats;
 }
 
 /** Every `playback_send` the app made, in order. */
