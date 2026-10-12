@@ -237,6 +237,11 @@ mod tests {
         );
         rendered.push('\n');
         rendered.push_str(
+            &crate::room::PlaybackSnapshot::export_to_string(&cfg)
+                .expect("render PlaybackSnapshot bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
             &crate::room::Participant::export_to_string(&cfg).expect("render Participant bindings"),
         );
         rendered.push('\n');
