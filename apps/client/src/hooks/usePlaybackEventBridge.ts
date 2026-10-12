@@ -23,6 +23,18 @@ export function usePlaybackEventBridge(): null {
         usePlaybackStore.getState().setRoomId(roomId);
     }, [roomId]);
 
+    // Catch up from the playback state the server puts in the room summary.
+    // A client that joins after the host pressed Play (or that was offline
+    // while commands went by) never saw those commands; without this it
+    // would assume the host is playing and wait for the next command.
+    // Re-runs on every summary that carries a snapshot: the store ignores
+    // one the live stream has already passed.
+    const snapshot = useRoomStore((s) => s.summary?.playback ?? null);
+    useEffect(() => {
+        if (roomId === null || snapshot === null) return;
+        usePlaybackStore.getState().seedFromSnapshot(roomId, snapshot);
+    }, [roomId, snapshot]);
+
     useEffect(() => {
         let cancelled = false;
         const unsubs: Array<() => void> = [];

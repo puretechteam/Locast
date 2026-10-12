@@ -53,6 +53,17 @@ export const VIEWER_ROOM = {
     ],
 };
 
+export type RoomFixture = typeof HOST_ROOM & {
+    playback?: {
+        paused: boolean;
+        media_position_ms: number;
+        server_ts_ms: number;
+        server_seq: number;
+        sender_id: string;
+        monotonic_seq: number;
+    } | null;
+};
+
 export type SentCommand = { action: string; media_position_ms: number; monotonic_seq: number };
 
 async function spaNavigate(page: Page, path: string): Promise<void> {
@@ -66,7 +77,7 @@ async function spaNavigate(page: Page, path: string): Promise<void> {
  *  and wait until the browser has decoded its metadata. */
 export async function mountRoomWithRealVideo(
     page: Page,
-    room: typeof HOST_ROOM,
+    room: RoomFixture,
     localUserId: string,
     media: { path?: string; contentType?: string; urlPath?: string } = {},
 ): Promise<void> {

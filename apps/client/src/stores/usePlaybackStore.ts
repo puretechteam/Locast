@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { PlaybackStateEvent } from "../services/playback";
+import type { PlaybackSnapshotIpc } from "../bindings";
 import {
     clearDedupState,
     evaluateDedup,
@@ -10,6 +11,9 @@ import {
 import { nextHostPaused } from "../drift/drift";
 
 export type { PlaybackStateEvent };
+
+/** The room summary's playback snapshot (see `RoomSummaryIpc.playback`). */
+export type PlaybackSnapshot = PlaybackSnapshotIpc;
 
 export type PlaybackKind = "play" | "pause" | "seek";
 
@@ -166,6 +170,17 @@ interface PlaybackStoreState {
      * applied or parked), `false` if the event was
      * dropped as stale, duplicate, or out of scope. */
     acceptEvent: (event: PlaybackStateEvent) => boolean;
+    /** Start (or catch up) from the room's playback snapshot, which the
+     * server sends in the room summary: it is what a client that joined
+     * late, or missed commands while disconnected, has instead of the
+     * commands themselves. The snapshot stands in for the last accepted
+     * command: it sets the host's play/pause state and the position to
+     * project from, and moves the sender's sequence baseline so the very
+     * next command applies in order instead of waiting out the 5 s gap
+     * buffer. Ignored for another room, when the live stream is already
+     * as new, and while the sender has an event parked in the dedup
+     * buffer. Returns whether it was applied. */
+    seedFromSnapshot: (roomId: string, snapshot: PlaybackSnapshot) => boolean;
     /** P4-T07: read the current per-sender dedup state
      * for the test seam. Production code should NOT call
      * this -- it is a debug-only surface used by the
@@ -353,6 +368,42 @@ export const usePlaybackStore = create<PlaybackStoreState>((set, get) => ({
         // time, which is by construction the newest
         // accepted event.
         set({ pending: { event: drained, parkedAtMs: Date.now() } });
+        return true;
+    },
+
+    seedFromSnapshot: (roomId, snapshot) => {
+        const state = get();
+        if (state.roomId !== null && state.roomId !== roomId) return false;
+        // The live stream (or an earlier snapshot) is already at least this new.
+        if (snapshot.server_seq <= state.lastAppliedServerSeq) return false;
+        if (state.pending !== null && state.pending.event.server_seq >= snapshot.server_seq) {
+            return false;
+        }
+        const sender = state.dedupState.bySender.get(snapshot.sender_id);
+        if (sender !== undefined && sender.pending !== null) return false;
+        const event: PlaybackStateEvent = {
+            room_id: roomId,
+            server_seq: snapshot.server_seq,
+            server_ts_ms: snapshot.server_ts_ms,
+            sender_id: snapshot.sender_id,
+            monotonic_seq: snapshot.monotonic_seq,
+            // A SEEK never changes play/pause, so the state is all that is
+            // needed: PLAY at the position and time it was last set, or
+            // PAUSE frozen there.
+            kind: snapshot.paused ? "pause" : "play",
+            media_position_ms: snapshot.media_position_ms,
+        };
+        const bySender = new Map(state.dedupState.bySender);
+        bySender.set(snapshot.sender_id, {
+            lastAppliedSeq: Math.max(sender?.lastAppliedSeq ?? 0, snapshot.monotonic_seq),
+            pending: null,
+        });
+        set({ dedupState: { bySender }, hostPaused: snapshot.paused });
+        if (state.mediaReady) {
+            set({ lastApplied: event });
+        } else {
+            set({ pending: { event, parkedAtMs: Date.now() } });
+        }
         return true;
     },
 

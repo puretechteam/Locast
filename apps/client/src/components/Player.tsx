@@ -98,6 +98,9 @@ export function Player({
     // The last event the apply effect handled, so a re-run caused by something
     // other than a new event (a host change) does not apply it a second time.
     const handledEventRef = useRef<typeof lastApplied>(null);
+    // The event that was applied before the clock skew was known (raw
+    // position), awaiting a one-time correction.
+    const rawAppliedRef = useRef<typeof lastApplied>(null);
     const mediaReady = usePlaybackStore((s) => s.mediaReady);
     const mediaSrc = usePlaybackStore((s) => s.mediaSrc);
     const setMediaReady = usePlaybackStore((s) => s.setMediaReady);
@@ -156,11 +159,12 @@ export function Player({
         // Move to where the host is NOW, not where it was when it sent this:
         // an event applied late (media still downloading, a late join) would
         // otherwise leave the viewer behind until they pressed Sync.
+        const skewNow = useClockSkewStore.getState().skewMs;
         const targetMs = appliedPositionMs(
             lastApplied,
             usePlaybackStore.getState().hostPaused,
             Date.now(),
-            useClockSkewStore.getState().skewMs,
+            skewNow,
         );
         applyPlaybackToVideo(v, kind, targetMs, (err) => {
             setErrorMessage(
@@ -169,9 +173,35 @@ export function Player({
                     : "local play() rejected",
             );
         });
+        // Without a measured clock skew the position above is the raw one.
+        // Remember to project it once the first probe lands (effect below).
+        rawAppliedRef.current = skewNow === null && kind !== "pause" ? lastApplied : null;
         markApplied(lastApplied.server_seq);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
     }, [lastApplied, localUserId, isHost, markApplied]);
+
+    // The first clock probe usually lands within a second of entering the
+    // room, but media can be ready (and the host's state applied) before it.
+    // An event applied then used the raw position, leaving a late joiner
+    // behind by the event's age. Correct it once, by position only: the
+    // viewer's play state is not touched.
+    const skewMs = useClockSkewStore((s) => s.skewMs);
+    useEffect(() => {
+        if (skewMs === null) return;
+        const ev = rawAppliedRef.current;
+        rawAppliedRef.current = null;
+        if (ev === null || ev !== usePlaybackStore.getState().lastApplied) return;
+        const v = ref.current;
+        if (!v) return;
+        const targetMs = appliedPositionMs(
+            ev,
+            usePlaybackStore.getState().hostPaused,
+            Date.now(),
+            skewMs,
+        );
+        applyPlaybackToVideo(v, "seek", targetMs);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `ref` is a ref object (the parent's videoRef or localRef), stable for the component's lifetime.
+    }, [skewMs]);
 
     // Drain the `pending` slot when `mediaReady` flips
     // true.
