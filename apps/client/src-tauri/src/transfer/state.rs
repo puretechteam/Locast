@@ -335,11 +335,15 @@ impl DownloadStore {
                 let _ = idx;
             }
             let mut q = sqlx::query(&sql);
-            for (i, (_idx, offset, length, hash)) in batch.iter().enumerate() {
+            for (i, (idx, offset, length, hash)) in batch.iter().enumerate() {
+                // `i` is the position within THIS batch (it indexes `ids`);
+                // the chunk's own index is `idx`. Binding `i` here made every
+                // batch after the first reuse 0..99, which `INSERT OR IGNORE`
+                // then silently dropped.
                 q = q
                     .bind(&ids[i])
                     .bind(&new.download_id)
-                    .bind(i as i64)
+                    .bind(*idx as i64)
                     .bind(*offset as i64)
                     .bind(*length as i64)
                     .bind(hash.clone());
@@ -1296,6 +1300,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ChunkStateError::ChunkHashMismatch { .. }));
+    }
+
+    /// The chunk rows are inserted 100 at a time. The index column once got
+    /// the position WITHIN the batch, so every batch after the first reused
+    /// 0..99 and `INSERT OR IGNORE` dropped them: a download of more than 100
+    /// chunks (25 MiB) kept only 100 rows and failed at chunk 100 ("chunk
+    /// index out of bounds: 100 >= 100"). A three hour film is ~400+ chunks.
+    #[tokio::test]
+    async fn create_keeps_every_chunk_row_beyond_the_first_batch() {
+        let pool = fresh_pool().await;
+        seed_fk_deps(&pool, "u-1", "m-1").await;
+        let s = DownloadStore::new(pool.clone());
+        let chunk = crate::transfer::CHUNK_SIZE_BYTES as u64;
+        // 250 chunks: three batches, the last one short, plus a short tail.
+        let n = 250u32;
+        let tail = 1234u64;
+        let total_bytes = chunk * (n as u64 - 1) + tail;
+        let chunks: Vec<(u32, u64, u32, String)> = (0..n)
+            .map(|i| {
+                let len = if i == n - 1 { tail } else { chunk } as u32;
+                (i, i as u64 * chunk, len, format!("{:064x}", i))
+            })
+            .collect();
+        s.create(
+            &NewDownload {
+                download_id: "dl-big".into(),
+                media_id: "m-1".into(),
+                room_id: None,
+                user_id: "u-1".into(),
+                total_bytes,
+                source_peer_id: peer_id(),
+                chunk_size_bytes: chunk as u32,
+                manifest_version: 1,
+            },
+            &chunks,
+        )
+        .await
+        .expect("create");
+
+        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "SELECT \"index\", offset, length, sha256 FROM download_chunks \
+             WHERE download_id = 'dl-big' ORDER BY \"index\"",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("rows");
+        assert_eq!(rows.len(), n as usize, "every chunk needs its own row");
+        for (i, (idx, off, len, sha)) in rows.iter().enumerate() {
+            assert_eq!(*idx, i as i64);
+            assert_eq!(*off as u64, i as u64 * chunk, "offset of chunk {i}");
+            let want_len = if i as u32 == n - 1 { tail } else { chunk };
+            assert_eq!(*len as u64, want_len, "length of chunk {i}");
+            assert_eq!(sha, &format!("{:064x}", i), "hash of chunk {i}");
+        }
+
+        // The last chunks can be marked verified (this is what failed at 100).
+        for i in [100u32, 101, 249] {
+            s.mark_chunk_verified("dl-big", i, &format!("{:064x}", i))
+                .await
+                .unwrap_or_else(|e| panic!("chunk {i}: {e}"));
+        }
+        assert_eq!(
+            s.completed_chunk_indices("dl-big").await.unwrap(),
+            vec![100, 101, 249]
+        );
     }
 
     #[tokio::test]
