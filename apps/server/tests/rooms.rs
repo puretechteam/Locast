@@ -4753,3 +4753,44 @@ async fn a_state_refusal_tells_the_sender_which_number_the_server_expects() {
     assert_eq!(p.code, RoomErrorCode::StaleCommand);
     assert_eq!(p.expected_seq, Some(2));
 }
+
+/// A host who makes a second room while still in the first is in the second
+/// only: the first is left as by a ROOM_LEAVE, and joiners of the second reach
+/// the host. (Both rooms used to hold the user; the connection followed
+/// whichever the registry found first.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_second_room_leaves_the_first() {
+    let mut r = parts_room().await;
+    // Host is in room one with viewer V. Host creates room two.
+    send_envelope(&mut r.ws_h, &room_create_envelope(r.h.token, "Two", true)).await;
+    let two = serde_json::from_value::<RoomCreatedPayload>(
+        next_of_kind(&mut r.ws_h, MessageKind::RoomCreated, "create two")
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room;
+    assert_ne!(two.id, r.room.id);
+    assert_eq!(
+        r.harness.rooms.get_user_room(r.h.user_id).await,
+        Some(two.id),
+        "the host is in room two only"
+    );
+    // The viewer left behind in room one is told (the host handed over).
+    next_of_kind(&mut r.ws_v, MessageKind::HostMigrated, "viewer in room one").await;
+
+    // A joiner of room two reaches the host.
+    let (kp_c, _) = fresh_keypair();
+    let mut ws_c = connect(r.harness.addr).await;
+    let c = complete_handshake(&mut ws_c, &kp_c).await;
+    send_envelope(&mut ws_c, &room_join_envelope(c.token, &two.code, "C")).await;
+    next_of_kind(&mut ws_c, MessageKind::RoomJoined, "C joins two").await;
+    let env = next_of_kind(&mut r.ws_h, MessageKind::ParticipantJoined, "host hears C").await;
+    let pj: ParticipantJoinedPayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(pj.participant.user_id, c.user_id);
+
+    // A wrong code does not cost a user the room they are in.
+    send_envelope(&mut ws_c, &room_join_envelope(c.token, "ZZZZZZ", "C")).await;
+    next_of_kind(&mut ws_c, MessageKind::RoomError, "wrong code").await;
+    assert_eq!(r.harness.rooms.get_user_room(c.user_id).await, Some(two.id));
+}

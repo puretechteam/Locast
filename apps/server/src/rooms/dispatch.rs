@@ -247,6 +247,31 @@ pub async fn dispatch_room_message(
     }
 }
 
+/// A user is in one room at a time. Creating or joining another room leaves
+/// the one they are in first, exactly as a ROOM_LEAVE would (the room's
+/// participants are told, a host hands over or the room ends). Without this
+/// the server held the user in both rooms: their connection's broadcast
+/// subscription followed whichever room it found first, so a host who made a
+/// second room never saw who joined it.
+async fn leave_other_room(
+    registry: &RoomRegistry,
+    store: &dyn RoomStore,
+    user_id: Uuid,
+    target: Option<Uuid>,
+    now_ms: i64,
+) {
+    if let Some(old) = registry.get_user_room(user_id).await {
+        if Some(old) != target {
+            if let Err(e) = registry
+                .leave_room(store, user_id, Some(old), true, now_ms)
+                .await
+            {
+                tracing::warn!(user_id = %user_id, room = %old, error = %e, "leaving the previous room failed");
+            }
+        }
+    }
+}
+
 async fn handle_room_create(
     envelope: Envelope,
     registry: &RoomRegistry,
@@ -277,6 +302,7 @@ async fn handle_room_create(
         ));
         return out;
     }
+    leave_other_room(registry, store, user_id, None, now_ms).await;
     match registry
         .create(
             store,
@@ -350,6 +376,11 @@ async fn handle_room_join_request(
         return out;
     }
     let display_name = payload.display_name.clone();
+    // Only when there is a room to move to (a wrong code must not cost the
+    // user the room they are in).
+    if let Some(target) = registry.get_by_code(&code).await {
+        leave_other_room(registry, store, user_id, Some(target), now_ms).await;
+    }
     match registry
         .join(store, &code, user_id, pubkey, display_name, now_ms)
         .await
