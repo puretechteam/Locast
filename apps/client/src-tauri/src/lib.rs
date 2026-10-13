@@ -24,6 +24,7 @@ pub mod library;
 pub mod media;
 pub mod net;
 pub mod probe;
+pub mod profile;
 pub mod room;
 pub mod storage;
 pub mod transfer;
@@ -140,11 +141,66 @@ pub fn invoke_handler<R: tauri::Runtime>(
 /// is granted to the webview; all privileged filesystem and network
 /// operations stay in Rust.
 pub fn run() {
+    // `locast --remove-test-profile <dir>`: delete a disposable test profile
+    // (see `profile`) and exit. Refuses anything that is not a marked test
+    // profile outside the real app directories.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--remove-test-profile") {
+        let code = match args.get(i + 1) {
+            Some(dir) => match profile::remove_test_profile(
+                std::path::Path::new(dir),
+                &profile::Protected::from_system(),
+            ) {
+                Ok(()) => {
+                    println!("removed test profile {dir}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("refusing: {e}");
+                    2
+                }
+            },
+            None => {
+                eprintln!("usage: locast --remove-test-profile <dir>");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
+
+    // Which profile: the normal per-user directories and OS keyring unless
+    // LOCAST_TEST_PROFILE_DIR names a disposable one. An unsafe value stops
+    // the app; it never falls back to (or touches) the real profile.
+    let profile = match profile::from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("locast: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let profile::Profile::Test(dir) = &profile {
+        if let Err(e) = profile::prepare_test_profile(dir) {
+            eprintln!("locast: {e}");
+            std::process::exit(2);
+        }
+        // The webview keeps its own storage; give it this profile's, so two
+        // instances do not share cookies and local storage either.
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", dir.join("webview"));
+        eprintln!(
+            "locast: TEST PROFILE {} (identity, library, database, logs and webview data are here)",
+            dir.display()
+        );
+    }
+    let profile_for_setup = profile.clone();
+    let log_target = match &profile {
+        profile::Profile::Default => Target::new(TargetKind::LogDir { file_name: None }),
+        profile::Profile::Test(dir) => Target::new(TargetKind::Folder {
+            path: dir.join("logs"),
+            file_name: None,
+        }),
+    };
     let log_plugin = tauri_plugin_log::Builder::new()
-        .targets([
-            Target::new(TargetKind::Stdout),
-            Target::new(TargetKind::LogDir { file_name: None }),
-        ])
+        .targets([Target::new(TargetKind::Stdout), log_target])
         .level(log::LevelFilter::Info)
         .build();
 
@@ -164,9 +220,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let _registry_cell = registry_cell_for_setup;
-            let _main = app
+            let main = app
                 .get_webview_window("main")
                 .expect("main window missing from tauri.conf.json");
+            if let profile::Profile::Test(dir) = &profile_for_setup {
+                let _ = main.set_title(&format!("Locast [TEST PROFILE {}]", dir.display()));
+            }
 
             // P1-T04: open (or create) the local SQLite database and
             // install it as managed state so `media_import` (and future
@@ -197,7 +256,12 @@ pub fn run() {
             // `tauri::async_runtime::block_on` is used because `setup`
             // is synchronous; the open + migrate step is bounded by
             // the SQLx pool warm-up and the single 0001_init migration.
-            let data_dir = app.path().app_data_dir().expect("resolve app data dir");
+            let data_dir = match &profile_for_setup {
+                profile::Profile::Default => {
+                    app.path().app_data_dir().expect("resolve app data dir")
+                }
+                profile::Profile::Test(dir) => dir.clone(),
+            };
             std::fs::create_dir_all(&data_dir).expect("create app data dir");
             let db_path = data_dir.join("index.sqlite");
             let storage =
@@ -206,7 +270,15 @@ pub fn run() {
             let accountant = core::quota::QuotaAccountant::new(storage.clone());
             let library_root = data_dir.clone();
             let protocol_handler = ProtocolHandler::new(storage.clone(), library_root.clone());
-            let identity_service = std::sync::Arc::new(IdentityService::new(storage.clone()));
+            let identity_service = std::sync::Arc::new(match &profile_for_setup {
+                profile::Profile::Default => IdentityService::new(storage.clone()),
+                profile::Profile::Test(dir) => IdentityService::with_keyring(
+                    std::sync::Arc::new(identity::keystore::FileKeyring::new(
+                        dir.join(profile::IDENTITY_FILE),
+                    )),
+                    storage.clone(),
+                ),
+            });
 
             // P3-T04 prerequisite 4: clone the storage pool
             // BEFORE the `Storage` is moved into

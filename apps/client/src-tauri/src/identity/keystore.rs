@@ -167,6 +167,52 @@ impl IdentityKeyring for OsKeyring {
     }
 }
 
+/// A keyring that keeps the key in a file. ONLY for a disposable test
+/// profile (`crate::profile`): the file lives inside that profile's directory
+/// and is deleted with it, so two test instances are two identities and
+/// nothing is left in the OS credential store. The production app never
+/// constructs this.
+pub struct FileKeyring {
+    path: std::path::PathBuf,
+}
+
+impl FileKeyring {
+    pub fn new(path: std::path::PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[async_trait::async_trait]
+impl IdentityKeyring for FileKeyring {
+    async fn load(&self) -> Result<Option<Keypair>, KeystoreError> {
+        match tokio::fs::read_to_string(&self.path).await {
+            Ok(s) => Keypair::from_base64(s.trim())
+                .map(Some)
+                .ok_or(KeystoreError::Corrupt),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(KeystoreError::Other(format!("read identity file: {e}"))),
+        }
+    }
+
+    async fn store(&self, keypair: &Keypair) -> Result<(), KeystoreError> {
+        let tmp = self.path.with_extension("tmp");
+        tokio::fs::write(&tmp, keypair.to_base64())
+            .await
+            .map_err(|e| KeystoreError::Other(format!("write identity file: {e}")))?;
+        tokio::fs::rename(&tmp, &self.path)
+            .await
+            .map_err(|e| KeystoreError::Other(format!("write identity file: {e}")))
+    }
+
+    async fn forget(&self) -> Result<(), KeystoreError> {
+        match tokio::fs::remove_file(&self.path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(KeystoreError::Other(format!("remove identity file: {e}"))),
+        }
+    }
+}
+
 /// Map the `keyring` crate's error onto the closed
 /// [`KeystoreError`] set. The mapping is documented in the
 /// unit tests in this file; the architecture requires a

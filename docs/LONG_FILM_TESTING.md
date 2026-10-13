@@ -68,12 +68,52 @@ after every outage the viewer must still be in the room and a fresh host
 command must reach it. About two seconds per cycle. The ordinary
 `viewer_reconnect` tests (no `--ignored`) run in CI.
 
+## Running the real desktop app twice on one machine (test profiles)
+
+The app normally keeps its database, library and staging files in
+`%APPDATA%\com.puretechteam.locast` and its identity in one fixed OS
+credential entry, so a second instance would be the same user, and launching
+the app for an experiment runs startup cleanup against real data. A disposable
+profile avoids both. It is opt-in and per process:
+
+```powershell
+# one instance = one empty directory you own
+$env:LOCAST_TEST_PROFILE_DIR = "C:\locast-test\alice"
+$env:LOCAST_SIGNALING_URL    = "ws://127.0.0.1:8787/ws"     # your test server
+.\target\debug\locast-client.exe
+```
+
+With the variable set, that process keeps its database, library, staging
+files, logs, webview data (cookies, local storage) and a key file
+(`identity.key`) inside the directory, and nothing in the OS credential store.
+The window title says `[TEST PROFILE ...]`. A second instance with a different
+directory is a different user.
+
+It fails closed. If the value is not a safe disposable location the app prints
+why and exits with status 2; it never falls back to the real profile. A
+directory is accepted only if it is absolute, has no `..`, is not a filesystem
+root, the home directory or an ancestor of it, does not overlap the real app
+directories (in either direction, symlinks resolved, case-insensitively), and
+is empty/new or already a test profile (it holds `.locast-test-profile`, which
+the app writes on first use). With the variable unset nothing changes.
+
+Cleanup removes exactly one profile and nothing else:
+
+```powershell
+.\target\debug\locast-client.exe --remove-test-profile C:\locast-test\alice
+```
+
+It applies the same checks and also requires the marker file, so a real data
+directory (marker or not) or any other folder is refused. Close the instance
+first (an open database cannot be removed on Windows). Use a debug build to see
+the messages: a release build has no console.
+
 ## What this does not prove
 
 - Three hours of real-time playback staying in sync. The sync maths is covered
   by unit checks and accelerated positions, not by a three hour wall clock.
-- The packaged desktop app. It has no app-data override and one fixed OS
-  keyring identity, so two instances on one machine would share an identity.
+- The packaged installer. Test profiles (above) run the built executable, not
+  an installed package.
 - Behaviour across NATs. Everything here is on localhost.
 - Release-build transfer throughput.
 
