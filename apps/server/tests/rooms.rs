@@ -4713,3 +4713,43 @@ async fn a_host_that_disconnects_mid_publication_leaves_nothing_and_can_retry() 
     )
     .await;
 }
+
+/// A SEEK or PAUSE in a room that has not started is refused for the room's
+/// state, and the refusal says which number the server expects next from the
+/// sender, so a host whose first PLAY was lost can find its way back. The
+/// number is not consumed by the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_state_refusal_tells_the_sender_which_number_the_server_expects() {
+    let mut r = parts_room().await;
+    for (action, seq) in [(PlaybackAction::Seek, 2u64), (PlaybackAction::Pause, 3)] {
+        send_envelope(
+            &mut r.ws_h,
+            &playback_cmd(r.h.token, r.room.id, action, seq, 5_000),
+        )
+        .await;
+        let env = next_of_kind(&mut r.ws_h, MessageKind::RoomError, "state refusal").await;
+        let p: RoomErrorPayload = serde_json::from_value(env.payload).unwrap();
+        assert_eq!(p.code, RoomErrorCode::InvalidState);
+        assert_eq!(
+            p.expected_seq,
+            Some(1),
+            "nothing was accepted from the host yet"
+        );
+    }
+    // The first PLAY, numbered as the server expects, is accepted; after it
+    // a SEEK is refused only for the number if it skips one.
+    send_envelope(
+        &mut r.ws_h,
+        &playback_cmd(r.h.token, r.room.id, PlaybackAction::Play, 1, 5_000),
+    )
+    .await;
+    send_envelope(
+        &mut r.ws_h,
+        &playback_cmd(r.h.token, r.room.id, PlaybackAction::Seek, 3, 9_000),
+    )
+    .await;
+    let env = next_of_kind(&mut r.ws_h, MessageKind::RoomError, "gap").await;
+    let p: RoomErrorPayload = serde_json::from_value(env.payload).unwrap();
+    assert_eq!(p.code, RoomErrorCode::StaleCommand);
+    assert_eq!(p.expected_seq, Some(2));
+}

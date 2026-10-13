@@ -30,7 +30,7 @@
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1039,6 +1039,11 @@ struct SentPlayback {
     media_position_ms: u64,
 }
 
+/// How many sent playback commands the client remembers, to be able to send
+/// them again after a loss. Commands the server has accepted are dropped as
+/// its answers show it; a host cannot outrun this between two answers.
+const PLAYBACK_REPLAY_WINDOW: usize = 16;
+
 /// The numbering of this client's playback commands.
 ///
 /// The server accepts exactly `last_acked + 1` from a sender and rejects
@@ -1046,22 +1051,106 @@ struct SentPlayback {
 /// command is lost in flight (the connection drops as it is sent): the next
 /// command carries a number past the gap, is rejected, and so is every one
 /// after it, silently, for the rest of the session. The client therefore
-/// numbers the commands itself and, when the server answers a rejection with
-/// the number it expects, goes back to that number and re-sends the rejected
-/// command once (a gap), or just carries on from there (a duplicate).
+/// numbers the commands itself, remembers the recent ones, and when the server
+/// answers a rejection with the number it expects (`expected_seq`) it goes
+/// back to that number and sends the commands from there again, in order:
+/// whatever was lost, including a first PLAY, is restored.
+///
+/// Two kinds of rejection carry the number. A gap (`StaleCommand`) means the
+/// commands from `expected` on never took effect. A refusal for the room's
+/// state (`InvalidState`: PAUSE or SEEK while the room has not started) is
+/// answered before the sequence is looked at, so a lost first PLAY shows up as
+/// this: the room is still waiting for it, and nothing but a PLAY can be
+/// applied. Commands that cannot apply before a PLAY are dropped rather than
+/// sent again (they would be refused again), and if there is no PLAY to
+/// start from nothing is sent and the numbering simply goes back.
+///
+/// Bounded: a replay happens at most once per `expected` value until the
+/// host sends a new command, so a command lost again is retried by the next
+/// one, never in a loop.
 #[derive(Debug)]
 struct PlaybackSeq {
     /// The number the next command will carry.
     next: u64,
-    last: Option<SentPlayback>,
+    /// Sent commands whose acceptance no answer has implied yet, oldest
+    /// first and numbered consecutively; the newest is `next - 1`.
+    sent: VecDeque<SentPlayback>,
+    /// The `expected` a replay was made for since the last new command.
+    replayed_for: Option<u64>,
+    /// The highest `expected` the server has reported. It only grows, so a
+    /// lower one is old news.
+    known_expected: u64,
 }
 
 impl PlaybackSeq {
     fn new() -> Self {
         Self {
             next: 1,
-            last: None,
+            sent: VecDeque::new(),
+            replayed_for: None,
+            known_expected: 0,
         }
+    }
+
+    /// Number a new command.
+    fn number(&mut self, action: locast_protocol::room::PlaybackAction, pos: u64) -> u64 {
+        let seq = self.next;
+        self.next = seq + 1;
+        self.sent.push_back(SentPlayback {
+            seq,
+            action,
+            media_position_ms: pos,
+        });
+        while self.sent.len() > PLAYBACK_REPLAY_WINDOW {
+            self.sent.pop_front();
+        }
+        self.replayed_for = None;
+        seq
+    }
+
+    /// Take back the number of a command that never reached the wire.
+    fn give_back(&mut self, seq: u64) {
+        if self.next == seq + 1 {
+            self.next = seq;
+            self.sent.pop_back();
+        }
+    }
+
+    /// The server rejected a command and said it expects `expected` next.
+    /// Returns what to send again, in order, with its (new) numbers.
+    /// `state_refusal` is true for a refusal for the room's state.
+    fn plan_resync(&mut self, expected: u64, state_refusal: bool) -> Vec<SentPlayback> {
+        use locast_protocol::room::PlaybackAction::Play;
+        if expected < self.known_expected {
+            return Vec::new();
+        }
+        self.known_expected = expected;
+        let newest = self.sent.back().map(|c| c.seq);
+        if newest.map_or(true, |n| n < expected) {
+            // The server is already ahead of anything we sent (a replay of
+            // a command it has): carry on from its number.
+            self.next = expected;
+            return Vec::new();
+        }
+        if self.replayed_for == Some(expected) {
+            // Already sent again for this; this is a second answer to the
+            // commands that were in flight.
+            return Vec::new();
+        }
+        self.replayed_for = Some(expected);
+        // Everything below `expected` has taken effect.
+        self.sent.retain(|c| c.seq >= expected);
+        if state_refusal {
+            // The room has not started: only a PLAY applies.
+            while self.sent.front().is_some_and(|c| c.action != Play) {
+                self.sent.pop_front();
+            }
+        }
+        for (i, c) in self.sent.iter_mut().enumerate() {
+            c.seq = expected + i as u64;
+        }
+        self.next = expected + self.sent.len() as u64;
+        self.sent.iter().copied().collect()
     }
 }
 
@@ -1492,17 +1581,11 @@ impl RoomClient {
             .as_ref()
             .and_then(|s| Uuid::parse_str(&s.id).ok())
             .ok_or_else(|| RoomClientError::Unexpected("not in a room".into()))?;
-        let seq = {
-            let mut g = self.playback_seq.lock().expect("playback_seq lock");
-            let seq = g.next;
-            g.next = seq + 1;
-            g.last = Some(SentPlayback {
-                seq,
-                action,
-                media_position_ms,
-            });
-            seq
-        };
+        let seq = self
+            .playback_seq
+            .lock()
+            .expect("playback_seq lock")
+            .number(action, media_position_ms);
         if let Err(e) = self
             .signaling
             .send_envelope(playback_envelope(room_id, action, seq, media_position_ms))
@@ -1510,14 +1593,28 @@ impl RoomClient {
         {
             // It never reached the wire: give the number back so the next
             // command does not open a gap.
-            let mut g = self.playback_seq.lock().expect("playback_seq lock");
-            if g.next == seq + 1 {
-                g.next = seq;
-                g.last = None;
-            }
+            self.playback_seq
+                .lock()
+                .expect("playback_seq lock")
+                .give_back(seq);
             return Err(RoomClientError::Signaling(e.to_string()));
         }
         Ok(seq)
+    }
+
+    /// **Test-only.** Number a playback command exactly as
+    /// [`Self::send_playback`] does but never send it, as if the connection
+    /// had dropped while it was in flight. Returns the number it carried.
+    #[doc(hidden)]
+    pub fn lose_playback_for_test(
+        &self,
+        action: locast_protocol::room::PlaybackAction,
+        media_position_ms: u64,
+    ) -> u64 {
+        self.playback_seq
+            .lock()
+            .expect("playback_seq lock")
+            .number(action, media_position_ms)
     }
 
     /// Start the playback numbering over (a new room, or none).
@@ -1530,49 +1627,52 @@ impl RoomClient {
     /// command was lost in flight: go back to the expected number and send
     /// that last command again, once. If the server is already ahead of us
     /// (a replay), just carry on from its number.
-    async fn resync_playback_seq(&self, expected: u64) {
+    async fn resync_playback_seq(&self, expected: u64, state_refusal: bool) {
         let resend = {
             let mut g = self.playback_seq.lock().expect("playback_seq lock");
-            match g.last {
-                Some(l) if l.seq > expected => {
-                    let again = SentPlayback { seq: expected, ..l };
-                    g.next = expected + 1;
-                    g.last = Some(again);
-                    Some(again)
-                }
-                // Already re-sent under this number (a second rejection of
-                // the same gap arrives after the first fixed it).
-                Some(l) if l.seq == expected => None,
-                _ => {
-                    g.next = expected;
-                    None
-                }
-            }
-        };
-        if let Some(l) = resend {
-            let room_id = self
-                .state
-                .lock()
-                .await
-                .as_ref()
-                .and_then(|s| Uuid::parse_str(&s.id).ok());
-            if let Some(room_id) = room_id {
+            let before = g.sent.len();
+            let plan = g.plan_resync(expected, state_refusal);
+            if plan.is_empty() && state_refusal && before > 0 && g.replayed_for == Some(expected) {
+                // Refused for the room's state with nothing that could start
+                // it: say so instead of silently losing the commands.
                 warn!(
                     expected,
-                    "playback command was numbered past a gap; re-sending it as the server expects"
+                    "the room has not started playing: playback commands sent before a PLAY \
+                     cannot apply; waiting for a PLAY"
                 );
-                if let Err(e) = self
-                    .signaling
-                    .send_envelope(playback_envelope(
-                        room_id,
-                        l.action,
-                        l.seq,
-                        l.media_position_ms,
-                    ))
-                    .await
-                {
-                    warn!(error = %e, "re-send of the rejected playback command failed");
-                }
+            }
+            plan
+        };
+        if resend.is_empty() {
+            return;
+        }
+        let room_id = self
+            .state
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|s| Uuid::parse_str(&s.id).ok());
+        let Some(room_id) = room_id else {
+            return;
+        };
+        warn!(
+            expected,
+            commands = resend.len(),
+            "playback commands were lost in flight; sending them again in order as the server expects"
+        );
+        for l in resend {
+            if let Err(e) = self
+                .signaling
+                .send_envelope(playback_envelope(
+                    room_id,
+                    l.action,
+                    l.seq,
+                    l.media_position_ms,
+                ))
+                .await
+            {
+                warn!(error = %e, "re-send of a playback command failed; the next command will retry");
+                break;
             }
         }
     }
@@ -2433,9 +2533,17 @@ impl RoomClient {
             MessageKind::RoomError if resolved.is_none() && !room_error_ends_membership(&env) => {
                 tracing::warn!("ROOM_ERROR rejected a command; room state kept");
                 if let Ok(p) = decode_payload::<RoomErrorPayload>(&env) {
-                    if let (RoomErrorCode::StaleCommand, Some(expected)) = (p.code, p.expected_seq)
-                    {
-                        self.resync_playback_seq(expected).await;
+                    match (p.code, p.expected_seq) {
+                        (RoomErrorCode::StaleCommand, Some(expected)) => {
+                            self.resync_playback_seq(expected, false).await;
+                        }
+                        // The room's state refused the command (PAUSE / SEEK
+                        // before the first PLAY) and said where the sender's
+                        // numbering stands.
+                        (RoomErrorCode::InvalidState, Some(expected)) => {
+                            self.resync_playback_seq(expected, true).await;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -3407,17 +3515,35 @@ mod tests {
         rc
     }
 
+    /// (next number, the newest remembered command as (seq, position)).
     fn playback_seq_of(rc: &RoomClient) -> (u64, Option<(u64, u64)>) {
         let g = rc.playback_seq.lock().unwrap();
-        (g.next, g.last.map(|l| (l.seq, l.media_position_ms)))
+        (g.next, g.sent.back().map(|l| (l.seq, l.media_position_ms)))
     }
 
-    fn sent(seq: u64, pos: u64) -> Option<SentPlayback> {
-        Some(SentPlayback {
+    fn cmd(seq: u64, action: locast_protocol::room::PlaybackAction, pos: u64) -> SentPlayback {
+        SentPlayback {
             seq,
-            action: locast_protocol::room::PlaybackAction::Seek,
+            action,
             media_position_ms: pos,
-        })
+        }
+    }
+
+    fn seek(seq: u64, pos: u64) -> SentPlayback {
+        cmd(seq, locast_protocol::room::PlaybackAction::Seek, pos)
+    }
+
+    fn seq_with(next: u64, sent: Vec<SentPlayback>) -> PlaybackSeq {
+        PlaybackSeq {
+            next,
+            sent: sent.into(),
+            replayed_for: None,
+            known_expected: 0,
+        }
+    }
+
+    fn actions_and_seqs(v: &[SentPlayback]) -> Vec<(u64, locast_protocol::room::PlaybackAction)> {
+        v.iter().map(|c| (c.seq, c.action)).collect()
     }
 
     /// A command the server saw as numbered past a gap (a command before it
@@ -3426,16 +3552,13 @@ mod tests {
     #[tokio::test]
     async fn a_gap_rejection_renumbers_the_last_command() {
         let rc = client_in_a_room().await;
-        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
-            next: 8,
-            last: sent(7, 42_000),
-        };
+        *rc.playback_seq.lock().unwrap() = seq_with(8, vec![seek(7, 42_000)]);
         // The server expected 5 (6 and 7 never arrived or were refused).
-        rc.resync_playback_seq(5).await;
+        rc.resync_playback_seq(5, false).await;
         assert_eq!(playback_seq_of(&rc), (6, Some((5, 42_000))));
         // The second rejection of the same gap arrives after the first fixed
         // it: nothing changes, nothing is sent again.
-        rc.resync_playback_seq(5).await;
+        rc.resync_playback_seq(5, false).await;
         assert_eq!(playback_seq_of(&rc), (6, Some((5, 42_000))));
     }
 
@@ -3443,11 +3566,8 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_rejection_moves_the_numbering_forward() {
         let rc = client_in_a_room().await;
-        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
-            next: 4,
-            last: sent(3, 9_000),
-        };
-        rc.resync_playback_seq(9).await;
+        *rc.playback_seq.lock().unwrap() = seq_with(4, vec![seek(3, 9_000)]);
+        rc.resync_playback_seq(9, false).await;
         assert_eq!(playback_seq_of(&rc), (9, Some((3, 9_000))));
     }
 
@@ -3462,12 +3582,101 @@ mod tests {
         assert!(err.is_err(), "no connection, so nothing is sent");
         assert_eq!(playback_seq_of(&rc), (1, None), "the number was returned");
 
-        *rc.playback_seq.lock().unwrap() = PlaybackSeq {
-            next: 40,
-            last: sent(39, 1),
-        };
+        *rc.playback_seq.lock().unwrap() = seq_with(40, vec![seek(39, 1)]);
         rc.reset_playback_seq();
         assert_eq!(playback_seq_of(&rc), (1, None));
+    }
+
+    use locast_protocol::room::PlaybackAction::{Pause, Play, Seek};
+
+    /// The first PLAY is lost, then the host seeks and pauses. The room is
+    /// still waiting for its first PLAY, so the server refuses the SEEK for
+    /// the room's state (before it looks at the number) and says it expects 1.
+    /// The commands go again in order from there: PLAY, SEEK, PAUSE.
+    #[test]
+    fn a_lost_first_play_is_sent_again_ahead_of_the_commands_after_it() {
+        let mut g = PlaybackSeq::new();
+        assert_eq!(g.number(Play, 0), 1); // lost
+        assert_eq!(g.number(Seek, 30_000), 2); // refused: room not started
+        assert_eq!(g.number(Pause, 30_000), 3); // refused too
+        let again = g.plan_resync(1, true);
+        assert_eq!(
+            actions_and_seqs(&again),
+            vec![(1, Play), (2, Seek), (3, Pause)]
+        );
+        assert_eq!(again[1].media_position_ms, 30_000);
+        assert_eq!(g.next, 4, "numbering continues after the replay");
+        // The second refusal (the PAUSE that was already in flight) arrives:
+        // nothing is sent a second time.
+        assert!(g.plan_resync(1, true).is_empty());
+        // A later command is numbered 4 and goes out normally.
+        assert_eq!(g.number(Play, 31_000), 4);
+    }
+
+    /// Commands that cannot apply before a PLAY are not sent again (they
+    /// would only be refused again), and with no PLAY nothing is sent at all;
+    /// the numbering goes back so the host's next PLAY is accepted.
+    #[test]
+    fn commands_refused_for_the_rooms_state_are_not_blindly_retried() {
+        let mut g = PlaybackSeq::new();
+        g.number(Seek, 5_000);
+        g.number(Pause, 5_000);
+        assert!(g.plan_resync(1, true).is_empty());
+        assert_eq!(g.next, 1);
+        assert_eq!(g.number(Play, 5_000), 1, "the PLAY now fits the server");
+
+        // A PLAY after refused commands is the point to start from; what
+        // came before it is dropped.
+        let mut g = PlaybackSeq::new();
+        g.number(Seek, 1_000);
+        g.number(Play, 2_000);
+        g.number(Seek, 3_000);
+        let again = g.plan_resync(1, true);
+        assert_eq!(actions_and_seqs(&again), vec![(1, Play), (2, Seek)]);
+        assert_eq!(g.next, 3);
+    }
+
+    /// A replay happens once per `expected` until the host sends a new
+    /// command, so a command lost a second time is retried by the next one
+    /// and nothing ever loops; answers the server already moved past are
+    /// ignored.
+    #[test]
+    fn a_replay_is_bounded() {
+        let mut g = PlaybackSeq::new();
+        g.number(Play, 0);
+        g.number(Seek, 9_000);
+        assert_eq!(g.plan_resync(1, false).len(), 2);
+        for _ in 0..5 {
+            assert!(g.plan_resync(1, false).is_empty(), "no loop");
+        }
+        // The replay is lost again; the host's next command is refused and
+        // earns one more replay.
+        g.number(Seek, 12_000);
+        let again = g.plan_resync(1, false);
+        assert_eq!(
+            actions_and_seqs(&again),
+            vec![(1, Play), (2, Seek), (3, Seek)]
+        );
+        // Old news: a lower `expected` than one already seen is ignored.
+        g.number(Seek, 13_000);
+        assert!(g.plan_resync(2, false).len() <= 3);
+        assert!(g.plan_resync(1, false).is_empty());
+    }
+
+    /// Commands the server accepted are forgotten as its answers show it, and
+    /// the memory is bounded.
+    #[test]
+    fn accepted_commands_are_dropped_and_the_memory_is_bounded() {
+        let mut g = PlaybackSeq::new();
+        for i in 0..(PLAYBACK_REPLAY_WINDOW as u64 + 10) {
+            g.number(Seek, i);
+        }
+        assert_eq!(g.sent.len(), PLAYBACK_REPLAY_WINDOW);
+        let newest = g.next - 1;
+        // The server expects the newest: everything before it was accepted.
+        let again = g.plan_resync(newest, false);
+        assert_eq!(again.len(), 1);
+        assert_eq!(g.sent.len(), 1);
     }
 
     #[tokio::test]

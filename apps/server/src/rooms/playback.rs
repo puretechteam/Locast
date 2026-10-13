@@ -99,9 +99,13 @@ pub enum PlaybackError {
     /// The room is live but its lifecycle does not accept this
     /// action (PAUSE / SEEK before the first PLAY). Wire code
     /// `InvalidState`, so the client keeps the room: only the
-    /// command was refused.
+    /// command was refused. `expected` is the `monotonic_seq` the
+    /// server would accept next from this sender: a sender whose
+    /// first PLAY was lost in flight has numbered everything after
+    /// it past a gap, and this refusal (the lifecycle is checked
+    /// before the sequence) is the only answer it ever gets.
     #[error("playback action not allowed in the room's current state")]
-    InvalidTransition,
+    InvalidTransition { expected: u64 },
     #[error("caller may not issue playback commands")]
     NotHost,
     #[error("playback monotonic_seq gap (got {got}, expected {expected})")]
@@ -192,6 +196,13 @@ pub async fn handle_playback_cmd(
     //    - PLAY from Open/Paused transitions to Playing.
     //    - PAUSE from Playing transitions to Paused.
     //    - All other (state, action) pairs are forbidden.
+    let last = state
+        .playback
+        .last_acked_seq
+        .get(&user_id)
+        .copied()
+        .unwrap_or(0);
+    let expected = last.saturating_add(1);
     match (state.state, payload.action) {
         (RoomLifecycle::Open | RoomLifecycle::Paused, PlaybackAction::Play) => {}
         (RoomLifecycle::Playing, PlaybackAction::Play) => {
@@ -203,7 +214,7 @@ pub async fn handle_playback_cmd(
             // §11.1: idempotent. Drops through.
         }
         (RoomLifecycle::Playing | RoomLifecycle::Paused, PlaybackAction::Seek) => {}
-        _ => return Err(PlaybackError::InvalidTransition),
+        _ => return Err(PlaybackError::InvalidTransition { expected }),
     }
 
     // 5. Per-sender monotonic-seq check. The valid window is
@@ -213,13 +224,6 @@ pub async fn handle_playback_cmd(
     //    commands and cannot apply this one without the
     //    missing range). Both cases are rejected per
     //    docs/ARCHITECTURE.md §13.2.
-    let last = state
-        .playback
-        .last_acked_seq
-        .get(&user_id)
-        .copied()
-        .unwrap_or(0);
-    let expected = last.saturating_add(1);
     match payload.monotonic_seq.cmp(&expected) {
         std::cmp::Ordering::Equal => {}
         std::cmp::Ordering::Less => {
@@ -294,7 +298,7 @@ impl From<PlaybackError> for RoomError {
             PlaybackError::NoRoomId => RoomError::InvalidState,
             PlaybackError::NotJoined => RoomError::NotJoined,
             PlaybackError::RoomClosed => RoomError::RoomClosed,
-            PlaybackError::InvalidTransition => RoomError::InvalidState,
+            PlaybackError::InvalidTransition { .. } => RoomError::InvalidState,
             PlaybackError::NotHost => RoomError::NotHost,
             PlaybackError::StaleCommand { got, expected } => {
                 RoomError::StaleCommand { got, expected }
@@ -669,7 +673,7 @@ mod tests {
             .await
             .expect_err("expected InvalidTransition");
         assert!(
-            matches!(err, PlaybackError::InvalidTransition),
+            matches!(err, PlaybackError::InvalidTransition { expected: 1 }),
             "got {err:?}"
         );
         // The room is still live: the wire code must not tell

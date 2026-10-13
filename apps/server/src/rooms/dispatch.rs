@@ -486,6 +486,12 @@ async fn handle_playback_cmd_dispatch(
             // this the sender can never find its way back.
             let expected_seq = match &e {
                 PlaybackError::StaleCommand { expected, .. } => Some(*expected),
+                // A refusal for the room's state (PAUSE / SEEK before the
+                // first PLAY) also says where the sender stands. A sender
+                // whose first PLAY was lost has numbered its later commands
+                // past a gap, but the state check runs first, so this is
+                // the only answer it gets.
+                PlaybackError::InvalidTransition { expected } => Some(*expected),
                 PlaybackError::DuplicateCommand { last, .. } => Some(last.saturating_add(1)),
                 _ => None,
             };

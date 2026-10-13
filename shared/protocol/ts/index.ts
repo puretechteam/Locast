@@ -534,10 +534,13 @@ reason: string, };
  */
 export type RoomErrorPayload = { code: "Unauthorized" | "InvalidCode" | "RoomNotFound" | "RoomClosed" | "RoomFull" | "AlreadyJoined" | "NotJoined" | "InvalidState" | "NotHost" | "MigrationDisabled" | "Internal" | "StaleCommand", message: string, 
 /**
- * For a rejected PLAYBACK_CMD (`StaleCommand`): the `monotonic_seq` the
- * server will accept next from this sender. A client whose command was
- * lost in flight (the connection dropped as it was sent) has numbered
- * every later command past a gap; this is how it finds its place again.
+ * For a rejected PLAYBACK_CMD (`StaleCommand`, or `InvalidState` when the
+ * room's state refused it): the `monotonic_seq` the server will accept
+ * next from this sender. A client whose command was lost in flight (the
+ * connection dropped as it was sent) has numbered every later command
+ * past a gap; this is how it finds its place again. The room's state is
+ * checked before the number, so a lost first PLAY is only ever visible
+ * as an `InvalidState` refusal of the command after it.
  */
 expected_seq?: bigint, };
 
