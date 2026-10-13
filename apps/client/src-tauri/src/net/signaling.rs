@@ -373,6 +373,12 @@ impl SignalingClient {
         self.inner.lock().await.bearer.is_some()
     }
 
+    /// **Test-only.** Say which server-assigned user id this client has.
+    #[cfg(test)]
+    pub async fn set_user_id_for_test(&self, id: Uuid) {
+        self.inner.lock().await.state.user_id = Some(id.to_string());
+    }
+
     /// **Test-only.** Put the client in the state of a WS that has a
     /// bearer but whose connection is mid-reconnect (`phase`), with a
     /// channel that records what is sent once a link is up.

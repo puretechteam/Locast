@@ -92,7 +92,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use locast_protocol::envelope::{Envelope, MessageKind, Sender};
 use locast_protocol::room::{SignalCandidate, SignalKind, SignalPayload};
@@ -223,6 +223,28 @@ struct ManagerState {
     room_id: Option<Uuid>,
     /// Per-peer entries, keyed by the remote `user_id`.
     peers: HashMap<Uuid, PeerEntry>,
+    /// Verified SIGNALs from peers we have no entry for yet, kept briefly so
+    /// they can be applied when the entry appears.
+    early: HashMap<Uuid, EarlySignals>,
+}
+
+/// How long a signal from a not-yet-known peer is kept.
+const EARLY_SIGNAL_TTL: Duration = Duration::from_secs(30);
+/// Peers with stashed signals at once, and signals kept per peer.
+const EARLY_SIGNAL_PEERS: usize = 8;
+const EARLY_SIGNALS_PER_PEER: usize = 64;
+
+/// SIGNALs from one peer that arrived before we had an entry for it.
+///
+/// A joining viewer learns who is in the room by polling the room state
+/// (every 200 ms), while the host sees the join at once and offers at once.
+/// The offer often arrived first and was dropped as "unknown peer", with no
+/// retry: no connection, so a download that never started. The (already
+/// verified) signals are stashed and applied, in order, when the entry is
+/// created.
+struct EarlySignals {
+    since: Instant,
+    payloads: Vec<SignalPayload>,
 }
 
 impl ManagerState {
@@ -230,6 +252,25 @@ impl ManagerState {
         Self {
             room_id: None,
             peers: HashMap::new(),
+            early: HashMap::new(),
+        }
+    }
+
+    /// Keep `payload` from `from` for when its entry exists. Bounded in age,
+    /// peers and signals per peer.
+    fn stash_early(&mut self, from: Uuid, payload: SignalPayload) {
+        let now = Instant::now();
+        self.early
+            .retain(|_, e| now.duration_since(e.since) < EARLY_SIGNAL_TTL);
+        if !self.early.contains_key(&from) && self.early.len() >= EARLY_SIGNAL_PEERS {
+            return;
+        }
+        let e = self.early.entry(from).or_insert_with(|| EarlySignals {
+            since: now,
+            payloads: Vec::new(),
+        });
+        if e.payloads.len() < EARLY_SIGNALS_PER_PEER {
+            e.payloads.push(payload);
         }
     }
 }
@@ -430,6 +471,7 @@ impl WebRtcManager {
         for (_uid, entry) in g.peers.drain() {
             let _ = entry.pc.close().await;
         }
+        g.early.clear();
         g.room_id = None;
     }
 
@@ -521,6 +563,7 @@ impl WebRtcManager {
         }
         let mut g = self.state.lock().await;
         g.peers.insert(remote_id, entry);
+        let early = g.early.remove(&remote_id);
         drop(g);
         // Spawn the per-peer pump that forwards handler
         // events (ICE candidates, data channels, state
@@ -537,6 +580,16 @@ impl WebRtcManager {
             rx,
             room_cancel,
         ));
+        // Signals that beat the entry here, in the order they arrived.
+        if let Some(early) = early {
+            if Instant::now().duration_since(early.since) < EARLY_SIGNAL_TTL {
+                for payload in early.payloads {
+                    if let Err(e) = self.apply_signal(remote_id, payload).await {
+                        warn!(error = %e, remote = %remote_id, "an early signal could not be applied");
+                    }
+                }
+            }
+        }
     }
 
     /// Build + sign + send a SIGNAL envelope to the signaling
@@ -616,6 +669,24 @@ impl WebRtcManager {
             return Err(InboundError::Auth("sig wrong length"));
         }
         verify_ed25519(&sender.pubkey, &sender.sig, &signed)?;
+        {
+            // Not a peer we know yet: keep it (checked under the same lock
+            // that inserts entries, so it cannot fall between the two).
+            let mut g = self.state.lock().await;
+            if !g.peers.contains_key(&from_user_id) {
+                debug!(remote = %from_user_id, kind = ?payload.kind, "signal from a peer not known yet; keeping it");
+                g.stash_early(from_user_id, payload);
+                return Ok(());
+            }
+        }
+        self.apply_signal(from_user_id, payload).await
+    }
+
+    async fn apply_signal(
+        &self,
+        from_user_id: Uuid,
+        payload: SignalPayload,
+    ) -> Result<(), InboundError> {
         match payload.kind {
             SignalKind::Offer => self.handle_remote_offer(from_user_id, payload).await,
             SignalKind::Answer => self.handle_remote_answer(from_user_id, payload).await,
@@ -1043,11 +1114,27 @@ fn build_local_ice_payload(remote_id: Uuid, init: &RTCIceCandidateInit) -> Signa
 
 /// Build a `PeerConnection` with the architecture-mandated
 /// SDP constraints and a per-peer event handler.
+/// Env var: make this process's peer connections use loopback only (no STUN,
+/// one `127.0.0.1` socket). Honoured ONLY inside a disposable test profile
+/// (`LOCAST_TEST_PROFILE_DIR`), for running several clients on one machine: with
+/// several network adapters (Wi-Fi, a VPN) the candidates a process offers
+/// include pairs that cannot reach each other, and the connection is then
+/// slow, fails, or opens and stalls. It narrows connectivity; it grants none.
+pub const ENV_LOCAL_ONLY: &str = "LOCAST_WEBRTC_LOCAL_ONLY";
+
+fn local_only() -> bool {
+    std::env::var_os(ENV_LOCAL_ONLY).is_some()
+        && std::env::var_os(crate::profile::ENV_TEST_PROFILE_DIR).is_some()
+}
+
 async fn build_peer_connection(
     remote_id: Uuid,
 ) -> Result<(Arc<dyn PeerConnection>, mpsc::UnboundedReceiver<PeerEvent>), WebRtcError> {
+    let local = local_only();
     let config = RTCConfigurationBuilder::default()
-        .with_ice_servers(
+        .with_ice_servers(if local {
+            Vec::new()
+        } else {
             STUN_SERVERS
                 .iter()
                 .map(|u| RTCIceServer {
@@ -1055,15 +1142,15 @@ async fn build_peer_connection(
                     username: String::new(),
                     credential: String::new(),
                 })
-                .collect::<Vec<_>>(),
-        )
+                .collect::<Vec<_>>()
+        })
         .build();
     let (tx, rx) = mpsc::unbounded_channel::<PeerEvent>();
     let handler: Arc<dyn PeerConnectionEventHandler> = Arc::new(PeerHandler::new(remote_id, tx));
     let pc = PeerConnectionBuilder::new()
         .with_handler(handler)
         .with_configuration(config)
-        .with_udp_addrs(vec!["0.0.0.0:0"])
+        .with_udp_addrs(vec![if local { "127.0.0.1:0" } else { "0.0.0.0:0" }])
         .build()
         .await?;
     Ok((Arc::new(pc), rx))
@@ -1327,6 +1414,163 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::identity::keystore::{IdentityKeyring, IdentityService, MockKeyring};
+    use crate::net::config::SignalingConfig;
+    use crate::net::room::{ParticipantIpc, ParticipantStatusIpc, RoomClient, RoomSummaryIpc};
+    use crate::net::state::ConnPhase;
+    use locast_protocol::envelope::Sender;
+    use locast_protocol::handshake::Platform;
+
+    fn participant(id: Uuid, host: bool) -> ParticipantIpc {
+        ParticipantIpc {
+            user_id: id.to_string(),
+            display_name: String::new(),
+            joined_ms: 0,
+            status: ParticipantStatusIpc::Connected,
+            last_seen_ms: 0,
+            is_host: host,
+            cap_set: 0,
+        }
+    }
+
+    /// The host sees a viewer join at once and offers at once; the viewer's
+    /// manager learns who is in the room by polling the room state, so the
+    /// offer (and its ICE candidates) can arrive FIRST. They used to be
+    /// dropped as "unknown peer" for good: no connection, and a download
+    /// that never started. They are kept, and applied in order when the peer
+    /// appears.
+    #[tokio::test]
+    async fn an_offer_that_beats_the_room_state_is_kept_and_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = crate::storage::Storage::open(&dir.path().join("index.sqlite"))
+            .await
+            .unwrap();
+        let keyring: Arc<dyn IdentityKeyring> = Arc::new(MockKeyring::new());
+        let identity = Arc::new(IdentityService::with_keyring(keyring, storage));
+        identity.get_or_create("viewer").await.unwrap();
+        let signaling = Arc::new(SignalingClient::new(
+            SignalingConfig::new_for_test(
+                "ws://127.0.0.1:1/ws".to_string(),
+                Duration::from_secs(1),
+                1024 * 1024,
+                Platform::Linux,
+            ),
+            identity.clone(),
+        ));
+        // Authenticated as the highest possible id, so the remote is the
+        // initiator and we answer.
+        let me = Uuid::from_bytes([0xFF; 16]);
+        let host = Uuid::from_bytes([0x01; 16]);
+        let mut sent = signaling
+            .set_link_for_test(ConnPhase::Authenticated, true)
+            .await;
+        signaling.set_user_id_for_test(me).await;
+        let room_client = Arc::new(RoomClient::new(signaling.clone()));
+        let manager = Arc::new(WebRtcManager::new(signaling.clone(), identity, room_client));
+
+        // The host's offer, signed by the host.
+        let (host_pc, _rx) = build_peer_connection(me).await.unwrap();
+        let _dc = host_pc
+            .create_data_channel(FILES_DC_LABEL, None)
+            .await
+            .unwrap();
+        let offer = host_pc.create_offer(None).await.unwrap();
+        host_pc.set_local_description(offer).await.unwrap();
+        let sdp = host_pc.local_description().await.unwrap().sdp.clone();
+        let payload = SignalPayload {
+            to_user_id: me,
+            kind: SignalKind::Offer,
+            sdp: Some(sdp),
+            candidates: None,
+        };
+        let seed = [9u8; 32];
+        let sig = locast_crypto::ed25519::sign(&seed, &signal_signed_bytes(&payload).unwrap());
+        let env = Envelope {
+            v: 1,
+            r#type: MessageKind::Signal,
+            id: Uuid::now_v7(),
+            room_id: None,
+            sender: Some(Sender {
+                user_id: host,
+                pubkey: locast_crypto::ed25519::public_key_from_seed(&seed).to_vec(),
+                sig: sig.to_vec(),
+            }),
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(&payload).unwrap(),
+        };
+
+        // The offer arrives; the manager does not know the host yet.
+        manager
+            .handle_inbound_signal(&env, host)
+            .await
+            .expect("kept, not an error");
+        assert_eq!(manager.peer_count().await, 0);
+        assert!(manager.peer_phase(host).await.is_none());
+
+        // The room state catches up: the host appears, and the kept offer is
+        // answered.
+        let summary = RoomSummaryIpc {
+            id: Uuid::now_v7().to_string(),
+            code: "ABC234".into(),
+            title: "t".into(),
+            host_user_id: host.to_string(),
+            host_migration_enabled: true,
+            created_ms: 0,
+            participants: vec![participant(host, true), participant(me, false)],
+            host_disconnected: false,
+            host_disconnect_deadline_ms: None,
+            you_cap_set: None,
+            you_user_id: Some(me.to_string()),
+            playback: None,
+        };
+        Arc::clone(&manager).on_room_state_changed(summary).await;
+        assert_eq!(
+            manager.peer_phase(host).await,
+            Some(PeerPhase::AnswerReceived)
+        );
+        let mut answered = false;
+        while let Ok(env) = sent.try_recv() {
+            if env.r#type == MessageKind::Signal {
+                let p: SignalPayload = serde_json::from_value(env.payload).unwrap();
+                answered |= p.kind == SignalKind::Answer && p.to_user_id == host;
+            }
+        }
+        assert!(answered, "the kept offer was answered");
+    }
+
+    #[test]
+    fn signals_kept_for_unknown_peers_are_bounded() {
+        let mut st = ManagerState::new();
+        let sig = |i: u32| SignalPayload {
+            to_user_id: Uuid::nil(),
+            kind: SignalKind::Ice,
+            sdp: None,
+            candidates: Some(vec![SignalCandidate {
+                candidate: format!("c{i}"),
+                sdp_mid: None,
+                sdp_m_line_index: None,
+            }]),
+        };
+        // Per peer.
+        let one = Uuid::from_bytes([1; 16]);
+        for i in 0..(EARLY_SIGNALS_PER_PEER as u32 + 50) {
+            st.stash_early(one, sig(i));
+        }
+        assert_eq!(st.early[&one].payloads.len(), EARLY_SIGNALS_PER_PEER);
+        // Peers.
+        for n in 0..(EARLY_SIGNAL_PEERS as u8 + 5) {
+            st.stash_early(Uuid::from_bytes([n + 10; 16]), sig(0));
+        }
+        assert!(st.early.len() <= EARLY_SIGNAL_PEERS);
+        // Old entries are dropped on the next stash.
+        for e in st.early.values_mut() {
+            e.since = Instant::now() - EARLY_SIGNAL_TTL - Duration::from_secs(1);
+        }
+        st.stash_early(Uuid::from_bytes([99; 16]), sig(0));
+        assert_eq!(st.early.len(), 1);
+    }
 
     #[test]
     fn initiator_decision_is_deterministic_by_uuid_bytes() {
