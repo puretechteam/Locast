@@ -49,17 +49,25 @@ pub async fn room_connect_signaling(
 #[specta::specta]
 pub async fn room_create(
     room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    registry: TauriState<'_, std::sync::Arc<TransferRegistry>>,
     title: String,
     migration_enabled: bool,
 ) -> Result<RoomSummaryIpc, AppError> {
+    let held = room.state().await.map(|s| s.id);
     // A trust anchor or media selection left over from a
     // previous room must not leak into this one. The host
     // installs its own key on its first publish.
     room.clear_expected_host_pubkey();
     room.clear_host_media_selection();
-    room.room_create(title, migration_enabled)
+    let created = room
+        .room_create(title, migration_enabled)
         .await
-        .map_err(room_err_to_app)
+        .map_err(room_err_to_app)?;
+    // Making a room while in one leaves it; its transfers end with it.
+    if held.is_some_and(|id| id != created.id) {
+        registry.cancel_all().await;
+    }
+    Ok(created)
 }
 
 /// Join a room by 6-char code and display name.
@@ -76,18 +84,26 @@ pub async fn room_create(
 #[specta::specta]
 pub async fn room_join(
     room: TauriState<'_, std::sync::Arc<RoomClient>>,
+    registry: TauriState<'_, std::sync::Arc<TransferRegistry>>,
     code: String,
     display_name: String,
     invite_url: Option<String>,
 ) -> Result<RoomSummaryIpc, AppError> {
+    let held = room.state().await.map(|s| s.id);
     let anchor = invite_anchor_for(&code, invite_url.as_deref())?;
     match anchor {
         Some(pk) => room.set_expected_host_pubkey(pk),
         None => room.clear_expected_host_pubkey(),
     }
-    room.room_join(code, display_name)
+    let joined = room
+        .room_join(code, display_name)
         .await
-        .map_err(room_err_to_app)
+        .map_err(room_err_to_app)?;
+    // Joining a different room leaves the current one; its transfers end.
+    if held.is_some_and(|id| id != joined.id) {
+        registry.cancel_all().await;
+    }
+    Ok(joined)
 }
 
 /// Parse an optional invite URL and check it belongs to `code`.

@@ -1508,6 +1508,16 @@ impl RoomClient {
         title: String,
         migration_enabled: bool,
     ) -> Result<RoomSummaryIpc, RoomClientError> {
+        // Making a room means leaving the one held: left first, so by the time
+        // the new room exists the old one is gone (a joiner of the new room
+        // cannot beat the leave, which would lose the host the join).
+        if let Some((old, _)) = self.held_room().await {
+            if let Ok(old) = Uuid::parse_str(&old) {
+                if let Err(e) = self.leave_room_inner(Some(old)).await {
+                    warn!(error = %e, "leaving the previous room failed; carrying on");
+                }
+            }
+        }
         let payload = RoomCreatePayload {
             title,
             migration_enabled,
@@ -1541,6 +1551,7 @@ impl RoomClient {
         code: String,
         display_name: String,
     ) -> Result<RoomSummaryIpc, RoomClientError> {
+        let held = self.held_room().await;
         let payload = RoomJoinRequestPayload {
             code: code.clone(),
             display_name: display_name.clone(),
@@ -1555,6 +1566,7 @@ impl RoomClient {
         self.reset_playback_seq();
         self.emit_state(&summary).await;
         self.spawn_presence_loop();
+        self.leave_replaced_room(held, &summary.id).await;
         // P7-T01: remember the join credentials so a
         // post-AUTH_OK rejoin can re-issue ROOM_JOIN_REQUEST
         // if the WS reconnects.
@@ -1783,7 +1795,41 @@ impl RoomClient {
     /// the inbound `ROOM_CLOSED` and `PARTICIPANT_LEFT`
     /// events to update the UI.
     pub async fn room_leave(&self) -> Result<(), RoomClientError> {
-        let env = envelope(MessageKind::RoomLeave, None, RoomLeavePayload {});
+        self.leave_room_inner(None).await
+    }
+
+    /// A client is in one room at a time. Once a join has
+    /// succeeded, the room the client held before (a different one) is left,
+    /// by id, exactly that room. The server allows a user to hold seats in
+    /// several rooms and its broadcasts follow only one of them, so a host who
+    /// made a second room without leaving the first never saw who joined it.
+    /// Done after the new room is held, never before: a refused join must
+    /// leave the user where they were.
+    async fn leave_replaced_room(&self, old: Option<(String, String)>, new_id: &str) {
+        let Some((old_id, _)) = old else { return };
+        if old_id == new_id {
+            return;
+        }
+        let Ok(old) = Uuid::parse_str(&old_id) else {
+            return;
+        };
+        let env = envelope(MessageKind::RoomLeave, Some(old), RoomLeavePayload {});
+        if let Err(e) = self.send_or_buffer(env).await {
+            warn!(error = %e, "leaving the previous room failed; carrying on");
+        }
+    }
+
+    /// The (id, code) of the room held now, if any.
+    async fn held_room(&self) -> Option<(String, String)> {
+        self.state
+            .lock()
+            .await
+            .as_ref()
+            .map(|s| (s.id.clone(), s.code.clone()))
+    }
+
+    async fn leave_room_inner(&self, room: Option<Uuid>) -> Result<(), RoomClientError> {
+        let env = envelope(MessageKind::RoomLeave, room, RoomLeavePayload {});
         self.send_or_buffer(env).await?;
         // If the leave was buffered (WS mid-reconnect), keep it past
         // `forget_room_session`, which clears that buffer.
