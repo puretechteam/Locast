@@ -282,10 +282,29 @@ impl From<RoomSummary> for RoomSummaryIpc {
 }
 
 /// Broadcast events that describe the state of one specific room.
+/// Manifests being reassembled at once per client (a fetch response can
+/// overlap a broadcast).
+const MANIFEST_PARTS_IN_FLIGHT: usize = 2;
+
+/// A half-received manifest with no new piece for this long is dropped.
+const MANIFEST_PARTS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most manifest bytes all clients in this process may be assembling.
+fn manifest_parts_budget() -> &'static locast_protocol::manifest_parts::ByteBudget {
+    static BUDGET: std::sync::OnceLock<locast_protocol::manifest_parts::ByteBudget> =
+        std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        locast_protocol::manifest_parts::ByteBudget::new(
+            2 * locast_protocol::manifest_parts::MAX_ASSEMBLED_BYTES,
+        )
+    })
+}
+
 fn is_room_scoped_event(kind: &MessageKind) -> bool {
     matches!(
         kind,
-        MessageKind::RoomState
+        MessageKind::ManifestPart
+            | MessageKind::RoomState
             | MessageKind::ParticipantJoined
             | MessageKind::ParticipantLeft
             | MessageKind::HostDisconnected
@@ -998,6 +1017,10 @@ pub struct LaserOffEvent {
 /// Default timeout for a single request-reply round trip.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A manifest fetch may be answered in many frames (a large manifest), so it
+/// gets longer than an ordinary request.
+const MANIFEST_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How often the background presence loop sends a
 /// `PRESENCE` envelope while the user is in a room. The
 /// server uses this to refresh `last_seen` so the
@@ -1091,6 +1114,11 @@ pub struct RoomClient {
     /// Woken whenever a manifest is accepted into the cache above (or the
     /// host dispatcher is bound to a room), so a waiter does not have to poll.
     manifest_changed: tokio::sync::Notify,
+    /// Pieces of a manifest too big for one frame (MANIFEST_PART) being
+    /// reassembled, whether broadcast (`published`) or answering this client's
+    /// fetch (`response`). Bounded in count, size and age; see
+    /// `locast_protocol::manifest_parts`.
+    manifest_parts: StdMutex<locast_protocol::manifest_parts::PartAssembler>,
     /// P3-T04 prerequisite 2: the trusted host public
     /// key, set by [`Self::set_expected_host_pubkey`] from
     /// the parsed invite URL. `None` until the invite
@@ -1163,6 +1191,11 @@ impl RoomClient {
             presence_task: StdMutex::new(None),
             verified_manifests: StdMutex::new(HashMap::new()),
             manifest_changed: tokio::sync::Notify::new(),
+            manifest_parts: StdMutex::new(locast_protocol::manifest_parts::PartAssembler::new(
+                MANIFEST_PARTS_IN_FLIGHT,
+                MANIFEST_PARTS_TTL,
+                manifest_parts_budget().clone(),
+            )),
             expected_host_pubkey: StdMutex::new(None),
             pool: StdMutex::new(None),
             current_versions: StdMutex::new(HashMap::new()),
@@ -1283,6 +1316,35 @@ impl RoomClient {
     /// [`Self::verified_manifest`]). Wait on it with the usual pattern: create
     /// and `enable()` the `Notified` future, THEN check the condition, so a
     /// manifest accepted in between is not missed.
+    /// Wait until the verified manifest cached for `room_id` carries the host
+    /// signature value `signature` (i.e. the server's broadcast of a manifest
+    /// this host sent has come back), or `timeout` passes. Returns whether it
+    /// arrived.
+    pub async fn wait_for_manifest_signature(
+        &self,
+        room_id: Uuid,
+        signature: &str,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register for the wake-up before checking, so one that lands
+            // between the check and the wait is not missed.
+            let notified = self.manifest_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self
+                .verified_manifest(room_id)
+                .and_then(|m| m.host_signature.map(|s| s.value));
+            if current.as_deref() == Some(signature) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
+
     pub fn manifest_changed(&self) -> &tokio::sync::Notify {
         &self.manifest_changed
     }
@@ -1815,7 +1877,9 @@ impl RoomClient {
     ) -> Result<locast_protocol::room::ManifestResponsePayload, RoomClientError> {
         let payload = locast_protocol::room::ManifestRequestPayload { media_id };
         let env = envelope(MessageKind::ManifestRequest, Some(room_id), payload);
-        let reply = self.request(env, MessageKind::ManifestResponse).await?;
+        let reply = self
+            .request_within(env, MessageKind::ManifestResponse, MANIFEST_FETCH_TIMEOUT)
+            .await?;
         let response: locast_protocol::room::ManifestResponsePayload = decode_payload(&reply)?;
         self.accept_manifest(
             response.manifest.clone(),
@@ -1956,6 +2020,83 @@ impl RoomClient {
         Ok(room_uuid)
     }
 
+    /// One piece of a manifest sent in several frames. Pieces accumulate in
+    /// the bounded assembler; the last one yields the whole manifest, which
+    /// then takes exactly the path of the single-frame message it stands in
+    /// for (so every check in [`Self::accept_manifest`] still applies). A
+    /// refused piece drops its assembly and nothing is accepted.
+    async fn handle_manifest_part(&self, env: &Envelope) {
+        use locast_protocol::manifest_parts::{ManifestPartKind, ManifestPartPayload};
+        let Some(room_id) = env.room_id else {
+            warn!("ignoring MANIFEST_PART: no room");
+            return;
+        };
+        let part: ManifestPartPayload = match decode_payload(env) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "ignoring MANIFEST_PART: bad payload");
+                return;
+            }
+        };
+        let step = self
+            .manifest_parts
+            .lock()
+            .expect("manifest_parts lock")
+            .push(room_id, &part, std::time::Instant::now());
+        let done = match step {
+            Ok(None) => return,
+            Ok(Some(done)) => done,
+            Err(e) => {
+                warn!(error = %e, "dropping a manifest that arrived in pieces");
+                return;
+            }
+        };
+        // The pieces were collected for the room the envelopes named; the
+        // manifest inside must be that room's, or it is not accepted.
+        if done.manifest.room_id != room_id.to_string() {
+            warn!("dropping a manifest that arrived in pieces: it names another room");
+            return;
+        }
+        match done.kind {
+            ManifestPartKind::Published => {
+                if let Err(e) = self
+                    .accept_manifest(
+                        done.manifest,
+                        done.version,
+                        done.published_at_ms,
+                        "MANIFEST_PUBLISHED",
+                    )
+                    .await
+                {
+                    warn!(source = "MANIFEST_PART", error = %e, "ignoring MANIFEST_PUBLISHED");
+                }
+            }
+            ManifestPartKind::Response => {
+                // The waiting `manifest_fetch` decodes and accepts it, as it
+                // does a single-frame response.
+                let payload = locast_protocol::room::ManifestResponsePayload {
+                    manifest: done.manifest,
+                    version: done.version,
+                    published_at_ms: done.published_at_ms,
+                };
+                let reply = Envelope {
+                    v: 1,
+                    r#type: MessageKind::ManifestResponse,
+                    id: env.id,
+                    room_id: env.room_id,
+                    sender: None,
+                    ts_ms: env.ts_ms,
+                    seq: 0,
+                    payload: serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
+                };
+                self.deliver_to_pending(&reply).await;
+            }
+            ManifestPartKind::Publish => {
+                warn!("ignoring a MANIFEST_PART of kind publish received from the server");
+            }
+        }
+    }
+
     async fn handle_manifest_published(&self, env: &Envelope) {
         let payload: locast_protocol::room::ManifestPublishedPayload = match decode_payload(env) {
             Ok(p) => p,
@@ -2080,6 +2221,12 @@ impl RoomClient {
     /// is straightforward to unit test in isolation
     /// (without the surrounding `mpsc::Receiver`).
     async fn handle_inbound(&self, env: Envelope) {
+        // Drop a half-received manifest the sender abandoned, so it does not
+        // hold memory until the next piece (which may never come).
+        self.manifest_parts
+            .lock()
+            .expect("manifest_parts lock")
+            .expire(std::time::Instant::now());
         // 0) Room-scoped events that name a room other than the cached one
         //    are not about this session. Applying them corrupted the roster
         //    and host flags, and a ROOM_CLOSED for an old room cleared the
@@ -2313,6 +2460,9 @@ impl RoomClient {
             }
             MessageKind::ManifestPublished => {
                 self.handle_manifest_published(&env).await;
+            }
+            MessageKind::ManifestPart => {
+                self.handle_manifest_part(&env).await;
             }
             // P4-T02: a server-accepted playback event
             // arrived. Decode the payload, scope-check
@@ -2686,6 +2836,15 @@ impl RoomClient {
         env: Envelope,
         expected: MessageKind,
     ) -> Result<Envelope, RoomClientError> {
+        self.request_within(env, expected, REQUEST_TIMEOUT).await
+    }
+
+    async fn request_within(
+        &self,
+        env: Envelope,
+        expected: MessageKind,
+        timeout: std::time::Duration,
+    ) -> Result<Envelope, RoomClientError> {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
@@ -2706,7 +2865,7 @@ impl RoomClient {
             }
             return Err(e);
         }
-        let res = tokio::time::timeout(REQUEST_TIMEOUT, rx).await;
+        let res = tokio::time::timeout(timeout, rx).await;
         match res {
             // The server answers a refused request with ROOM_ERROR, which is
             // delivered to the waiter whatever kind it asked for. Callers
@@ -4119,6 +4278,245 @@ mod tests {
         assert_eq!(fired[0].room_id, room_uuid.to_string());
         assert_eq!(fired[0].version, 1);
         assert_eq!(fired[0].manifest_hash.len(), 64); // 32-byte BLAKE3 hex
+    }
+
+    // ---- MANIFEST_PART: a manifest that arrives in pieces ----
+
+    /// RFC 8032 section 7.1 test 1 seed and its verifying key.
+    const PART_SEED: [u8; 32] = [
+        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
+        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+        0x7f, 0x60,
+    ];
+    const PART_PUBKEY: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+
+    fn signed_film(room: Uuid, created_at: i64, chunks: u32) -> locast_manifest::MediaManifest {
+        use locast_manifest::{MediaEntry, MediaManifest, Source};
+        locast_manifest::sign_manifest(
+            &PART_SEED,
+            &MediaManifest {
+                manifest_version: 1,
+                room_id: room.to_string(),
+                media: vec![MediaEntry {
+                    id: Uuid::new_v4().to_string(),
+                    filename: "film.mkv".into(),
+                    sha256: "ab".repeat(32),
+                    blake3: "cd".repeat(32),
+                    size_bytes: u64::from(chunks) * 262_144,
+                    mime: "video/x-matroska".into(),
+                    duration_ms: 10_800_000,
+                    dimensions: None,
+                    codecs: None,
+                    sources: vec![Source {
+                        peer_id: "p".repeat(64),
+                        url_hint: None,
+                        priority: 0,
+                        chunk_size: 262_144,
+                        total_chunks: chunks,
+                        chunk_hashes: (0..chunks).map(|i| format!("{i:064x}")).collect(),
+                    }],
+                }],
+                subtitles: vec![],
+                created_at,
+                host_signature: None,
+            },
+        )
+        .expect("sign")
+    }
+
+    fn part_envelopes(
+        manifest: &locast_manifest::MediaManifest,
+        kind: locast_protocol::manifest_parts::ManifestPartKind,
+        version: i64,
+        envelope_room: Uuid,
+    ) -> Vec<Envelope> {
+        use locast_protocol::manifest_parts::{encode_manifest, split_manifest_bytes};
+        split_manifest_bytes(
+            &encode_manifest(manifest).unwrap(),
+            kind,
+            version,
+            1_700_000_000_000,
+            Uuid::new_v4(),
+            60_000,
+        )
+        .unwrap()
+        .iter()
+        .map(|p| Envelope {
+            v: 1,
+            r#type: MessageKind::ManifestPart,
+            id: Uuid::now_v7(),
+            room_id: Some(envelope_room),
+            sender: None,
+            ts_ms: 0,
+            seq: 0,
+            payload: serde_json::to_value(p).unwrap(),
+        })
+        .collect()
+    }
+
+    async fn part_client() -> (RoomClient, Arc<RecordingSink>) {
+        let rc = fresh_room_client().await;
+        let recorder = Arc::new(RecordingSink::new());
+        rc.install_event_sink(recorder.clone()).await;
+        rc.set_expected_host_pubkey(PART_PUBKEY);
+        (rc, recorder)
+    }
+
+    #[tokio::test]
+    async fn a_manifest_in_pieces_is_verified_and_cached_only_when_complete() {
+        use locast_protocol::manifest_parts::ManifestPartKind::Published;
+        let room = Uuid::now_v7();
+        let m = signed_film(room, 10, 6_000);
+        let envs = part_envelopes(&m, Published, 1, room);
+        assert!(envs.len() > 3);
+        let (rc, recorder) = part_client().await;
+        let last = envs.len() - 1;
+        for env in &envs[..last] {
+            rc.handle_inbound(env.clone()).await;
+            assert!(
+                rc.verified_manifest(room).is_none(),
+                "a partial manifest is never accepted"
+            );
+        }
+        assert!(recorder.manifests.lock().unwrap().is_empty());
+        rc.handle_inbound(envs[last].clone()).await;
+        assert_eq!(rc.verified_manifest(room), Some(m));
+        assert_eq!(rc.verified_manifest_version(room), Some(1));
+        assert_eq!(recorder.manifests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_altered_piece_means_nothing_is_accepted() {
+        use locast_protocol::manifest_parts::ManifestPartKind::Published;
+        let room = Uuid::now_v7();
+        let m = signed_film(room, 10, 6_000);
+        let envs = part_envelopes(&m, Published, 1, room);
+
+        // A piece is lost on the way.
+        let (rc, recorder) = part_client().await;
+        for (i, env) in envs.iter().enumerate() {
+            if i != 1 {
+                rc.handle_inbound(env.clone()).await;
+            }
+        }
+        assert!(rc.verified_manifest(room).is_none());
+
+        // A piece is altered on the way.
+        let mut altered = envs.clone();
+        let mut p: locast_protocol::manifest_parts::ManifestPartPayload =
+            serde_json::from_value(altered[1].payload.clone()).unwrap();
+        let mut raw = locast_crypto::ed25519::from_base64(&p.data).unwrap();
+        raw[3] ^= 0x01;
+        p.data = locast_crypto::ed25519::to_base64(&raw);
+        altered[1].payload = serde_json::to_value(&p).unwrap();
+        let (rc2, _rec2) = part_client().await;
+        for env in &altered {
+            rc2.handle_inbound(env.clone()).await;
+        }
+        assert!(rc2.verified_manifest(room).is_none());
+        assert!(recorder.manifests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn pieces_of_a_forged_or_misattributed_manifest_are_not_accepted() {
+        use locast_protocol::manifest_parts::ManifestPartKind::Published;
+        let room = Uuid::now_v7();
+        let good = signed_film(room, 10, 6_000);
+
+        // A signed field changed, with consistent pieces and digest: the
+        // signature no longer verifies.
+        let mut forged = good.clone();
+        forged.media[0].filename = "other.mkv".into();
+        let (rc, _r) = part_client().await;
+        for env in part_envelopes(&forged, Published, 1, room) {
+            rc.handle_inbound(env).await;
+        }
+        assert!(rc.verified_manifest(room).is_none(), "bad signature");
+
+        // Signed by a key other than the invite's host.
+        let (rc, _r) = part_client().await;
+        rc.set_expected_host_pubkey([7u8; 32]);
+        for env in part_envelopes(&good, Published, 1, room) {
+            rc.handle_inbound(env).await;
+        }
+        assert!(rc.verified_manifest(room).is_none(), "wrong host");
+
+        // Pieces carried under a different room than the manifest names.
+        let (rc, _r) = part_client().await;
+        let other = Uuid::now_v7();
+        for env in part_envelopes(&good, Published, 1, other) {
+            rc.handle_inbound(env).await;
+        }
+        assert!(rc.verified_manifest(room).is_none(), "room mismatch");
+        assert!(rc.verified_manifest(other).is_none(), "room mismatch");
+
+        // The server never sends a publish piece to a client.
+        let (rc, _r) = part_client().await;
+        for env in part_envelopes(
+            &good,
+            locast_protocol::manifest_parts::ManifestPartKind::Publish,
+            0,
+            room,
+        ) {
+            rc.handle_inbound(env).await;
+        }
+        assert!(rc.verified_manifest(room).is_none(), "publish kind");
+    }
+
+    #[tokio::test]
+    async fn a_stale_manifest_in_pieces_does_not_replace_a_newer_one() {
+        use locast_protocol::manifest_parts::ManifestPartKind::Published;
+        let room = Uuid::now_v7();
+        let v1 = signed_film(room, 10, 6_000);
+        let v2 = signed_film(room, 20, 6_000);
+        let (rc, _r) = part_client().await;
+        for env in part_envelopes(&v2, Published, 2, room) {
+            rc.handle_inbound(env).await;
+        }
+        for env in part_envelopes(&v1, Published, 1, room) {
+            rc.handle_inbound(env).await;
+        }
+        assert_eq!(rc.verified_manifest(room), Some(v2));
+        assert_eq!(rc.verified_manifest_version(room), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_fetch_answered_in_pieces_resolves_the_waiting_request() {
+        use locast_protocol::manifest_parts::ManifestPartKind::Response;
+        let room = Uuid::now_v7();
+        let m = signed_film(room, 10, 6_000);
+        let (rc, _r) = part_client().await;
+        let (tx, mut rx) = oneshot::channel();
+        rc.pending
+            .lock()
+            .await
+            .entry(MessageKind::ManifestResponse)
+            .or_default()
+            .push(tx);
+        let envs = part_envelopes(&m, Response, 4, room);
+        let last = envs.len() - 1;
+        for env in &envs[..last] {
+            rc.handle_inbound(env.clone()).await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "the request is not answered by a partial manifest"
+        );
+        rc.handle_inbound(envs[last].clone()).await;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("answered")
+            .expect("reply");
+        assert_eq!(reply.r#type, MessageKind::ManifestResponse);
+        let payload: locast_protocol::room::ManifestResponsePayload =
+            serde_json::from_value(reply.payload).unwrap();
+        assert_eq!(payload.manifest, m);
+        assert_eq!(payload.version, 4);
+        assert_eq!(payload.published_at_ms, 1_700_000_000_000);
     }
 
     #[tokio::test]

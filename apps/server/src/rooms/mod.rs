@@ -30,7 +30,9 @@ pub mod temp_files;
 pub mod validation;
 
 pub use codes::{generate_code, is_valid_code, normalize, ALPHABET, CODE_LEN};
-pub use dispatch::{dispatch_room_message, DispatchContext, RoomDispatchOutcome};
+pub use dispatch::{
+    dispatch_room_message, handle_manifest_part, DispatchContext, PartStep, RoomDispatchOutcome,
+};
 pub use error::RoomError;
 pub use manifest::{handle_manifest_publish, manifest_published_envelope};
 pub use playback::{handle_playback_cmd, PlaybackError};

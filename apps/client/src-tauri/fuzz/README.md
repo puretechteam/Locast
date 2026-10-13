@@ -60,6 +60,18 @@ every accepted frame re-encodes with `codec::encode` and decodes back
 to an equal frame. `validate` is `pub(crate)`, so the round trip is
 how the target re-checks it.
 
+## manifest_parts
+
+`fuzz_targets/manifest_parts.rs` drives
+`locast_protocol::manifest_parts::PartAssembler`, which reassembles a
+manifest sent in `MANIFEST_PART` frames from an untrusted peer. The input is
+used twice: as a JSON array of arbitrary pieces pushed in order into a few
+rooms, and as the raw bytes of a manifest that is split into pieces and pushed
+cleanly, then again with one piece missing. It asserts: nothing panics; the
+assemblies in flight and the budget stay within their caps; a clean split that
+parses reassembles to exactly that manifest; a split missing a piece never
+completes; and dropping the assembler returns every reserved byte.
+
 ## manifest_verify
 
 `fuzz_targets/manifest_verify.rs` feeds arbitrary bytes to
@@ -140,6 +152,7 @@ cargo +nightly fuzz run subtitle_vtt -- -runs=2000 -seed=1 -max_len=65536
 cargo +nightly fuzz run subtitle_ass -- -runs=2000 -seed=1 -max_len=65536
 cargo +nightly fuzz run transfer_frame -- -runs=2000 -seed=1 -max_len=65536
 cargo +nightly fuzz run manifest_verify -- -runs=2000 -seed=1 -max_len=65536
+cargo +nightly fuzz run manifest_parts -- -runs=2000 -seed=1 -max_len=65536
 cargo +nightly fuzz run protocol_url -- -runs=2000 -seed=1 -max_len=1024
 ```
 
@@ -177,6 +190,7 @@ cargo +nightly fuzz run subtitle_vtt -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run subtitle_ass -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run transfer_frame -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run manifest_verify -- -max_total_time=60 -max_len=65536
+cargo +nightly fuzz run manifest_parts -- -max_total_time=60 -max_len=65536
 cargo +nightly fuzz run protocol_url -- -max_total_time=60 -max_len=1024
 ```
 
@@ -198,7 +212,7 @@ cargo +nightly fuzz run --no-include-main-msvc subtitle_ass -- -max_total_time=6
 ```
 
 The same `check` / `run --no-include-main-msvc` pair applies to
-`transfer_frame`, `manifest_verify` and `protocol_url`, with the
+`transfer_frame`, `manifest_verify`, `manifest_parts` and `protocol_url`, with the
 `-max_len` values from the Linux list above.
 
 Notes for Windows:

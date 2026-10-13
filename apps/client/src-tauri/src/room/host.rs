@@ -81,6 +81,14 @@ pub enum HostError {
          signaling limit is {cap} bytes; share fewer or smaller files"
     )]
     ManifestTooLarge { bytes: usize, cap: usize },
+    /// A manifest sent in several frames was never seen coming back from the
+    /// server, after every attempt: a piece was lost or refused. The room is
+    /// untouched; sharing can be tried again.
+    #[error(
+        "the server did not confirm the shared files after {attempts} attempts; \
+         try sharing again"
+    )]
+    PublishNotConfirmed { attempts: usize },
     /// The file on disk no longer matches the size recorded for it, so a
     /// manifest built from it would contradict itself (hashes and chunk
     /// count from the file, size from the database).
@@ -325,23 +333,83 @@ pub async fn build_manifest_for(
 /// ack from the server (the server does not send one in
 /// v1 — it broadcasts `MANIFEST_PUBLISHED` to every
 /// participant including the host).
+///
+/// A manifest that fits one frame goes as a single `MANIFEST_PUBLISH`. A larger
+/// one (one hash per 256 KiB chunk: ~13.7 MB for 50 GiB) goes as paced
+/// `MANIFEST_PART` frames that the server reassembles and verifies as one
+/// signed object; see [`locast_protocol::manifest_parts`].
 pub async fn sign_and_publish(
     identity: &IdentityService,
     signaling: &SignalingClient,
     manifest: &MediaManifest,
 ) -> Result<MediaManifest, HostError> {
+    sign_and_publish_counted(identity, signaling, manifest)
+        .await
+        .map(|(signed, _frames)| signed)
+}
+
+/// [`sign_and_publish`], also returning how many frames the manifest took
+/// (`1` for a single `MANIFEST_PUBLISH`).
+async fn sign_and_publish_counted(
+    identity: &IdentityService,
+    signaling: &SignalingClient,
+    manifest: &MediaManifest,
+) -> Result<(MediaManifest, usize), HostError> {
+    use locast_protocol::manifest_parts::{
+        encode_manifest, part_size_for_frame_cap, split_manifest_bytes, ManifestPartKind,
+        PartError, SINGLE_FRAME_MANIFEST_BYTES,
+    };
     let signed = identity.sign_manifest(manifest).await?;
     let room_uuid = Uuid::parse_str(&signed.room_id)
         .map_err(|e| HostError::Signing(format!("bad room_id uuid: {e}")))?;
-    let env = envelope(
-        MessageKind::ManifestPublish,
-        room_uuid,
-        &ManifestPublishPayload {
-            manifest: signed.clone(),
-        },
-    );
-    signaling.send_envelope(env).await?;
-    Ok(signed)
+    let cap = signaling.max_frame_bytes();
+    let too_large = |e: PartError, bytes: usize| match e {
+        PartError::TooLarge { limit, .. } => HostError::ManifestTooLarge { bytes, cap: limit },
+        PartError::FrameCapTooSmall { cap } => HostError::ManifestTooLarge { bytes, cap },
+        other => HostError::Signing(other.to_string()),
+    };
+    let json = encode_manifest(&signed).map_err(|e| too_large(e, 0))?;
+    if json.len() <= SINGLE_FRAME_MANIFEST_BYTES {
+        let env = envelope(
+            MessageKind::ManifestPublish,
+            room_uuid,
+            &ManifestPublishPayload {
+                manifest: signed.clone(),
+            },
+        );
+        match signaling.send_envelope(env).await {
+            Ok(()) => return Ok((signed, 1)),
+            // A frame cap below the single-frame size: use pieces.
+            Err(SignalingError::OversizedFrame { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let part_size = part_size_for_frame_cap(cap).map_err(|e| too_large(e, json.len()))?;
+    let parts = split_manifest_bytes(
+        &json,
+        ManifestPartKind::Publish,
+        0,
+        0,
+        Uuid::new_v4(),
+        part_size,
+    )
+    .map_err(|e| too_large(e, json.len()))?;
+    let frames = parts.len();
+    let envs = parts
+        .iter()
+        .map(|p| envelope(MessageKind::ManifestPart, room_uuid, p))
+        .collect();
+    signaling.send_envelopes_paced(envs).await?;
+    Ok((signed, frames))
+}
+
+/// How many times a multi-frame publish is attempted before giving up.
+const MAX_PUBLISH_ATTEMPTS: usize = 3;
+
+/// How long to wait for the server's broadcast of a manifest sent in `frames`
+/// frames to come back before trying again.
+fn publish_confirm_timeout(frames: usize) -> std::time::Duration {
+    std::time::Duration::from_secs(30 + 2 * frames as u64)
 }
 
 /// Build the host's invite URL of the form:
@@ -462,23 +530,54 @@ pub async fn build_sign_and_publish_selected(
         selection.as_deref(),
     )
     .await?;
-    let signed = sign_and_publish(&identity, &signaling, &manifest).await?;
-    room_client.set_host_media_selection(selection);
-    // P3-T15: the host is its own trust anchor. Install
-    // the local pubkey as the expected host pubkey, then
-    // accept our own manifest into the verified cache.
-    // Without this, the host dispatch's
-    // `room.verified_manifest(room_id)` returns `None`
-    // and the sender cannot serve chunks.
+    // The host is its own trust anchor; installed before publishing so the
+    // server's broadcast of a large manifest is accepted when it comes back.
     room_client.set_expected_host_pubkey(host_pubkey);
-    if let Err(e) = room_client
-        .accept_manifest(signed.clone(), 1, signed.created_at, "LOCAL_PUBLISH")
-        .await
-    {
+    let mut attempt = 0;
+    let (signed, confirmed) = loop {
+        attempt += 1;
+        let (signed, frames) = sign_and_publish_counted(&identity, &signaling, &manifest).await?;
+        if frames <= 1 {
+            // One frame: sent, as it always was.
+            break (signed, false);
+        }
+        // Several frames: any piece lost on the way (a rate-limit drop, a
+        // refusal) would leave the room without a manifest and no error, so
+        // wait for the server's broadcast of this manifest to come back.
+        let signature = signed
+            .host_signature
+            .as_ref()
+            .map(|s| s.value.clone())
+            .unwrap_or_default();
+        if room_client
+            .wait_for_manifest_signature(room_id, &signature, publish_confirm_timeout(frames))
+            .await
+        {
+            break (signed, true);
+        }
+        if attempt >= MAX_PUBLISH_ATTEMPTS {
+            return Err(HostError::PublishNotConfirmed { attempts: attempt });
+        }
         warn!(
-            error = ?e,
-            "host: failed to accept own manifest into RoomClient cache; sender dispatch will be unable to serve chunks"
+            attempt,
+            frames, "host: the server did not confirm a multi-frame manifest; sending it again"
         );
+    };
+    room_client.set_host_media_selection(selection);
+    // P3-T15: accept our own manifest into the verified cache. Without
+    // this, the host dispatch's `room.verified_manifest(room_id)` returns
+    // `None` and the sender cannot serve chunks. (A confirmed multi-frame
+    // publish already came back through the broadcast.)
+    if !confirmed {
+        if let Err(e) = room_client
+            .accept_manifest(signed.clone(), 1, signed.created_at, "LOCAL_PUBLISH")
+            .await
+        {
+            warn!(
+                error = ?e,
+                "host: failed to accept own manifest into RoomClient cache; sender dispatch will be unable to serve chunks"
+            );
+        }
     }
     Ok(())
 }

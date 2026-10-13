@@ -500,6 +500,40 @@ impl RoomRegistry {
                 RoomEvent::ChatMessage(ChatMessage { room_id, .. }) => *room_id,
                 _ => room_id_for_event(event),
             };
+            // A manifest too big for one frame goes out as MANIFEST_PART
+            // pieces. They are published here, in one run, so every
+            // subscriber sees them contiguous and in order (the caller holds
+            // the room lock).
+            if let RoomEvent::ManifestPublished {
+                manifest,
+                version,
+                published_at_ms,
+                ..
+            } = event
+            {
+                if let Some(parts) = super::manifest::split_for_wire(
+                    locast_protocol::manifest_parts::ManifestPartKind::Published,
+                    manifest,
+                    *version,
+                    *published_at_ms,
+                ) {
+                    for part in parts {
+                        self.publish(
+                            room_id,
+                            BroadcastItem {
+                                kind: locast_protocol::envelope::MessageKind::ManifestPart,
+                                payload: serde_json::to_value(&part)
+                                    .unwrap_or(serde_json::json!({})),
+                                room_id,
+                                originator,
+                                sender: None,
+                                seq: 0,
+                            },
+                        );
+                    }
+                    return;
+                }
+            }
             let mut item = event_to_broadcast_item(event, room_id, originator);
             item.seq = seq;
             self.publish(room_id, item);

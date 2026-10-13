@@ -534,6 +534,7 @@ jobs:
         subtitle_ass
         transfer_frame
         manifest_verify
+        manifest_parts
         protocol_url
     steps:
       - name: Checkout

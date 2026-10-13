@@ -216,6 +216,10 @@ pub struct SignalingInner {
     /// link Tauri's WebView2 / GUI subsystem DLLs on
     /// Windows (the closure type is `AppHandle`-free).
     pub emit_state: Option<Arc<dyn Fn(ConnectionState) + Send + Sync>>,
+    /// The sustained bytes-per-second the server said it will accept from this
+    /// connection (WELCOME). `None` before the first handshake. Used to pace a
+    /// message sent in many frames.
+    pub server_bytes_per_sec: Option<u32>,
 }
 
 impl SignalingInner {
@@ -229,6 +233,7 @@ impl SignalingInner {
             outbound_notify: Arc::new(tokio::sync::Notify::new()),
             emit_state: None,
             on_authenticated: Vec::new(),
+            server_bytes_per_sec: None,
         }
     }
 }
@@ -483,12 +488,72 @@ impl SignalingClient {
     /// currently authenticated (the bearer is not held) or
     /// if the connection is not running.
     pub async fn send_envelope(&self, env: Envelope) -> Result<(), SignalingError> {
+        self.send_envelope_in_session(env, None).await
+    }
+
+    /// The largest frame, in bytes, this client sends or accepts.
+    pub fn max_frame_bytes(&self) -> usize {
+        self.config.max_frame_bytes
+    }
+
+    /// Send the frames of ONE message that is split over several envelopes
+    /// (a manifest too big for one frame), in order, spaced so the average
+    /// stays inside what the server accepts from a connection.
+    ///
+    /// The frames are only meaningful together on one connection (the server
+    /// reassembles them per connection), so the send stops with an error as
+    /// soon as the session changes (the connection dropped and came back with
+    /// a new bearer): the caller starts over rather than sending the rest of
+    /// the pieces into a fresh connection.
+    pub async fn send_envelopes_paced(&self, envs: Vec<Envelope>) -> Result<(), SignalingError> {
+        let (session, rate) = {
+            let g = self.inner.lock().await;
+            let bearer = g
+                .bearer
+                .as_ref()
+                .ok_or(SignalingError::IdentityNotInitialized)?;
+            let advertised = g
+                .server_bytes_per_sec
+                .unwrap_or(DEFAULT_SERVER_BYTES_PER_SEC);
+            (bearer.token, paced_rate(advertised))
+        };
+        let started = tokio::time::Instant::now();
+        let mut sent: u64 = 0;
+        for env in envs {
+            // The frame as it will be written, so the budget counts what the
+            // server counts.
+            let len = rmp_serde::to_vec_named(&env)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
+            // Allow `PACED_BURST_BYTES` up front, then `rate` per second.
+            let earliest = (sent + len).saturating_sub(PACED_BURST_BYTES) as f64 / rate as f64;
+            let due = started + Duration::from_secs_f64(earliest);
+            tokio::time::sleep_until(due).await;
+            self.send_envelope_in_session(env, Some(session)).await?;
+            sent += len;
+        }
+        Ok(())
+    }
+
+    async fn send_envelope_in_session(
+        &self,
+        env: Envelope,
+        session: Option<[u8; 32]>,
+    ) -> Result<(), SignalingError> {
         let (bearer, tx) = {
             let g = self.inner.lock().await;
             let bearer = g
                 .bearer
                 .as_ref()
                 .ok_or(SignalingError::IdentityNotInitialized)?;
+            if let Some(expected) = session {
+                if bearer.token != expected {
+                    return Err(SignalingError::Protocol {
+                        message: "the connection was re-established while a multi-frame message                                   was being sent"
+                            .into(),
+                    });
+                }
+            }
             // Only while the handshake is complete. The bearer outlives a
             // dropped connection (it is kept for the resume attempt), so
             // without this check an envelope sent during the outage was
@@ -551,6 +616,19 @@ impl SignalingClient {
         self.inner.lock().await.outbound_notify.notify_one();
         Ok(())
     }
+}
+
+/// What a server with no advertised limit is assumed to accept, bytes/s.
+const DEFAULT_SERVER_BYTES_PER_SEC: u32 = 1_000_000;
+
+/// Frames of a multi-frame message may use up front this many bytes of the
+/// server's burst allowance (default burst: 2 MB).
+const PACED_BURST_BYTES: u64 = 1_000_000;
+
+/// 60% of the advertised sustained rate, leaving the rest for the
+/// connection's other traffic (playback, positions, WebRTC signaling).
+fn paced_rate(advertised_bytes_per_sec: u32) -> u64 {
+    (u64::from(advertised_bytes_per_sec) * 6 / 10).max(16 * 1024)
 }
 
 /// Top-level connection loop. Drives the state machine: open
@@ -899,6 +977,7 @@ async fn run_handshake(
                 {
                     let mut g = inner.lock().await;
                     g.state.session_id = Some(w.session_id.to_string());
+                    g.server_bytes_per_sec = Some(w.config.rate.bytes_per_sec);
                 }
                 welcome = Some(w);
             }

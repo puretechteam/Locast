@@ -77,13 +77,43 @@ command must reach it. About two seconds per cycle. The ordinary
 - Behaviour across NATs. Everything here is on localhost.
 - Release-build transfer throughput.
 
-## Sharing films larger than about 4 GB
+## Sharing large films (multi-frame manifests)
 
-The signed manifest lists a SHA-256 per 256 KiB chunk (about 66 bytes each) in
-one signaling frame, capped at 1 MiB by default, which fits roughly 15 800
-chunks (about 4.1 GB). A larger selection is refused with a clear message.
-The caps are configurable, and `tests/large_manifest.rs` shows a ~10.5 GB
-manifest going through with them raised: `LOCAST_BIND_MAX_FRAME_BYTES` and
-`LOCAST_RATE_BYTES_BURST` on the server, `LOCAST_SIGNALING_MAX_FRAME_BYTES` on
-every client. Whether to raise the defaults, scale the chunk size with the file
-or send the hashes another way is a product decision.
+The signed manifest lists a SHA-256 per 256 KiB chunk (about 67 bytes each):
+~2.7 MB for a 10.5 GB film, ~13.7 MB for the default 50 GiB media quota. The
+signaling socket caps a frame at 1 MiB, so a manifest above ~640 KiB (about
+9,500 chunks, 2.4 GB) travels as `MANIFEST_PART` frames instead of one
+`MANIFEST_PUBLISH`; smaller manifests are unchanged, so older peers still work
+for them. This works with the default settings on both ends; nothing needs
+raising.
+
+- The host serializes the ONE signed manifest, splits it into pieces of at
+  most 512 KiB (about 683 KiB as base64), and paces them at 60% of the
+  server's advertised byte rate (WELCOME), so a 50 GiB manifest takes about
+  30 seconds to send. It then waits for the server's broadcast of that
+  manifest to come back, and re-sends it (a fresh assembly, up to three
+  attempts) if it does not, so a lost piece is an error or a retry, never a
+  silently missing manifest.
+- The server reassembles per connection, only for the room's host, then runs
+  the same checks as for a single frame (signature, signed room id, signer ==
+  authenticated host, version, storage) before relaying the pieces to the room.
+  A late joiner's `MANIFEST_REQUEST` is answered in pieces the same way.
+- A viewer reassembles and then runs exactly the single-frame acceptance
+  (signature, trust anchor from the invite, stale-version guard), plus a check
+  that the manifest names the room the pieces came in. A manifest is never
+  accepted partially.
+- Limits: 32 MiB per manifest (about 120 GiB of media), 1,024 pieces, one
+  assembly per server connection, two per client, all charged to a shared byte
+  budget; an assembly with no progress for 30 s (server) or 60 s (client)
+  expires and a dropped connection frees it. An out-of-order or conflicting
+  piece, a changed header or a digest mismatch drops the assembly.
+- A selection whose manifest exceeds 32 MiB is refused up front with
+  `ManifestTooLarge`.
+
+Tests: `tests/large_manifest.rs` (client crate) runs a 10.5 GB and a 50 GiB
+manifest through the production signing, pacing, server relay, viewer
+assembly and a late joiner's fetch with default settings;
+`apps/server/tests/rooms.rs` covers missing, duplicate, conflicting, altered
+and oversized pieces, a non-host, and a host that disconnects mid-publication;
+`shared/protocol/src/manifest_parts.rs` and `net/room.rs` have the unit tests;
+`fuzz_targets/manifest_parts.rs` fuzzes the assembler.

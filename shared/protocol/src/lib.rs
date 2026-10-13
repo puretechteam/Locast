@@ -20,6 +20,7 @@ use ts_rs::TS;
 pub mod download;
 pub mod envelope;
 pub mod handshake;
+pub mod manifest_parts;
 pub mod room;
 
 /// Library version string.
@@ -313,6 +314,16 @@ mod tests {
         rendered.push_str(
             &crate::room::ManifestResponsePayload::export_to_string(&cfg)
                 .expect("render ManifestResponsePayload bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::manifest_parts::ManifestPartKind::export_to_string(&cfg)
+                .expect("render ManifestPartKind bindings"),
+        );
+        rendered.push('\n');
+        rendered.push_str(
+            &crate::manifest_parts::ManifestPartPayload::export_to_string(&cfg)
+                .expect("render ManifestPartPayload bindings"),
         );
         rendered.push('\n');
         rendered.push_str(

@@ -306,6 +306,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
     // without limit. The forwarder awaits space (so the room broadcast
     // channel lags and DRAW_SYNC recovery applies); signals are dropped.
     let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Envelope>(OUTBOUND_QUEUE_CAP);
+    // Pieces of a manifest too big for one frame (MANIFEST_PART) are
+    // reassembled here, one assembly per connection. Dropped with the
+    // connection, which releases whatever it held; `parts_tick` expires one the
+    // host abandoned on a connection that stays open.
+    let parts = Arc::new(Mutex::new(crate::rooms::manifest::new_part_assembler()));
+    let mut parts_tick = tokio::time::interval(Duration::from_secs(5));
+    parts_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     debug!(request_id = %request_id, "ws connection open");
 
@@ -385,6 +392,13 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
                 )
                 .await;
                 break;
+            }
+            _ = parts_tick.tick() => {
+                let expired = parts.lock().await.expire(Instant::now());
+                if expired > 0 {
+                    debug!(request_id = %request_id, "abandoned manifest assembly expired");
+                }
+                continue;
             }
             res = receiver.next() => match res {
                 Some(Ok(f)) => f,
@@ -656,6 +670,7 @@ async fn connection_loop(socket: WebSocket, state: AppState) {
             authed,
             request_id,
             handshake_deadline,
+            &parts,
         )
         .await;
 
@@ -870,6 +885,7 @@ impl DispatchOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     envelope: Envelope,
     state: &AppState,
@@ -878,10 +894,11 @@ async fn dispatch(
     authed: Option<(Uuid, [u8; 32])>,
     request_id: Uuid,
     handshake_deadline: i64,
+    parts: &Arc<Mutex<locast_protocol::manifest_parts::PartAssembler>>,
 ) -> DispatchOutcome {
     if let Some((_user_id, _pubkey)) = authed {
         // Post-handshake path.
-        return dispatch_authed(envelope, state, authed, request_id).await;
+        return dispatch_authed(envelope, state, authed, request_id, parts).await;
     }
 
     match envelope.r#type {
@@ -933,6 +950,7 @@ async fn dispatch_authed(
     state: &AppState,
     authed: Option<(Uuid, [u8; 32])>,
     request_id: Uuid,
+    parts: &Arc<Mutex<locast_protocol::manifest_parts::PartAssembler>>,
 ) -> DispatchOutcome {
     // Post-handshake: every message must carry a bearer field
     // in its payload. The bearer is validated against the
@@ -990,6 +1008,36 @@ async fn dispatch_authed(
     if envelope.r#type.is_skew_probe() {
         return handle_skew_probe(envelope, state.clock.as_ref(), request_id).await;
     }
+    // A piece of a manifest sent in several frames. Pieces accumulate until
+    // the last one completes the manifest, which then continues below as an
+    // ordinary MANIFEST_PUBLISH (so it takes the same capability gate,
+    // signature and binding checks, version, storage and broadcast).
+    let envelope = if envelope.r#type == MessageKind::ManifestPart {
+        let step = {
+            let mut assembler = parts.lock().await;
+            crate::rooms::handle_manifest_part(
+                &envelope,
+                &state.rooms,
+                state.clock.as_ref(),
+                user_id,
+                &mut assembler,
+            )
+            .await
+        };
+        match step {
+            crate::rooms::PartStep::Pending => return DispatchOutcome::default(),
+            crate::rooms::PartStep::Reply(reply) => {
+                let mut actions = Vec::new();
+                if let Ok(msg) = encode_envelope_message(&reply) {
+                    actions.push(Action::Send(msg));
+                }
+                return DispatchOutcome { actions };
+            }
+            crate::rooms::PartStep::Publish(publish) => publish,
+        }
+    } else {
+        envelope
+    };
     // The message passed bearer validation. Route every
     // client-originated room envelope to the room dispatcher,
     // which runs the capability gate and the per-type handler.

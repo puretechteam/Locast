@@ -788,6 +788,75 @@ fn position_code_for_message(code: RoomErrorCode) -> &'static str {
     }
 }
 
+/// What a `MANIFEST_PART` from a client leads to.
+pub enum PartStep {
+    /// More pieces are expected; nothing to send.
+    Pending,
+    /// The piece was refused; send this `ROOM_ERROR` to the caller.
+    Reply(Envelope),
+    /// The last piece arrived: this is the reassembled manifest as an
+    /// ordinary `MANIFEST_PUBLISH`, to run through the normal publish path
+    /// (capability gate, signature check, room and signer binding, version,
+    /// persistence, broadcast).
+    Publish(Envelope),
+}
+
+/// A host's `MANIFEST_PART`. Only the room's host may feed an assembly (the
+/// capability gate runs on every piece, so a non-host cannot make the server
+/// hold memory); the reassembled manifest then takes exactly the path of a
+/// single-frame `MANIFEST_PUBLISH`.
+pub async fn handle_manifest_part(
+    envelope: &Envelope,
+    registry: &RoomRegistry,
+    clock: &dyn Clock,
+    user_id: Uuid,
+    parts: &mut locast_protocol::manifest_parts::PartAssembler,
+) -> PartStep {
+    use locast_protocol::manifest_parts::{ManifestPartKind, ManifestPartPayload};
+    let now_ms = clock.now_ms();
+    let refuse = |code: RoomErrorCode, message: String| {
+        PartStep::Reply(err_envelope(MessageKind::RoomError, code, message, now_ms))
+    };
+    let Some(room_id) = envelope.room_id else {
+        return refuse(
+            RoomErrorCode::InvalidState,
+            "manifest piece names no room".into(),
+        );
+    };
+    if let Err(e) =
+        caps::check_capability(registry, user_id, Some(room_id), Command::PublishManifest).await
+    {
+        parts.clear();
+        let code = match e {
+            caps::CapsError::NotHost => RoomErrorCode::NotHost,
+            caps::CapsError::NotMember => RoomErrorCode::NotJoined,
+        };
+        return refuse(code, e.to_string());
+    }
+    let part: ManifestPartPayload = match serde_json::from_value(envelope.payload.clone()) {
+        Ok(p) => p,
+        Err(_) => return refuse(RoomErrorCode::InvalidState, "bad manifest piece".into()),
+    };
+    if part.kind != ManifestPartKind::Publish {
+        return refuse(
+            RoomErrorCode::InvalidState,
+            "only a publish piece may be sent to the server".into(),
+        );
+    }
+    match parts.push(room_id, &part, std::time::Instant::now()) {
+        Ok(None) => PartStep::Pending,
+        Ok(Some(done)) => PartStep::Publish(envelope_with_payload(
+            MessageKind::ManifestPublish,
+            Some(room_id),
+            &ManifestPublishPayload {
+                manifest: done.manifest,
+            },
+            now_ms,
+        )),
+        Err(e) => refuse(RoomErrorCode::InvalidState, e.to_string()),
+    }
+}
+
 /// P3-T04 prerequisite 3: the manifest fetch dispatch.
 /// A late-joiner catch-up request. The server replies to
 /// the caller only (not broadcast) with a
@@ -804,13 +873,31 @@ async fn handle_manifest_fetch_dispatch(
     let mut out = RoomDispatchOutcome::default();
     match handle_manifest_fetch(&envelope, user_id, registry).await {
         Ok(payload) => {
-            let env = envelope_with_payload(
-                MessageKind::ManifestResponse,
-                envelope.room_id,
-                &payload,
-                now_ms,
-            );
-            out.to_caller.push(env);
+            // Too big for one frame: the response goes as MANIFEST_PART
+            // pieces, which the room client reassembles into the same
+            // response.
+            if let Some(parts) = super::manifest::split_for_wire(
+                locast_protocol::manifest_parts::ManifestPartKind::Response,
+                &payload.manifest,
+                payload.version,
+                payload.published_at_ms,
+            ) {
+                for part in &parts {
+                    out.to_caller.push(envelope_with_payload(
+                        MessageKind::ManifestPart,
+                        envelope.room_id,
+                        part,
+                        now_ms,
+                    ));
+                }
+            } else {
+                out.to_caller.push(envelope_with_payload(
+                    MessageKind::ManifestResponse,
+                    envelope.room_id,
+                    &payload,
+                    now_ms,
+                ));
+            }
         }
         Err(e) => {
             let code: RoomErrorCode = match e {

@@ -57,6 +57,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use locast_manifest::MediaManifest;
 use locast_protocol::envelope::MessageKind;
+use locast_protocol::manifest_parts::{
+    split_manifest_bytes, ManifestPartKind, ManifestPartPayload, MAX_PART_BYTES,
+    SINGLE_FRAME_MANIFEST_BYTES,
+};
 use locast_protocol::room::{
     ManifestPublishPayload, ManifestPublishedPayload, ParticipantStatus, RoomErrorCode,
     RoomErrorPayload,
@@ -69,6 +73,33 @@ use super::registry::{CachedManifest, RoomEvent, RoomRegistry};
 use super::state::RoomLifecycle;
 use crate::db::Db;
 use crate::time::Clock;
+
+/// Most bytes of manifest pieces all connections together may be holding
+/// at once (8 assemblies of the largest supported size).
+pub const MANIFEST_ASSEMBLY_BUDGET_BYTES: usize =
+    8 * locast_protocol::manifest_parts::MAX_ASSEMBLED_BYTES;
+
+/// How long a half-received manifest may sit without a new piece.
+pub const MANIFEST_ASSEMBLY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The process-wide budget every connection's assembler is charged to.
+pub fn assembly_budget() -> &'static locast_protocol::manifest_parts::ByteBudget {
+    static BUDGET: std::sync::OnceLock<locast_protocol::manifest_parts::ByteBudget> =
+        std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        locast_protocol::manifest_parts::ByteBudget::new(MANIFEST_ASSEMBLY_BUDGET_BYTES)
+    })
+}
+
+/// A fresh per-connection assembler: one manifest in flight at a time (a
+/// new publish replaces a half-sent one), sharing the process-wide budget.
+pub fn new_part_assembler() -> locast_protocol::manifest_parts::PartAssembler {
+    locast_protocol::manifest_parts::PartAssembler::new(
+        1,
+        MANIFEST_ASSEMBLY_TTL,
+        assembly_budget().clone(),
+    )
+}
 
 /// How many of a room's most recent manifest versions the database keeps. Only
 /// the latest is ever read; a few more are kept for debugging.
@@ -251,6 +282,42 @@ pub async fn handle_manifest_publish(
     registry.publish_events(std::slice::from_ref(&event), |_| room_id);
     drop(state);
     Ok(event)
+}
+
+/// The `MANIFEST_PART` pieces to send for `manifest`, or `None` when it fits
+/// one legacy frame ([`SINGLE_FRAME_MANIFEST_BYTES`]) and goes as a
+/// `MANIFEST_PUBLISHED` / `MANIFEST_RESPONSE` as before. Each call uses a fresh
+/// `assembly_id`.
+pub fn split_for_wire(
+    kind: ManifestPartKind,
+    manifest: &MediaManifest,
+    version: i64,
+    published_at_ms: i64,
+) -> Option<Vec<ManifestPartPayload>> {
+    let bytes = match locast_protocol::manifest_parts::encode_manifest(manifest) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "manifest cannot be split for the wire; sending it whole");
+            return None;
+        }
+    };
+    if bytes.len() <= SINGLE_FRAME_MANIFEST_BYTES {
+        return None;
+    }
+    match split_manifest_bytes(
+        &bytes,
+        kind,
+        version,
+        published_at_ms,
+        Uuid::new_v4(),
+        MAX_PART_BYTES,
+    ) {
+        Ok(parts) => Some(parts),
+        Err(e) => {
+            tracing::warn!(error = %e, "manifest cannot be split for the wire; sending it whole");
+            None
+        }
+    }
 }
 
 /// The raw Ed25519 public key that signed `manifest`. Only called

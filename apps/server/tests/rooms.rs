@@ -4280,3 +4280,436 @@ async fn stale_connection_teardown_does_not_end_a_live_hosts_room() {
         .expect("relay delivers to the live connection");
     let _ = next_of_kind(&mut ws_h2, MessageKind::Hello, "live host connection").await;
 }
+
+// ---------------------------------------------------------------------------
+// MANIFEST_PART: a manifest too big for one frame, in pieces.
+// ---------------------------------------------------------------------------
+
+use locast_protocol::manifest_parts::{
+    encode_manifest, split_manifest_bytes, ByteBudget, ManifestPartKind, ManifestPartPayload,
+    PartAssembler, MAX_ASSEMBLED_BYTES, MAX_PARTS, MAX_PART_BYTES,
+};
+
+/// Config for these tests: the byte-rate limit is out of the way (the pacing
+/// that keeps a real host inside the DEFAULT limit is exercised by the client
+/// crate's `large_manifest` test), and the host's grace is long enough to
+/// reconnect.
+fn parts_config() -> Config {
+    let mut c = test_config();
+    c.rate_bytes_per_sec = 500_000_000;
+    c.rate_bytes_burst = 500_000_000;
+    c.host_disconnect_grace_ms = 30_000;
+    // These tests take longer than the default presence timeout, and the
+    // silent viewer would be dropped from the room in the middle of them.
+    c.participant_disconnect_after_ms = 600_000;
+    c
+}
+
+/// A manifest of `chunks` chunk hashes, validly signed by `signer` for
+/// `room_id`.
+fn big_manifest(room_id: Uuid, signer: &SigningKey, chunks: u32) -> locast_manifest::MediaManifest {
+    use locast_manifest::{MediaEntry, MediaManifest, Source};
+    locast_manifest::sign_manifest(
+        &signer.to_bytes(),
+        &MediaManifest {
+            manifest_version: 1,
+            room_id: room_id.to_string(),
+            media: vec![MediaEntry {
+                id: Uuid::new_v4().to_string(),
+                filename: "long film.mkv".into(),
+                sha256: "ab".repeat(32),
+                blake3: "cd".repeat(32),
+                size_bytes: u64::from(chunks) * 262_144,
+                mime: "video/x-matroska".into(),
+                duration_ms: 10_800_000,
+                dimensions: None,
+                codecs: None,
+                sources: vec![Source {
+                    peer_id: "p".repeat(64),
+                    url_hint: None,
+                    priority: 0,
+                    chunk_size: 262_144,
+                    total_chunks: chunks,
+                    chunk_hashes: (0..chunks).map(|i| format!("{i:064x}")).collect(),
+                }],
+            }],
+            subtitles: vec![],
+            created_at: 1,
+            host_signature: None,
+        },
+    )
+    .expect("sign manifest")
+}
+
+fn publish_parts(
+    manifest: &locast_manifest::MediaManifest,
+    part_size: usize,
+) -> Vec<ManifestPartPayload> {
+    split_manifest_bytes(
+        &encode_manifest(manifest).unwrap(),
+        ManifestPartKind::Publish,
+        0,
+        0,
+        Uuid::new_v4(),
+        part_size,
+    )
+    .unwrap()
+}
+
+fn part_envelope(token: [u8; 32], room_id: Uuid, part: &ManifestPartPayload) -> Envelope {
+    room_scoped_envelope(
+        token,
+        MessageKind::ManifestPart,
+        room_id,
+        serde_json::to_value(part).unwrap(),
+    )
+}
+
+/// Read MANIFEST_PART frames until one manifest is complete.
+async fn read_assembled(
+    ws: &mut Ws,
+    kind: ManifestPartKind,
+    ctx: &str,
+) -> locast_protocol::manifest_parts::AssembledManifest {
+    let mut assembler = PartAssembler::new(1, Duration::from_secs(60), ByteBudget::new(1 << 30));
+    loop {
+        let env = next_of_kind(ws, MessageKind::ManifestPart, ctx).await;
+        // Every frame stays inside the default frame cap.
+        assert!(
+            encode(&env).len() < 1_048_576,
+            "{ctx}: a piece exceeded the frame cap"
+        );
+        let part: ManifestPartPayload = serde_json::from_value(env.payload).unwrap();
+        assert_eq!(part.kind, kind, "{ctx}");
+        if let Some(done) = assembler
+            .push(env.room_id.unwrap(), &part, std::time::Instant::now())
+            .unwrap_or_else(|e| panic!("{ctx}: {e}"))
+        {
+            return done;
+        }
+    }
+}
+
+struct PartsRoom {
+    harness: TestHarness,
+    ws_h: Ws,
+    ws_v: Ws,
+    h: AuthedClient,
+    v: AuthedClient,
+    kp_h: SigningKey,
+    kp_v: SigningKey,
+    room: RoomSummary,
+}
+
+async fn parts_room() -> PartsRoom {
+    let harness = spawn_test_server_with_config(parts_config()).await;
+    let (kp_h, _) = fresh_keypair();
+    let (kp_v, _) = fresh_keypair();
+    let mut ws_h = connect(harness.addr).await;
+    let mut ws_v = connect(harness.addr).await;
+    let h = complete_handshake(&mut ws_h, &kp_h).await;
+    let v = complete_handshake(&mut ws_v, &kp_v).await;
+    send_envelope(&mut ws_h, &room_create_envelope(h.token, "Parts", true)).await;
+    let room = serde_json::from_value::<RoomCreatedPayload>(
+        next_of_kind(&mut ws_h, MessageKind::RoomCreated, "create")
+            .await
+            .payload,
+    )
+    .unwrap()
+    .room;
+    send_envelope(&mut ws_v, &room_join_envelope(v.token, &room.code, "V")).await;
+    next_of_kind(&mut ws_v, MessageKind::RoomJoined, "join").await;
+    PartsRoom {
+        harness,
+        ws_h,
+        ws_v,
+        h,
+        v,
+        kp_h,
+        kp_v,
+        room,
+    }
+}
+
+impl PartsRoom {
+    async fn nothing_published(&mut self, ctx: &str) {
+        assert!(
+            self.harness
+                .db
+                .get_latest_room_manifest(self.room.id)
+                .await
+                .expect("db")
+                .is_none(),
+            "{ctx}: persisted"
+        );
+        assert!(
+            self.harness
+                .rooms
+                .current_manifest(self.room.id)
+                .await
+                .is_none(),
+            "{ctx}: cached"
+        );
+        assert_no_kind_within(
+            &mut self.ws_v,
+            MessageKind::ManifestPart,
+            Duration::from_millis(250),
+            ctx,
+        )
+        .await;
+        assert_no_kind_within(
+            &mut self.ws_v,
+            MessageKind::ManifestPublished,
+            Duration::from_millis(50),
+            ctx,
+        )
+        .await;
+    }
+}
+
+/// A manifest above one frame (a ~10.5 GB film: 40,000 chunks, ~2.7 MB) is
+/// sent by the host in pieces, reassembled, verified, stored and relayed in
+/// pieces; the viewer and the host rebuild exactly what was signed, and a late
+/// joiner's fetch is answered the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_manifest_above_one_frame_is_relayed_in_pieces_and_arrives_whole() {
+    let mut r = parts_room().await;
+    let manifest = big_manifest(r.room.id, &r.kp_h, 40_000);
+    let parts = publish_parts(&manifest, MAX_PART_BYTES);
+    assert!(parts.len() > 3, "a multi-frame manifest ({})", parts.len());
+    for p in &parts {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+
+    let seen = read_assembled(&mut r.ws_v, ManifestPartKind::Published, "viewer").await;
+    assert_eq!(
+        seen.manifest, manifest,
+        "every hash and field, and the signature"
+    );
+    assert_eq!(seen.version, 1);
+    assert_eq!(seen.room_id, r.room.id);
+    locast_manifest::verify_manifest(&seen.manifest).expect("the viewer can verify it");
+    // The host gets the broadcast too, as the single-frame path does.
+    let echo = read_assembled(&mut r.ws_h, ManifestPartKind::Published, "host").await;
+    assert_eq!(echo.manifest, manifest);
+    // Stored once, cached, and no single-frame copy was sent.
+    let row = r
+        .harness
+        .db
+        .get_latest_room_manifest(r.room.id)
+        .await
+        .unwrap()
+        .expect("persisted");
+    assert_eq!(row.version, 1);
+    assert_eq!(
+        r.harness
+            .rooms
+            .current_manifest(r.room.id)
+            .await
+            .unwrap()
+            .manifest,
+        manifest
+    );
+    assert_no_kind_within(
+        &mut r.ws_v,
+        MessageKind::ManifestPublished,
+        Duration::from_millis(200),
+        "no single-frame copy",
+    )
+    .await;
+
+    // A late joiner's MANIFEST_REQUEST is answered in pieces as well.
+    let (kp_l, _) = fresh_keypair();
+    let mut ws_l = connect(r.harness.addr).await;
+    let l = complete_handshake(&mut ws_l, &kp_l).await;
+    send_envelope(&mut ws_l, &room_join_envelope(l.token, &r.room.code, "L")).await;
+    next_of_kind(&mut ws_l, MessageKind::RoomJoined, "late join").await;
+    send_envelope(
+        &mut ws_l,
+        &room_scoped_envelope(
+            l.token,
+            MessageKind::ManifestRequest,
+            r.room.id,
+            json!({ "media_id": Uuid::new_v4() }),
+        ),
+    )
+    .await;
+    let fetched = read_assembled(&mut ws_l, ManifestPartKind::Response, "late joiner").await;
+    assert_eq!(fetched.manifest, manifest);
+    assert_eq!(fetched.version, 1);
+}
+
+/// Manifests that fit one frame keep using the single-frame messages, so
+/// small shares behave exactly as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_small_manifest_still_travels_as_one_frame() {
+    let mut r = parts_room().await;
+    let manifest = big_manifest(r.room.id, &r.kp_h, 50);
+    send_envelope(
+        &mut r.ws_h,
+        &room_scoped_envelope(
+            r.h.token,
+            MessageKind::ManifestPublish,
+            r.room.id,
+            json!({ "manifest": manifest }),
+        ),
+    )
+    .await;
+    let env = next_of_kind(&mut r.ws_v, MessageKind::ManifestPublished, "viewer").await;
+    assert_eq!(env.payload["version"], 1);
+    assert_no_kind_within(
+        &mut r.ws_v,
+        MessageKind::ManifestPart,
+        Duration::from_millis(200),
+        "no pieces for a small manifest",
+    )
+    .await;
+}
+
+/// Hostile and broken input: nothing is stored or relayed, each refusal is a
+/// ROOM_ERROR to the sender, and the connection and the room survive a clean
+/// retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_or_hostile_pieces_are_refused_and_nothing_is_published() {
+    let mut r = parts_room().await;
+    let good = big_manifest(r.room.id, &r.kp_h, 20_000);
+    let parts = publish_parts(&good, 100_000);
+    assert!(parts.len() > 6);
+
+    // (a) A missing piece: 0, 1, then 3.
+    for i in [0usize, 1, 3] {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, &parts[i])).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "gap").await;
+    // The rest of that assembly finds nothing to continue.
+    send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, &parts[4])).await;
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "after the gap").await;
+    r.nothing_published("gap").await;
+
+    // (b) A duplicate with different content.
+    let mut conflicting = parts[1].clone();
+    conflicting.data = parts[0].data.clone();
+    for p in [&parts[0], &parts[1], &conflicting] {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "conflict").await;
+    r.nothing_published("conflict").await;
+
+    // (c) A piece altered in transit: the digest does not match.
+    let mut altered = parts.clone();
+    let mut raw = locast_crypto::ed25519::from_base64(&altered[2].data).unwrap();
+    raw[5] ^= 0x01;
+    altered[2].data = locast_crypto::ed25519::to_base64(&raw);
+    for p in &altered {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "digest").await;
+    r.nothing_published("digest").await;
+
+    // (d) A signed field altered by someone who also fixes the digest: the
+    // pieces are consistent, the signature is not.
+    let mut forged = good.clone();
+    forged.media[0].filename = "other.mkv".into();
+    for p in &publish_parts(&forged, 100_000) {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "bad signature").await;
+    r.nothing_published("bad signature").await;
+
+    // (e) Validly signed, but by a key that is not the authenticated host.
+    let wrong_signer = big_manifest(r.room.id, &r.kp_v, 20_000);
+    for p in &publish_parts(&wrong_signer, 100_000) {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "wrong signer").await;
+    // (f) Validly signed, but for another room.
+    let wrong_room = big_manifest(Uuid::new_v4(), &r.kp_h, 20_000);
+    for p in &publish_parts(&wrong_room, 100_000) {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, "wrong room").await;
+    r.nothing_published("wrong signer / room").await;
+
+    // (g) Abusive headers: a declared size and a piece count over the limits,
+    // an index out of range, junk data, an empty piece, a server-only kind.
+    type Mutation = fn(&mut ManifestPartPayload);
+    let mutations: [(&str, Mutation); 7] = [
+        ("size", |p| p.total_bytes = (MAX_ASSEMBLED_BYTES + 1) as u32),
+        ("zero size", |p| p.total_bytes = 0),
+        ("count", |p| p.total = MAX_PARTS + 1),
+        ("index", |p| p.index = p.total),
+        ("junk", |p| p.data = "!!! not base64 !!!".into()),
+        ("empty", |p| p.data = String::new()),
+        ("kind", |p| p.kind = ManifestPartKind::Published),
+    ];
+    for (name, mutate) in mutations {
+        let mut p = parts[0].clone();
+        mutate(&mut p);
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, &p)).await;
+        expect_room_error(&mut r.ws_h, RoomErrorCode::InvalidState, name).await;
+    }
+    r.nothing_published("abusive headers").await;
+
+    // (h) A viewer cannot start an assembly at all.
+    send_envelope(&mut r.ws_v, &part_envelope(r.v.token, r.room.id, &parts[0])).await;
+    expect_room_error(&mut r.ws_v, RoomErrorCode::NotHost, "viewer").await;
+    r.nothing_published("viewer").await;
+
+    // The host is still connected and in the room, and a clean retry with a
+    // fresh assembly succeeds as version 1.
+    for p in &publish_parts(&good, 100_000) {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    let seen = read_assembled(&mut r.ws_v, ManifestPartKind::Published, "retry").await;
+    assert_eq!(seen.manifest, good);
+    assert_eq!(
+        seen.version, 1,
+        "none of the refused attempts took a version"
+    );
+}
+
+/// A host whose connection dies halfway through leaves nothing behind: no
+/// partial manifest anywhere, and after it reconnects a clean publish works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_disconnects_mid_publication_leaves_nothing_and_can_retry() {
+    let mut r = parts_room().await;
+    let manifest = big_manifest(r.room.id, &r.kp_h, 20_000);
+    let parts = publish_parts(&manifest, 100_000);
+    let half = parts.len() / 2;
+    for p in &parts[..half] {
+        send_envelope(&mut r.ws_h, &part_envelope(r.h.token, r.room.id, p)).await;
+    }
+    // The transport drops with the manifest half sent.
+    let _ = r.ws_h.close(None).await;
+    next_of_kind(&mut r.ws_v, MessageKind::HostDisconnected, "viewer").await;
+    r.nothing_published("half a manifest").await;
+
+    // The host comes back (a new connection, a new bearer) and publishes
+    // from the start. The abandoned half is not completed by it.
+    let mut ws_h2 = connect(r.harness.addr).await;
+    let h2 = complete_handshake(&mut ws_h2, &r.kp_h).await;
+    assert_eq!(h2.user_id, r.h.user_id);
+    next_of_kind(&mut r.ws_v, MessageKind::HostReconnected, "viewer").await;
+    // Continuing the OLD assembly on the new connection finds nothing.
+    send_envelope(
+        &mut ws_h2,
+        &part_envelope(h2.token, r.room.id, &parts[half]),
+    )
+    .await;
+    expect_room_error(&mut ws_h2, RoomErrorCode::InvalidState, "orphan piece").await;
+    r.nothing_published("orphan piece").await;
+
+    for p in &publish_parts(&manifest, 100_000) {
+        send_envelope(&mut ws_h2, &part_envelope(h2.token, r.room.id, p)).await;
+    }
+    let seen = read_assembled(&mut r.ws_v, ManifestPartKind::Published, "retry").await;
+    assert_eq!(seen.manifest, manifest);
+    assert_eq!(seen.version, 1);
+    assert_no_kind_within(
+        &mut r.ws_v,
+        MessageKind::ManifestPart,
+        Duration::from_millis(300),
+        "exactly one publication",
+    )
+    .await;
+}

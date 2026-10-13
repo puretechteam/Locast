@@ -2661,9 +2661,11 @@ dependencies = [
  "libfuzzer-sys",
  "locast-client",
  "locast-manifest",
+ "locast-protocol",
  "rmp-serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

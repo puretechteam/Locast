@@ -23,6 +23,13 @@ path = ".."
 [dependencies.locast-manifest]
 path = "../../../../shared/manifest"
 
+# Drives the manifest_parts target (the multi-frame manifest assembler).
+[dependencies.locast-protocol]
+path = "../../../../shared/protocol"
+
+[dependencies.uuid]
+version = "1"
+
 # Keep the fuzz targets out of `cargo test` and `cargo doc` of
 # this workspace; each target is a `[[bin]]` with the standard
 # cargo-fuzz scaffolding below.
@@ -71,6 +78,13 @@ bench = false
 [[bin]]
 name = "manifest_verify"
 path = "fuzz_targets/manifest_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest_parts"
+path = "fuzz_targets/manifest_parts.rs"
 test = false
 doc = false
 bench = false

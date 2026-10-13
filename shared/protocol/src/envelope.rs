@@ -133,6 +133,13 @@ pub enum MessageKind {
     ManifestRequest,
     #[serde(rename = "MANIFEST_RESPONSE")]
     ManifestResponse,
+    // MANIFEST_PART carries one piece of a manifest too large for a single
+    // frame, in any of the three directions above (see
+    // `manifest_parts`). Additive: a manifest that fits one frame still uses
+    // the single-frame messages, so a peer that does not know this type only
+    // misses manifests above ~640 KiB.
+    #[serde(rename = "MANIFEST_PART")]
+    ManifestPart,
     // ----- P3-T05: WebRTC SDP/ICE relay -----
     // SIGNAL envelopes carry per-target SDP (offer/answer) or ICE
     // candidate material. The server is a pure relay: it does not
@@ -297,6 +304,7 @@ impl MessageKind {
             MessageKind::ManifestPublished => "MANIFEST_PUBLISHED",
             MessageKind::ManifestRequest => "MANIFEST_REQUEST",
             MessageKind::ManifestResponse => "MANIFEST_RESPONSE",
+            MessageKind::ManifestPart => "MANIFEST_PART",
             MessageKind::Signal => "SIGNAL",
             MessageKind::PlaybackCmd => "PLAYBACK_CMD",
             MessageKind::PositionReport => "POSITION_REPORT",
@@ -343,6 +351,7 @@ impl MessageKind {
                 | MessageKind::ManifestPublished
                 | MessageKind::ManifestRequest
                 | MessageKind::ManifestResponse
+                | MessageKind::ManifestPart
         )
     }
 
