@@ -39,7 +39,6 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
-#[derive(Default)]
 struct Recorder;
 
 impl RoomEventSink for Recorder {
@@ -75,7 +74,7 @@ async fn client(addr: SocketAddr, label: &str) -> Client {
         identity,
     ));
     let room = Arc::new(RoomClient::new(signaling.clone()));
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder);
     room.install_event_sink(recorder.clone()).await;
     room.init().await;
     signaling.start().await.expect("start");
