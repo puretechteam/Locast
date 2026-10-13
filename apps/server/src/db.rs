@@ -184,6 +184,26 @@ pub struct BearerInfo {
     pub room_id: Option<Uuid>,
 }
 
+/// Pool options for `url`. An in-memory database lives only as long as at
+/// least one connection to it is open, and the pool closes idle connections
+/// after 10 minutes and old ones after 30, so by default a server that was
+/// started without `LOCAST_DATABASE_URL` lost every table half an hour in
+/// ("no such table: rooms", nobody could authenticate). Connections to an
+/// in-memory database are therefore never recycled. (A file database is
+/// unaffected and keeps the pool's defaults.)
+fn pool_options_for(url: &str) -> SqlitePoolOptions {
+    let opts = SqlitePoolOptions::new()
+        .max_connections(POOL_SIZE)
+        .acquire_timeout(BUSY_TIMEOUT);
+    if url.contains(":memory:") || url.contains("mode=memory") {
+        opts.idle_timeout(None)
+            .max_lifetime(None)
+            .min_connections(1)
+    } else {
+        opts
+    }
+}
+
 impl Db {
     /// Open the database, set the architecture's PRAGMAs, and run
     /// the embedded migrations.
@@ -196,9 +216,7 @@ impl Db {
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(POOL_SIZE)
-            .acquire_timeout(BUSY_TIMEOUT)
+        let pool = pool_options_for(&config.database_url)
             .connect_with(opts)
             .await?;
 
@@ -224,9 +242,7 @@ impl Db {
             .busy_timeout(BUSY_TIMEOUT)
             .foreign_keys(true);
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(POOL_SIZE)
-            .acquire_timeout(BUSY_TIMEOUT)
+        let pool = pool_options_for("sqlite::memory:")
             .connect_with(opts)
             .await?;
 
@@ -1247,6 +1263,17 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(db.validate_bearer(&dead).await.unwrap().is_none());
+    }
+
+    /// The in-memory database must outlive the pool's connection recycling.
+    #[test]
+    fn an_in_memory_database_is_never_recycled() {
+        let mem = pool_options_for("sqlite::memory:");
+        assert_eq!(mem.get_idle_timeout(), None);
+        assert_eq!(mem.get_max_lifetime(), None);
+        assert_eq!(mem.get_min_connections(), 1);
+        let file = pool_options_for("/var/lib/locast/locast-server.db");
+        assert!(file.get_idle_timeout().is_some() && file.get_max_lifetime().is_some());
     }
 
     #[tokio::test]
