@@ -371,7 +371,7 @@ async fn rate_limit_flood_isolated_to_offender() {
         // 500 small envelopes, each 32-byte bearer payload.
         // The msg/s bucket is the limiter.
         for _ in 0..500 {
-            let env = presence_envelope(c_token);
+            let env = room_create_envelope(c_token, "X");
             if ws_c.send(Message::Binary(encode(&env))).await.is_err() {
                 break;
             }

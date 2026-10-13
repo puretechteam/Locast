@@ -259,14 +259,7 @@ async function main() {
 
   // ---- transfer, verification, atomic install
   const t0 = Date.now();
-  // The app's own shared-media bridge asks again, with backoff, until a source
-  // channel is open ("pending", transfer not started); do the same.
-  let dl = await C.bob.call("download_open", { mediaId: manifest.media[0].id });
-  for (let attempt = 0; dl.state !== "complete" && !dl.transfer_started; attempt++) {
-    if (attempt > 40) throw new Error("no source channel opened for the download: " + JSON.stringify(dl));
-    await sleep(Math.min(500 * 2 ** attempt, 4000));
-    dl = await C.bob.call("download_open", { mediaId: manifest.media[0].id });
-  }
+  const dl = await C.bob.call("download_open", { mediaId: manifest.media[0].id });
   log("download_open -> " + JSON.stringify(dl));
   await until("download complete", async () => {
     const evs = await C.bob.events("download://state");
