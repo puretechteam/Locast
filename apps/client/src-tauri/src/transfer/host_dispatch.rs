@@ -347,8 +347,11 @@ impl HostSenderDispatcher {
         // 4. Wrap the DC in a Transport. The cancellation
         //    token is per-sender; the transport's recv pump
         //    exits when the token fires OR the DC closes.
-        let transport: Arc<dyn Transport> =
-            Arc::new(WebRtcTransport::new(dc.clone(), sender_cancel.clone()));
+        let transport: Arc<dyn Transport> = Arc::new(WebRtcTransport::new_for(
+            dc.clone(),
+            sender_cancel.clone(),
+            super::webrtc_transport::Role::Sender,
+        ));
 
         // 5. Reserve the per-peer slot. Hold the lock just
         //    long enough to insert; the spawned task does

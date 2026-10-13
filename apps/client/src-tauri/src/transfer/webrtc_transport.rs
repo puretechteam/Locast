@@ -83,6 +83,103 @@ const INBOUND_QUEUE_FRAMES: usize = 16;
 
 type Inbound = Result<Vec<u8>, TransportError>;
 
+/// Which half of the transfer protocol a transport consumes.
+///
+/// One data channel can carry both halves at once: the answerer of a
+/// connection is often the one that DOWNLOADS (the host opened the channel and
+/// serves), yet every peer also runs a sender for channels it did not open. If
+/// both consumers polled the channel themselves they would steal each other's
+/// segments (the download saw "continuation segment with no open frame" and
+/// failed, some of the time). So there is ONE receive pump per channel; it
+/// reassembles whole frames and routes each to the role that consumes its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Serves: receives `hello`, `request`, `ack`, `nak`, `cancel`.
+    Sender,
+    /// Downloads: receives `offer`, `chunk`.
+    Requester,
+}
+
+/// The role a complete frame (length prefix + JSON) belongs to, read from its
+/// leading `"kind"` tag without parsing the body (a chunk is ~350 KiB).
+/// `None` for `error` and anything unrecognised: both roles get those.
+fn role_of_frame(frame: &[u8]) -> Option<Role> {
+    let json = frame.get(4..)?;
+    let rest = json.strip_prefix(b"{\"kind\":\"")?;
+    let end = rest.iter().position(|b| *b == b'"')?;
+    match &rest[..end] {
+        b"hello" | b"request" | b"ack" | b"nak" | b"cancel" => Some(Role::Sender),
+        b"offer" | b"chunk" => Some(Role::Requester),
+        _ => None,
+    }
+}
+
+/// One role's end of a channel's pump.
+struct RoleEnd {
+    /// The pump's way in; taken when the pump ends so readers see end of
+    /// stream.
+    tx: std::sync::Mutex<Option<mpsc::Sender<Inbound>>>,
+    /// The role's reader side. A transport holds a clone while it lives, so
+    /// "someone is reading" is "more than the pump's own handle exists".
+    rx: Arc<Mutex<mpsc::Receiver<Inbound>>>,
+}
+
+impl RoleEnd {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<Inbound>(INBOUND_QUEUE_FRAMES);
+        Self {
+            tx: std::sync::Mutex::new(Some(tx)),
+            rx: Arc::new(Mutex::new(rx)),
+        }
+    }
+
+    fn sender(&self) -> Option<mpsc::Sender<Inbound>> {
+        self.tx.lock().expect("role tx").clone()
+    }
+
+    /// The pump is done: readers get end of stream once they have drained.
+    fn close(&self) {
+        self.tx.lock().expect("role tx").take();
+    }
+
+    /// A reader for this role. Frames left from an earlier reader are
+    /// discarded: a peer sends a role nothing before that role has asked.
+    fn attach(&self) -> Arc<Mutex<mpsc::Receiver<Inbound>>> {
+        if let Ok(mut rx) = self.rx.try_lock() {
+            while rx.try_recv().is_ok() {}
+        }
+        self.rx.clone()
+    }
+
+    fn is_taken(&self) -> bool {
+        Arc::strong_count(&self.rx) > 1
+    }
+}
+
+/// The shared receive pump of one data channel.
+struct Demux {
+    sender: RoleEnd,
+    requester: RoleEnd,
+}
+
+impl Demux {
+    fn end(&self, role: Role) -> &RoleEnd {
+        match role {
+            Role::Sender => &self.sender,
+            Role::Requester => &self.requester,
+        }
+    }
+}
+
+/// Live pumps by channel identity, so a second transport on the same channel
+/// joins the existing pump instead of starting a competing one.
+fn pumps() -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sync::Weak<Demux>>> {
+    static PUMPS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<usize, std::sync::Weak<Demux>>>,
+    > = std::sync::OnceLock::new();
+    PUMPS.get_or_init(Default::default)
+}
+
 /// Adapter that exposes a webrtc 0.20 `Arc<dyn DataChannel>` as the
 /// transfer layer's [`Transport`] trait. Bytes-in, bytes-out; no
 /// framing layer lives here (the wire codec lives in
@@ -91,77 +188,119 @@ pub struct WebRtcTransport {
     dc: Arc<dyn DataChannel>,
     rx: Arc<Mutex<mpsc::Receiver<Inbound>>>,
     cancel: CancellationToken,
+    /// The channel's shared pump handle.
+    _demux: Arc<Demux>,
 }
 
 impl WebRtcTransport {
-    /// Wrap `dc` in a Transport. Spawns a blocking-thread receive
-    /// pump that drains `DataChannelEvent::OnMessage` bytes into the
-    /// internal mpsc. On `OnClose` or cancel, the pump exits and
-    /// `recv()` returns `Ok(None)`.
+    /// A transport that DOWNLOADS over `dc` (see [`Role::Requester`]).
     pub fn new(dc: Arc<dyn DataChannel>, cancel: CancellationToken) -> Self {
-        let (tx, rx) = mpsc::channel::<Inbound>(INBOUND_QUEUE_FRAMES);
-        let dc2 = dc.clone();
-        let cancel2 = cancel.clone();
-        tokio::spawn(async move {
-            let mut reassembler = Reassembler::default();
-            loop {
-                let ev = tokio::select! {
-                    biased;
-                    _ = cancel2.cancelled() => break,
-                    ev = dc2.poll() => match ev {
-                        Some(e) => e,
-                        None => break,
-                    }
-                };
-                match ev {
-                    DataChannelEvent::OnMessage(msg) => {
-                        let bytes = &msg.data[..];
-                        if bytes.len() < 4 {
-                            continue;
-                        }
-                        let total_segments = u16::from_be_bytes([bytes[0], bytes[1]]);
-                        let segment_index = u16::from_be_bytes([bytes[2], bytes[3]]);
-                        match reassembler.push(total_segments, segment_index, &bytes[4..]) {
-                            Ok(None) => {}
-                            Ok(Some(frame)) => {
-                                if !deliver(&tx, &cancel2, Ok(frame)).await {
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "files data channel segmentation violation; closing the channel");
-                                let err = TransportError::Io(format!("webrtc segmentation: {e}"));
-                                deliver(&tx, &cancel2, Err(err)).await;
-                                let _ = dc2.close().await;
-                                break;
-                            }
-                        }
-                    }
-                    DataChannelEvent::OnClose => break,
-                    DataChannelEvent::OnOpen
-                    | DataChannelEvent::OnClosing
-                    | DataChannelEvent::OnError
-                    | DataChannelEvent::OnBufferedAmountLow
-                    | DataChannelEvent::OnBufferedAmountHigh => {}
+        Self::new_for(dc, cancel, Role::Requester)
+    }
+
+    /// A transport for `role` over `dc`. Joins the channel's shared receive
+    /// pump, starting it if this is the first.
+    pub fn new_for(dc: Arc<dyn DataChannel>, cancel: CancellationToken, role: Role) -> Self {
+        let key = Arc::as_ptr(&dc) as *const () as usize;
+        let demux = {
+            let mut map = pumps().lock().expect("pumps");
+            map.retain(|_, w| w.strong_count() > 0);
+            match map.get(&key).and_then(|w| w.upgrade()) {
+                Some(d) => d,
+                None => {
+                    let d = Arc::new(Demux {
+                        sender: RoleEnd::new(),
+                        requester: RoleEnd::new(),
+                    });
+                    map.insert(key, Arc::downgrade(&d));
+                    spawn_pump(dc.clone(), d.clone());
+                    d
                 }
             }
-        });
+        };
+        let rx = demux.end(role).attach();
         Self {
             dc,
-            rx: Arc::new(Mutex::new(rx)),
+            rx,
             cancel,
+            _demux: demux,
         }
     }
 }
 
-/// Queue `item` for `recv()`, waiting while the queue is full. Returns
-/// false when the reader is gone or the transport was cancelled.
-async fn deliver(tx: &mpsc::Sender<Inbound>, cancel: &CancellationToken, item: Inbound) -> bool {
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => false,
-        r = tx.send(item) => r.is_ok(),
+/// Start the one receive pump of `dc`. It lives until the channel closes or a
+/// protocol violation closes it; transports for either role join and leave
+/// it meanwhile.
+fn spawn_pump(dc: Arc<dyn DataChannel>, d: Arc<Demux>) {
+    tokio::spawn(async move {
+        let mut reassembler = Reassembler::default();
+        loop {
+            let ev = match dc.poll().await {
+                Some(e) => e,
+                None => break,
+            };
+            match ev {
+                DataChannelEvent::OnMessage(msg) => {
+                    let bytes = &msg.data[..];
+                    if bytes.len() < 4 {
+                        continue;
+                    }
+                    let total_segments = u16::from_be_bytes([bytes[0], bytes[1]]);
+                    let segment_index = u16::from_be_bytes([bytes[2], bytes[3]]);
+                    match reassembler.push(total_segments, segment_index, &bytes[4..]) {
+                        Ok(None) => {}
+                        Ok(Some(frame)) => {
+                            if !route(&d, frame).await {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "files data channel segmentation violation; closing the channel");
+                            for role in [Role::Sender, Role::Requester] {
+                                let end = d.end(role);
+                                if let (true, Some(tx)) = (end.is_taken(), end.sender()) {
+                                    let err =
+                                        TransportError::Io(format!("webrtc segmentation: {e}"));
+                                    let _ = tx.send(Err(err)).await;
+                                }
+                            }
+                            let _ = dc.close().await;
+                            break;
+                        }
+                    }
+                }
+                DataChannelEvent::OnClose => break,
+                DataChannelEvent::OnOpen
+                | DataChannelEvent::OnClosing
+                | DataChannelEvent::OnError
+                | DataChannelEvent::OnBufferedAmountLow
+                | DataChannelEvent::OnBufferedAmountHigh => {}
+            }
+        }
+        // The channel is finished for everyone reading it.
+        d.sender.close();
+        d.requester.close();
+    });
+}
+
+/// Hand a complete frame to the role(s) that consume it. Waits while the
+/// reader's queue is full (flow control). A role nobody reads is skipped, not
+/// waited for. Returns false when no reader is left.
+async fn route(d: &Demux, frame: Vec<u8>) -> bool {
+    let targets: &[Role] = match role_of_frame(&frame) {
+        Some(Role::Sender) => &[Role::Sender],
+        Some(Role::Requester) => &[Role::Requester],
+        None => &[Role::Sender, Role::Requester],
+    };
+    for role in targets {
+        let end = d.end(*role);
+        // A role with no reader (none attached yet, or it finished) is
+        // skipped: a peer sends a role nothing before that role has asked.
+        if let (true, Some(tx)) = (end.is_taken(), end.sender()) {
+            let _ = tx.send(Ok(frame.clone())).await;
+        }
     }
+    true
 }
 
 /// Why an inbound segment was refused. Every variant is a peer protocol
@@ -283,7 +422,12 @@ impl Transport for WebRtcTransport {
 
     async fn recv(&self) -> Result<Option<Vec<u8>>, TransportError> {
         let mut g = self.rx.lock().await;
-        match g.recv().await {
+        let next = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return Ok(None),
+            n = g.recv() => n,
+        };
+        match next {
             Some(Ok(b)) => Ok(Some(b)),
             Some(Err(e)) => Err(e),
             None => Ok(None),
@@ -299,6 +443,7 @@ impl Transport for WebRtcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn push_all(r: &mut Reassembler, total: u16, parts: &[&[u8]]) -> Option<Vec<u8>> {
         let mut out = None;
@@ -306,6 +451,200 @@ mod tests {
             out = r.push(total, i as u16, p).expect("valid segment");
         }
         out
+    }
+
+    #[test]
+    fn a_frames_role_is_read_from_its_kind_tag() {
+        use crate::transfer::wire::{codec, Frame};
+        // Every real frame's tag is found, and routes to the right half.
+        let id = "0190f4a0-0000-7000-8000-000000000001".to_string();
+        let peer = "a".repeat(64);
+        let frames = vec![
+            (
+                Frame::Hello(crate::transfer::wire::HelloFrame {
+                    peer_id: peer.clone(),
+                    download_id: id.clone(),
+                    media_id: "m".into(),
+                    manifest_version: 1,
+                    have_chunks: vec![],
+                }),
+                Some(Role::Sender),
+            ),
+            (
+                Frame::Cancel(crate::transfer::wire::CancelFrame {
+                    download_id: id.clone(),
+                    reason: "x".into(),
+                }),
+                Some(Role::Sender),
+            ),
+        ];
+        for (f, want) in frames {
+            let mut bytes = Vec::new();
+            codec::encode(&f, &mut bytes).expect("encode");
+            assert_eq!(role_of_frame(&bytes), want, "{:?}", f.kind());
+        }
+        // Not a tagged frame: both roles get it.
+        assert_eq!(role_of_frame(b"\0\0\0\x02{}"), None);
+        assert_eq!(role_of_frame(b"\0\0"), None);
+        assert_eq!(
+            role_of_frame(b"\0\0\0\x20{\"kind\":\"chunk\",\"download_id\":\"x\"}"),
+            Some(Role::Requester)
+        );
+        assert_eq!(
+            role_of_frame(b"\0\0\0\x20{\"kind\":\"offer\",\"download_id\":\"x\"}"),
+            Some(Role::Requester)
+        );
+        assert_eq!(
+            role_of_frame(b"\0\0\0\x20{\"kind\":\"error\",\"download_id\":\"x\"}"),
+            None
+        );
+    }
+
+    /// A channel fed by the test, standing in for a real DataChannel.
+    struct MockDc {
+        events: Mutex<mpsc::UnboundedReceiver<DataChannelEvent>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DataChannel for MockDc {
+        async fn label(&self) -> webrtc::error::Result<String> {
+            Ok("files".into())
+        }
+        async fn ordered(&self) -> webrtc::error::Result<bool> {
+            Ok(true)
+        }
+        async fn max_packet_life_time(&self) -> webrtc::error::Result<Option<u16>> {
+            Ok(None)
+        }
+        async fn max_retransmits(&self) -> webrtc::error::Result<Option<u16>> {
+            Ok(None)
+        }
+        async fn protocol(&self) -> webrtc::error::Result<String> {
+            Ok(String::new())
+        }
+        async fn negotiated(&self) -> webrtc::error::Result<bool> {
+            Ok(false)
+        }
+        fn id(&self) -> webrtc::data_channel::RTCDataChannelId {
+            1
+        }
+        async fn ready_state(
+            &self,
+        ) -> webrtc::error::Result<webrtc::data_channel::RTCDataChannelState> {
+            Ok(webrtc::data_channel::RTCDataChannelState::Open)
+        }
+        async fn buffered_amount_high_threshold(&self) -> webrtc::error::Result<u32> {
+            Ok(0)
+        }
+        async fn set_buffered_amount_high_threshold(&self, _t: u32) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+        async fn buffered_amount_low_threshold(&self) -> webrtc::error::Result<u32> {
+            Ok(0)
+        }
+        async fn set_buffered_amount_low_threshold(&self, _t: u32) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+        async fn send(&self, _data: BytesMut) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+        async fn send_text(&self, _text: &str) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+        async fn poll(&self) -> Option<DataChannelEvent> {
+            self.events.lock().await.recv().await
+        }
+        async fn close(&self) -> webrtc::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `frame` as the SCTP messages a peer would send for it.
+    fn segments(frame: &[u8]) -> Vec<DataChannelEvent> {
+        let total = frame.len().div_ceil(MAX_SCTP_SEGMENT_PAYLOAD) as u16;
+        frame
+            .chunks(MAX_SCTP_SEGMENT_PAYLOAD)
+            .enumerate()
+            .map(|(i, c)| {
+                let mut b = BytesMut::new();
+                b.extend_from_slice(&total.to_be_bytes());
+                b.extend_from_slice(&(i as u16).to_be_bytes());
+                b.extend_from_slice(c);
+                DataChannelEvent::OnMessage(webrtc::data_channel::RTCDataChannelMessage {
+                    is_string: false,
+                    data: b,
+                })
+            })
+            .collect()
+    }
+
+    fn tagged(kind: &str, pad: usize) -> Vec<u8> {
+        let json = format!("{{\"kind\":\"{kind}\",\"pad\":\"{}\"}}", "x".repeat(pad));
+        let mut f = (json.len() as u32).to_be_bytes().to_vec();
+        f.extend_from_slice(json.as_bytes());
+        f
+    }
+
+    /// The viewer both downloads (it reads the host's `offer`/`chunk`
+    /// frames) and runs a sender on the same channel (which reads
+    /// `hello`/`request`). They used to poll the channel separately, each
+    /// taking some of every frame's segments: "continuation segment with no
+    /// open frame", the channel closed, the download failed (about one run in
+    /// three on two real desktop clients). Now each role gets whole frames of
+    /// its own kinds.
+    #[tokio::test]
+    async fn a_downloader_and_a_sender_on_one_channel_do_not_steal_each_others_frames() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let dc: Arc<dyn DataChannel> = Arc::new(MockDc {
+            events: Mutex::new(rx),
+        });
+        let sender = WebRtcTransport::new_for(dc.clone(), CancellationToken::new(), Role::Sender);
+        let requester =
+            WebRtcTransport::new_for(dc.clone(), CancellationToken::new(), Role::Requester);
+
+        // Multi-segment frames of both kinds, interleaved in arrival order.
+        let offer = tagged("offer", 50_000); // 4 segments
+        let hello = tagged("hello", 40_000); // 3 segments
+        let chunk = tagged("chunk", 120_000); // 8 segments
+        let request = tagged("request", 20_000);
+        for f in [&offer, &hello, &chunk, &request] {
+            for ev in segments(f) {
+                tx.send(ev).unwrap();
+            }
+        }
+        let t = Duration::from_secs(5);
+        assert_eq!(
+            tokio::time::timeout(t, requester.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            offer
+        );
+        assert_eq!(
+            tokio::time::timeout(t, requester.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            chunk
+        );
+        assert_eq!(
+            tokio::time::timeout(t, sender.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            hello
+        );
+        assert_eq!(
+            tokio::time::timeout(t, sender.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            request
+        );
     }
 
     #[test]
