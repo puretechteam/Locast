@@ -108,10 +108,59 @@ directory (marker or not) or any other folder is refused. Close the instance
 first (an open database cannot be removed on Windows). Use a debug build to see
 the messages: a release build has no console.
 
+## Two real desktop clients, end to end
+
+`scripts/desktop-acceptance.mjs` launches two real `locast-client` windows (and
+a third, late one) in test profiles, a real `locast-server` with a file
+database, and the frontend dev server, then drives the real Tauri IPC of each
+window over the WebView2 remote-debugging port. Build first, then run it:
+
+```bash
+cargo build -p locast-client -p locast-server
+node scripts/desktop-acceptance.mjs                                   # 5 MB clip made with ffmpeg
+node scripts/desktop-acceptance.mjs --media /path/movie_3h.mp4        # your own file
+node scripts/desktop-acceptance.mjs --media /path/movie_3h.mp4 --soak-minutes 35
+```
+
+It needs Windows with WebView2, ffmpeg/ffprobe on `PATH`, and port 1420 (the
+frontend; an already running dev server is reused), 18787 (server) and
+9231-9233 (debug ports) free. Each client runs with `LOCAST_WEBRTC_LOCAL_ONLY=1`,
+which (only inside a test profile) keeps WebRTC on loopback with no STUN: on a
+machine with several adapters (Wi-Fi plus a VPN) the candidate pairs two local
+processes offer include ones that cannot reach each other, and the connection
+then fails or stalls. That mode narrows connectivity; it is not how the app
+runs for two people on different machines.
+
+What it checks, and fails on the first miss: separate identities, key files and
+databases; import, room, invite link, signed manifest, the viewer joining
+through the invite with the host key as trust anchor; the WebRTC transfer,
+whole-file verification and atomic install; the installed file playing through
+`locast://` in a real `<video>` (duration, seeks near the start, middle and end,
+playing out to `ended`, a missing file erroring instead of hanging); host Play,
+Seek and Pause reaching the viewer in order; a late joiner receiving the
+current playback snapshot; the viewer disconnecting and reconnecting while
+paused and while playing, host control continuing; leaving and a fresh room
+carrying nothing over; and that the real app profile was not touched.
+`--soak-minutes N` then keeps three clients in the room for N real minutes with
+the host commanding every 20 s and a viewer reconnecting now and then.
+
+Reading a result honestly:
+
+| What | Kind |
+| --- | --- |
+| `smoke_host_viewer` with a 6.2 GB / 10 800 s file | real file through import, transfer, install and Range reads, in one process (debug build, ~27 min for the transfer) |
+| this script with a 6.2 GB / 10 800 s file | the same, through two real windows and the real IPC |
+| `long_session`, `viewer_reconnect` soak | accelerated (short bearer lifetime, many cycles) |
+| `--soak-minutes` | real time, but minutes, not three hours |
+| a genuine three hours of playback | not run; the sync maths is covered by unit tests and accelerated positions |
+
 ## What this does not prove
 
 - Three hours of real-time playback staying in sync. The sync maths is covered
-  by unit checks and accelerated positions, not by a three hour wall clock.
+  by unit checks and accelerated positions, not by a three hour wall clock; the
+  longest real-time run is the `--soak-minutes` one above.
+- Two peers on different networks. There is no TURN relay (STUN only), so two
+  people behind symmetric NATs may not connect; nothing here exercises a NAT.
 - The packaged installer. Test profiles (above) run the built executable, not
   an installed package.
 - Behaviour across NATs. Everything here is on localhost.

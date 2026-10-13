@@ -186,7 +186,7 @@ async function main() {
   log(`media ${media} ${sizeBytes} bytes ${durationS}s`);
 
   // Server + frontend dev server.
-  start(serverExe, [], { env: { ...process.env, LOCAST_BIND_ADDR: `127.0.0.1:${SERVER_PORT}`, LOCAST_LOG: "info" }, logFile: path.join(logs, "server.log") });
+  start(serverExe, [], { env: { ...process.env, LOCAST_BIND_ADDR: `127.0.0.1:${SERVER_PORT}`, LOCAST_LOG: "info", LOCAST_DATABASE_URL: path.join(base, "server.db") }, logFile: path.join(logs, "server.log") });
   await until("server", async () => (await httpGet(`http://127.0.0.1:${SERVER_PORT}/health`).catch(() => ({ status: 0 }))).status > 0, 30000).catch(() => {});
   const viteUp = await httpGet(`http://127.0.0.1:${VITE_PORT}/`).then((r) => r.status === 200).catch(() => false);
   if (!viteUp) {
@@ -206,6 +206,9 @@ async function main() {
         ...process.env,
         LOCAST_TEST_PROFILE_DIR: dirs[n],
         LOCAST_SIGNALING_URL: `ws://127.0.0.1:${SERVER_PORT}/ws`,
+        // Several local clients: loopback only, so adapters like a VPN do not
+        // offer candidate pairs that cannot reach each other.
+        LOCAST_WEBRTC_LOCAL_ONLY: "1",
         WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${ports[n]} --autoplay-policy=no-user-gesture-required`,
       },
       logFile: path.join(logs, `${n}.log`),
@@ -245,6 +248,9 @@ async function main() {
     return r.ok ? r.v : null;
   }, 30000, 500);
   check("viewer joined through the invite", joined.id === room.id);
+  await until("host sees the viewer arrive", async () => ((await C.alice.call("room_get_state"))?.participants ?? []).length >= 2, 15000)
+    .then(() => check("host's roster shows the viewer", true))
+    .catch(async () => check("host's roster shows the viewer", false, JSON.stringify((await C.alice.call("room_get_state"))?.participants)));
   const manifest = await until("viewer verified manifest", async () => {
     const m = await C.bob.call("manifest_current");
     return m && m.media && m.media.length ? m : null;
@@ -260,7 +266,7 @@ async function main() {
     const last = evs[evs.length - 1];
     if (last && last.state === "failed") throw new Error("download failed: " + last.error_message);
     return last && last.state === "complete";
-  }, 30 * 60 * 1000, 500);
+  }, 90 * 60 * 1000, 500);
   log(`transfer + verify + install took ${((Date.now() - t0) / 1000).toFixed(1)}s`);
   const lib = await C.bob.call("library_list", { query: null, limit: 50, offset: 0 });
   const mine = lib.find((x) => x.filename === path.basename(media));
@@ -377,6 +383,59 @@ async function main() {
     return r.ok ? r.v : null;
   }, 30000, 500);
   check("the viewer sees no playback state or manifest from the old room", !b2.playback && !((await C.bob.call("manifest_current"))?.media?.length));
+
+  // ---- optional real-time soak: stay in the room for N minutes with the
+  // default settings (so the 15-minute bearer lifetime is crossed for real),
+  // the host commanding every 20 s and the viewers reconnecting now and then.
+  const soakMin = parseFloat(argVal("--soak-minutes") ?? "0");
+  if (soakMin > 0) {
+    const room3 = await C.alice.call("room_get_state");
+    const inv3 = await C.alice.call("room_invite_url");
+    // Bob rejoined the fresh room above; Carol is still in the first room, so
+    // move her over too.
+    await C.carol.call("room_leave").catch(() => {});
+    await until("carol joins the soak room", async () => (await C.carol.inv("room_join", { code: room3.code, displayName: "Carol", inviteUrl: inv3 })).ok, 30000, 500);
+    log("soak rosters: " + JSON.stringify(await Promise.all([C.alice, C.bob, C.carol].map(async (c) => { const st = await c.call("room_get_state"); return st && { id: st.id.slice(0, 6), code: st.code, who: st.participants.map((p) => [p.display_name, p.status, p.is_host]) }; }))) + " fresh=" + fresh.id.slice(0, 6) + " room3=" + room3.id.slice(0, 6));
+    const t0 = Date.now();
+    const end = t0 + soakMin * 60000;
+    let pos = 0, n = 0, playing = false, lastSeq = 0;
+    const samples = [];
+    log(`soak: ${soakMin} min in real time, started`);
+    while (Date.now() < end) {
+      n++;
+      const action = !playing ? "play" : n % 4 === 0 ? "seek" : "pause";
+      if (action === "seek") pos += 600000;
+      await play(C.alice, action, pos);
+      playing = action === "play" ? true : action === "pause" ? false : playing;
+      // Everyone hears it.
+      await until(`both viewers hear ${action} #${n}`, async () => {
+        for (const v of [C.bob, C.carol]) {
+          const evs = await v.events("playback://state");
+          if (!evs.some((e) => e.kind === action && e.media_position_ms === pos && e.server_seq > lastSeq)) return false;
+        }
+        return true;
+      }, 30000);
+      lastSeq = (await C.bob.events("playback://state")).slice(-1)[0].server_seq;
+      samples.push({ minute: +((Date.now() - t0) / 60000).toFixed(1), action, seq: lastSeq });
+      if (n % 9 === 0) {
+        // A viewer's connection drops and comes back.
+        await C.carol.call("signaling_disconnect");
+        await sleep(1500);
+        await C.carol.call("signaling_connect");
+        await until("carol back in step", async () => {
+          const s = await C.carol.call("room_get_state");
+          return s && s.playback && s.playback.server_seq >= lastSeq;
+        }, 60000);
+      }
+      for (const [nm, c] of [["alice", C.alice], ["bob", C.bob], ["carol", C.carol]]) {
+        const st = await c.call("room_get_state");
+        const live = st ? st.participants.filter((p) => p.status === "Connected" || p.status === "connected") : [];
+        if (!st || live.length < 3) throw new Error(`${nm} sees ${JSON.stringify(st && st.participants.map((p) => [p.display_name, p.status]))} at minute ${((Date.now() - t0) / 60000).toFixed(1)}`);
+      }
+      await sleep(Math.max(0, 20000 - 0));
+    }
+    check(`soak: ${soakMin} real minutes, ${n} host commands each heard by both viewers in order, nobody dropped`, true, `last seq ${lastSeq}`);
+  }
 
   // ---- the real profile was never touched
   check("the real app profile was not touched", snapshotReal() === realBefore);
