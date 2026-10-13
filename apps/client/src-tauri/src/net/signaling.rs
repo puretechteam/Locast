@@ -79,7 +79,7 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::identity::keystore::IdentityService;
@@ -838,6 +838,19 @@ async fn connection_loop(
                     return;
                 }
             }
+            Ok(HandshakeResult::ResumeRejected) => {
+                info!("session resume refused; authenticating from scratch");
+                {
+                    let mut g = inner.lock().await;
+                    g.resume_token = None;
+                    g.bearer = None;
+                }
+                // Not a failure of the client: no backoff growth, just a
+                // beat before the full handshake.
+                if sleep_with_cancel(&cancel, Duration::from_millis(250), &inner).await {
+                    return;
+                }
+            }
             Ok(HandshakeResult::ProtocolError(msg)) => {
                 warn!(error = %msg, "protocol error during handshake");
                 record_failure(&inner, &mut backoff, DisconnectReason::ProtocolError, &msg).await;
@@ -889,6 +902,9 @@ enum HandshakeResult {
         reason: AuthFailReason,
         message: String,
     },
+    /// The server refused AUTH_RESUME (the bearer it names is gone). Not a
+    /// failure of the client; the next attempt is a full AUTH.
+    ResumeRejected,
     ProtocolError(String),
     Oversized {
         bytes: usize,
@@ -921,6 +937,9 @@ async fn run_handshake(
     // skipped CHALLENGE in response to a valid
     // resume_token (future work).
     let mut resume_token_held: Option<Vec<u8>> = inner.lock().await.resume_token.clone();
+    // Whether this handshake presented AUTH_RESUME (so an AUTH_FAIL is the
+    // resume being refused, not the client being rejected).
+    let mut sent_resume = false;
 
     for _ in 0..FRAME_LIMIT {
         if cancel.is_cancelled() {
@@ -1076,6 +1095,13 @@ async fn run_handshake(
                             return HandshakeResult::ProtocolError(format!("bad AUTH_FAIL: {e}"));
                         }
                     };
+                if sent_resume {
+                    // The server did not accept the resume (the bearer it
+                    // names has expired or is gone). That says nothing
+                    // against the client: forget the resume credentials and
+                    // authenticate from scratch on the next attempt.
+                    return HandshakeResult::ResumeRejected;
+                }
                 return HandshakeResult::AuthFailed {
                     reason: f.reason,
                     message: reason_to_string(f.reason),
@@ -1127,6 +1153,7 @@ async fn run_handshake(
                     // not retry AUTH_RESUME on a stale
                     // token if the server rejects it.
                     resume_token_held = None;
+                    sent_resume = true;
                     (
                         MessageKind::AuthResume,
                         serde_json::to_value(AuthResumePayload {

@@ -3079,8 +3079,12 @@ impl RoomClient {
                     ))
                     .await
                 {
-                    warn!(error = %e, "presence send failed; ending loop");
-                    return;
+                    // The connection is mid-reconnect (or refused this one):
+                    // the next tick tries again. The loop ends only when the
+                    // room does (leave / room closed abort it); ending it on
+                    // one failed send left a host silent for the rest of the
+                    // session, and the server then reaped it from the room.
+                    debug!(error = %e, "presence not sent; will try again");
                 }
             }
         });

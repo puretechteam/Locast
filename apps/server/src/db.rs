@@ -176,6 +176,8 @@ pub struct ResumeInfo {
 /// against the current ConnState.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerInfo {
+    /// Absolute expiry, unix ms.
+    pub expires_ms: i64,
     pub user_id: Uuid,
     pub pubkey: [u8; 32],
     pub connection_epoch: u64,
@@ -386,6 +388,7 @@ impl Db {
                     None => None,
                 };
                 Ok(Some(BearerInfo {
+                    expires_ms,
                     user_id: uuid,
                     pubkey: arr,
                     connection_epoch: connection_epoch as u64,
@@ -394,6 +397,40 @@ impl Db {
             }
             _ => Ok(None),
         }
+    }
+
+    /// [`Self::validate_bearer`] for a message from a live connection: a
+    /// bearer that is in use does not run out. When less than half of
+    /// `ttl_ms` is left, its expiry moves to `now + ttl_ms` (at most one write
+    /// per half lifetime per bearer), so a session that keeps talking (presence
+    /// every 5 s) outlives any fixed lifetime, while one that goes quiet for a
+    /// full lifetime still expires. The lifetime used to be absolute: the
+    /// server closed every connection 15 minutes in, however busy, on a
+    /// three hour film.
+    pub async fn validate_bearer_renewing(
+        &self,
+        token_hash: &[u8; 32],
+        ttl_ms: i64,
+    ) -> Result<Option<BearerInfo>, sqlx::Error> {
+        let Some(mut info) = self.validate_bearer(token_hash).await? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        if info.expires_ms - now < ttl_ms / 2 {
+            let new_expiry = now + ttl_ms;
+            let _g = self.write_lock.lock().await;
+            sqlx::query(
+                "UPDATE bearer_tokens SET expires_ms = ?1 \
+                 WHERE token_hash = ?2 AND expires_ms > ?3",
+            )
+            .bind(new_expiry)
+            .bind(&token_hash[..])
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+            info.expires_ms = new_expiry;
+        }
+        Ok(Some(info))
     }
 
     /// Revoke a single bearer. Used by tests and by the future
@@ -1156,6 +1193,60 @@ mod tests {
         let a = db.upsert_user(&random_pubkey()).await.expect("upsert a");
         let b = db.upsert_user(&random_pubkey()).await.expect("upsert b");
         assert_ne!(a, b);
+    }
+
+    /// A bearer in use does not run out; one that is not used does; and an
+    /// expired one is never brought back.
+    #[tokio::test]
+    async fn a_bearer_in_use_is_renewed_but_an_expired_one_is_not_revived() {
+        let db = fresh_db().await;
+        let user_id = db.upsert_user(&random_pubkey()).await.expect("upsert");
+        let ttl = 60_000;
+
+        // Plenty left (over half): no write, same expiry.
+        let fresh = [2u8; 32];
+        let exp = now_ms() + 50_000;
+        db.insert_bearer(user_id, fresh, exp, 0, None)
+            .await
+            .unwrap();
+        let info = db
+            .validate_bearer_renewing(&fresh, ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.expires_ms, exp);
+
+        // Under half left: pushed out to a full lifetime from now.
+        let aging = [3u8; 32];
+        let exp = now_ms() + 5_000;
+        db.insert_bearer(user_id, aging, exp, 0, None)
+            .await
+            .unwrap();
+        let info = db
+            .validate_bearer_renewing(&aging, ttl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            info.expires_ms >= now_ms() + ttl - 1_000,
+            "{}",
+            info.expires_ms
+        );
+        // And the new expiry is what the table holds.
+        let again = db.validate_bearer(&aging).await.unwrap().unwrap();
+        assert_eq!(again.expires_ms, info.expires_ms);
+
+        // Already expired: gone, and stays gone.
+        let dead = [4u8; 32];
+        db.insert_bearer(user_id, dead, now_ms() - 1, 0, None)
+            .await
+            .unwrap();
+        assert!(db
+            .validate_bearer_renewing(&dead, ttl)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.validate_bearer(&dead).await.unwrap().is_none());
     }
 
     #[tokio::test]

@@ -976,7 +976,11 @@ async fn dispatch_authed(
         }
     };
     let token_hash = locast_crypto::sha256::sha256(&bearer_bytes);
-    let info = match state.db.validate_bearer(&token_hash).await {
+    let info = match state
+        .db
+        .validate_bearer_renewing(&token_hash, state.config.bearer_ttl_seconds * 1000)
+        .await
+    {
         Ok(Some(info)) => info,
         Ok(None) => {
             warn!(request_id = %request_id, "bearer not found or expired");
