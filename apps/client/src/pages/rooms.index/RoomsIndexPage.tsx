@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
 import { listRecentRooms, upsertRecentRoom } from "../../services/recentRooms";
 import { onRoomStateChange } from "../../services/room";
 import { useRoomStore } from "../../stores/useRoomStore";
 import { commands } from "../../services/ipc";
 import type { RecentRoomEntry, RecentRoomRole } from "../../services/recentRooms";
 import type { RoomSummaryIpc } from "../../services/room";
+import { EmptyState, Icon, LinkButton, PageHeader, Spinner, StatusPill } from "../../components/ui";
+import "../../styles/rooms.css";
 
 const RECENTS_REFRESH_MS = 5_000;
 const IDENTITY_PLACEHOLDER_NAME = "guest";
@@ -178,118 +179,132 @@ export function RoomsIndexPage(): JSX.Element {
         };
     }, [summary]);
 
+    // The room you are in is shown under Active, not again under Recent.
+    const recentOthers = recents.filter((r) => r.room_id !== summary?.id);
+
     const activeRow: ActiveRow | null = summary !== null
         ? { summary, hostDisplayName: hostDisplayNameOf(summary) }
         : null;
 
-    const hasContent = activeRow !== null || recents.length > 0;
-
     return (
-        <div className="page-shell__content-inner">
-            {hasContent && (
-                <ul className="rooms-index__list">
-                    <li>
-                        <Link to="/rooms/new">Create room</Link>
-                    </li>
-                    <li>
-                        <Link to="/rooms/join">Join room</Link>
-                    </li>
-                    <li>
-                        <Link to="/library">Back to library</Link>
-                    </li>
-                </ul>
-            )}
+        <div className="page rooms-index">
+            <PageHeader
+                title="Rooms"
+                description="Watch together with friends. Create a room, or join one with a code or an invite link."
+                back={{ to: "/library", label: "Back to library" }}
+                actions={
+                    <>
+                        <LinkButton to="/rooms/join" icon="join">
+                            Join a room
+                        </LinkButton>
+                        <LinkButton to="/rooms/new" variant="primary" icon="plus">
+                            Create a room
+                        </LinkButton>
+                    </>
+                }
+            />
 
-            {!hydrated && <p className="rooms-index__empty">Loading rooms...</p>}
+            {!hydrated && (
+                <p className="loading" role="status" aria-busy="true">
+                    <Spinner />
+                    Loading rooms...
+                </p>
+            )}
 
             {hydrated && (
                 <>
-                    <section className="rooms-index__section" aria-label="Active room">
-                        <h2 className="rooms-index__heading">Active</h2>
+                    <section className="rooms-index__section" aria-labelledby="rooms-active-heading">
+                        <h2 id="rooms-active-heading" className="section-title">
+                            Active room
+                        </h2>
                         {activeRow === null ? (
-                            <p className="rooms-index__empty">No active room.</p>
+                            <EmptyState icon="users" plain compact title="You are not in a room">
+                                Create a room to host a watch party, or join a friend&apos;s room with its code.
+                            </EmptyState>
                         ) : (
-                            <ul className="rooms-index__list">
-                                <li className="rooms-index__tile">
-                                    <div className="rooms-index__tile-title">
-                                        {activeRow.summary.title}
-                                    </div>
-                                    <div className="rooms-index__tile-meta">
-                                        <code className="rooms-index__tile-code">
-                                            {activeRow.summary.code}
-                                        </code>
-                                        <span className="rooms-index__tile-host">
-                                            Host: {activeRow.hostDisplayName}
-                                        </span>
-                                    </div>
-                                    <Link
-                                        to={`/rooms/${activeRow.summary.id}`}
-                                        className="rooms-index__tile-link"
-                                    >
-                                        Go to room
-                                    </Link>
-                                </li>
-                            </ul>
+                            <ActiveRoomRow row={activeRow} />
                         )}
                     </section>
 
-                    <section className="rooms-index__section" aria-label="Recent rooms">
-                        <h2 className="rooms-index__heading">Recent</h2>
-                        {recents.length === 0 ? (
-                            <p className="rooms-index__empty">No recent rooms yet.</p>
+                    <section className="rooms-index__section" aria-labelledby="rooms-recent-heading">
+                        <h2 id="rooms-recent-heading" className="section-title">
+                            Recent rooms
+                        </h2>
+                        {recentOthers.length === 0 ? (
+                            <p className="rooms-index__none">
+                                Rooms you host or join appear here, so you can find a code again.
+                            </p>
                         ) : (
                             <ul className="rooms-index__list">
-                                {recents.map((r) => {
-                                    const ended = r.last_ended_ms !== null;
-                                    const tileClass = ended
-                                        ? "rooms-index__tile rooms-index__tile--ended"
-                                        : "rooms-index__tile";
-                                    return (
-                                        <li key={r.room_id} className={tileClass}>
-                                            <div className="rooms-index__tile-title">
-                                                {r.title}
-                                            </div>
-                                            <div className="rooms-index__tile-meta">
-                                                <code className="rooms-index__tile-code">
-                                                    {r.code}
-                                                </code>
-                                                <span className="rooms-index__tile-host">
-                                                    Host: {r.host_display_name}
-                                                </span>
-                                                <span className="rooms-index__tile-badge">
-                                                    {r.role}
-                                                </span>
-                                            </div>
-                                            <div className="rooms-index__tile-sub">
-                                                Seen {formatRelative(r.last_seen_ms, now)}
-                                                {ended &&
-                                                    ` · ended ${formatRelative(
-                                                        r.last_ended_ms as number,
-                                                        now,
-                                                    )}`}
-                                            </div>
-                                        </li>
-                                    );
-                                })}
+                                {recentOthers.map((r) => (
+                                    <RecentRoomRow key={r.room_id} entry={r} now={now} />
+                                ))}
                             </ul>
                         )}
                     </section>
-
-                    {!hasContent && (
-                        <ul className="rooms-index__list">
-                            <li>
-                                <Link to="/rooms/new">Create room</Link>
-                            </li>
-                            <li>
-                                <Link to="/rooms/join">Join room</Link>
-                            </li>
-                            <li>
-                                <Link to="/library">Back to library</Link>
-                            </li>
-                        </ul>
-                    )}
                 </>
             )}
         </div>
+    );
+}
+
+function ActiveRoomRow({ row }: { row: ActiveRow }): JSX.Element {
+    const { summary, hostDisplayName } = row;
+    const present = summary.participants.filter((p) => p.status !== "Left").length;
+    return (
+        <div className="room-row room-row--active" data-testid="rooms-active">
+            <div className="room-row__main">
+                <h3 className="room-row__title">{summary.title}</h3>
+                <p className="room-row__meta">
+                    <code className="room-row__code">{summary.code}</code>
+                    <span>Host: {hostDisplayName.trim() || "Unnamed"}</span>
+                    <span>
+                        {present} {present === 1 ? "person" : "people"}
+                    </span>
+                </p>
+            </div>
+            {summary.host_disconnected ? (
+                <StatusPill tone="warning" dot pulse>
+                    Host reconnecting
+                </StatusPill>
+            ) : (
+                <StatusPill tone="success" dot>
+                    Live
+                </StatusPill>
+            )}
+            <LinkButton to={`/rooms/${summary.id}`} variant="primary" icon="play">
+                Go to room
+            </LinkButton>
+        </div>
+    );
+}
+
+function RecentRoomRow({ entry, now }: { entry: RecentRoomEntry; now: number }): JSX.Element {
+    const ended = entry.last_ended_ms !== null;
+    return (
+        <li className={`room-row${ended ? " room-row--ended" : ""}`}>
+            <div className="room-row__main">
+                <h3 className="room-row__title">{entry.title}</h3>
+                <p className="room-row__meta">
+                    <code className="room-row__code">{entry.code}</code>
+                    <span>Host: {entry.host_display_name.trim() || "Unnamed"}</span>
+                    <span className="room-row__when">
+                        <Icon name="clock" />
+                        Seen {formatRelative(entry.last_seen_ms, now)}
+                        {ended && ` · ended ${formatRelative(entry.last_ended_ms as number, now)}`}
+                    </span>
+                </p>
+            </div>
+            <StatusPill tone={entry.role === "host" ? "accent" : "neutral"}>
+                {entry.role === "host" ? "Host" : "Guest"}
+            </StatusPill>
+            {ended ? (
+                <StatusPill>Ended</StatusPill>
+            ) : entry.role === "host" ? null : (
+                <LinkButton to={`/rooms/join?code=${encodeURIComponent(entry.code)}`} size="sm" icon="join">
+                    Join again
+                </LinkButton>
+            )}
+        </li>
     );
 }

@@ -254,14 +254,15 @@ test("the grid is keyboard navigable", async ({ page }) => {
     await page.keyboard.press("End");
     expect(await activeId()).toBe("item-1");
 
-    // ArrowDown moves one row (as many tiles as share the first row).
+    // ArrowDown moves one row (as many tiles as share the first row). The
+    // library is a list of full-width rows, so a row holds one tile.
     await page.keyboard.press("Home");
     const columns = await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('[data-testid="library-tile"]'));
         const top = els[0]?.getBoundingClientRect().top ?? 0;
         return els.filter((e) => Math.abs(e.getBoundingClientRect().top - top) < 2).length;
     });
-    expect(columns).toBeGreaterThan(1);
+    expect(columns).toBeGreaterThanOrEqual(1);
     await page.keyboard.press("ArrowDown");
     expect(await activeId()).toBe(`item-${9 - columns}`);
 
@@ -281,7 +282,8 @@ test("every control has an accessible name", async ({ page }) => {
     await openLibrary(page, [item(1, { status: "temporary" })]);
     await expect(page.getByRole("searchbox", { name: "Search library" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Import files" })).toBeVisible();
-    await expect(page.getByRole("navigation", { name: "Rooms" })).toBeVisible();
+    await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Settings" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Make permanent" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Delete File 1.mkv" })).toBeVisible();
     await expect(page.getByRole("heading", { name: "File 1.mkv" })).toBeVisible();

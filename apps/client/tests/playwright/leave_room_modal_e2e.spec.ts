@@ -68,7 +68,7 @@ async function seedTempFiles(page: Page, ids: string[]) {
 test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ page, locast }) => {
     await navigate(page);
     await seedTempFiles(page, ["dl-1", "dl-2", "dl-3"]);
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
     await expect(page.locator(".lrm-panel")).toBeVisible();
     await expect(page.locator(".lrm-item")).toHaveCount(3);
     await locast.resetInvokeLog();
@@ -85,7 +85,7 @@ test("Delete: 3 temp files listed, delete_files_to_trash IPC logged", async ({ p
 test("Keep: 3 temp files listed, mark_files_permanent IPC logged", async ({ page, locast }) => {
     await navigate(page);
     await seedTempFiles(page, ["dl-k1", "dl-k2", "dl-k3"]);
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
     await expect(page.locator(".lrm-panel")).toBeVisible();
     await expect(page.locator(".lrm-item")).toHaveCount(3);
     await locast.resetInvokeLog();
@@ -105,7 +105,7 @@ test("Keep: 3 temp files listed, mark_files_permanent IPC logged", async ({ page
 test("a failed leave is reported in the dialog, which stays open for a retry", async ({ page }) => {
     await navigate(page, { room_leave: "signaling is down" });
     await seedTempFiles(page, ["dl-1"]);
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
     await page.locator(".lrm-btn--keep").click();
 
     await expect(page.locator('[data-testid="lrm-error"]')).toContainText("signaling is down");
@@ -119,7 +119,7 @@ test("a failed leave is reported in the dialog, which stays open for a retry", a
 test("a failed keep is reported and the room is not left", async ({ page }) => {
     await navigate(page, { mark_files_permanent: "disk error" });
     await seedTempFiles(page, ["dl-1"]);
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
     await page.locator(".lrm-btn--keep").click();
 
     await expect(page.locator('[data-testid="lrm-error"]')).toContainText("disk error");
@@ -129,7 +129,7 @@ test("a failed keep is reported and the room is not left", async ({ page }) => {
 
 test("a failed file listing is reported, not shown as 'no files', and leaving still works", async ({ page }) => {
     await navigate(page, { get_temp_files: "database is locked" });
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
 
     await expect(page.locator('[data-testid="lrm-load-error"]')).toContainText("database is locked");
     await expect(page.locator(".lrm-panel")).not.toContainText("No temporary files in this room");
@@ -142,7 +142,7 @@ test("a failed file listing is reported, not shown as 'no files', and leaving st
 
 test("Escape closes the dialog without leaving", async ({ page }) => {
     await navigate(page);
-    await page.locator(".room-footer__leave").click();
+    await page.locator(".room-bar__leave").click();
     await expect(page.locator(".lrm-panel")).toBeVisible();
     await page.keyboard.press("Escape");
     await expect(page.locator(".lrm-panel")).toHaveCount(0);

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useParams } from "react-router-dom";
+import { Button, EmptyState, LinkButton, Spinner, StatusPill } from "../../components/ui";
 import { events } from "../../services/ipc";
 import { getRoomState } from "../../services/room";
 import { getSignalingState } from "../../services/signaling";
@@ -25,7 +26,7 @@ import { useClockSkewStore } from "../../stores/useClockSkewStore";
 import { useCapabilityStore } from "../../stores/useCapabilityStore";
 import { ParticipantStrip } from "./ParticipantStrip";
 import { RoomMediaPanel } from "./RoomMediaPanel";
-import { RoomFooter } from "./RoomFooter";
+import { RoomBar } from "./RoomBar";
 import { RoomTopBar } from "../../components/RoomTopBar";
 
 export function RoomPage(): JSX.Element {
@@ -357,7 +358,11 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     if (!hydrated) {
         return (
             <div className="room-page room-page--loading">
-                <p>Loading room...</p>
+                <h1 className="sr-only">Room</h1>
+                <p className="loading" role="status" aria-busy="true">
+                    <Spinner />
+                    Loading room...
+                </p>
             </div>
         );
     }
@@ -368,30 +373,51 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
         return (
             <div className="room-page room-page--local" data-testid="room-local">
                 <RoomTopBar summary={null} />
-                <p className="room-page__local-note">
-                    Playing locally: <strong>{localMediaTitle ?? "media"}</strong>.{" "}
-                    <Link to="/library">Back to library</Link>
-                </p>
-                <Player videoRef={videoRef} />
+                <div className="room-local">
+                    <div className="room-local__bar">
+                        <LinkButton to="/library" variant="ghost" size="sm" icon="arrow-left">
+                            Back to library
+                        </LinkButton>
+                        <h1 className="sr-only">Local playback</h1>
+                        <p className="room-page__local-note">
+                            Playing locally: <strong>{localMediaTitle ?? "media"}</strong>
+                        </p>
+                        <StatusPill>Only on this computer</StatusPill>
+                    </div>
+                    <Player videoRef={videoRef} />
+                </div>
             </div>
         );
     }
 
     if (summary === null) {
         return (
-            <div className="room-page">
+            <div className="room-page room-page--empty">
                 <RoomTopBar summary={null} />
-                <div className="room-page room-page--empty" data-testid="room-empty">
-                    <p>Not in a room.</p>
-                    <p>
-                        <Link to="/rooms/new">Create a room</Link> or{" "}
-                        <Link to="/rooms/join">join one</Link>.
-                    </p>
-                    {params.id !== undefined && (
-                        <p className="room-page__hint">
-                            (URL id: <code>{params.id}</code>)
-                        </p>
-                    )}
+                <div className="page page--narrow" data-testid="room-empty">
+                    <EmptyState
+                        icon="users"
+                        title="You are not in a room"
+                        headingLevel={1}
+                        actions={
+                            <>
+                                <LinkButton to="/rooms/join" icon="join">
+                                    Join a room
+                                </LinkButton>
+                                <LinkButton to="/rooms/new" variant="primary" icon="plus">
+                                    Create a room
+                                </LinkButton>
+                            </>
+                        }
+                    >
+                        This room is not active. Create a new one, or join with a code.
+                        {params.id !== undefined && (
+                            <span className="room-page__hint">
+                                {" "}
+                                (URL id: <code>{params.id}</code>)
+                            </span>
+                        )}
+                    </EmptyState>
                 </div>
             </div>
         );
@@ -401,160 +427,147 @@ const lastApplied = usePlaybackStore((s) => s.lastApplied);
     const idMismatch =
         expectedId !== undefined && expectedId.length > 0 && expectedId !== summary.id;
 
+    const otherViewers = Object.values(viewerPositions).filter((v) => v.userId !== localUserId);
+
     return (
         <div className="room-page">
             <RoomTopBar summary={summary} />
-            <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
-            <ParticipantStrip summary={summary} />
-            <RoomMediaPanel />
-            {isHost && (
-                <button
-                    className="room-page__permissions-btn"
-                    onClick={() => setShowPermissions(true)}
-                >
-                    Permissions
-                </button>
-            )}
-            {/* P4-T04: drift indicator. Hidden by
-             * default; only renders when the smoothed
-             * offset exceeds 2.0 s. Non-blocking; the
-             * user is notified but playback is NOT
-             * auto-corrected. */}
-            <DriftIndicator sample={drift} onResync={onResync} />
-            {isHost && (
-                <section
-                    className="room-page__viewer-positions"
-                    data-testid="viewer-positions"
-                    aria-label="Viewer positions"
-                >
-                    <h3 className="room-page__viewer-positions-title">
-                        Viewer positions
-                    </h3>
-                    {/* P4-T04: room median surface
-                     * (architecture §25.3.4 "thin marker
-                     * for the median participant
-                     * position"). Until the full
-                     * project-owned seek bar lands in a
-                     * later task, the median is rendered
-                     * here as a labeled line so the host
-                     * can see the room's central
-                     * position alongside each viewer's
-                     * row. The label is hidden when no
-                     * valid (playing + fresh) report is
-                     * available. */}
-                    {drift.roomMedianMs !== null && (
-                        <div
-                            className="room-page__viewer-positions-median"
-                            data-testid="room-median"
-                        >
-                            <span className="room-page__viewer-positions-median-label">
-                                Room median
-                            </span>
-                            <span className="room-page__viewer-positions-median-value">
-                                {(drift.roomMedianMs / 1000).toFixed(1)}s
-                            </span>
-                            {drift.driftVsMedianMs !== null && (
-                                <span
-                                    className="room-page__viewer-positions-median-drift"
-                                    data-testid="room-median-drift"
-                                    data-direction={drift.direction}
-                                >
-                                    {drift.direction === "ahead"
-                                        ? "ahead"
-                                        : drift.direction === "behind"
-                                          ? "behind"
-                                          : "aligned"}
-                                    {" "}
-                                    {Math.abs(drift.driftVsMedianMs / 1000).toFixed(1)}s
-                                </span>
-                            )}
-                        </div>
-                    )}
-                    <ul className="room-page__viewer-positions-list">
-                        {Object.values(viewerPositions)
-                            .filter((v) => v.userId !== localUserId)
-                            .map((v) => {
-                                const ageSec = Math.max(
-                                    0,
-                                    Math.round(
-                                        (Date.now() - v.receivedAtMs) / 1000,
-                                    ),
-                                );
-                                const posSec = (v.mediaPositionMs / 1000).toFixed(
-                                    1,
-                                );
-                                return (
-                                    <li
-                                        key={v.userId}
-                                        className="room-page__viewer-position-row"
-                                        data-testid="viewer-position-row"
-                                        data-sender-id={v.userId}
-                                    >
-                                        <span className="room-page__viewer-position-user">
-                                            {v.userId.slice(0, 8)}
-                                        </span>
-                                        <span className="room-page__viewer-position-time">
-                                            {posSec}s
-                                        </span>
-                                        <span className="room-page__viewer-position-state">
-                                            {v.playing ? "playing" : "paused"}
-                                        </span>
-                                        <span className="room-page__viewer-position-age">
-                                            {ageSec}s ago
-                                        </span>
-                                    </li>
-                                );
-                            })}
-                        {Object.values(viewerPositions).filter(
-                            (v) => v.userId !== localUserId,
-                        ).length === 0 && (
-                            <li
-                                className="room-page__viewer-position-empty"
-                                data-testid="viewer-positions-empty"
-                            >
-                                No viewer position reports yet.
-                            </li>
-                        )}
-                    </ul>
-                </section>
-            )}
-            <PlaybackControls
-                isHost={isHost}
-                positionMs={displayPositionMs}
-                localUserId={localUserId}
-                getVideo={getVideo}
-            />
-            {/* P4-T05: standalone "Sync to Host" button.
-             * The DriftIndicator's Resync button is
-             * the same affordance hidden inside the
-             * drift indicator; this button is always
-             * visible (when in a room) so the user can
-             * manually converge to the host at any time,
-             * regardless of whether drift has crossed
-             * the 2 s indicator threshold. Both buttons
-             * call the same `useManualSync` hook. */}
-            <div className="room-page__sync-row">
-                <SyncButton sync={sync} />
-            </div>
-            <RoomFooter
+            <RoomBar
                 summary={summary}
                 signaling={signaling}
                 onLeft={handleLeft}
                 isHost={isHost}
                 lastKnownHostPositionMs={useRoomStore.getState().lastKnownHostPositionMs}
             />
+            <div className="room-layout">
+                <div className="room-main">
+                    <Player localUserId={localUserId} isHost={isHost} videoRef={videoRef} />
+                    <div className="room-controls">
+                        <PlaybackControls
+                            isHost={isHost}
+                            positionMs={displayPositionMs}
+                            localUserId={localUserId}
+                            getVideo={getVideo}
+                        />
+                        {/* P4-T05: the Sync button is always visible so the
+                         * user can converge on the host at any time; the
+                         * drift indicator's Resync below is the same action
+                         * (one shared `useManualSync` hook). */}
+                        <div className="room-controls__sync">
+                            <SyncButton sync={sync} />
+                        </div>
+                    </div>
+                    {/* P4-T04: hidden until the smoothed offset exceeds 2.0 s.
+                     * Non-blocking; playback is never auto-corrected. */}
+                    <DriftIndicator sample={drift} onResync={onResync} />
+                    <RoomMediaPanel />
+                    {isHost && (
+                        <section
+                            className="room-page__viewer-positions panel"
+                            data-testid="viewer-positions"
+                            aria-label="Viewer positions"
+                        >
+                            <div className="panel__header">
+                                <h2 className="panel__title">Viewer positions</h2>
+                                {drift.roomMedianMs !== null && (
+                                    <span
+                                        className="room-page__viewer-positions-median"
+                                        data-testid="room-median"
+                                    >
+                                        <span className="room-page__viewer-positions-median-label">
+                                            Room median
+                                        </span>
+                                        <span className="room-page__viewer-positions-median-value">
+                                            {(drift.roomMedianMs / 1000).toFixed(1)}s
+                                        </span>
+                                        {drift.driftVsMedianMs !== null && (
+                                            <span
+                                                className="room-page__viewer-positions-median-drift"
+                                                data-testid="room-median-drift"
+                                                data-direction={drift.direction}
+                                            >
+                                                {drift.direction === "ahead"
+                                                    ? "ahead"
+                                                    : drift.direction === "behind"
+                                                      ? "behind"
+                                                      : "aligned"}
+                                                {" "}
+                                                {Math.abs(drift.driftVsMedianMs / 1000).toFixed(1)}s
+                                            </span>
+                                        )}
+                                    </span>
+                                )}
+                            </div>
+                            <ul className="room-page__viewer-positions-list">
+                                {otherViewers.map((v) => {
+                                    const ageSec = Math.max(
+                                        0,
+                                        Math.round((Date.now() - v.receivedAtMs) / 1000),
+                                    );
+                                    const posSec = (v.mediaPositionMs / 1000).toFixed(1);
+                                    return (
+                                        <li
+                                            key={v.userId}
+                                            className="room-page__viewer-position-row"
+                                            data-testid="viewer-position-row"
+                                            data-sender-id={v.userId}
+                                        >
+                                            <span className="room-page__viewer-position-user">
+                                                {v.userId.slice(0, 8)}
+                                            </span>
+                                            <span className="room-page__viewer-position-time">
+                                                {posSec}s
+                                            </span>
+                                            <span className="room-page__viewer-position-state">
+                                                {v.playing ? "playing" : "paused"}
+                                            </span>
+                                            <span className="room-page__viewer-position-age">
+                                                {ageSec}s ago
+                                            </span>
+                                        </li>
+                                    );
+                                })}
+                                {otherViewers.length === 0 && (
+                                    <li
+                                        className="room-page__viewer-position-empty"
+                                        data-testid="viewer-positions-empty"
+                                    >
+                                        No viewer position reports yet.
+                                    </li>
+                                )}
+                            </ul>
+                        </section>
+                    )}
+                    {idMismatch && (
+                        <p className="room-page__hint">
+                            Note: URL id <code>{expectedId}</code> differs from the
+                            active room <code>{summary.id}</code>; showing the active
+                            room.
+                        </p>
+                    )}
+                </div>
+                <aside className="room-side" aria-label="Room sidebar">
+                    <ParticipantStrip
+                        summary={summary}
+                        action={
+                            isHost ? (
+                                <Button
+                                    size="sm"
+                                    icon="shield"
+                                    className="room-page__permissions-btn"
+                                    onClick={() => setShowPermissions(true)}
+                                >
+                                    Permissions
+                                </Button>
+                            ) : undefined
+                        }
+                    />
+                    <ChatPanel messages={messages} />
+                </aside>
+            </div>
             {showPermissions && (
                 <PermissionsModal onClose={() => setShowPermissions(false)} />
-            )}
-            <ChatPanel messages={messages} />
-            {idMismatch && (
-                <p className="room-page__hint">
-                    Note: URL id <code>{expectedId}</code> differs from the
-                    active room <code>{summary.id}</code>; showing the active
-                    room.
-                </p>
             )}
         </div>
     );
 }
-

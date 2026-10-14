@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Link } from "react-router-dom";
+import { Icon, LinkButton } from "./ui";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
 import { sendPositionReport } from "../services/playback";
@@ -304,9 +304,22 @@ export function Player({
 return (
         <div className="room-page__player" data-testid="locast-player">
             {mediaSrc === null ? (
-                <p className="room-page__player-empty">
-                    No media loaded yet. <Link to="/library">Choose a file from your library</Link>.
-                </p>
+                <div className="room-page__player-empty">
+                    <span className="room-page__player-empty-icon">
+                        <Icon name="film" />
+                    </span>
+                    <p className="room-page__player-empty-title">No media loaded yet.</p>
+                    {summaryId !== null && (
+                        <p className="room-page__player-empty-hint">
+                            {isHost
+                                ? "Share a file from your library below, then press Play."
+                                : "Waiting for the host to share media."}
+                        </p>
+                    )}
+                    <LinkButton to="/library" size="sm">
+                        Choose a file from your library
+                    </LinkButton>
+                </div>
             ) : (
                 <div className="room-page__player-stage" data-testid="locast-player-stage">
                     <video
@@ -332,11 +345,12 @@ return (
             )}
             {errorMessage !== null && (
                 <p
-                    className="room-page__player-empty"
+                    className="room-page__player-error"
                     role="status"
                     data-testid="locast-player-error"
                 >
-                    {errorMessage}
+                    <Icon name="alert" />
+                    <span>{errorMessage}</span>
                 </p>
             )}
         </div>

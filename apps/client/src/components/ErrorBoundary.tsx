@@ -41,12 +41,14 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
                 <p className="error-boundary__detail" data-testid="error-boundary-detail">
                     {this.state.error.message}
                 </p>
-                <p>
-                    <button type="button" onClick={() => window.location.reload()}>
+                <div className="error-boundary__actions">
+                    <button type="button" className="btn btn--primary" onClick={() => window.location.reload()}>
                         Reload
-                    </button>{" "}
-                    <a href="/library">Back to library</a>
-                </p>
+                    </button>
+                    <a className="btn" href="/library">
+                        Back to library
+                    </a>
+                </div>
             </div>
         );
     }

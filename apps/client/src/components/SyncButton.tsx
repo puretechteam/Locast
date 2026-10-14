@@ -30,6 +30,7 @@
  */
 
 import type { ManualSyncResult } from "../drift/useManualSync";
+import { Button } from "./ui";
 
 export interface SyncButtonProps {
     sync: ManualSyncResult;
@@ -57,9 +58,9 @@ export function SyncButton({ sync, label = "Sync to Host" }: SyncButtonProps): R
         }
     }
     return (
-        <button
-            type="button"
+        <Button
             className="sync-button"
+            icon="refresh"
             data-testid="sync-button"
             data-can-sync={sync.canSync ? "true" : "false"}
             onClick={onClick}
@@ -68,6 +69,6 @@ export function SyncButton({ sync, label = "Sync to Host" }: SyncButtonProps): R
             {...(disabledReason !== null ? { title: disabledReason } : {})}
         >
             {label}
-        </button>
+        </Button>
     );
 }

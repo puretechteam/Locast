@@ -3,6 +3,7 @@ import { useCapabilityStore, CAP } from "../stores/useCapabilityStore";
 import { sendChatMessage } from "../services/chat";
 import { errorText } from "../services/errors";
 import type { ChatMessage } from "../services/chat";
+import { Button, Icon } from "./ui";
 
 interface ChatPanelProps {
     messages: ChatMessage[];
@@ -88,11 +89,16 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
             aria-label="Chat"
             data-testid="chat-panel"
         >
+            <div className="chat-panel__head">
+                <h2 className="section-title">Chat</h2>
+            </div>
             <div className="chat-panel__messages" role="log" aria-live="polite">
                 {messages.length === 0 && (
-                    <p className="chat-panel__empty" data-testid="chat-empty">
-                        No messages yet
-                    </p>
+                    <div className="chat-panel__empty">
+                        <Icon name="chat" />
+                        <p data-testid="chat-empty">No messages yet</p>
+                        <p className="chat-panel__empty-hint">Say hello to everyone in the room.</p>
+                    </div>
                 )}
                 {messages.map((msg) => {
                     const isReply = msg.reply_to !== null;
@@ -130,7 +136,9 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
                             <p className="chat-panel__message-text" data-testid="chat-message-text">
                                 {msg.text}
                             </p>
-                            <button
+                            <Button
+                                variant="ghost"
+                                size="sm"
                                 className="chat-panel__message-reply-btn"
                                 onClick={() =>
                                     handleReplyClick(`${msg.room_id}-${msg.ts_ms}-${msg.sender_id}`)
@@ -140,7 +148,7 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
                                 data-testid="chat-message-reply-btn"
                             >
                                 Reply
-                            </button>
+                            </Button>
                         </div>
                     );
                 })}
@@ -150,21 +158,23 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
             {replyTo !== null && (
                 <div className="chat-panel__reply-banner" data-testid="chat-reply-banner">
                     <span>Replying to a message</span>
-                    <button
+                    <Button
+                        variant="ghost"
+                        size="sm"
                         className="chat-panel__reply-cancel"
                         onClick={handleCancelReply}
                         aria-label="Cancel reply"
                         data-testid="chat-reply-cancel"
                     >
                         Cancel
-                    </button>
+                    </Button>
                 </div>
             )}
 
             <div className="chat-panel__compose">
                 <textarea
                     ref={inputRef}
-                    className="chat-panel__input"
+                    className="textarea chat-panel__input"
                     value={text}
                     onChange={handleTextChange}
                     onKeyDown={handleKeyDown}
@@ -186,7 +196,8 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
                         {error}
                     </p>
                 )}
-                <button
+                <Button
+                    variant="primary"
                     className="chat-panel__send"
                     onClick={() => void handleSend()}
                     disabled={
@@ -198,7 +209,7 @@ export function ChatPanel({ messages }: ChatPanelProps): React.ReactNode {
                     data-testid="chat-send-btn"
                 >
                     {sending ? "Sending..." : "Send"}
-                </button>
+                </Button>
             </div>
         </section>
     );

@@ -1,6 +1,7 @@
 import { forwardRef, useState } from "react";
 import type { KeyboardEventHandler } from "react";
 import type { LibraryItem } from "../../services/mediaCatalog";
+import { Button, Icon, StatusPill } from "../../components/ui";
 import { formatBytes, formatDuration } from "./format";
 
 interface LibraryTileProps {
@@ -14,12 +15,13 @@ interface LibraryTileProps {
     onDelete: (id: string) => void;
 }
 
-function describe(item: LibraryItem): string {
-    const parts: string[] = [formatBytes(item.size_bytes)];
-    if (item.duration_ms !== null) parts.push(formatDuration(item.duration_ms));
+/** "1920x1080 / h264 / matroska": whatever the importer found, nothing invented. */
+function details(item: LibraryItem): string {
+    const parts: string[] = [];
     if (item.width !== null && item.height !== null) parts.push(`${item.width}×${item.height}`);
+    if (item.video_codec !== null) parts.push(item.video_codec);
     if (item.container !== null) parts.push(item.container);
-    return parts.filter((p) => p !== "").join(" · ");
+    return parts.join(" · ");
 }
 
 export const LibraryTile = forwardRef<HTMLElement, LibraryTileProps>(function LibraryTile(
@@ -28,12 +30,13 @@ export const LibraryTile = forwardRef<HTMLElement, LibraryTileProps>(function Li
 ) {
     const [confirming, setConfirming] = useState(false);
     const temporary = item.status === "temporary";
+    const detail = details(item);
 
     return (
         <li className="library-grid__cell">
             <article
                 ref={ref}
-                className="library-tile"
+                className="media-row"
                 data-testid="library-tile"
                 data-media-id={item.id}
                 tabIndex={active ? 0 : -1}
@@ -41,57 +44,59 @@ export const LibraryTile = forwardRef<HTMLElement, LibraryTileProps>(function Li
                 onFocus={onFocusTile}
                 onKeyDown={onKeyDown}
             >
-                <h2 className="library-tile__name" title={item.filename}>
-                    {item.filename}
-                </h2>
-                <p className="library-tile__meta">{describe(item)}</p>
-                <p
-                    className={`library-tile__badge library-tile__badge--${item.status}`}
-                    data-testid="library-tile-status"
-                >
-                    {temporary ? "Temporary" : "Permanent"}
-                </p>
+                <span className="media-row__icon" aria-hidden="true">
+                    <Icon name="film" />
+                </span>
+                <div className="media-row__main">
+                    <h2 className="media-row__name" title={item.filename}>
+                        {item.filename}
+                    </h2>
+                    {detail !== "" && <p className="media-row__detail">{detail}</p>}
+                </div>
+                <span className="media-row__stat media-row__stat--duration">
+                    {item.duration_ms !== null ? formatDuration(item.duration_ms) : ""}
+                </span>
+                <span className="media-row__stat media-row__stat--size">{formatBytes(item.size_bytes)}</span>
+                <span className="media-row__status">
+                    <StatusPill tone={temporary ? "warning" : "neutral"} testId="library-tile-status">
+                        {temporary ? "Temporary" : "Permanent"}
+                    </StatusPill>
+                </span>
                 {confirming ? (
-                    <div className="library-tile__actions" role="group" aria-label={`Delete ${item.filename}?`}>
-                        <span className="library-tile__confirm-text">Delete from your library?</span>
-                        <button
-                            type="button"
-                            className="library-btn library-btn--danger"
-                            onClick={() => onDelete(item.id)}
-                        >
+                    <div className="media-row__actions media-row__actions--confirm" role="group" aria-label={`Delete ${item.filename}?`}>
+                        <span className="media-row__confirm-text">Delete from your library?</span>
+                        <Button variant="danger-solid" size="sm" onClick={() => onDelete(item.id)}>
                             Confirm delete
-                        </button>
-                        <button type="button" className="library-btn" onClick={() => setConfirming(false)}>
+                        </Button>
+                        <Button size="sm" onClick={() => setConfirming(false)}>
                             Cancel
-                        </button>
+                        </Button>
                     </div>
                 ) : (
-                    <div className="library-tile__actions">
-                        <button
-                            type="button"
-                            className="library-btn library-btn--primary"
+                    <div className="media-row__actions">
+                        <Button
+                            variant="primary"
+                            size="sm"
+                            icon="play"
                             aria-label={`Play ${item.filename}`}
                             onClick={() => onPlay(item)}
                         >
                             Play
-                        </button>
+                        </Button>
                         {temporary && (
-                            <button
-                                type="button"
-                                className="library-btn"
-                                onClick={() => onMakePermanent(item.id)}
-                            >
+                            <Button size="sm" onClick={() => onMakePermanent(item.id)}>
                                 Make permanent
-                            </button>
+                            </Button>
                         )}
-                        <button
-                            type="button"
-                            className="library-btn"
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            iconOnly
+                            icon="trash"
+                            title="Delete"
                             aria-label={`Delete ${item.filename}`}
                             onClick={() => setConfirming(true)}
-                        >
-                            Delete
-                        </button>
+                        />
                     </div>
                 )}
             </article>

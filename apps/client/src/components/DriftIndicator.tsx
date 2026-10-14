@@ -25,6 +25,7 @@
  */
 
 import type { DriftSmootherResult } from "../drift/useDriftSmoother";
+import { Button, Icon } from "./ui";
 
 export interface DriftIndicatorProps {
     sample: Pick<DriftSmootherResult, "smoothedDriftMs" | "direction" | "indicatorVisible">;
@@ -63,19 +64,19 @@ export function DriftIndicator({ sample, onResync }: DriftIndicatorProps): React
             aria-live="polite"
         >
             <span className="drift-indicator__icon" aria-hidden="true">
-                !
+                <Icon name="alert" />
             </span>
             <span className="drift-indicator__text">
                 Drift: {formatSeconds(sample.smoothedDriftMs)} {directionLabel}
             </span>
-            <button
-                type="button"
+            <Button
+                size="sm"
                 className="drift-indicator__resync"
                 data-testid="drift-indicator-resync"
-                onClick={onResync}
+                {...(onResync !== undefined ? { onClick: onResync } : {})}
             >
                 Resync
-            </button>
+            </Button>
         </div>
     );
 }

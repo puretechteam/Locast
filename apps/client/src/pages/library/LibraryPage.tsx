@@ -1,9 +1,11 @@
 import { useEffect } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { useMediaStore } from "../../stores/useMediaStore";
 import { useRoomStore } from "../../stores/useRoomStore";
 import type { LibraryItem } from "../../services/mediaCatalog";
+import { Button, EmptyState, Icon, LinkButton, Notice, PageHeader, Spinner } from "../../components/ui";
 import { LibraryGrid } from "./LibraryGrid";
+import { formatBytes } from "./format";
 import "../../styles/library.css";
 
 export function LibraryPage(): JSX.Element {
@@ -35,73 +37,143 @@ export function LibraryPage(): JSX.Element {
 
     const searching = query.trim() !== "";
     const loadedEmpty = status === "ready" && items.length === 0;
+    // A truly empty library gets one prominent Import action in its empty
+    // state instead of a second, duplicate button in the header.
+    const emptyLibrary = loadedEmpty && !searching;
+    const showToolbar = searching || (status === "ready" && items.length > 0);
+
+    let description: string;
+    if (status !== "ready") description = "Your local media, ready to watch together.";
+    else if (searching) description = `${items.length} ${items.length === 1 ? "match" : "matches"} for “${query.trim()}”`;
+    else if (items.length === 0) description = "Import video files to watch them together with friends.";
+    else {
+        const total = formatBytes(items.reduce((sum, i) => sum + i.size_bytes, 0));
+        description = `${items.length} ${items.length === 1 ? "file" : "files"}${total !== "" ? ` · ${total}` : ""}`;
+    }
+
+    const importButton = (
+        <Button
+            variant="primary"
+            icon={importing ? undefined : "upload"}
+            onClick={() => void importFiles()}
+            disabled={importing}
+        >
+            {importing && <Spinner />}
+            {importing ? "Importing..." : "Import files"}
+        </Button>
+    );
 
     return (
-        <div className="library">
-            <div className="library__toolbar">
-                <input
-                    type="search"
-                    className="library__search"
-                    aria-label="Search library"
-                    placeholder="Search by file name"
-                    value={query}
-                    onChange={(e) => void setQuery(e.target.value)}
-                />
-                <button
-                    type="button"
-                    className="library-btn library-btn--primary"
-                    onClick={() => void importFiles()}
-                    disabled={importing}
-                >
-                    {importing ? "Importing..." : "Import files"}
-                </button>
-                <nav className="library__links" aria-label="Rooms">
-                    <Link to="/rooms/new">Create a room</Link>
-                    <Link to="/rooms/join">Join a room</Link>
-                    <Link to="/rooms">Rooms</Link>
-                    <Link to="/settings">Settings</Link>
-                </nav>
-            </div>
+        <div className="page library">
+            <PageHeader
+                title="Library"
+                description={description}
+                actions={
+                    <>
+                        <LinkButton to="/rooms/join" icon="join">
+                            Join a room
+                        </LinkButton>
+                        <LinkButton to="/rooms/new" icon="plus">
+                            Create a room
+                        </LinkButton>
+                        {!emptyLibrary && importButton}
+                    </>
+                }
+            />
 
             {notice !== null && (
-                <p
-                    className={`library__notice library__notice--${notice.kind}`}
-                    role={notice.kind === "error" ? "alert" : "status"}
-                    data-testid="library-notice"
+                <Notice
+                    kind={notice.kind === "error" ? "error" : "success"}
+                    testId="library-notice"
+                    actions={
+                        <Button variant="ghost" size="sm" onClick={dismissNotice}>
+                            Dismiss
+                        </Button>
+                    }
                 >
-                    <span>{notice.message}</span>
-                    <button type="button" className="library-btn" onClick={dismissNotice}>
-                        Dismiss
-                    </button>
-                </p>
+                    {notice.message}
+                </Notice>
+            )}
+
+            {importing && (
+                <div className="library__importing" aria-busy="true">
+                    <p>Importing your files. Large videos can take a little while.</p>
+                    <div className="progress progress--indeterminate">
+                        <span />
+                    </div>
+                </div>
+            )}
+
+            {showToolbar && (
+                <div className="library__toolbar">
+                    <div className="search">
+                        <Icon name="search" className="search__icon" />
+                        <input
+                            type="search"
+                            className="input"
+                            aria-label="Search library"
+                            placeholder="Search by file name"
+                            value={query}
+                            onChange={(e) => void setQuery(e.target.value)}
+                        />
+                    </div>
+                </div>
             )}
 
             {(status === "idle" || status === "loading") && (
-                <p className="library__state" role="status" aria-busy="true">
+                <p className="loading" role="status" aria-busy="true">
+                    <Spinner />
                     Loading your library...
                 </p>
             )}
 
             {status === "error" && (
-                <div className="library__state library__state--error" role="alert">
-                    <p>Could not load your library: {error}</p>
-                    <button type="button" className="library-btn" onClick={() => void refresh()}>
-                        Try again
-                    </button>
-                </div>
+                <EmptyState
+                    icon="alert"
+                    tone="error"
+                    role="alert"
+                    title="Could not load your library"
+                    actions={
+                        <Button icon="refresh" onClick={() => void refresh()}>
+                            Try again
+                        </Button>
+                    }
+                >
+                    {error}
+                </EmptyState>
             )}
 
-            {loadedEmpty && !searching && (
-                <div className="library__state" data-testid="library-empty">
-                    <p>Your library is empty.</p>
-                    <p>Import media files from your computer to start watching with friends.</p>
-                </div>
+            {emptyLibrary && (
+                <EmptyState
+                    icon="film"
+                    title="Add your first video"
+                    testId="library-empty"
+                    actions={
+                        <>
+                            {importButton}
+                            <LinkButton to="/rooms/join" icon="join">
+                                Join a room
+                            </LinkButton>
+                        </>
+                    }
+                >
+                    Your library is empty. Import video files from this computer, then share one in a room and
+                    your friends receive it directly from you.
+                </EmptyState>
             )}
 
             {loadedEmpty && searching && (
-                <p className="library__state" data-testid="library-no-matches">
-                    No files match &ldquo;{query.trim()}&rdquo;.
-                </p>
+                <EmptyState
+                    icon="search"
+                    plain
+                    title="No matching files"
+                    testId="library-no-matches"
+                    actions={
+                        <Button onClick={() => void setQuery("")}>Clear search</Button>
+                    }
+                >
+                    No files match &ldquo;{query.trim()}&rdquo;. Check the spelling or try a shorter word.
+                </EmptyState>
             )}
 
             {items.length > 0 && (

@@ -7,12 +7,12 @@ interface ParticipantTileProps {
     quality?: ConnectionQuality;
 }
 
-const STATUS_COLOR: Record<ParticipantStatusIpc, string> = {
-    Joining: "#f5a3a3",
-    Connected: "#7bd88f",
-    Reconnecting: "#f5c869",
-    Disconnected: "#9aa3ad",
-    Left: "#5b6168",
+/** Statuses that need words next to the dot, so color is never the only signal. */
+const STATUS_TEXT: Partial<Record<ParticipantStatusIpc, string>> = {
+    Joining: "Joining",
+    Reconnecting: "Reconnecting",
+    Disconnected: "Disconnected",
+    Left: "Left",
 };
 
 export const ParticipantTile = React.memo(
@@ -24,11 +24,16 @@ export const ParticipantTile = React.memo(
                 <div className="participant-tile__avatar">{initial}</div>
                 <div className="participant-tile__body">
                     <div className="participant-tile__name">
-                        {participant.display_name}
+                        <span className="participant-tile__text" title={participant.display_name}>
+                            {participant.display_name.trim() || "Unnamed"}
+                        </span>
                         {participant.is_host && (
                             <span className="participant-tile__badge">Host</span>
                         )}
                     </div>
+                    {STATUS_TEXT[participant.status] !== undefined && (
+                        <div className="participant-tile__status">{STATUS_TEXT[participant.status]}</div>
+                    )}
                 </div>
                 {qualityLevel !== "good" && (
                     <span
@@ -41,8 +46,8 @@ export const ParticipantTile = React.memo(
                     </span>
                 )}
                 <span
-                    className="participant-tile__dot"
-                    style={{ background: STATUS_COLOR[participant.status] }}
+                    className={`participant-tile__dot participant-tile__dot--${participant.status.toLowerCase()}`}
+                    role="img"
                     aria-label={`Status: ${participant.status}`}
                 />
             </li>

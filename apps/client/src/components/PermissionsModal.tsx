@@ -1,9 +1,9 @@
 import { useCallback, useState } from "react";
-import type { MouseEvent } from "react";
 import { useRoomStore } from "../stores/useRoomStore";
 import { errorText } from "../services/errors";
 import { setCapabilities, CAP } from "../services/permissions";
 import type { Cap } from "../services/permissions";
+import { Button, Dialog, Spinner } from "./ui";
 import "../styles/permissions-modal.css";
 
 type Preset = "viewer" | "editor" | "co-host";
@@ -49,19 +49,6 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
     const [applying, setApplying] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
-    // A click on the backdrop itself does nothing (the modal
-    // closes only through X / Apply). Clicks inside the panel
-    // bubble here too and must keep their default action, or
-    // the preset radios can never change.
-    const handleBackdropClick = useCallback(
-        (e: MouseEvent) => {
-            if (e.target !== e.currentTarget) return;
-            e.preventDefault();
-            e.stopPropagation();
-        },
-        [],
-    );
-
     const handleClose = useCallback(() => {
         onClose();
     }, [onClose]);
@@ -97,105 +84,87 @@ export function PermissionsModal({ onClose }: PermissionsModalProps): JSX.Elemen
         setSelections((prev) => ({ ...prev, [userId]: preset }));
     }, []);
 
+    const PRESETS: Array<{ value: Preset; label: string }> = [
+        { value: "viewer", label: "Viewer" },
+        { value: "editor", label: "Editor" },
+        { value: "co-host", label: "Co-host" },
+    ];
+
     return (
-        <div
-            className="permissions-modal__backdrop"
-            onClick={handleBackdropClick}
-            role="presentation"
-        >
-            <dialog
-                className="permissions-modal__panel"
-                open
-                aria-modal="true"
-                aria-labelledby="permissions-modal-title"
-            >
-                <header className="permissions-modal__header">
-                    <h2 id="permissions-modal-title" className="permissions-modal__title">
-                        Permissions
-                    </h2>
-                    <button
-                        className="permissions-modal__close"
-                        onClick={handleClose}
-                        aria-label="Close"
-                    >
-                        X
-                    </button>
-                </header>
-
-                <ul className="permissions-modal__list">
-                    {summary?.participants.map((p) => {
-                        const preset = selections[p.user_id] ?? "viewer";
-                        return (
-                            <li key={p.user_id} className="permissions-modal__participant">
-                                <div className="permissions-modal__participant-info">
-                                    <span className="permissions-modal__participant-name">
-                                        {p.display_name}
-                                    </span>
-                                    {p.is_host && (
-                                        <span className="permissions-modal__badge">Host</span>
-                                    )}
-                                </div>
-                                {!p.is_host && (
-                                    <div className="permissions-modal__preset-group">
-                                        <label className="permissions-modal__preset">
-                                            <input
-                                                type="radio"
-                                                name={`preset-${p.user_id}`}
-                                                value="viewer"
-                                                checked={preset === "viewer"}
-                                                onChange={() =>
-                                                    handlePresetChange(p.user_id, "viewer")
-                                                }
-                                            />
-                                            <span>Viewer</span>
-                                        </label>
-                                        <label className="permissions-modal__preset">
-                                            <input
-                                                type="radio"
-                                                name={`preset-${p.user_id}`}
-                                                value="editor"
-                                                checked={preset === "editor"}
-                                                onChange={() =>
-                                                    handlePresetChange(p.user_id, "editor")
-                                                }
-                                            />
-                                            <span>Editor</span>
-                                        </label>
-                                        <label className="permissions-modal__preset">
-                                            <input
-                                                type="radio"
-                                                name={`preset-${p.user_id}`}
-                                                value="co-host"
-                                                checked={preset === "co-host"}
-                                                onChange={() =>
-                                                    handlePresetChange(p.user_id, "co-host")
-                                                }
-                                            />
-                                            <span>Co-host</span>
-                                        </label>
-                                    </div>
-                                )}
-                            </li>
-                        );
-                    })}
-                </ul>
-
-                {error !== null && (
-                    <p className="form__error" role="alert" data-testid="permissions-error">
-                        {error}
-                    </p>
-                )}
-
-                <footer className="permissions-modal__footer">
-                    <button
+        <Dialog
+            title="Permissions"
+            wide
+            className="permissions-modal__panel"
+            backdropClassName="permissions-modal__backdrop"
+            onEscape={applying ? undefined : handleClose}
+            onClose={handleClose}
+            closeDisabled={applying}
+            footer={
+                <>
+                    <Button onClick={handleClose} disabled={applying}>
+                        Cancel
+                    </Button>
+                    <Button
+                        variant="primary"
                         className="permissions-modal__apply"
                         onClick={handleApply}
                         disabled={applying}
                     >
+                        {applying && <Spinner />}
                         {applying ? "Applying..." : "Apply"}
-                    </button>
-                </footer>
-            </dialog>
-        </div>
+                    </Button>
+                </>
+            }
+        >
+            <p className="permissions-modal__help">
+                <strong>Viewer</strong> can chat. <strong>Editor</strong> can also control playback, draw and use
+                the laser pointer. <strong>Co-host</strong> can also manage the room.
+            </p>
+
+            <ul className="permissions-modal__list">
+                {summary?.participants.map((p) => {
+                    const preset = selections[p.user_id] ?? "viewer";
+                    return (
+                        <li key={p.user_id} className="permissions-modal__participant">
+                            <div className="permissions-modal__participant-info">
+                                <span className="permissions-modal__participant-name" title={p.display_name}>
+                                    {p.display_name.trim() || "Unnamed"}
+                                </span>
+                                {p.is_host && <span className="permissions-modal__badge">Host</span>}
+                            </div>
+                            {!p.is_host && (
+                                <div
+                                    className="permissions-modal__preset-group"
+                                    role="radiogroup"
+                                    aria-label={`Role for ${p.display_name.trim() || "Unnamed"}`}
+                                >
+                                    {PRESETS.map((opt) => (
+                                        <label
+                                            key={opt.value}
+                                            className={`permissions-modal__preset${preset === opt.value ? " permissions-modal__preset--on" : ""}`}
+                                        >
+                                            <input
+                                                type="radio"
+                                                name={`preset-${p.user_id}`}
+                                                value={opt.value}
+                                                checked={preset === opt.value}
+                                                onChange={() => handlePresetChange(p.user_id, opt.value)}
+                                            />
+                                            <span>{opt.label}</span>
+                                        </label>
+                                    ))}
+                                </div>
+                            )}
+                        </li>
+                    );
+                })}
+            </ul>
+
+            {error !== null && (
+                <p className="dialog__error" role="alert" data-testid="permissions-error">
+                    {error}
+                </p>
+            )}
+        </Dialog>
     );
 }

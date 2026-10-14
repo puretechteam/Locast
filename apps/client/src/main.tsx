@@ -1,3 +1,7 @@
+import "./styles/tokens.css";
+import "./styles/base.css";
+import "./styles/ui.css";
+import "./styles/room.css";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
@@ -17,7 +21,6 @@ import { JoinRoomPage } from "./pages/rooms.join";
 import { NewRoomPage } from "./pages/rooms.new";
 import { RoomsIndexPage } from "./pages/rooms.index";
 import { SettingsPage } from "./pages/settings";
-import "./styles/room.css";
 
 function App(): JSX.Element {
     return (
@@ -38,11 +41,11 @@ function App(): JSX.Element {
                     path="/rooms/:id"
                     element={
                         <DownloadBlockingGuard>
-                            <PageShell title="Room"><RoomPage /></PageShell>
+                            <PageShell title="Room" layout="fill"><RoomPage /></PageShell>
                         </DownloadBlockingGuard>
                     }
                 />
-                <Route path="*" element={<NotFoundPage />} />
+                <Route path="*" element={<PageShell title="Not found"><NotFoundPage /></PageShell>} />
             </Routes>
             <DownloadProgressModal />
         </BrowserRouter>

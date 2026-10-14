@@ -1,0 +1,84 @@
+/* Rooms index: active room and recent rooms. */
+
+.rooms-index__section {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+}
+
+.rooms-index__list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.rooms-index__none {
+    color: var(--text-3);
+    font-size: var(--text-sm);
+}
+
+.room-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    background: var(--bg-1);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+}
+
+.room-row--active {
+    border-color: rgba(95, 207, 138, 0.35);
+}
+
+.room-row--ended .room-row__title {
+    color: var(--text-2);
+}
+
+.room-row__main {
+    flex: 1;
+    min-width: 0;
+}
+
+.room-row__title {
+    font-size: var(--text-base);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.room-row__meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.25rem var(--space-3);
+    margin-top: 0.2rem;
+    font-size: var(--text-xs);
+    color: var(--text-2);
+}
+
+.room-row__code {
+    letter-spacing: 0.18em;
+    color: var(--text);
+}
+
+.room-row__when {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--text-3);
+}
+
+@media (max-width: 640px) {
+    .room-row {
+        flex-wrap: wrap;
+    }
+
+    .room-row__main {
+        flex-basis: 100%;
+    }
+}

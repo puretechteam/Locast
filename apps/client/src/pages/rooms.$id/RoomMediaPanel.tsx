@@ -5,6 +5,8 @@ import { getInviteUrl, shareMedia } from "../../services/sharedMedia";
 import type { SharedMediaIpc } from "../../services/sharedMedia";
 import { usePlaybackStore } from "../../stores/usePlaybackStore";
 import { useSharedMediaStore } from "../../stores/useSharedMediaStore";
+import { Button, Icon, StatusPill } from "../../components/ui";
+import type { PillTone } from "../../components/ui";
 import type { SharedItemStatus } from "../../stores/useSharedMediaStore";
 
 function messageOf(err: unknown): string {
@@ -44,6 +46,20 @@ function statusLabel(s: SharedItemStatus | undefined): string {
     }
 }
 
+function statusTone(kind: SharedItemStatus["kind"] | undefined): PillTone {
+    switch (kind) {
+        case "local":
+            return "success";
+        case "error":
+            return "danger";
+        case "downloading":
+        case "waiting":
+            return "accent";
+        default:
+            return "neutral";
+    }
+}
+
 /**
  * Slice 3: the room's shared-media controls. The host picks one library
  * item to share and sees the invite link viewers need; a viewer sees what
@@ -68,55 +84,69 @@ export function RoomMediaPanel(): JSX.Element {
     };
 
     return (
-        <section className="room-media" data-testid="room-media" aria-label="Shared media">
-            <h3 className="room-media__title">Shared media</h3>
-            {isHost && <HostControls current={manifest?.media ?? []} />}
-            {manifest === null || manifest.media.length === 0 ? (
-                <p className="room-media__empty" data-testid="room-media-empty">
-                    {isHost
-                        ? "Nothing shared yet."
-                        : manifestError !== null
-                          ? "The shared media could not be verified. Join with the host's invite link to receive it."
-                          : "Waiting for the host to share media."}
-                </p>
-            ) : (
-                <ul className="room-media__list">
-                    {manifest.media.map((m: SharedMediaIpc) => {
-                        const st = isHost ? undefined : items[m.id];
-                        const localId = isHost
-                            ? m.id
-                            : st?.kind === "local"
-                              ? st.localMediaId
-                              : null;
-                        return (
-                            <li
-                                key={m.id}
-                                className="room-media__item"
-                                data-testid="room-media-item"
-                                data-media-id={m.id}
-                                data-status={isHost ? "shared" : (st?.kind ?? "checking")}
-                            >
-                                <span className="room-media__name">{m.filename}</span>
-                                <span className="room-media__size">{humanBytes(m.size_bytes)}</span>
-                                <span className="room-media__status" data-testid="room-media-status">
-                                    {isHost ? "Shared with the room" : statusLabel(st)}
-                                </span>
-                                {localId !== null && (
-                                    <button
-                                        type="button"
-                                        className="room-media__btn"
-                                        data-testid="room-media-play"
-                                        onClick={() => void play(localId, m.filename)}
+        <section className="room-media panel" data-testid="room-media" aria-label="Shared media">
+            <div className="panel__header">
+                <h2 className="panel__title">Shared media</h2>
+            </div>
+            <div className="room-media__body">
+                {isHost && <HostControls current={manifest?.media ?? []} />}
+                {manifest === null || manifest.media.length === 0 ? (
+                    <p className="room-media__empty" data-testid="room-media-empty">
+                        {isHost
+                            ? "Nothing shared yet."
+                            : manifestError !== null
+                              ? "The shared media could not be verified. Join with the host's invite link to receive it."
+                              : "Waiting for the host to share media."}
+                    </p>
+                ) : (
+                    <ul className="room-media__list">
+                        {manifest.media.map((m: SharedMediaIpc) => {
+                            const st = isHost ? undefined : items[m.id];
+                            const localId = isHost
+                                ? m.id
+                                : st?.kind === "local"
+                                  ? st.localMediaId
+                                  : null;
+                            return (
+                                <li
+                                    key={m.id}
+                                    className="room-media__item"
+                                    data-testid="room-media-item"
+                                    data-media-id={m.id}
+                                    data-status={isHost ? "shared" : (st?.kind ?? "checking")}
+                                >
+                                    <span className="room-media__icon" aria-hidden="true">
+                                        <Icon name="film" />
+                                    </span>
+                                    <span className="room-media__name" title={m.filename}>
+                                        {m.filename}
+                                    </span>
+                                    <span className="room-media__size">{humanBytes(m.size_bytes)}</span>
+                                    <StatusPill
+                                        tone={isHost ? "accent" : statusTone(st?.kind)}
+                                        pulse={!isHost && (st?.kind === "downloading" || st?.kind === "waiting")}
+                                        testId="room-media-status"
                                     >
-                                        Play
-                                    </button>
-                                )}
-                            </li>
-                        );
-                    })}
-                </ul>
-            )}
-            {error !== null && <p className="room-media__error">{error}</p>}
+                                        {isHost ? "Shared with the room" : statusLabel(st)}
+                                    </StatusPill>
+                                    {localId !== null && (
+                                        <Button
+                                            variant="primary"
+                                            size="sm"
+                                            icon="play"
+                                            data-testid="room-media-play"
+                                            onClick={() => void play(localId, m.filename)}
+                                        >
+                                            Play
+                                        </Button>
+                                    )}
+                                </li>
+                            );
+                        })}
+                    </ul>
+                )}
+                {error !== null && <p className="room-media__error">{error}</p>}
+            </div>
         </section>
     );
 }
@@ -180,30 +210,35 @@ function HostControls({ current }: { current: SharedMediaIpc[] }): JSX.Element {
     const sharedId = current[0]?.id;
     return (
         <div className="room-media__host" data-testid="room-media-host">
-            <label className="room-media__row">
-                <span>Invite link</span>
+            <div className="room-media__row">
+                <label className="room-media__label" htmlFor="room-media-invite">
+                    Invite link
+                </label>
                 <input
+                    id="room-media-invite"
                     type="text"
                     readOnly
-                    className="room-media__invite"
+                    className="input input--mono"
                     data-testid="room-media-invite"
                     value={invite ?? ""}
                     placeholder="Loading..."
                     onFocus={(e) => e.currentTarget.select()}
                 />
-                <button
-                    type="button"
-                    className="room-media__btn"
+                <Button
+                    icon={copied ? "check" : "copy"}
                     onClick={() => void onCopy()}
                     disabled={invite === null}
                 >
                     {copied ? "Copied" : "Copy"}
-                </button>
-            </label>
-            <label className="room-media__row">
-                <span>Media</span>
+                </Button>
+            </div>
+            <div className="room-media__row">
+                <label className="room-media__label" htmlFor="room-media-select">
+                    Media
+                </label>
                 <select
-                    className="room-media__select"
+                    id="room-media-select"
+                    className="select"
                     data-testid="room-media-select"
                     value={selected}
                     onChange={(e) => setSelected(e.target.value)}
@@ -216,16 +251,15 @@ function HostControls({ current }: { current: SharedMediaIpc[] }): JSX.Element {
                         </option>
                     ))}
                 </select>
-                <button
-                    type="button"
-                    className="room-media__btn"
+                <Button
+                    variant="primary"
                     data-testid="room-media-share"
                     onClick={() => void onShare()}
                     disabled={selected === "" || busy || selected === sharedId}
                 >
                     {busy ? "Sharing..." : selected === sharedId ? "Shared" : "Share"}
-                </button>
-            </label>
+                </Button>
+            </div>
             {error !== null && <p className="room-media__error">{error}</p>}
         </div>
     );

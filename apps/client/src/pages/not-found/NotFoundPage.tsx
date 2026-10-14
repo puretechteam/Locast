@@ -1,12 +1,20 @@
-import { Link } from "react-router-dom";
+import { EmptyState, LinkButton } from "../../components/ui";
 
 export function NotFoundPage(): JSX.Element {
     return (
-        <div className="page-shell__content-inner">
-            <p>Page not found.</p>
-            <p>
-                <Link to="/library">Back to library</Link>
-            </p>
+        <div className="page page--narrow">
+            <EmptyState
+                icon="search"
+                title="Page not found"
+                headingLevel={1}
+                actions={
+                    <LinkButton to="/library" variant="primary" icon="film">
+                        Back to library
+                    </LinkButton>
+                }
+            >
+                That address does not match anything in Locast.
+            </EmptyState>
         </div>
     );
 }

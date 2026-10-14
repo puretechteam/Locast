@@ -1,0 +1,83 @@
+/*
+ * Locast design tokens.
+ *
+ * One palette for the whole app: deep graphite surfaces separated by thin
+ * borders, a single restrained blue accent for primary actions and focus, and
+ * semantic colors for state. Every other stylesheet reads these variables
+ * instead of hard-coding colors, so the look can be tuned in one place.
+ *
+ * Contrast: --text 15.5:1, --text-2 8.2:1, --text-3 5.7:1 on --bg-1;
+ * --accent-text 8.4:1 on --bg-1. White on --accent 5.2:1, on --accent-hover
+ * 4.65:1. Input borders (--control-border) are 3.4:1 against --bg-2.
+ */
+:root {
+    color-scheme: dark;
+
+    /* Surfaces, darkest to lightest. */
+    --bg-0: #0b0d10; /* app background */
+    --bg-1: #12161b; /* header, panels */
+    --bg-2: #181d23; /* raised: inputs, tiles */
+    --bg-3: #1f262d; /* hover */
+    --bg-4: #28313a; /* pressed / selected */
+
+    /* Lines. */
+    --line: #232a32;
+    --line-strong: #323c47;
+    --control-border: #66737f; /* form control outlines, 3:1 non-text contrast */
+
+    /* Text. */
+    --text: #e9ecf0;
+    --text-2: #b0b8c1;
+    --text-3: #8591a0;
+
+    /* Accent. */
+    --accent: #2a66da;
+    --accent-hover: #2f6fe4;
+    --accent-pressed: #245bc6;
+    --accent-text: #86b2ff;
+    --accent-soft: rgba(47, 111, 228, 0.16);
+    --focus-ring: #6ea0ff;
+
+    /* Semantic. */
+    --success: #5fcf8a;
+    --success-soft: rgba(95, 207, 138, 0.13);
+    --warning: #f0c25e;
+    --warning-soft: rgba(240, 194, 94, 0.13);
+    --danger: #f27a82;
+    --danger-solid: #b83a43;
+    --danger-solid-hover: #cb4852;
+    --danger-soft: rgba(242, 122, 130, 0.13);
+
+    /* Shape. */
+    --radius-sm: 6px;
+    --radius-md: 8px;
+    --radius-lg: 12px;
+
+    /* Spacing scale (4 px base). */
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.5rem;
+    --space-6: 2rem;
+
+    /* Type. */
+    --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --font-mono: ui-monospace, "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+    --text-xs: 0.75rem;
+    --text-sm: 0.8125rem;
+    --text-base: 0.9375rem;
+    --text-lg: 1.125rem;
+    --text-xl: 1.5rem;
+
+    /* Depth. Used sparingly: dialogs and floating toolbars only. */
+    --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.55), 0 0 0 1px rgba(255, 255, 255, 0.03);
+
+    /* Layout. */
+    --header-h: 3rem;
+    --page-pad: 1.5rem;
+    --content-w: 72rem;
+    --content-w-narrow: 34rem;
+
+    --ease: 140ms cubic-bezier(0.2, 0, 0, 1);
+}

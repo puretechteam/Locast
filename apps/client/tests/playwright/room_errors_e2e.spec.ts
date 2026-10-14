@@ -52,13 +52,31 @@ test("a failed create shows the server's reason", async ({ page }) => {
 });
 
 // Neither page had any link out, so a user who opened one by mistake had no
-// visible way back.
+// visible way back. The application header's Library link is always there, and
+// each page also offers a way back to the Rooms screen it is reached from.
 for (const path of ["/rooms/new", "/rooms/join"]) {
     test(`${path} offers a way back to the library`, async ({ page }) => {
         await injectLocastShim(page);
         await page.goto(path);
-        await page.getByRole("link", { name: "Back to library" }).click();
+        await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Library" }).click();
         await expect(page).toHaveURL(/\/library$/);
+    });
+
+    test(`${path} can be left for the rooms screen`, async ({ page }) => {
+        await injectLocastShim(page);
+        await page.addInitScript(() => {
+            const w = window as unknown as {
+                __TAURI_INTERNALS__: {
+                    invoke: (name: string, args?: unknown, options?: unknown) => Promise<unknown>;
+                };
+            };
+            const original = w.__TAURI_INTERNALS__.invoke;
+            w.__TAURI_INTERNALS__.invoke = (name, args, options) =>
+                name === "recent_rooms_list" ? Promise.resolve([]) : original(name, args, options);
+        });
+        await page.goto(path);
+        await page.getByRole("link", { name: "Back to rooms" }).click();
+        await expect(page).toHaveURL(/\/rooms$/);
     });
 }
 

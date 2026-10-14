@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import { usePlaybackStore, type PlaybackKind } from "../stores/usePlaybackStore";
 import { useRoomStore } from "../stores/useRoomStore";
+import { Button, StatusPill } from "./ui";
 import {
     hostCommandAllowed,
     sendHostPlaybackCommand,
@@ -99,42 +100,63 @@ export function PlaybackControls({
     const needsPlayFirst = isHost && !hasRoomCommand;
     const playFirstHint = needsPlayFirst ? "Press Play first" : undefined;
 
+    const mediaLoaded = usePlaybackStore((s) => s.mediaSrc !== null);
+    const hostPaused = usePlaybackStore((s) => s.hostPaused);
+
+    // What the room is doing, from the host's last accepted command.
+    let stateLabel: string;
+    let stateTone: "neutral" | "success" | "warning" = "neutral";
+    if (!mediaLoaded) stateLabel = "No media loaded";
+    else if (!hasRoomCommand) stateLabel = isHost ? "Ready. Press Play to start for everyone" : "Waiting for the host to press play";
+    else if (hostPaused) {
+        stateLabel = "Paused";
+        stateTone = "warning";
+    } else {
+        stateLabel = "Playing";
+        stateTone = "success";
+    }
+
     return (
         <div className="playback-controls" data-testid="locast-playback-controls">
-            <button
-                type="button"
-                onClick={onPlay}
-                disabled={!isHost}
-                data-testid="locast-playback-play"
-            >
-                Play
-            </button>
-            <button
-                type="button"
-                onClick={onPause}
-                disabled={!isHost || needsPlayFirst}
-                title={playFirstHint}
-                data-testid="locast-playback-pause"
-            >
-                Pause
-            </button>
-            <button
-                type="button"
-                onClick={onSeek60}
-                disabled={!isHost || needsPlayFirst}
-                title={playFirstHint}
-                data-testid="locast-playback-seek60"
-            >
-                Seek 60s
-            </button>
+            <div className="playback-controls__buttons" role="group" aria-label="Playback">
+                <Button
+                    variant={isHost ? "primary" : "secondary"}
+                    icon="play"
+                    onClick={onPlay}
+                    disabled={!isHost}
+                    data-testid="locast-playback-play"
+                >
+                    Play
+                </Button>
+                <Button
+                    icon="pause"
+                    onClick={onPause}
+                    disabled={!isHost || needsPlayFirst}
+                    title={playFirstHint}
+                    data-testid="locast-playback-pause"
+                >
+                    Pause
+                </Button>
+                <Button
+                    onClick={onSeek60}
+                    disabled={!isHost || needsPlayFirst}
+                    title={playFirstHint}
+                    data-testid="locast-playback-seek60"
+                >
+                    Seek 60s
+                </Button>
+            </div>
+            <StatusPill tone={stateTone} dot={hasRoomCommand && mediaLoaded}>
+                {stateLabel}
+            </StatusPill>
             {!isHost && (
                 <span className="playback-controls__hint">
-                    (host only)
+                    Only the host controls playback
                 </span>
             )}
             {sendFailed && (
                 <span
-                    className="playback-controls__hint"
+                    className="playback-controls__hint playback-controls__hint--error"
                     role="alert"
                     data-testid="playback-send-failed"
                 >
