@@ -43,7 +43,20 @@ const PATHS = {
     join: <path d="M15 4h4a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-4M10 8l4 4-4 4M14 12H4" />,
     leave: <path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9" />,
     link: <path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" />,
+    laser: (
+        <>
+            <circle cx="12" cy="12" r="7" />
+            <circle cx="12" cy="12" r="1.5" />
+            <path d="M12 2v3M12 19v3M2 12h3M19 12h3" />
+        </>
+    ),
     pause: <path d="M8 5v14M16 5v14" />,
+    pen: (
+        <>
+            <path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19z" />
+            <path d="M14.5 6.5l3 3" />
+        </>
+    ),
     play: <path d="M7 4.5v15l12-7.5z" />,
     plus: <path d="M12 5v14M5 12h14" />,
     refresh: <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" />,

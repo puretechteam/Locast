@@ -40,6 +40,7 @@ import { planUndo, UndoTracker } from "../drawing/undoPolicy";
 import type { PointerSample } from "../drawing/pointerPipeline";
 import { LaserPointer } from "./LaserPointer";
 import { DrawingToolbar } from "./DrawingToolbar";
+import { Button } from "./ui";
 
 /**
  * Props
@@ -132,6 +133,7 @@ export function DrawingLayer({
     const canUndoOwn =
         youCapSet !== null && (youCapSet & (CAP.UNDO_OWN | CAP.UNDO_ANY)) !== 0;
     const canClearAll = youCapSet !== null && (youCapSet & CAP.CLEAR_ALL) !== 0;
+    const canLaser = youCapSet !== null && (youCapSet & CAP.LASER) !== 0;
 
     // P5-T02: the production send path. One DrawingService
     // per room (a new roomId gives a fresh instance, so no
@@ -355,6 +357,56 @@ export function DrawingLayer({
                 onPointerCancel={handlePointerCancel}
                 onPointerLeave={handlePointerUp}
             />
+            {/* A visible way in to drawing and the laser; D, L and Esc still work. */}
+            {(canDraw || canLaser) && (
+                <div className="drawing-dock" role="toolbar" aria-label="Annotate the video" data-testid="drawing-dock">
+                    {canDraw && (
+                        <Button
+                            size="sm"
+                            icon="pen"
+                            className="drawing-dock__btn"
+                            aria-pressed={keyboard.toolbarVisible || keyboard.isDrawing}
+                            title="Draw on the video (D)"
+                            data-testid="drawing-dock-draw"
+                            onClick={() => {
+                                if (!keyboard.laserActive && !keyboard.isDrawing) keyboard.toggleToolbar();
+                            }}
+                        >
+                            Draw
+                        </Button>
+                    )}
+                    {canLaser && (
+                        <Button
+                            size="sm"
+                            icon="laser"
+                            className="drawing-dock__btn"
+                            aria-pressed={keyboard.laserActive}
+                            title="Laser pointer (L)"
+                            data-testid="drawing-dock-laser"
+                            onClick={() => {
+                                if (!keyboard.isDrawing) keyboard.setLaserActive(!keyboard.laserActive);
+                            }}
+                        >
+                            Laser
+                        </Button>
+                    )}
+                    {(keyboard.isDrawing || keyboard.laserActive) && (
+                        <Button
+                            size="sm"
+                            variant="primary"
+                            className="drawing-dock__btn"
+                            title="Stop and go back to the video controls (Esc)"
+                            data-testid="drawing-dock-done"
+                            onClick={() => {
+                                keyboard.setDrawingMode("none");
+                                keyboard.setLaserActive(false);
+                            }}
+                        >
+                            Done
+                        </Button>
+                    )}
+                </div>
+            )}
             {/* P5-T04/P5-T06: laser pointer overlay */}
             <LaserPointer
                 videoRef={videoRef}

@@ -465,6 +465,43 @@ for (const size of SIZES) {
             await shot(page, "room-busy");
         });
 
+        test("drawing and laser have visible buttons, gated by the room role", async ({ page }) => {
+            await injectLocastShim(page);
+            await page.goto("/");
+            const host = { ...HOST_ROOM, you_cap_set: 0xffff };
+            await mountRoomWithRealVideo(page, host as unknown as typeof HOST_ROOM, HOST_ID);
+            const dock = page.getByTestId("drawing-dock");
+            await expect(dock).toBeVisible();
+            await shot(page, "room-draw-dock");
+
+            // Draw opens the drawing toolbar; pressing it again closes it.
+            await page.getByTestId("drawing-dock-draw").click();
+            await expect(page.getByTestId("drawing-toolbar")).toBeVisible();
+            await expect(page.getByTestId("drawing-dock-draw")).toHaveAttribute("aria-pressed", "true");
+            await shot(page, "room-draw-toolbar");
+            await page.getByTestId("drawing-toolbar-tool-pen").click();
+            // Drawing mode: Done leaves it.
+            await expect(page.getByTestId("drawing-dock-done")).toBeVisible();
+            await page.getByTestId("drawing-dock-done").click();
+            await expect(page.getByTestId("drawing-dock-done")).toHaveCount(0);
+
+            // Laser toggles on and off.
+            await page.getByTestId("drawing-dock-laser").click();
+            await expect(page.getByTestId("drawing-dock-laser")).toHaveAttribute("aria-pressed", "true");
+            await page.getByTestId("drawing-dock-done").click();
+            await expect(page.getByTestId("drawing-dock-laser")).toHaveAttribute("aria-pressed", "false");
+            await noHorizontalOverflow(page);
+        });
+
+        test("a viewer who may only chat sees no drawing buttons", async ({ page }) => {
+            await injectLocastShim(page);
+            await page.goto("/");
+            const viewer = { ...VIEWER_ROOM, you_cap_set: 0x80 };
+            await mountRoomWithRealVideo(page, viewer as unknown as typeof HOST_ROOM, VIEWER_ID);
+            await expect(page.getByTestId("locast-player-video")).toBeVisible();
+            await expect(page.getByTestId("drawing-dock")).toHaveCount(0);
+        });
+
         test("download dialog shows progress and blocks the room", async ({ page, locast }) => {
             await injectLocastShim(page);
             await page.goto("/");

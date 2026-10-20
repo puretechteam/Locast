@@ -846,6 +846,27 @@
     gap: var(--space-2);
 }
 
+/* Visible entry points for drawing and the laser (top left of the picture). */
+.drawing-dock {
+    position: absolute;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 3;
+    display: flex;
+    gap: var(--space-2);
+    padding: 0.25rem;
+    border-radius: var(--radius-md);
+    background: rgba(11, 13, 16, 0.78);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(4px);
+}
+
+.drawing-dock__btn[aria-pressed="true"] {
+    background: var(--accent-soft);
+    border-color: var(--accent-text);
+    color: var(--accent-text);
+}
+
 /* ---- Drawing and laser overlays (kept from P5) ---------------------- */
 
 /* P5-T01: drawing canvas overlay. The .room-page__player-stage
