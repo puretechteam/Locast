@@ -111,6 +111,11 @@ pub enum SignalingError {
     #[error("identity not initialized")]
     IdentityNotInitialized,
 
+    /// There is no signaling session to send on: the connection has not
+    /// finished its handshake yet, or it dropped and is being re-established.
+    #[error("not connected to the signaling server yet")]
+    NotConnected,
+
     /// The configured URL could not be parsed or the upgrade
     /// failed for transport reasons.
     #[error("transport error: {message}")]
@@ -318,6 +323,38 @@ impl SignalingClient {
         Ok(())
     }
 
+    /// Wait until the connection is authenticated, so a command sent next
+    /// has a session to go on. `start` only spawns the connection loop; the
+    /// handshake finishes a moment later, and an envelope sent before it has
+    /// no bearer to carry (reported as [`SignalingError::NotConnected`]).
+    ///
+    /// Fails after `timeout` with the last connection error if there is one,
+    /// or at once if the client is shutting down.
+    pub async fn wait_authenticated(&self, timeout: Duration) -> Result<(), SignalingError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let s = self.snapshot().await;
+            match s.phase {
+                ConnPhase::Authenticated => return Ok(()),
+                ConnPhase::ShuttingDown => {
+                    return Err(SignalingError::Transport {
+                        message: "the connection to the signaling server is closing".into(),
+                    });
+                }
+                _ => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let detail = s
+                    .last_error
+                    .unwrap_or_else(|| format!("no answer within {} s", timeout.as_secs()));
+                return Err(SignalingError::Transport {
+                    message: format!("could not connect to the signaling server: {detail}"),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// Signal cancellation and await the connection loop. Safe
     /// to call multiple times; the second call is a no-op
     /// once the loop has exited.
@@ -514,10 +551,7 @@ impl SignalingClient {
     pub async fn send_envelopes_paced(&self, envs: Vec<Envelope>) -> Result<(), SignalingError> {
         let (session, rate) = {
             let g = self.inner.lock().await;
-            let bearer = g
-                .bearer
-                .as_ref()
-                .ok_or(SignalingError::IdentityNotInitialized)?;
+            let bearer = g.bearer.as_ref().ok_or(SignalingError::NotConnected)?;
             let advertised = g
                 .server_bytes_per_sec
                 .unwrap_or(DEFAULT_SERVER_BYTES_PER_SEC);
@@ -548,10 +582,7 @@ impl SignalingClient {
     ) -> Result<(), SignalingError> {
         let (bearer, tx) = {
             let g = self.inner.lock().await;
-            let bearer = g
-                .bearer
-                .as_ref()
-                .ok_or(SignalingError::IdentityNotInitialized)?;
+            let bearer = g.bearer.as_ref().ok_or(SignalingError::NotConnected)?;
             if let Some(expected) = session {
                 if bearer.token != expected {
                     return Err(SignalingError::Protocol {
@@ -1145,10 +1176,19 @@ async fn run_handshake(
                     !token_bytes.is_empty() && user_id.is_some() && resume_token_held.is_some();
                 let keypair = match identity.load_keypair().await {
                     Ok(k) => k,
-                    Err(_) => {
-                        return HandshakeResult::ProtocolError(
-                            "identity not initialized".to_string(),
-                        );
+                    Err(e) => {
+                        // Say what actually went wrong. A missing key, a
+                        // locked or unavailable credential store and a
+                        // corrupt entry were all reported as "identity not
+                        // initialized", which sent people looking for a key
+                        // that was there.
+                        warn!(error = %e, "signaling handshake: could not load the identity keypair");
+                        return HandshakeResult::ProtocolError(match e {
+                            crate::identity::keystore::IdentityServiceError::NotInitialized => {
+                                "identity not initialized".to_string()
+                            }
+                            other => format!("could not load your identity key: {other}"),
+                        });
                     }
                 };
                 let sig = keypair.sign_challenge(nonce_bytes);

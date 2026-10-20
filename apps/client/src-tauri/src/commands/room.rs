@@ -40,8 +40,19 @@ pub async fn room_connect_signaling(
     signaling
         .start()
         .await
+        .map_err(|e| AppError::other(e.to_string()))?;
+    // `start` returns as soon as the connection loop is spawned. Callers send
+    // a room command right after this one, so wait for the handshake: without
+    // it the first create or join after launch failed with a misleading
+    // "identity not initialized" (no session yet), and only worked on a retry.
+    signaling
+        .wait_authenticated(CONNECT_TIMEOUT)
+        .await
         .map_err(|e| AppError::other(e.to_string()))
 }
+
+/// How long `room_connect_signaling` waits for the signaling handshake.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Create a new room. The caller picks the title and the
 /// migration setting.
