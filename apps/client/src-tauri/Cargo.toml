@@ -52,7 +52,18 @@ locast-protocol = { path = "../../../shared/protocol" }
 locast-manifest = { path = "../../../shared/manifest" }
 url = "2"
 percent-encoding = "2"
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+# rustls-tls-native-roots: wss:// support, verifying the server against
+# the OS trust store (ARCHITECTURE 21.12). Without a TLS feature,
+# connect_async refuses every wss:// URL, and the Settings page only
+# accepts wss:// for a remote server. Do not add the webpki-roots
+# feature as well: that would trust the bundled Mozilla list on top of
+# the system store.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+# Named directly to install the ring provider explicitly (see
+# net::signaling::ensure_crypto_provider; ring is already in the tree)
+# and to turn on tls12, which default-features = false leaves off, so a
+# TLS 1.2-only reverse proxy in front of the server is still reachable.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rmp-serde = "1"
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["rt"] }

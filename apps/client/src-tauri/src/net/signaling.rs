@@ -727,6 +727,7 @@ async fn connection_loop(
         // flight when the connection died; their senders resync.)
         while outbound_rx.try_recv().is_ok() {}
 
+        ensure_crypto_provider();
         let open = tokio::time::timeout(
             config.handshake_timeout,
             tokio_tungstenite::connect_async(&config.url),
@@ -1532,6 +1533,18 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Installs rustls' ring provider as the process default before the
+/// first wss:// connect. rustls picks a provider from crate features on
+/// its own only while exactly one is enabled, so a dependency that later
+/// turned on aws-lc-rs would make that implicit choice panic inside the
+/// connect. An `Err` means a provider is already installed, which is fine.
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 fn redact_token(token: &[u8; 32]) -> String {
