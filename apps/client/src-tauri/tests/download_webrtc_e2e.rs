@@ -1,5 +1,5 @@
 //! P3-T13 acceptance: the `WebRtcTransport` adapter shuttles
-//! bytes correctly through a webrtc 0.20 `DataChannel`.
+//! bytes correctly through a webrtc 0.21 `DataChannel`.
 //!
 //! The roadmap acceptance criterion for P3-T13 is:
 //!
@@ -10,13 +10,13 @@
 //! We do NOT spin up a real `WebRtcManager` or PeerConnection
 //! in this test -- those require libwebrtc network plumbing
 //! and a signaling server. Instead we implement a minimal
-//! `DataChannel` stub (`StubDataChannel`) that captures
+//! `FilesChannel` stub (`StubDataChannel`) that captures
 //! outbound `send` payloads and exposes an mpsc queue of
 //! `DataChannelEvent`s for `poll()` to drain. Two stubs
 //! wired back-to-back (one's outbound queue is the other's
 //! inbound queue, and vice versa) prove that:
 //!
-//! 1. `WebRtcTransport::send` -> `DataChannel::send` calls
+//! 1. `WebRtcTransport::send` -> `FilesChannel::send` calls
 //!    the correct API with `BytesMut` payload.
 //! 2. `DataChannelEvent::OnMessage` -> `WebRtcTransport::recv`
 //!    hands bytes to the consumer verbatim.
@@ -30,6 +30,10 @@
 //! orchestrator + scheduler work over any `Transport`, and
 //! `WebRtcTransport` is a `Transport` that delegates to a
 //! DataChannel.
+//!
+//! webrtc 0.21 sealed its `DataChannel` trait, so the stubs
+//! implement the transfer layer's `FilesChannel` (the calls the
+//! transport makes on a channel) instead.
 
 #![allow(clippy::needless_range_loop)]
 
@@ -38,30 +42,25 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use locast_client_lib::transfer::transport::{Transport, TransportError};
-use locast_client_lib::transfer::webrtc_transport::WebRtcTransport;
+use locast_client_lib::transfer::webrtc_transport::{FilesChannel, WebRtcTransport};
 use tokio::sync::{mpsc, Mutex};
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
+use webrtc::data_channel::{DataChannelEvent, RTCDataChannelState};
 use webrtc::error::Result as WebRtcResult;
 
-/// In-memory stub that satisfies the full `DataChannel` trait
-/// surface. Captures every `send` payload into a shared Vec,
-/// exposes `poll()` via an mpsc queue, and signals `OnClose`
-/// on `close()`. All other methods return fixed values so the
-/// trait surface is satisfied without real WebRTC plumbing.
+/// In-memory `FilesChannel` stub. Captures every `send` payload
+/// into a shared Vec, exposes `poll()` via an mpsc queue, and
+/// signals `OnClose` on `close()`; `ready_state` is always
+/// `Open`, so no real WebRTC plumbing is needed.
 struct StubDataChannel {
-    label: String,
-    protocol: String,
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
     events_tx: mpsc::UnboundedSender<DataChannelEvent>,
     events_rx: Arc<Mutex<mpsc::UnboundedReceiver<DataChannelEvent>>>,
 }
 
 impl StubDataChannel {
-    fn new(label: &str, protocol: &str) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<DataChannelEvent>();
         Arc::new(Self {
-            label: label.to_string(),
-            protocol: protocol.to_string(),
             sent: Arc::new(Mutex::new(Vec::new())),
             events_tx: tx,
             events_rx: Arc::new(Mutex::new(rx)),
@@ -93,49 +92,13 @@ impl StubDataChannel {
 }
 
 #[async_trait]
-impl DataChannel for StubDataChannel {
-    async fn label(&self) -> WebRtcResult<String> {
-        Ok(self.label.clone())
-    }
-    async fn ordered(&self) -> WebRtcResult<bool> {
-        Ok(true)
-    }
-    async fn max_packet_life_time(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn max_retransmits(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn protocol(&self) -> WebRtcResult<String> {
-        Ok(self.protocol.clone())
-    }
-    async fn negotiated(&self) -> WebRtcResult<bool> {
-        Ok(false)
-    }
-    fn id(&self) -> u16 {
-        0
-    }
+impl FilesChannel for StubDataChannel {
     async fn ready_state(&self) -> WebRtcResult<RTCDataChannelState> {
         Ok(RTCDataChannelState::Open)
-    }
-    async fn buffered_amount_high_threshold(&self) -> WebRtcResult<u32> {
-        Ok(u32::MAX)
-    }
-    async fn set_buffered_amount_high_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn buffered_amount_low_threshold(&self) -> WebRtcResult<u32> {
-        Ok(0)
-    }
-    async fn set_buffered_amount_low_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
     }
     async fn send(&self, data: BytesMut) -> WebRtcResult<()> {
         let mut g = self.sent.lock().await;
         g.push(data.to_vec());
-        Ok(())
-    }
-    async fn send_text(&self, _text: &str) -> WebRtcResult<()> {
         Ok(())
     }
     async fn poll(&self) -> Option<DataChannelEvent> {
@@ -151,7 +114,7 @@ impl DataChannel for StubDataChannel {
 /// Build a stub + its wrapped `WebRtcTransport`. Returns the
 /// stub so the test can inject messages.
 fn make_stub_transport() -> (Arc<StubDataChannel>, Arc<WebRtcTransport>) {
-    let stub = StubDataChannel::new("files", "locast-files-v1");
+    let stub = StubDataChannel::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     let transport = Arc::new(WebRtcTransport::new(stub.clone(), cancel));
     (stub, transport)
@@ -166,7 +129,7 @@ async fn webrtc_transport_send_round_trips_through_stub_datachannel() {
     //    WebRtcTransport prepends a 4-byte segmentation header
     //    [2B total_segments][2B segment_index] to every frame
     //    so that frames > 16 KiB can be reassembled on the
-    //    receive side (the webrtc 0.20 DataChannel silently
+    //    receive side (the webrtc 0.21 DataChannel silently
     //    drops messages larger than 16 KiB without the detach
     //    API). For a 13-byte payload, total_segments=1 and
     //    segment_index=0.
@@ -246,7 +209,7 @@ async fn webrtc_transport_cancel_token_ends_pending_recv() {
     );
 }
 
-/// A `DataChannel` whose `poll()` resolves to `None`
+/// A `FilesChannel` whose `poll()` resolves to `None`
 /// immediately (i.e. the channel is closed and has no more
 /// events). Used by the cancel-token test above so the receive
 /// pump exits via the cancel branch instead of OnClose.
@@ -259,47 +222,11 @@ impl ClosedStub {
 }
 
 #[async_trait]
-impl DataChannel for ClosedStub {
-    async fn label(&self) -> WebRtcResult<String> {
-        Ok("files".into())
-    }
-    async fn ordered(&self) -> WebRtcResult<bool> {
-        Ok(true)
-    }
-    async fn max_packet_life_time(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn max_retransmits(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn protocol(&self) -> WebRtcResult<String> {
-        Ok("locast-files-v1".into())
-    }
-    async fn negotiated(&self) -> WebRtcResult<bool> {
-        Ok(false)
-    }
-    fn id(&self) -> u16 {
-        0
-    }
+impl FilesChannel for ClosedStub {
     async fn ready_state(&self) -> WebRtcResult<RTCDataChannelState> {
         Ok(RTCDataChannelState::Closed)
     }
-    async fn buffered_amount_high_threshold(&self) -> WebRtcResult<u32> {
-        Ok(u32::MAX)
-    }
-    async fn set_buffered_amount_high_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn buffered_amount_low_threshold(&self) -> WebRtcResult<u32> {
-        Ok(0)
-    }
-    async fn set_buffered_amount_low_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
     async fn send(&self, _data: BytesMut) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn send_text(&self, _text: &str) -> WebRtcResult<()> {
         Ok(())
     }
     async fn poll(&self) -> Option<DataChannelEvent> {
@@ -314,8 +241,8 @@ impl DataChannel for ClosedStub {
 // side arrive as `OnMessage`s on the other side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webrtc_transport_pair_round_trips_through_linked_stubs() {
-    let stub_a = StubDataChannel::new("files", "locast-files-v1");
-    let stub_b = StubDataChannel::new("files", "locast-files-v1");
+    let stub_a = StubDataChannel::new();
+    let stub_b = StubDataChannel::new();
     // Capture B's sent bytes, then inject them into A's
     // inbound event queue. Same the other way.
     let cancel_a = tokio_util::sync::CancellationToken::new();
@@ -368,48 +295,12 @@ impl ErroringStub {
 }
 
 #[async_trait]
-impl DataChannel for ErroringStub {
-    async fn label(&self) -> WebRtcResult<String> {
-        Ok("files".into())
-    }
-    async fn ordered(&self) -> WebRtcResult<bool> {
-        Ok(true)
-    }
-    async fn max_packet_life_time(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn max_retransmits(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn protocol(&self) -> WebRtcResult<String> {
-        Ok("locast-files-v1".into())
-    }
-    async fn negotiated(&self) -> WebRtcResult<bool> {
-        Ok(false)
-    }
-    fn id(&self) -> u16 {
-        0
-    }
+impl FilesChannel for ErroringStub {
     async fn ready_state(&self) -> WebRtcResult<RTCDataChannelState> {
         Ok(RTCDataChannelState::Open)
     }
-    async fn buffered_amount_high_threshold(&self) -> WebRtcResult<u32> {
-        Ok(u32::MAX)
-    }
-    async fn set_buffered_amount_high_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn buffered_amount_low_threshold(&self) -> WebRtcResult<u32> {
-        Ok(0)
-    }
-    async fn set_buffered_amount_low_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
     async fn send(&self, _data: BytesMut) -> WebRtcResult<()> {
         Err(webrtc::error::Error::ErrDataChannelClosed)
-    }
-    async fn send_text(&self, _text: &str) -> WebRtcResult<()> {
-        Ok(())
     }
     async fn poll(&self) -> Option<DataChannelEvent> {
         None
@@ -419,7 +310,7 @@ impl DataChannel for ErroringStub {
     }
 }
 
-/// P3-T15 regression: the webrtc 0.20 DataChannel silently drops
+/// P3-T15 regression: the webrtc 0.21 DataChannel silently drops
 /// `OnMessage` events larger than 16 KiB (per the doc comment on
 /// `webrtc::data_channel::DataChannelEvent::OnMessage`). The
 /// production chunk payload is ~350 KiB, which is way over the
@@ -432,7 +323,7 @@ impl DataChannel for ErroringStub {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn webrtc_transport_segmentation_round_trips_large_frames() {
     let (stub, transport) = make_stub_transport();
-    // 1. Send a frame larger than the 16 KiB webrtc 0.20 cap.
+    // 1. Send a frame larger than the 16 KiB webrtc 0.21 cap.
     //    64 KiB guarantees multiple segments.
     let payload = vec![0xABu8; 64 * 1024];
     transport
@@ -538,7 +429,7 @@ async fn web_rtc_transport_satisfies_source_handle_transport_type() {
     use locast_client_lib::transfer::scheduler::Scheduler;
     use std::collections::VecDeque;
 
-    let stub = StubDataChannel::new("files", "locast-files-v1");
+    let stub = StubDataChannel::new();
     let cancel = tokio_util::sync::CancellationToken::new();
     let transport: Arc<dyn Transport> =
         Arc::new(WebRtcTransport::new(stub.clone(), cancel.clone()));
@@ -565,7 +456,7 @@ async fn web_rtc_transport_satisfies_source_handle_transport_type() {
     // a 4-byte segmentation header (total_segments=1,
     // segment_index=0) to every frame so that frames larger
     // than 16 KiB can be reassembled on the receive side
-    // (the webrtc 0.20 DataChannel silently drops messages
+    // (the webrtc 0.21 DataChannel silently drops messages
     // larger than 16 KiB without the detach API).
     transport
         .send(b"probe".to_vec())

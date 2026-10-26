@@ -97,14 +97,14 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use webrtc::data_channel::{DataChannel, RTCDataChannelState};
+use webrtc::data_channel::RTCDataChannelState;
 
 use locast_manifest::MediaManifest;
 
 use super::plan::plan_download;
 use super::session::{SenderSession, SessionError};
 use super::transport::Transport;
-use super::webrtc_transport::WebRtcTransport;
+use super::webrtc_transport::{FilesChannel, WebRtcTransport};
 use crate::core::paths;
 use crate::room::peer_id::derive_peer_id;
 use crate::storage::Storage;
@@ -228,7 +228,7 @@ impl HostSenderDispatcher {
     /// library in v1) and the inbound `Hello.media_id` /
     /// `download_id` / `manifest_version` are checked
     /// against the bound plan instead.
-    pub async fn spawn_for_dc(self: &Arc<Self>, dc: Arc<dyn DataChannel>, peer_user_id: Uuid) {
+    pub async fn spawn_for_dc(self: &Arc<Self>, dc: Arc<dyn FilesChannel>, peer_user_id: Uuid) {
         // 1. Allocate the per-sender cancel token first so
         //    the open-wait loop can check it.
         let sender_cancel = self.ctx.master_cancel.child_token();

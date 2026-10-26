@@ -20,12 +20,13 @@ use locast_client_lib::net::config::SignalingConfig;
 use locast_client_lib::net::room::RoomClient;
 use locast_client_lib::net::signaling::SignalingClient;
 use locast_client_lib::storage::Storage;
+use locast_client_lib::transfer::webrtc_transport::FilesChannel;
 use locast_client_lib::transfer::{HostDispatchContext, HostSenderDispatcher};
 use locast_manifest::MediaManifest;
 use locast_protocol::handshake::Platform;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
-use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
+use webrtc::data_channel::{DataChannelEvent, RTCDataChannelState};
 use webrtc::error::Result as WebRtcResult;
 
 /// A data channel that is open until told otherwise and never receives
@@ -48,28 +49,7 @@ impl StubDataChannel {
 }
 
 #[async_trait]
-impl DataChannel for StubDataChannel {
-    async fn label(&self) -> WebRtcResult<String> {
-        Ok("files".into())
-    }
-    async fn ordered(&self) -> WebRtcResult<bool> {
-        Ok(true)
-    }
-    async fn max_packet_life_time(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn max_retransmits(&self) -> WebRtcResult<Option<u16>> {
-        Ok(None)
-    }
-    async fn protocol(&self) -> WebRtcResult<String> {
-        Ok("locast-files-v1".into())
-    }
-    async fn negotiated(&self) -> WebRtcResult<bool> {
-        Ok(false)
-    }
-    fn id(&self) -> u16 {
-        0
-    }
+impl FilesChannel for StubDataChannel {
     async fn ready_state(&self) -> WebRtcResult<RTCDataChannelState> {
         Ok(if self.open.load(Ordering::SeqCst) {
             RTCDataChannelState::Open
@@ -77,22 +57,7 @@ impl DataChannel for StubDataChannel {
             RTCDataChannelState::Closed
         })
     }
-    async fn buffered_amount_high_threshold(&self) -> WebRtcResult<u32> {
-        Ok(u32::MAX)
-    }
-    async fn set_buffered_amount_high_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn buffered_amount_low_threshold(&self) -> WebRtcResult<u32> {
-        Ok(0)
-    }
-    async fn set_buffered_amount_low_threshold(&self, _t: u32) -> WebRtcResult<()> {
-        Ok(())
-    }
     async fn send(&self, _data: BytesMut) -> WebRtcResult<()> {
-        Ok(())
-    }
-    async fn send_text(&self, _text: &str) -> WebRtcResult<()> {
         Ok(())
     }
     async fn poll(&self) -> Option<DataChannelEvent> {

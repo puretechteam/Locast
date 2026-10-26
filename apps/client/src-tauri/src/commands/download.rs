@@ -44,7 +44,7 @@ use crate::transfer::scheduler::Scheduler;
 use crate::transfer::state::DownloadStore;
 use crate::transfer::state::NewDownload;
 use crate::transfer::transport::Transport;
-use crate::transfer::webrtc_transport::WebRtcTransport;
+use crate::transfer::webrtc_transport::{files_channel, WebRtcTransport};
 
 use sqlx::error::ErrorKind;
 
@@ -493,8 +493,10 @@ pub async fn open_download_inner(
                     continue;
                 };
                 let cancel_token = tokio_util::sync::CancellationToken::new();
-                let transport: Arc<dyn Transport> =
-                    Arc::new(WebRtcTransport::new(dc, cancel_token.clone()));
+                let transport: Arc<dyn Transport> = Arc::new(WebRtcTransport::new(
+                    files_channel(dc),
+                    cancel_token.clone(),
+                ));
                 let scheduler = Arc::new(Scheduler::new(transport.clone(), cancel_token.clone()));
                 source_handles.push(SourceHandle {
                     peer_id: src.peer_id.clone(),

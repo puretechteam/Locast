@@ -86,6 +86,11 @@
 //!   `MaxBundle` / `Require` / `All` / `unified-plan` (see
 //!   `RTCConfigurationBuilder` defaults), which match
 //!   architecture §19.3.
+//! - 0.21 seals `DataChannel` (only webrtc implements it).
+//!   The transfer layer takes the narrower
+//!   `transfer::webrtc_transport::FilesChannel`; this module
+//!   keeps the real type and wraps a channel with
+//!   `files_channel` where it hands it to the host dispatch.
 
 #![deny(unsafe_code)]
 #![warn(rust_2018_idioms)]
@@ -113,6 +118,7 @@ use crate::identity::keystore::IdentityService;
 use crate::net::room::RoomSummaryIpc;
 use crate::net::signaling::SignalingClient;
 use crate::room::peer_id::derive_peer_id;
+use crate::transfer::webrtc_transport::files_channel;
 
 use super::webrtc_canonical::signal_signed_bytes;
 
@@ -519,7 +525,9 @@ impl WebRtcManager {
                     if let Some(dispatch) = self.host_dispatch() {
                         let dc_for_spawn = dc.clone();
                         tokio::spawn(async move {
-                            dispatch.spawn_for_dc(dc_for_spawn, remote_id).await;
+                            dispatch
+                                .spawn_for_dc(files_channel(dc_for_spawn), remote_id)
+                                .await;
                         });
                     }
                     entry.dc = Some(dc);
@@ -912,7 +920,9 @@ impl WebRtcManager {
             if let Some(dispatch) = self.host_dispatch() {
                 let dc_for_spawn = dc.clone();
                 tokio::spawn(async move {
-                    dispatch.spawn_for_dc(dc_for_spawn, remote_id).await;
+                    dispatch
+                        .spawn_for_dc(files_channel(dc_for_spawn), remote_id)
+                        .await;
                 });
             }
         } else {

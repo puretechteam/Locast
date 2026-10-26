@@ -1,4 +1,4 @@
-//! P3-T13: WebRtcTransport -- bridges a webrtc 0.20 DataChannel to the
+//! P3-T13: WebRtcTransport -- bridges a webrtc 0.21 DataChannel to the
 //! `Transport` trait used by MultiSourceReceiver.
 //!
 //! Spawns a per-channel receive pump that pushes incoming bytes into
@@ -10,8 +10,9 @@
 //! already a binary-clean stream (no line discipline), so the adapter
 //! shuttles raw bytes end-to-end.
 //!
-//! P3-T15 segmentation: the webrtc 0.20 `DataChannel::poll` silently
-//! drops incoming messages larger than 16 KiB
+//! P3-T15 segmentation: under webrtc 0.20 `DataChannel::poll` silently
+//! dropped incoming messages larger than 16 KiB, and 0.21 still
+//! documents the cap, so it is kept as a conservative interop limit
 //! (`webrtc::data_channel::DataChannelEvent::OnMessage` doc comment:
 //! "OnMessage can currently receive messages up to 16384 bytes in
 //! size. Check out the detach API if you want to use larger message
@@ -59,14 +60,71 @@ use thiserror::Error;
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelState};
 
 use crate::transfer::transport::{Transport, TransportError};
 use crate::transfer::wire::MAX_FRAME_BYTES;
 
-/// Maximum payload bytes per SCTP DataChannel message. The webrtc
-/// 0.20 `DataChannelEvent::OnMessage` silently drops messages larger
-/// than 16384 bytes (the "detach API" is required for larger sizes).
+/// The calls the transfer layer makes on a `files` data channel.
+///
+/// webrtc 0.21 sealed `webrtc::data_channel::DataChannel`, so only the
+/// crate's own channels can implement it and a test can no longer stand
+/// in for one. Transfer code takes this narrower trait instead: a real
+/// channel gets it through [`files_channel`], test doubles implement it
+/// directly.
+#[async_trait::async_trait]
+pub trait FilesChannel: Send + Sync + 'static {
+    /// The channel's current state (`DataChannel::ready_state`).
+    async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState>;
+    /// Queue one binary message (`DataChannel::send`).
+    async fn send(&self, data: BytesMut) -> webrtc::error::Result<()>;
+    /// The next event, or `None` once the channel is finished
+    /// (`DataChannel::poll`).
+    async fn poll(&self) -> Option<DataChannelEvent>;
+    /// Close the channel (`DataChannel::close`).
+    async fn close(&self) -> webrtc::error::Result<()>;
+    /// Identity of the underlying channel: the same for every handle on
+    /// one channel, so transports on it share one receive pump. Defaults
+    /// to this object's address, which is right for a test double that is
+    /// itself the channel.
+    fn channel_key(&self) -> usize {
+        self as *const Self as *const () as usize
+    }
+}
+
+/// A real webrtc data channel as a [`FilesChannel`].
+struct RtcFilesChannel(Arc<dyn DataChannel>);
+
+#[async_trait::async_trait]
+impl FilesChannel for RtcFilesChannel {
+    async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState> {
+        self.0.ready_state().await
+    }
+    async fn send(&self, data: BytesMut) -> webrtc::error::Result<()> {
+        self.0.send(data).await
+    }
+    async fn poll(&self) -> Option<DataChannelEvent> {
+        self.0.poll().await
+    }
+    async fn close(&self) -> webrtc::error::Result<()> {
+        self.0.close().await
+    }
+    /// The webrtc channel's address, not the wrapper's: each call to
+    /// [`files_channel`] makes a new wrapper around the same channel.
+    fn channel_key(&self) -> usize {
+        Arc::as_ptr(&self.0) as *const () as usize
+    }
+}
+
+/// Wrap a webrtc data channel for the transfer layer.
+pub fn files_channel(dc: Arc<dyn DataChannel>) -> Arc<dyn FilesChannel> {
+    Arc::new(RtcFilesChannel(dc))
+}
+
+/// Maximum payload bytes per SCTP DataChannel message. webrtc 0.20's
+/// `DataChannelEvent::OnMessage` silently dropped messages larger than
+/// 16384 bytes, and 0.21 still documents that cap (the "detach API" is
+/// required for larger sizes), so it stays as the interop limit.
 /// We use 16384 as the cap; the 4-byte segment header reduces the
 /// effective payload to 16380 bytes per segment.
 const MAX_SCTP_MESSAGE_SIZE: usize = 16384;
@@ -180,12 +238,12 @@ fn pumps() -> &'static std::sync::Mutex<std::collections::HashMap<usize, std::sy
     PUMPS.get_or_init(Default::default)
 }
 
-/// Adapter that exposes a webrtc 0.20 `Arc<dyn DataChannel>` as the
+/// Adapter that exposes a [`FilesChannel`] as the
 /// transfer layer's [`Transport`] trait. Bytes-in, bytes-out; no
 /// framing layer lives here (the wire codec lives in
 /// `transfer::wire::codec`).
 pub struct WebRtcTransport {
-    dc: Arc<dyn DataChannel>,
+    dc: Arc<dyn FilesChannel>,
     rx: Arc<Mutex<mpsc::Receiver<Inbound>>>,
     cancel: CancellationToken,
     /// The channel's shared pump handle.
@@ -194,14 +252,14 @@ pub struct WebRtcTransport {
 
 impl WebRtcTransport {
     /// A transport that DOWNLOADS over `dc` (see [`Role::Requester`]).
-    pub fn new(dc: Arc<dyn DataChannel>, cancel: CancellationToken) -> Self {
+    pub fn new(dc: Arc<dyn FilesChannel>, cancel: CancellationToken) -> Self {
         Self::new_for(dc, cancel, Role::Requester)
     }
 
     /// A transport for `role` over `dc`. Joins the channel's shared receive
     /// pump, starting it if this is the first.
-    pub fn new_for(dc: Arc<dyn DataChannel>, cancel: CancellationToken, role: Role) -> Self {
-        let key = Arc::as_ptr(&dc) as *const () as usize;
+    pub fn new_for(dc: Arc<dyn FilesChannel>, cancel: CancellationToken, role: Role) -> Self {
+        let key = dc.channel_key();
         let demux = {
             let mut map = pumps().lock().expect("pumps");
             map.retain(|_, w| w.strong_count() > 0);
@@ -231,7 +289,7 @@ impl WebRtcTransport {
 /// Start the one receive pump of `dc`. It lives until the channel closes or a
 /// protocol violation closes it; transports for either role join and leave
 /// it meanwhile.
-fn spawn_pump(dc: Arc<dyn DataChannel>, d: Arc<Demux>) {
+fn spawn_pump(dc: Arc<dyn FilesChannel>, d: Arc<Demux>) {
     tokio::spawn(async move {
         let mut reassembler = Reassembler::default();
         loop {
@@ -275,6 +333,15 @@ fn spawn_pump(dc: Arc<dyn DataChannel>, d: Arc<Demux>) {
                 | DataChannelEvent::OnError
                 | DataChannelEvent::OnBufferedAmountLow
                 | DataChannelEvent::OnBufferedAmountHigh => {}
+                // webrtc 0.21 made the enum `#[non_exhaustive]` without
+                // adding a variant (0.21.1 has the same seven as 0.20).
+                // A variant added later cannot carry inbound data we
+                // understand, and the end of the channel still shows up
+                // as `OnClose` or `poll()` returning `None`, so keep
+                // pumping.
+                other => {
+                    tracing::debug!(event = ?other, "files data channel: unhandled event");
+                }
             }
         }
         // The channel is finished for everyone reading it.
@@ -506,49 +573,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl DataChannel for MockDc {
-        async fn label(&self) -> webrtc::error::Result<String> {
-            Ok("files".into())
-        }
-        async fn ordered(&self) -> webrtc::error::Result<bool> {
-            Ok(true)
-        }
-        async fn max_packet_life_time(&self) -> webrtc::error::Result<Option<u16>> {
-            Ok(None)
-        }
-        async fn max_retransmits(&self) -> webrtc::error::Result<Option<u16>> {
-            Ok(None)
-        }
-        async fn protocol(&self) -> webrtc::error::Result<String> {
-            Ok(String::new())
-        }
-        async fn negotiated(&self) -> webrtc::error::Result<bool> {
-            Ok(false)
-        }
-        fn id(&self) -> webrtc::data_channel::RTCDataChannelId {
-            1
-        }
-        async fn ready_state(
-            &self,
-        ) -> webrtc::error::Result<webrtc::data_channel::RTCDataChannelState> {
-            Ok(webrtc::data_channel::RTCDataChannelState::Open)
-        }
-        async fn buffered_amount_high_threshold(&self) -> webrtc::error::Result<u32> {
-            Ok(0)
-        }
-        async fn set_buffered_amount_high_threshold(&self, _t: u32) -> webrtc::error::Result<()> {
-            Ok(())
-        }
-        async fn buffered_amount_low_threshold(&self) -> webrtc::error::Result<u32> {
-            Ok(0)
-        }
-        async fn set_buffered_amount_low_threshold(&self, _t: u32) -> webrtc::error::Result<()> {
-            Ok(())
+    impl FilesChannel for MockDc {
+        async fn ready_state(&self) -> webrtc::error::Result<RTCDataChannelState> {
+            Ok(RTCDataChannelState::Open)
         }
         async fn send(&self, _data: BytesMut) -> webrtc::error::Result<()> {
-            Ok(())
-        }
-        async fn send_text(&self, _text: &str) -> webrtc::error::Result<()> {
             Ok(())
         }
         async fn poll(&self) -> Option<DataChannelEvent> {
@@ -595,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn a_downloader_and_a_sender_on_one_channel_do_not_steal_each_others_frames() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let dc: Arc<dyn DataChannel> = Arc::new(MockDc {
+        let dc: Arc<dyn FilesChannel> = Arc::new(MockDc {
             events: Mutex::new(rx),
         });
         let sender = WebRtcTransport::new_for(dc.clone(), CancellationToken::new(), Role::Sender);
