@@ -88,6 +88,12 @@ fn is_unique_violation_sqlx(e: &sqlx::Error) -> bool {
 }
 
 fn is_unique_violation_chunk(e: &crate::transfer::state::ChunkStateError) -> bool {
+    if matches!(
+        e,
+        crate::transfer::state::ChunkStateError::ActiveDownloadExists { .. }
+    ) {
+        return true;
+    }
     let msg = e.to_string();
     msg.contains("UNIQUE constraint failed") || msg.contains("ux_downloads_active")
 }
@@ -436,26 +442,47 @@ pub async fn open_download_inner(
             .await?;
             // A retry (or a duplicate call) for a row whose
             // transfer is already running must not spawn a
-            // second orchestrator: `TransferRegistry::register`
-            // would cancel the running one.
-            if registry.is_active(&active_download_id).await {
-                let (state, transferred): (String, i64) =
-                    sqlx::query_as("SELECT state, transferred_bytes FROM downloads WHERE id = ?1")
-                        .bind(&active_download_id)
-                        .fetch_one(&storage.pool())
-                        .await
-                        .map_err(|e| AppError::other(format!("downloads SELECT: {e}")))?;
-                return Ok(DownloadSessionIpc {
-                    download_id: active_download_id,
-                    media_id: resolved_media_id,
-                    state,
-                    dedup_hit: false,
-                    total_bytes: entry.size_bytes,
-                    transferred_bytes: transferred.max(0) as u64,
-                    on_disk_path: None,
-                    transfer_started: true,
-                });
-            }
+            // second orchestrator. Claim the id atomically here,
+            // before the awaits below: with a plain check here and
+            // a register after the setup, two overlapping calls
+            // both passed the check and the second cancelled the
+            // first, which then marked the shared row Cancelled.
+            // The claim is released on every early return below
+            // (the guard drops) and handed to the spawned task.
+            let claim = registry
+                .try_register(
+                    active_download_id.clone(),
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let guard = match claim {
+                crate::transfer::registry::Claim::Claimed(g) => g,
+                // Running: report it as started. Busy (another call
+                // is still setting up, or a cancelled run is winding
+                // down): report not started so the caller asks
+                // again; that setup may still end without a
+                // transfer (no source channel yet, an error).
+                other => {
+                    let running = matches!(other, crate::transfer::registry::Claim::Running);
+                    let (state, transferred): (String, i64) = sqlx::query_as(
+                        "SELECT state, transferred_bytes FROM downloads WHERE id = ?1",
+                    )
+                    .bind(&active_download_id)
+                    .fetch_one(&storage.pool())
+                    .await
+                    .map_err(|e| AppError::other(format!("downloads SELECT: {e}")))?;
+                    return Ok(DownloadSessionIpc {
+                        download_id: active_download_id,
+                        media_id: resolved_media_id,
+                        state,
+                        dedup_hit: false,
+                        total_bytes: entry.size_bytes,
+                        transferred_bytes: transferred.max(0) as u64,
+                        on_disk_path: None,
+                        transfer_started: running,
+                    });
+                }
+            };
             // P3-T13: wire the actual transfer on the Missing
             // path. We need:
             //   1. a `user_id -> [u8;32] pubkey` lookup table
@@ -578,7 +605,6 @@ pub async fn open_download_inner(
             // RegisterGuard ensures unregister on any exit path
             // including panic (P7-T05). Wrapped in panic_boundary
             // to catch panics and transition to Failed state.
-            let registry_for_task = registry.clone();
             let download_id_for_task = active_download_id.clone();
             let cancel_for_registry = receiver.cancel_handle();
             let cancel_for_panic = cancel_for_registry.clone();
@@ -587,9 +613,22 @@ pub async fn open_download_inner(
             let media_id_for_panic = resolved_media_id.clone();
             let download_id_for_panic = download_id_for_task.clone();
             let download_id_for_err = download_id_for_task.clone();
-            let guard = registry_for_task
-                .register(download_id_for_task, cancel_for_registry)
-                .await;
+            // Hand the orchestrator's token to the claim taken
+            // above. If a cancel / cancel_all (room_leave) removed
+            // the claim during the setup, do not start at all.
+            if !guard.adopt_token(cancel_for_registry) {
+                info!(download_id = %download_id_for_task, "download cancelled before the transfer started");
+                return Ok(DownloadSessionIpc {
+                    download_id: active_download_id,
+                    media_id: resolved_media_id,
+                    state: "pending".into(),
+                    dedup_hit: false,
+                    total_bytes: entry.size_bytes,
+                    transferred_bytes: 0,
+                    on_disk_path: None,
+                    transfer_started: false,
+                });
+            }
             tokio::spawn(async move {
                 let _guard = guard;
                 // P7-T05: wrap in panic boundary
@@ -597,7 +636,10 @@ pub async fn open_download_inner(
                     download_id_for_panic.clone(),
                     media_id_for_panic.clone(),
                     storage_for_panic.clone(),
-                    Some(registry_for_task.clone()),
+                    // No registry here: the task's guard releases the
+                    // claim on any exit. An unregister by id could
+                    // remove a newer claim on the same row.
+                    None,
                     Some(cancel_for_panic),
                     None,
                     move || async move {
@@ -616,7 +658,6 @@ pub async fn open_download_inner(
                     warn!(download_id = %download_id_for_err, error = %e, "download task panicked and was caught");
                 }
             });
-            let _ = registry_for_task;
 
             emit_state_and_progress(
                 &active_download_id,

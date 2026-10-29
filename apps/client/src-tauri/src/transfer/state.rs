@@ -198,6 +198,11 @@ pub enum ChunkStateError {
     InvalidMediaId { value: String },
     #[error("invalid user_id: {value}")]
     InvalidUserId { value: String },
+    /// `create` lost a race: another row is already the active
+    /// download for this (media, room, user), so the partial
+    /// `ux_downloads_active` index made the insert a no-op.
+    #[error("an active download already exists for media {media_id} (ux_downloads_active)")]
+    ActiveDownloadExists { media_id: String },
     #[error("database error: {0}")]
     Sqlx(String),
 }
@@ -292,7 +297,11 @@ impl DownloadStore {
         // download; a race where two callers both won
         // the SELECT and got here is resolved by the
         // chunk UNIQUE (download_id, "index") index.
-        sqlx::query(
+        // The IGNORE also swallows a `ux_downloads_active`
+        // conflict (another id is already the active row for
+        // this media/room/user). That case is detected below:
+        // nothing was inserted and no row has our id.
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO downloads
                  (id, media_id, room_id, user_id, state, total_bytes, transferred_bytes,
                   started_at, source_peer_id, chunk_size_bytes, manifest_version, last_error)
@@ -309,6 +318,21 @@ impl DownloadStore {
         .bind(new.manifest_version)
         .execute(&mut *tx)
         .await?;
+        if inserted.rows_affected() == 0 {
+            let ours: Option<(String,)> = sqlx::query_as("SELECT id FROM downloads WHERE id = ?")
+                .bind(&new.download_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if ours.is_none() {
+                // Without this the chunk INSERT below fails on
+                // the foreign key, which the caller's race
+                // recovery does not recognise. The transaction
+                // rolls back when `tx` drops.
+                return Err(ChunkStateError::ActiveDownloadExists {
+                    media_id: new.media_id.clone(),
+                });
+            }
+        }
 
         // Bulk insert chunks. SQLite has a 999-parameter limit per
         // statement. Each chunk row has 6 bound parameters; we use
@@ -1226,6 +1250,55 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(n, 3);
+    }
+
+    #[tokio::test]
+    async fn create_reports_an_existing_active_row_instead_of_a_foreign_key_error() {
+        // Two download_open calls racing past the SELECT: the second
+        // create (new id, same media/room/user) is absorbed by
+        // ux_downloads_active and must say so, not fail on the
+        // chunk rows' foreign key.
+        let pool = fresh_pool().await;
+        // SCHEMA_DDL does not mirror migration 0004; add its index.
+        sqlx::query(
+            "CREATE UNIQUE INDEX ux_downloads_active
+                 ON downloads(media_id, COALESCE(room_id, ''), user_id)
+                 WHERE state IN ('pending','connecting','transferring','verifying','paused')",
+        )
+        .execute(&pool)
+        .await
+        .expect("ux_downloads_active");
+        seed_fk_deps(&pool, "u-1", "m-1").await;
+        let s = DownloadStore::new(pool.clone());
+        let chunks = fake_chunks(2);
+        let new = |id: &str| NewDownload {
+            download_id: id.into(),
+            media_id: "m-1".into(),
+            room_id: None,
+            user_id: "u-1".into(),
+            total_bytes: crate::transfer::CHUNK_SIZE_BYTES as u64 * 2,
+            source_peer_id: peer_id(),
+            chunk_size_bytes: crate::transfer::CHUNK_SIZE_BYTES as u32,
+            manifest_version: 1,
+        };
+        s.create(&new("dl-a"), &chunks).await.expect("first create");
+        let err = s
+            .create(&new("dl-b"), &chunks)
+            .await
+            .expect_err("second create");
+        assert!(
+            matches!(err, ChunkStateError::ActiveDownloadExists { .. }),
+            "got {err:?}"
+        );
+        // A re-entrant create for the SAME id still succeeds.
+        s.create(&new("dl-a"), &chunks)
+            .await
+            .expect("same-id create");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM downloads")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
     }
 
     #[tokio::test]
